@@ -69,6 +69,7 @@ from backend.model_catalog import (
     LOCAL_TRANSCRIPTION_MODELS,
     OPENROUTER_UPSCALE_FALLBACK_MODELS,
     REMOTE_TRANSCRIPTION_PROVIDERS,
+    gigaam_available,
     health_model_catalog,
 )
 from backend.audio_mime import AUDIO_EXT_TO_MIME, audio_content_type
@@ -79,6 +80,12 @@ from backend.audio import (
     ensure_wav_16k_preserve_channels,
     split_channels,
     write_wav_from_pcm16_stream,
+)
+from backend.cli_access import (
+    CliAccess,
+    base_url_from_scope,
+    cli_defaults,
+    cli_token_may_call,
 )
 from backend.config import APP_ROOT, DATA_DIR, load_config, redact_config, save_config
 from backend.storage import (
@@ -841,6 +848,19 @@ def _load_or_create_api_token() -> str:
 
 API_TOKEN = _load_or_create_api_token()
 
+# ── The command-line client's access ────────────────────────────────
+#
+# A second caller with a second life. The renderer's token is minted at
+# boot and lives as long as the process; a command run by a shell or an
+# agent is authorised separately, stays authorised across restarts, and
+# must be revocable while the app keeps running. ``CliAccess`` owns
+# every file behind that — the token, the connection file the client
+# reads, the wrapper script — and ``cli_token_may_call`` owns what the
+# token opens. Loaded once here so the auth path compares against
+# memory and never touches the disk per request.
+CLI_ACCESS = CliAccess(DATA_DIR)
+CLI_ACCESS.load()
+
 
 # The tmp-name convention lives with the atomic writers that produce it
 # (``backend.storage.TMP_ORPHAN_RE``). Both producers are covered:
@@ -1497,8 +1517,23 @@ async def _require_api_auth(request: Request) -> None:
     # recovery of API_TOKEN over the loopback/LAN. secrets.compare_digest
     # requires both operands to be the same type; encode to bytes so a
     # unicode-only user input cannot panic the comparison.
-    if not provided or not secrets.compare_digest(provided.encode("utf-8"), API_TOKEN.encode("utf-8")):
+    if not provided:
         raise HTTPException(status_code=401, detail="unauthorized")
+    if not secrets.compare_digest(provided.encode("utf-8"), API_TOKEN.encode("utf-8")):
+        # Not the renderer. The command-line client holds a token of its
+        # own, and it is NOT the renderer's under another name: it opens
+        # the transcription routes and nothing else, so a leaked CLI
+        # token cannot read the config, the provider keys or the
+        # archive. The route list is ``cli_access._CLI_ROUTES``; a route
+        # that is not on it answers 403 rather than 401, because the
+        # token IS valid — it is this path that is closed to it.
+        if not CLI_ACCESS.token_matches(provided):
+            raise HTTPException(status_code=401, detail="unauthorized")
+        if not cli_token_may_call(request.method, request.url.path):
+            raise HTTPException(
+                status_code=403,
+                detail="the command-line token may not call this endpoint",
+            )
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         origin = request.headers.get("origin")
         if origin and not _origin_allowed(origin, request):
@@ -1538,6 +1573,16 @@ async def guard_host_and_set_cache_control(request: Request, call_next):
             request.url.path,
         )
         return JSONResponse(status_code=421, content={"detail": "misdirected request"})
+    # The address this backend was actually reached at, recorded for the
+    # command-line client. The desktop shell asks for 8321 and takes the
+    # next free port when it is busy, so the port is not a constant and
+    # the connection file would otherwise point at a backend that moved.
+    # A no-op unless CLI access is on AND the address changed (see
+    # CliAccess.sync_connection), so the common request pays a bool and
+    # a string compare. Placed after the Host allowlist so a rejected
+    # request can never rewrite the recorded address.
+    if CLI_ACCESS.is_enabled():
+        CLI_ACCESS.sync_connection(base_url_from_scope(request.scope))
     response = await call_next(request)
     path = request.url.path or ""
     if path.startswith("/assets/"):
@@ -1923,6 +1968,45 @@ def _best_effort_unlink(path: Path, *, context: str) -> bool:
         return False
 
 
+# ── The upload-snapshot name convention ─────────────────────────────
+#
+# Every file the backend parks in UPLOADS_DIR is named
+# ``<job or request id>.<original filename>``. Five call sites wrote
+# that shape by hand and nothing read it back, which is why a recording
+# saved from a snapshot was filed under the job's UUID: the archive
+# names a recording after its source file, and the source file's name
+# had a UUID glued to the front of it.
+#
+# Stated here once, with the reader that inverts it, so the two cannot
+# drift — the failure mode of a private convention with two authors is
+# a name that is right on the way in and wrong on the way back.
+_UPLOAD_SNAPSHOT_PREFIX_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.",
+    re.IGNORECASE,
+)
+
+
+def _upload_snapshot_path(owner_id: str, orig_name: str) -> Path:
+    """Where a snapshot of *orig_name* for job/request *owner_id* lives."""
+    return UPLOADS_DIR / f"{owner_id}.{orig_name}"
+
+
+def _source_media_original_name(source_path: Path) -> str:
+    """The name the USER knows the file by.
+
+    For a file the user picked, that is its own name. For a snapshot the
+    backend made, it is the name underneath the id prefix — the archive
+    is the user's, and "meeting.mp4" is what belongs in it, not
+    "9f2c….meeting.mp4". A path outside UPLOADS_DIR is never stripped,
+    so a real file whose name merely starts with something UUID-shaped
+    keeps every character of it.
+    """
+    name = source_path.name
+    if not _is_backend_owned_upload_path(source_path):
+        return name
+    return _UPLOAD_SNAPSHOT_PREFIX_RE.sub("", name, count=1) or name
+
+
 def _is_backend_owned_upload_path(path: Path) -> bool:
     try:
         path.resolve(strict=False).relative_to(UPLOADS_DIR.resolve(strict=False))
@@ -2059,7 +2143,7 @@ def _copy_source_media_file(source_path: Path, target: Path) -> int:
 
 def _snapshot_source_media_for_job(source_path: Path, job_id: str) -> Path:
     orig_name = _normalize_filename(source_path.name)
-    target = UPLOADS_DIR / f"{job_id}.{orig_name}"
+    target = _upload_snapshot_path(job_id, orig_name)
     _copy_source_media_file(source_path, target)
     return target
 
@@ -5981,7 +6065,7 @@ async def create_job(
     orig_name = _normalize_filename(file.filename or "audio.wav")
     _validate_audio_filename(orig_name)
     job_id = str(uuid.uuid4())
-    upload_path = UPLOADS_DIR / f"{job_id}.{orig_name}"
+    upload_path = _upload_snapshot_path(job_id, orig_name)
     await _save_upload_file(file, upload_path)
 
     jobs.create(job_id)
@@ -6050,7 +6134,7 @@ async def transcribe_sync(
     request_id = str(uuid.uuid4())
     orig_name = _normalize_filename(file.filename or "audio.wav")
     _validate_audio_filename(orig_name)
-    upload_path = UPLOADS_DIR / f"{request_id}.{orig_name}"
+    upload_path = _upload_snapshot_path(request_id, orig_name)
     await _save_upload_file(file, upload_path)
     loop = asyncio.get_running_loop()
     try:
@@ -6432,7 +6516,7 @@ async def create_remote_job(
     orig_name = _normalize_filename(file.filename or "audio.wav")
     _validate_audio_filename(orig_name)
     job_id = str(uuid.uuid4())
-    upload_path = UPLOADS_DIR / f"{job_id}.{orig_name}"
+    upload_path = _upload_snapshot_path(job_id, orig_name)
     await _save_upload_file(file, upload_path)
 
     jobs.create(job_id)
@@ -6508,7 +6592,7 @@ async def remote_transcribe_sync(
     orig_name = _normalize_filename(file.filename or "audio.wav")
     _validate_audio_filename(orig_name)
     request_id = str(uuid.uuid4())
-    upload_path = UPLOADS_DIR / f"{request_id}.{orig_name}"
+    upload_path = _upload_snapshot_path(request_id, orig_name)
     await _save_upload_file(file, upload_path)
 
     cfg = load_config()
@@ -6884,6 +6968,52 @@ def download(job_id: str, kind: str, _auth: None = Depends(_require_api_auth)):
     media_type = "application/json" if kind == "json" else "text/plain"
     filename = f"{job_id}.{kind}"
     return FileResponse(path, media_type=media_type, filename=filename)
+
+
+# ── Command-line access ─────────────────────────────────────────────
+#
+# Three routes, one owner. ``GET /api/cli`` is the only one the CLI
+# token itself may call: the client reads it to learn what the app would
+# do by default, so a bare ``transcriptor transcribe file.mp4``
+# transcribes exactly as the Upload tab would. Enable and disable are
+# renderer-only — they are not on ``cli_access._CLI_ROUTES``, so a
+# command holding the CLI token cannot widen its own access.
+
+
+def _cli_status_payload(request: Request) -> dict[str, Any]:
+    """The CLI section's whole view: switch state, paths, cards, defaults."""
+    payload = CLI_ACCESS.status(base_url=base_url_from_scope(request.scope))
+    payload["defaults"] = cli_defaults(load_config(), gigaam_available())
+    return payload
+
+
+@app.get("/api/cli")
+def get_cli_access(request: Request, _auth: None = Depends(_require_api_auth)):
+    return _cli_status_payload(request)
+
+
+@app.post("/api/cli/enable")
+def enable_cli_access(request: Request, _auth: None = Depends(_require_api_auth)):
+    try:
+        CLI_ACCESS.enable(base_url_from_scope(request.scope))
+    except OSError as e:
+        # The switch reports what the file system holds, so a failed
+        # write must surface as a failure — not as an "on" the next
+        # boot would contradict. CliAccess rolls its own state back.
+        logger.exception("cli access could not be enabled")
+        raise HTTPException(
+            status_code=500,
+            detail=f"command-line access not enabled: {_safe_error_text(e)}",
+        )
+    logger.info("cli access enabled; files under %s", CLI_ACCESS.dir)
+    return _cli_status_payload(request)
+
+
+@app.post("/api/cli/disable")
+def disable_cli_access(request: Request, _auth: None = Depends(_require_api_auth)):
+    CLI_ACCESS.disable()
+    logger.info("cli access disabled; token revoked")
+    return _cli_status_payload(request)
 
 
 @app.get("/api/config")
@@ -7874,7 +8004,7 @@ async def save_recording_from_path(
 
     consume_source_path = _payload_bool(payload, "consume_source_path", False)
     result = await _save_recording_audio_source(
-        orig_name=_normalize_filename(source_path.name),
+        orig_name=_normalize_filename(_source_media_original_name(source_path)),
         write_tmp_audio=write_tmp_audio,
         name=str((payload or {}).get("name") or ""),
         archive_dir=str((payload or {}).get("archive_dir") or ""),

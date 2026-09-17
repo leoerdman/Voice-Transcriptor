@@ -5,6 +5,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.6.5] - 2026-09-18
+
+### Added
+
+- **The app is now a transcriber anything on the machine can call.** A shell script, a terminal, a Makefile or an AI agent hands it an audio or video file and gets the text back — through the same pipeline the Upload tab drives, with the same engines, the same models and the same archive. Switched on in Settings → Command line; the section shows the exact command, plus a paragraph written for pasting into CLAUDE.md, AGENTS.md or any system prompt.
+
+  The client is `backend/cli.py`, standard library only, so it starts in milliseconds inside someone else's shell loop and never imports the crypto stack or creates a directory as a side effect of answering `--help`. It talks to the RUNNING app over the same HTTP API the renderer uses: there is no second backend, no second copy of the models, and when the app is not running the command says so and exits non-zero instead of doing half the job somewhere else.
+
+  ```
+  transcriptor transcribe talk.mp4                    # the text on stdout
+  transcriptor transcribe call.wav --engine deepgram --diarize --save
+  transcriptor submit long-call.wav                   # queue it, print the job id
+  transcriptor result <job-id> --wait --json --out call.json
+  transcriptor status <job-id> · cancel <job-id> · info
+  ```
+
+  Three properties make it usable from a script without parsing prose. **Stdout is the transcript** and nothing else — progress, notes and errors all go to stderr, so `$(transcriptor transcribe x.mp4)` is the text with nothing to strip. **The exit code says what happened**: 0 done, 1 the job failed, 2 the command line was wrong, 3 the app is unreachable or access is off, 4 cancelled, 130 interrupted. **A bare command does what the app would**: `GET /api/cli` reports the Upload tab's current engine, model, language and diarization, and the client inherits them, so the CLI and the window never disagree about what "transcribe this" means.
+
+  Ctrl-C cancels the job as well as the wait — without that the app keeps decoding a file nobody is waiting for, burning a core or paid provider minutes into a result no one will read. A `--timeout` deliberately does NOT cancel: it stops waiting and prints the id to come back with, because the work is the app's and may be nearly done.
+
+  **Access is a second token, not the renderer's under another name.** `backend/cli_access.py` owns it: the switch IS the presence of the token file, so there is no "enabled" flag in the config that could disagree with what the file system holds, and switching off revokes the token in the running process and deletes every file — no restart. `cli_token_may_call` is the whole reach of that token: create a job from a path, poll it, cancel it, download its result, save it to the archive, and read `/api/cli`. Nothing else. A CLI token pasted into an agent's prompt cannot read the config, the provider keys or the archive listing, cannot open the live socket, and cannot re-issue itself — `/api/cli/enable` answers it 403.
+
+  The connection file follows the app: the desktop shell takes the next free port when 8321 is busy, so the backend records the address it was actually reached at (from the ASGI scope's bound socket, not a client-supplied header) and rewrites the file when it moves. A switch-on that fails halfway — token written, wrapper not — revokes what it wrote and reports off, rather than showing a command path with no command behind it.
+
+### Fixed
+
+- **A transcription saved from a file was filed in the archive under a UUID.** The archive names a recording after its source file, and the backend's snapshot of that file is named `<job id>.<original name>` — so "Team meeting.mp4" was saved as "9f2c1d4e-….Team meeting.txt". Five call sites wrote that name convention by hand and nothing read it back. It is now stated once, next to the reader that inverts it (`_upload_snapshot_path` / `_source_media_original_name`), and a path outside the uploads directory is never stripped, so a real file whose name merely starts with something UUID-shaped keeps every character of it. Fixes the Upload tab and `transcriptor transcribe --save` together, since both save through the same route.
+
+
 ## [1.6.4] - 2026-09-05
 
 The window/Dock lifecycle rewrite, merged onto the 1.6.3 self-heal work it was built alongside. Suites: desktop 287 (was 270), frontend 375, backend 819, all green.

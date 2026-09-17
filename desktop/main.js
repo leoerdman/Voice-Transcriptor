@@ -15,6 +15,15 @@ const { migrateShortcutPair } = require("./shortcut-migration");
 // wmctrl -x joins X11's two WM_CLASS strings with a dot and gives no way to
 // tell where the join is — see desktop/linux-wm-class.js.
 const { parseLinuxWmClass } = require("./linux-wm-class");
+// SSOT for the name of the directory this app keeps its data in, and
+// for what to do about one left behind under the previous spelling —
+// see desktop/user-data-dir.js.
+const {
+  USER_DATA_MIGRATION,
+  userDataDirName,
+  decideUserDataMigration,
+  userDataDirCandidates,
+} = require("./user-data-dir");
 const { formatConsoleMirrorLine, createConsoleMirrorLimiter } = require("./renderer-console");
 // SSOT for every main-window transition: what to do on activate, close,
 // minimise, quit, second-instance and capsule-shown, and where the window
@@ -298,6 +307,83 @@ function _relocateUserDataOffOneDrive() {
   // computed lazily from app.getPath). Old log in OneDrive'd path
   // stays as an artefact — harmless.
 }
+// ── The data directory's name ───────────────────────────────────────
+//
+// Electron names ``userData`` after the package's ``name`` field, which
+// npm requires to be lower case. ``backend/data_dir.py`` spells the same
+// directory ``Transcriptor``, and so does the OneDrive re-home above.
+// This makes the shell use the backend's spelling, so there is one
+// answer wherever the path is resolved or shown.
+//
+// Must run BEFORE anything reads ``app.getPath('userData')`` — the
+// OneDrive re-home below, ``appendMainLog`` (which caches the log path
+// on first use) and the single-instance lock all do.
+function _useOneSpellingForUserDataDir() {
+  const preferredName = userDataDirName(process.platform);
+  const legacyName = app.getName();
+  if (!preferredName || legacyName === preferredName) return;
+
+  const { legacyDir, preferredDir } = userDataDirCandidates(
+    app.getPath("appData"), legacyName, preferredName,
+  );
+  // Adopt the new spelling FIRST: everything below logs, and the logger
+  // pins its path to whatever userData says the moment it is called.
+  try { app.setName(preferredName); } catch { /* pre-ready only; ignore */ }
+
+  const statDir = (dir) => {
+    try {
+      const st = fs.statSync(dir);
+      return st.isDirectory() ? st : null;
+    } catch { return null; }
+  };
+  const legacyStat = statDir(legacyDir);
+  const preferredStat = statDir(preferredDir);
+  const decision = decideUserDataMigration({
+    legacyName,
+    preferredName,
+    legacyExists: Boolean(legacyStat),
+    preferredExists: Boolean(preferredStat),
+    // Device + inode, not a string compare: on a case-insensitive
+    // volume — the normal case on macOS and Windows — the two names
+    // ARE one directory, and "renaming" it would be a mistake.
+    sameDirectory: Boolean(
+      legacyStat && preferredStat
+      && legacyStat.dev === preferredStat.dev
+      && legacyStat.ino === preferredStat.ino,
+    ),
+  });
+
+  if (decision.action === USER_DATA_MIGRATION.ADOPT) {
+    try {
+      fs.renameSync(legacyDir, preferredDir);
+      appendMainLog(`[user-data-dir] adopted ${legacyDir} as ${preferredDir}`);
+      return;
+    } catch (e) {
+      // The rename is the only branch that can lose the user's data by
+      // half-succeeding, and it cannot: renameSync either moves the
+      // directory or leaves it exactly where it was. Point userData
+      // back at what actually holds the data and say so.
+      try { app.setPath("userData", legacyDir); } catch { /* keep going */ }
+      appendMainLog(
+        `[user-data-dir] could not adopt ${legacyDir}: ${e?.message || e}` +
+        " — still using the old directory",
+      );
+      return;
+    }
+  }
+  if (decision.action === USER_DATA_MIGRATION.KEEP_BOTH) {
+    // Both names hold a real, distinct directory. One of them has the
+    // user's config, provider keys and archive; merging is guesswork
+    // and the wrong guess loses data nothing can reconstruct.
+    appendMainLog(
+      `[user-data-dir] two data directories exist (${legacyDir} and ${preferredDir});` +
+      ` using ${preferredDir} and leaving both untouched`,
+    );
+    return;
+  }
+  appendMainLog(`[user-data-dir] name=${preferredName} decision=${decision.action}/${decision.reason}`);
+}
+_useOneSpellingForUserDataDir();
 _relocateUserDataOffOneDrive();
 
 let backend = null;

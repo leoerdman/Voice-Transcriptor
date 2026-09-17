@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from backend.audio_mime import AUDIO_EXT_TO_MIME
+from backend.data_dir import default_data_dir
 from backend.model_catalog import (
     DEFAULT_OPENROUTER_AUDIO_MODEL,
     DEFAULT_REMOTE_TRANSCRIPTION_PROVIDER,
@@ -84,16 +85,11 @@ LEGACY_DATA_DIR = APP_ROOT / "data"
 _ENC_PREFIX = "enc:"
 
 
-def _default_data_dir() -> Path:
-    env_dir = (os.environ.get("TRANSCRIPTOR_DATA_DIR") or "").strip()
-    if env_dir:
-        return Path(env_dir).expanduser()
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "Transcriptor"
-    if os.name == "nt":
-        base = Path(os.environ.get("APPDATA") or Path.home())
-        return base / "Transcriptor"
-    return Path.home() / ".local" / "share" / "transcriptor"
+# The rule itself lives in ``backend.data_dir`` so the command-line
+# client can apply it without importing this module (and its crypto
+# stack and directory-creating side effects). This alias keeps the
+# existing readers and the tests that patch it.
+_default_data_dir = default_data_dir
 
 
 def _resolve_data_dir() -> Path:

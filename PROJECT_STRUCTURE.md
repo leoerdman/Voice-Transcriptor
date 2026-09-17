@@ -42,6 +42,9 @@ backend/
 ├── main.py                    # FastAPI app, REST/WS routes, jobs, recordings, config endpoints;
 │                              #   audio-retention policy table + recordings-scan caches
 ├── config.py                  # config loading, migration, encrypted provider keys
+├── data_dir.py                # where this installation keeps its data — one rule, dependency-free (config.py and cli.py both read it)
+├── cli_access.py              # command-line access SSOT: the CLI token, connection file, wrapper script, and what that token may call
+├── cli.py                     # the command-line client itself (stdlib only) — `transcriptor transcribe|submit|status|result|cancel|info`
 ├── audio.py                   # ffmpeg/soundfile conversion and chunking
 ├── audio_constants.py         # shared audio constants
 ├── live.py                    # local live transcription session logic
@@ -75,6 +78,7 @@ Backend owns:
 - recording persistence and retention.
 - upload/from-path job lifecycle.
 - provider config storage.
+- command-line access: the second token, its route allowlist, and every file the CLI client reads.
 
 Graph is dormant: no backend graph route is registered.
 
@@ -99,6 +103,7 @@ frontend/
     ├── capture-warm.ts               # warm-hold/pre-roll/reuse decision SSOT for held-microphone captures (pure)
     ├── deepgram-dual.ts              # dual-stream Auto preference-resolution SSOT (pure)
     ├── live-envelope.ts              # the `final` stop-envelope wire type: one reader, matches backend/live_envelope.py
+    ├── cli-section.ts                # Settings → Command line: parses /api/cli and decides what the section shows (the backend composes every command)
     ├── upload-queue-restore.ts       # upload-queue snapshot restore SSOT: a failed read leaves the latch down (pure)
     ├── settings-autosave.ts          # settings autosave gate SSOT: no write of a config that was never read (pure)
     ├── recording-title.ts            # recording title rule SSOT (pure)

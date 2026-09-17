@@ -2645,6 +2645,74 @@ textarea:focus-visible,
   box-shadow: var(--glass-surface-outline);
 }
 
+/* ── Settings → Command line ─────────────────────────────────────────
+   The cards hold shell commands and a paragraph meant to be pasted into
+   an agent's prompt. Both are long, and neither may be re-wrapped into
+   something that no longer runs — so the card spans the settings grid
+   and each command scrolls on its own axis rather than wrapping. */
+.card-cli {
+  grid-column: 1 / -1;
+}
+
+.cli-cards {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.cli-cards[hidden] {
+  display: none;
+}
+
+.cli-card {
+  padding: 10px 12px;
+  border-radius: var(--control-radius);
+  background: var(--surface-2);
+}
+
+.cli-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-bottom: 6px;
+}
+
+.cli-card-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.cli-card-copy {
+  height: 26px;
+  min-height: 26px;
+  padding: 0 10px;
+  font-size: 11px;
+}
+
+.cli-card-text {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text);
+  /* A command must survive being read: wrapped mid-path it is no longer
+     the thing the Copy button copied. The agent paragraph is prose and
+     does wrap, which is why the whitespace mode is pre-wrap and the
+     overflow guard is on the long unbreakable token instead. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.cli-card-note {
+  margin: 6px 0 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-3);
+}
+
 /* ── Shortcut picker button ─────────────────────────────────────────── */
 .shortcut-btn {
   display: inline-flex;

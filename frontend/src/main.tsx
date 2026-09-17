@@ -89,6 +89,12 @@ import {
 import { mergeInterim } from "./live-source";
 import { checkForUpdate, shouldAutoCheck } from "./update-check";
 import { mayAutosaveUiPreferences } from "./settings-autosave";
+import {
+  CLI_ACCESS_OFF,
+  cliSectionView,
+  normalizeCliStatus,
+  type CliAccessStatus,
+} from "./cli-section";
 import { smartRecordingTitle } from "./recording-title";
 import {
   UPLOAD_QUEUE_RESTORE_FAILED_STATUS,
@@ -5247,7 +5253,14 @@ function parseViewName(value: string): ViewName {
 }
 
 function switchView(view: ViewName): void {
-  if (view === "settings") void refreshLocalModels();
+  if (view === "settings") {
+    void refreshLocalModels();
+    // Cheap, and the answer moves without the renderer touching it:
+    // the backend rewrites the connection file when its port changes,
+    // and the defaults line follows the Upload tab. Re-read on every
+    // visit rather than caching a sentence that can go stale.
+    void refreshCliSection();
+  }
   // A popover belongs to the view that opened it.
   setTranscribeSettingsOpen(false);
   document.querySelectorAll(".view").forEach((el) => {
@@ -7516,6 +7529,130 @@ $("resetShortcutsBtn").addEventListener("click", () => {
   publishShortcutUpdateToMain();
   queueUiPreferencesSave();
   void flushUiPreferencesSaveNow();
+});
+
+// ── Settings → Command line ─────────────────────────────────────────────────
+//
+// The backend is the only author of what this section shows (see
+// src/cli-section.ts). Here: fetch it, paint it, and post the switch.
+
+let cliAccessStatus: CliAccessStatus = CLI_ACCESS_OFF;
+/** Set while a switch request is in flight, so the toggle cannot race itself. */
+let cliAccessBusy = false;
+
+function setCliAccessError(message: string): void {
+  const node = $("cliAccessError");
+  const text = String(message || "").trim();
+  node.textContent = text;
+  node.hidden = !text;
+}
+
+function renderCliSection(): void {
+  const view = cliSectionView(cliAccessStatus);
+  const toggle = $("cliAccessToggle") as HTMLInputElement;
+  toggle.checked = view.enabled;
+  toggle.disabled = cliAccessBusy;
+  $("cliAccessNote").textContent = view.summary;
+
+  const wrap = $("cliAccessCards");
+  wrap.hidden = !view.showCards;
+  wrap.textContent = "";
+  for (const card of view.cards) {
+    const row = document.createElement("div");
+    row.className = "cli-card";
+
+    const head = document.createElement("div");
+    head.className = "cli-card-head";
+    const title = document.createElement("span");
+    title.className = "cli-card-title";
+    title.textContent = card.title;
+    head.appendChild(title);
+
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "btn btn-ghost cli-card-copy";
+    copy.textContent = "Copy";
+    copy.setAttribute("aria-label", `Copy: ${card.title}`);
+    // The command travels on the element, not through a lookup by index
+    // into a list that re-renders under it.
+    copy.addEventListener("click", () => {
+      void copyCliCard(copy, card.text, card.title);
+    });
+    head.appendChild(copy);
+    row.appendChild(head);
+
+    // textContent, never innerHTML: this string is a shell command with
+    // a filesystem path in it, and the path is the user's.
+    const body = document.createElement("pre");
+    body.className = "cli-card-text";
+    body.textContent = card.text;
+    row.appendChild(body);
+
+    if (card.note) {
+      const note = document.createElement("p");
+      note.className = "cli-card-note";
+      note.textContent = card.note;
+      row.appendChild(note);
+    }
+    wrap.appendChild(row);
+  }
+}
+
+async function copyCliCard(btn: HTMLButtonElement, text: string, title: string): Promise<void> {
+  const ok = await writeTextToClipboard(text);
+  flashButtonFeedback(btn, ok ? "Copied" : "Copy failed", `Copy: ${title}`, {
+    durationMs: UI_TOKENS.feedback.flashMs,
+    // A text button: the visible label swaps too, not only the one a
+    // screen reader hears.
+    swapLabel: true,
+  });
+}
+
+async function refreshCliSection(): Promise<void> {
+  try {
+    cliAccessStatus = normalizeCliStatus(await apiGet<unknown>("/api/cli"));
+    setCliAccessError("");
+  } catch (e) {
+    // Do not leave the previous answer on screen: an unreachable
+    // backend is not evidence that access is still on.
+    cliAccessStatus = CLI_ACCESS_OFF;
+    setCliAccessError(sanitizeUiErrorMessage(e, "Could not read command-line access."));
+  }
+  renderCliSection();
+}
+
+async function setCliAccess(next: boolean): Promise<void> {
+  if (cliAccessBusy) return;
+  cliAccessBusy = true;
+  renderCliSection();
+  try {
+    const route = next ? "/api/cli/enable" : "/api/cli/disable";
+    cliAccessStatus = normalizeCliStatus(await apiPost<unknown>(route, {}));
+    setCliAccessError("");
+    setStatus(next ? "Command-line access is on." : "Command-line access is off.", "info");
+  } catch (e) {
+    // The switch reports what the backend holds, so a failed write
+    // leaves it where the backend left it — re-read rather than
+    // assuming the click took effect.
+    setCliAccessError(
+      sanitizeUiErrorMessage(
+        e,
+        next ? "Could not switch command-line access on." : "Could not switch it off.",
+      ),
+    );
+    try {
+      cliAccessStatus = normalizeCliStatus(await apiGet<unknown>("/api/cli"));
+    } catch {
+      cliAccessStatus = CLI_ACCESS_OFF;
+    }
+  } finally {
+    cliAccessBusy = false;
+    renderCliSection();
+  }
+}
+
+$("cliAccessToggle").addEventListener("change", (e) => {
+  void setCliAccess((e.target as HTMLInputElement).checked);
 });
 
 let recordingItems: RecordingItem[] = [];

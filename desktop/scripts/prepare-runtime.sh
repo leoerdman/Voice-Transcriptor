@@ -56,10 +56,10 @@ PY_ABI_TAG="cp${PY_XY//./}"
 PBS_TAG="20260414"
 
 # ffmpeg sources.
-FFMPEG_WIN_RELEASE="autobuild-2026-06-18-14-21"
-FFMPEG_WIN_ASSET="ffmpeg-N-125093-gd2d371d10d-win64-gpl.zip"
+FFMPEG_WIN_RELEASE="autobuild-2026-09-07-15-39"
+FFMPEG_WIN_ASSET="ffmpeg-N-126455-gecc7eb519e-win64-gpl.zip"
 FFMPEG_WIN_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_WIN_RELEASE}/${FFMPEG_WIN_ASSET}"
-FFMPEG_WIN_SHA256="90582d696445953f154beac0f73180961fe8c079db1c50238f9f28b5f84dfc1c"
+FFMPEG_WIN_SHA256="5f2453aabafaf52926fe051cbdf8bbdb781171eacbab99f2bdc66f35134bc809"
 # macOS packaged runtime support is arm64-only. Intel packaging was
 # dropped before 1.1.25 and cannot use the current wheel-only runtime
 # graph because cryptography 49.0.0 publishes macOS arm64 wheels only.

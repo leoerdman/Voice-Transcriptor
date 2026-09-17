@@ -1,6 +1,6 @@
 {
   "name": "transcriptor",
-  "version": "1.6.4",
+  "version": "1.6.5",
   "description": "Voice-to-text transcription with auto-paste",
   "author": "Leo Erdman",
   "license": "MIT",
@@ -61,6 +61,7 @@
       "linux-wm-class.js",
       "python-version.js",
       "window-lifecycle.js",
+    "user-data-dir.js",
       "preload.js",
       "shortcut-defaults.json",
       "package.json",

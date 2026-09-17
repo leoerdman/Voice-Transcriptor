@@ -241,6 +241,30 @@ class RecordingNameTests(unittest.TestCase):
 
         self.assertEqual(cm.exception.status_code, 409)
 
+    def test_a_saved_snapshot_is_named_after_the_user_s_file(self):
+        # The archive names a recording after its source file, and a
+        # snapshot's name is "<job id>.<original>". Saving one straight
+        # filed the user's meeting under a UUID — through the Upload tab
+        # and through `transcriptor transcribe --save` alike.
+        job_id = "9f2c1d4e-6a7b-4c8d-9e0f-1a2b3c4d5e6f"
+        snapshot = self.main._upload_snapshot_path(job_id, "Team meeting.mp4")
+        self.assertEqual(snapshot.name, f"{job_id}.Team meeting.mp4")
+        self.assertEqual(
+            self.main._source_media_original_name(snapshot), "Team meeting.mp4"
+        )
+
+    def test_a_users_own_file_keeps_every_character_of_its_name(self):
+        # Same shape, but outside UPLOADS_DIR: nothing is stripped.
+        outside = Path(self._tmp.name) / "9f2c1d4e-6a7b-4c8d-9e0f-1a2b3c4d5e6f.wav"
+        self.assertEqual(
+            self.main._source_media_original_name(outside),
+            "9f2c1d4e-6a7b-4c8d-9e0f-1a2b3c4d5e6f.wav",
+        )
+        # And a snapshot whose name is ONLY an id keeps it rather than
+        # becoming the empty string.
+        bare = self.main.UPLOADS_DIR / "9f2c1d4e-6a7b-4c8d-9e0f-1a2b3c4d5e6f."
+        self.assertEqual(self.main._source_media_original_name(bare), bare.name)
+
     def test_local_from_path_uses_backend_owned_snapshot(self):
         source = Path(self._tmp.name) / "clip.wav"
         source.write_bytes(b"RIFF")

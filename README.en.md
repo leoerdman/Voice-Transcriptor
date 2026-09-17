@@ -13,6 +13,7 @@ Desktop speech-to-text app: record from the microphone, transcribe your own file
 - **History** — saved transcripts and their source audio, search, statistics, re-transcription.
 - **AI upscale** — prompt presets via OpenRouter.
 - **Auto-paste** — the result goes into the focused field (optional `Enter` after pasting).
+- **Command line** — any script, terminal or AI agent can transcribe through the app.
 - **Platforms** — macOS Apple Silicon, Windows x64, Linux x64.
 
 ## How it works
@@ -44,6 +45,34 @@ Desktop speech-to-text app: record from the microphone, transcribe your own file
 
 - Prompt presets through OpenRouter: strip the filler, turn it into minutes, extract action items, translate, or your own prompt.
 - Works on any text in the history.
+
+### 5. Command line — the app as a transcriber for scripts and agents
+
+Switched on in **Settings → Command line**. The app mints a token of its own,
+writes the connection file and a ready-made command, and switching it off revokes
+that access at once without restarting the app. The command-line token opens only
+the transcription routes — it cannot read the config, the provider keys or the
+archive.
+
+```bash
+transcriptor transcribe talk.mp4                  # the text on stdout
+transcriptor transcribe talk.mp4 --json --out t.json
+transcriptor transcribe call.wav --engine deepgram --diarize --save
+transcriptor submit long-call.wav                 # queue it, print the job id
+transcriptor result <job-id> --wait               # collect the finished result
+transcriptor status <job-id>
+transcriptor cancel <job-id>
+transcriptor info                                 # the app's address and current defaults
+```
+
+The transcript goes to **stdout**, progress and errors to **stderr**, and the exit
+code says what happened: `0` done, `1` the job failed, `2` the command line was
+wrong, `3` the app is unreachable or access is off, `4` cancelled. A command with
+no options transcribes exactly as the Upload tab would right now.
+
+The "For an agent" card in Settings is a paragraph ready to paste into CLAUDE.md,
+AGENTS.md or any system prompt: any agent that can run a shell command uses it as
+is.
 
 ## Screenshots
 

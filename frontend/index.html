@@ -739,6 +739,33 @@
             </div>
             <div class="settings-save-status settings-save-status-neutral" id="settingsArchiveStatus" hidden></div>
           </div>
+          <!--
+            Command line. The whole section is a switch and whatever the
+            backend hands back: the toggle posts to /api/cli/enable or
+            /api/cli/disable, and the cards below are rendered verbatim
+            from that response. Nothing here composes a command — see
+            src/cli-section.ts for why the renderer must not be a second
+            author of the one string that has to be exactly right.
+          -->
+          <div class="card card-cli">
+            <div class="card-header">
+              <div class="card-header-copy">
+                <h2>Command line</h2>
+              </div>
+            </div>
+            <div class="field-stack">
+              <label class="toggle-inline settings-toggle">
+                <span>Let commands and agents use this app</span>
+                <input type="checkbox" id="cliAccessToggle" />
+              </label>
+              <!-- Written by renderCliSection(); the placeholder is what
+                   shows for the one frame before the first /api/cli
+                   answer arrives. -->
+              <p class="settings-note" id="cliAccessNote">Checking…</p>
+              <div class="cli-cards" id="cliAccessCards" hidden></div>
+              <div class="settings-save-status settings-save-status-warning" id="cliAccessError" hidden></div>
+            </div>
+          </div>
           <div class="card card-shortcuts">
             <div class="card-header">
               <div class="card-header-copy">
