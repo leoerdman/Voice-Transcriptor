@@ -95,7 +95,31 @@ import {
   normalizeCliStatus,
   type CliAccessStatus,
 } from "./cli-section";
+import {
+  VOICE_PROFILES_EMPTY,
+  nextFreeSlot,
+  normalizeVoiceProfiles,
+  voiceMaskTarget,
+  voiceMaskView,
+  type VoiceProfilesStatus,
+} from "./voice-profiles-section";
+import {
+  ENROL_MIN_SECONDS,
+  ENROL_NO_MIC,
+  ENROL_SCRIPT,
+  ENROL_SECONDS,
+  enrolExpectationText,
+  enrolLiveView,
+  type EnrolLiveView,
+} from "./voice-enrol-prompt";
+import {
+  concatSamples,
+  int16FromFloat,
+  pcmSeconds,
+  resampleTo16k,
+} from "./enrol-audio";
 import { smartRecordingTitle } from "./recording-title";
+import { voiceMaskNoteText, type VoiceMaskState } from "./voice-mask-note";
 import {
   UPLOAD_QUEUE_RESTORE_FAILED_STATUS,
   decideUploadQueueRestore,
@@ -449,7 +473,10 @@ type LiveWsMessage =
   // them), while ``backend/live.py`` does not send them at all — so for
   // the local-assist path they were silently ``false``, a contract
   // mismatch that only stayed harmless because there was no reader.
-  | { type: "segments"; segments: TranscriptSegment[] }
+  | {
+      type: "segments";
+      segments: TranscriptSegment[];
+    }
   | { type: "interim"; segment: TranscriptSegment }
   /**
    * The stop envelope. ``LiveFinalEnvelope`` is this branch minus its
@@ -465,7 +492,15 @@ type LiveWsMessage =
    * verdict — whether that wait is expected to yield words we do not
    * already have. One number, decided where the coverage data lives.
    */
-  | { type: "finalizing"; budgetMs: number; expectsMore: boolean };
+  | { type: "finalizing"; budgetMs: number; expectsMore: boolean }
+  /**
+   * §5.3's line of state: how much audio the target-speaker gate zeroed
+   * before it reached the provider, and whether that is still happening.
+   * Not a transcript event — it is drawn beside the pane, never merged
+   * into the text — and it is the only thing that tells a mask refusal
+   * apart from speech the app lost (§5.4).
+   */
+  | ({ type: "voice-mask" } & VoiceMaskState);
 
 function parseLiveWsMessage(raw: string): LiveWsMessage | null {
   let parsed: unknown;
@@ -498,6 +533,23 @@ function parseLiveWsMessage(raw: string): LiveWsMessage | null {
       type: "finalizing",
       budgetMs: Number.isFinite(budgetMs) && budgetMs > 0 ? budgetMs : 0,
       expectsMore: !!obj.expectsMore,
+    };
+  }
+
+  if (type === "voice-mask") {
+    // A gate state the renderer cannot read is a report it must not
+    // invent: an unknown word is dropped rather than drawn as "idle",
+    // and the count is clamped at zero because a negative "withheld"
+    // would be a number the backend cannot produce.
+    const state = String(obj.state || "").trim();
+    if (state !== "idle" && state !== "open" && state !== "closed") return null;
+    const withheldSec = Number(obj.withheldSec);
+    return {
+      type: "voice-mask",
+      state,
+      withheldSec: Number.isFinite(withheldSec) && withheldSec > 0 ? withheldSec : 0,
+      degraded: !!obj.degraded,
+      final: !!obj.final,
     };
   }
 
@@ -5260,6 +5312,10 @@ function switchView(view: ViewName): void {
     // and the defaults line follows the Upload tab. Re-read on every
     // visit rather than caching a sentence that can go stale.
     void refreshCliSection();
+    // The slots are a file the backend owns; a delete from another window,
+    // or a profile the last visit enrolled, must show up on this one. The
+    // take list comes from the History load that already ran at boot.
+    void refreshVoiceProfiles();
   }
   // A popover belongs to the view that opened it.
   setTranscribeSettingsOpen(false);
@@ -7653,6 +7709,493 @@ async function setCliAccess(next: boolean): Promise<void> {
 
 $("cliAccessToggle").addEventListener("change", (e) => {
   void setCliAccess((e.target as HTMLInputElement).checked);
+});
+
+// ── Settings → Voice mask ───────────────────────────────────────────────────
+//
+// Three slots, one switch each, one Forget per learned voice (§5.1, §7.4). The
+// view is src/voice-profiles-section.ts; this is the part that reads the store
+// and carries out a press.
+//
+// A press on an empty slot is the whole enrolment: there is no take dropdown
+// and no "make a profile" button, because the switch that needs a voice is the
+// one that learns it — it opens the microphone for six seconds and keeps the
+// presser reading the printed line. A voice kept from the newest take would be
+// whoever spoke last in History, which is the one person the mask is least
+// likely to be for. Nothing here filters audio; the gate that reads the
+// profile is §7.3's.
+
+let voiceProfilesStatus: VoiceProfilesStatus = VOICE_PROFILES_EMPTY;
+/**
+ * The slot whose switch is being carried out, drawn as already pressed.
+ *
+ * A switch that waits for the store before it moves reads as a switch that
+ * refused: the write takes as long as enrolment does (seconds, on a cold
+ * model), and until it lands the row paints the old answer, so the knob flicks
+ * on and back. This is the press, held on screen for exactly as long as the
+ * store is being asked — every switch is disabled meanwhile, so the pending
+ * answer cannot be overwritten by a second press.
+ */
+let voiceSwitchPending: { slot: number; on: boolean } | null = null;
+/**
+ * Whether `voiceProfilesStatus` came from the store.
+ *
+ * A failed read leaves the same empty payload a genuinely empty store would,
+ * and the card would then say "nothing learned yet" about a store nobody
+ * read. This is the one bit that tells the two apart, and it is false until
+ * the first answer arrives.
+ */
+let voiceProfilesKnown = false;
+/** Set while one of this section's requests is in flight. */
+let voiceProfilesBusy = false;
+
+/** What the card calls a slot, in the one voice the rows use. */
+function voiceLabel(slot: number): string {
+  return voiceMaskView(voiceProfilesStatus).rows[slot - 1]?.label ?? `Voice ${slot}`;
+}
+
+/**
+ * Which row control had focus, so a rebuild can put it back.
+ *
+ * The rows are thrown away and rebuilt on every render, and a render happens
+ * whenever the store answers — including a refresh that lands while the user
+ * is tabbing through them. Without this, the keyboard focus falls to the body
+ * on a background read and the user has to start the card over.
+ */
+function voiceFocusKey(): { slot: string; kind: "switch" | "forget" } | null {
+  const active = document.activeElement as HTMLElement | null;
+  const row = active?.closest?.(".voice-slot") as HTMLElement | null;
+  if (!active || !row) return null;
+  const kind = active.matches("input[type=checkbox]")
+    ? "switch"
+    : active.matches("button.voice-slot-forget")
+      ? "forget"
+      : null;
+  const slot = row.dataset.slot || "";
+  return kind && slot ? { slot, kind } : null;
+}
+
+function restoreVoiceFocus(key: { slot: string; kind: "switch" | "forget" } | null): void {
+  if (!key) return;
+  const control = key.kind === "switch" ? "input[type=checkbox]" : "button.voice-slot-forget";
+  document
+    .querySelector<HTMLElement>(
+      `#voiceProfileSlots .voice-slot[data-slot="${key.slot}"] ${control}`,
+    )
+    ?.focus({ preventScroll: true });
+}
+
+function setVoiceProfilesError(message: string): void {
+  const node = $("voiceProfilesError");
+  const text = String(message || "").trim();
+  node.textContent = text;
+  node.hidden = !text;
+}
+
+/** The three rows, the note, and the pane's knob. */
+function renderVoiceMask(): void {
+  const view = voiceMaskView(voiceProfilesStatus, { unknown: !voiceProfilesKnown });
+  $("voiceProfilesNote").textContent = view.summary;
+
+  // The expectation and the script are painted from their constants, so the
+  // seconds in the sentence and the seconds in the countdown are one number.
+  $("voiceEnrolExpectation").textContent = enrolExpectationText();
+  $("voiceEnrolScript").textContent = `“${ENROL_SCRIPT}”`;
+
+  // A press in flight is painted as the answer it asked for, not as the one
+  // still in the store: otherwise the knob flicks on and back for as long as
+  // enrolment takes, which reads as a rejection.
+  const pending = voiceSwitchPending;
+
+  const knob = $("voiceMaskToggle") as HTMLInputElement;
+  knob.checked = pending ? pending.on : view.checked;
+  knob.disabled = view.disabled || voiceProfilesBusy;
+  // The word the switch has no room for.
+  knob.setAttribute("aria-label", view.summary);
+  $("voiceMaskSwitch").title = view.summary;
+
+  const list = $("voiceProfileSlots");
+  // The rows are rebuilt wholesale, so whatever had focus is about to be
+  // detached: remember which control it was and put it back at the end.
+  const focusKey = voiceFocusKey();
+  list.textContent = "";
+  for (const row of view.rows) {
+    const item = document.createElement("div");
+    item.className = `voice-slot${row.empty ? " is-empty" : ""}${row.enabled ? " is-kept" : ""}`;
+    item.dataset.slot = String(row.slot);
+    item.setAttribute("role", "listitem");
+
+    const copy = document.createElement("div");
+    copy.className = "voice-slot-copy";
+    const label = document.createElement("span");
+    label.className = "voice-slot-name";
+    label.textContent = row.label;
+    const meta = document.createElement("span");
+    meta.className = "voice-slot-meta";
+    // The date is the only fact a slot has besides its number: no name was
+    // asked for, and none was invented. While the press is recording, the
+    // row says so in place of the date — the switch being on is not the same
+    // fact as "six seconds are being taken right now".
+    const learning = pending !== null && pending.slot === row.slot && pending.on;
+    meta.textContent = learning ? "Learning…" : row.empty ? "Empty" : row.learnedOn;
+    copy.append(label, meta);
+
+    const toggle = document.createElement("label");
+    toggle.className = "toggle-inline voice-slot-switch";
+    const caption = document.createElement("span");
+    caption.textContent = "Keep";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = pending && pending.slot === row.slot ? pending.on : row.enabled;
+    // An empty slot is still pressable: pressing it is how a voice gets
+    // learned. Only a mask that cannot work at all (no weights, nobody read
+    // the store, a write in flight) disables the switch.
+    input.disabled = view.disabled || voiceProfilesBusy;
+    input.setAttribute(
+      "aria-label",
+      row.empty ? `Learn ${row.label} from your latest recording` : `Keep only ${row.label}`,
+    );
+    input.addEventListener("change", () => {
+      void switchSlot(row.slot, input.checked);
+    });
+    toggle.append(caption, input);
+    item.append(copy, toggle);
+
+    if (!row.empty) {
+      const forget = document.createElement("button");
+      forget.type = "button";
+      forget.className = "btn btn-ghost voice-slot-forget";
+      forget.textContent = "Forget";
+      forget.disabled = voiceProfilesBusy;
+      forget.setAttribute("aria-label", `Forget ${row.label}`);
+      forget.addEventListener("click", () => {
+        void forgetSlot(row.slot, row.label);
+      });
+      item.appendChild(forget);
+    }
+
+    list.appendChild(item);
+  }
+  restoreVoiceFocus(focusKey);
+}
+
+/** One write against the store, and the re-read that paints what it did. */
+async function writeVoiceProfiles(run: () => Promise<unknown>, failure: string): Promise<void> {
+  voiceProfilesBusy = true;
+  renderVoiceMask();
+  try {
+    voiceProfilesStatus = normalizeVoiceProfiles(await run());
+    voiceProfilesKnown = true;
+    setVoiceProfilesError("");
+  } catch (e) {
+    // Every refusal the backend makes here is about this press ("no speech",
+    // "shorter than the window", "weights not installed"), and the message is
+    // the whole point of it failing.
+    setVoiceProfilesError(sanitizeUiErrorMessage(e, failure));
+    try {
+      voiceProfilesStatus = normalizeVoiceProfiles(await apiGet<unknown>("/api/voice/profiles"));
+      voiceProfilesKnown = true;
+    } catch {
+      voiceProfilesStatus = VOICE_PROFILES_EMPTY;
+      voiceProfilesKnown = false;
+    }
+  } finally {
+    voiceProfilesBusy = false;
+    renderVoiceMask();
+  }
+}
+
+async function refreshVoiceProfiles(): Promise<void> {
+  try {
+    voiceProfilesStatus = normalizeVoiceProfiles(await apiGet<unknown>("/api/voice/profiles"));
+    voiceProfilesKnown = true;
+    setVoiceProfilesError("");
+  } catch (e) {
+    // An unreachable backend is not evidence that no voice is learned: the
+    // card falls back to "could not read" rather than painting an answer.
+    voiceProfilesStatus = VOICE_PROFILES_EMPTY;
+    voiceProfilesKnown = false;
+    setVoiceProfilesError(sanitizeUiErrorMessage(e, "Could not read the voice profiles."));
+  }
+  renderVoiceMask();
+}
+
+/** Is the card showing the microphone as open right now? */
+let enrolRecording = false;
+
+/**
+ * The card's live line: dot, countdown, and whether it is really recording.
+ *
+ * The dot is the window's own (`record-toggle-dot` plus `is-recording`), so
+ * "recording" looks the same in Settings as it does in the topbar: same
+ * colour, same 1.4 s pulse, none of it under `prefers-reduced-motion`. The
+ * card paints from `enrolLiveView` so the caption and the countdown share one
+ * clock with the capture timeout.
+ */
+function paintEnrolLive(view: EnrolLiveView): void {
+  const box = $("voiceEnrolLive");
+  box.hidden = !enrolRecording;
+  box.classList.toggle("is-recording", enrolRecording && view.recording);
+  $("voiceEnrolLiveText").textContent = view.caption;
+}
+
+/**
+ * Open the microphone for six seconds and hand back what it heard.
+ *
+ * This is the whole point of the card's press: a voice is learned from a
+ * recording the user makes on purpose, at the moment they ask for it. It used
+ * to enrol from the newest take in the archive, which meant the card silently
+ * turned somebody's last meeting — with everyone else in the room — into their
+ * voice, and the answer to "what am I supposed to do here" was "already done,
+ * from something you did not choose".
+ *
+ * Returns null when the press has to stop (no microphone, a take already
+ * running, the capture was refused), with the reason already on the card.
+ */
+async function captureEnrolment(label: string): Promise<Int16Array | null> {
+  if (isRecording) {
+    // Two microphones at once would mean two AudioContexts on one device and
+    // a take whose gate is being pressed mid-stream; one at a time.
+    setVoiceProfilesError("Stop the recording first: the mask listens to one microphone at a time.");
+    return null;
+  }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    setVoiceProfilesError(ENROL_NO_MIC);
+    return null;
+  }
+
+  let stream: MediaStream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch {
+    setVoiceProfilesError(ENROL_NO_MIC);
+    return null;
+  }
+
+  const ctx = new AudioContext();
+  const chunks: Float32Array[] = [];
+  let node: ScriptProcessorNode | null = null;
+  let source: MediaStreamAudioSourceNode | null = null;
+  let sink: GainNode | null = null;
+  let timer = 0;
+  const startedAt = performance.now();
+  const before = { text: liveStatusText, kind: liveStatusKind };
+
+  try {
+    await ctx.resume();
+    source = ctx.createMediaStreamSource(stream);
+    // The app already ships a ScriptProcessor fallback for the same reason:
+    // the worklet needs a module URL and a fetch, and this capture is six
+    // seconds that must start now. 4096 frames is ~85 ms at 48 kHz — the same
+    // buffer size the fallback uses.
+    node = ctx.createScriptProcessor(4096, 1, 1);
+    node.onaudioprocess = (event) => {
+      if (!enrolRecording) return;
+      chunks.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+    };
+    // A muted gain into the destination keeps the graph running in Chromium:
+    // a ScriptProcessor with no path to an output is never pulled, so it
+    // never fires.
+    sink = ctx.createGain();
+    sink.gain.value = 0;
+    source.connect(node);
+    node.connect(sink);
+    sink.connect(ctx.destination);
+
+    enrolRecording = true;
+    paintEnrolLive(enrolLiveView(0, label));
+    setStatus(`Recording ${label} — ${ENROL_SECONDS} s left`, "recording");
+
+    const elapsed = () =>
+      new Promise<void>((resolve) => {
+        timer = window.setInterval(() => {
+          const view = enrolLiveView(performance.now() - startedAt, label);
+          paintEnrolLive(view);
+          setStatus(view.caption, view.recording ? "recording" : "processing");
+          if (!view.recording) {
+            window.clearInterval(timer);
+            timer = 0;
+            resolve();
+          }
+        }, 100);
+      });
+    await elapsed();
+  } finally {
+    enrolRecording = false;
+    if (timer) window.clearInterval(timer);
+    if (node) {
+      node.onaudioprocess = null;
+      node.disconnect();
+    }
+    source?.disconnect();
+    sink?.disconnect();
+    for (const track of stream.getTracks()) track.stop();
+    // close() is a promise that nothing awaits: the capture is over either
+    // way, and a device that is slow to release must not hold the press.
+    void ctx.close().catch(() => undefined);
+    paintEnrolLive(enrolLiveView(Number.MAX_SAFE_INTEGER, label));
+    setStatus(before.text || "Idle", before.kind);
+  }
+
+  const heard = resampleTo16k(concatSamples(chunks), ctx.sampleRate);
+  const pcm = int16FromFloat(heard);
+  if (pcmSeconds(pcm) < ENROL_MIN_SECONDS) {
+    // The microphone opened but delivered nothing: a muted device, or a
+    // permission dialog that was answered after the countdown started.
+    setVoiceProfilesError(
+      "Nothing reached the microphone. Check that it is not muted, then press the switch again.",
+    );
+    return null;
+  }
+  return pcm;
+}
+
+/**
+ * Learn a voice into `slot` from the six seconds just captured.
+ *
+ * The bytes go up as they are — 16 kHz mono PCM16, no container, no temp file
+ * — and the store answers with the whole card, so the row appears from the
+ * same read that wrote it. Returns whether a profile was written; every
+ * refusal is the backend's own reason, which is actionable ("no speech the
+ * mask could hear…"), so it is shown as it came.
+ */
+async function learnInto(slot: number, label: string): Promise<boolean> {
+  const pcm = await captureEnrolment(label);
+  if (!pcm) return false;
+  try {
+    const response = await fetch(`/api/voice/profiles/${slot}/enrol-live`, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream", ...authHeaders() },
+      body: pcm.buffer as ArrayBuffer,
+    });
+    if (!response.ok) throw new Error(await parseError(response));
+    voiceProfilesStatus = normalizeVoiceProfiles(await response.json());
+    voiceProfilesKnown = true;
+    setVoiceProfilesError("");
+    return true;
+  } catch (e) {
+    setVoiceProfilesError(sanitizeUiErrorMessage(e, "Could not learn that voice."));
+    return false;
+  }
+}
+
+/** One row's switch: keep that slot, or stop keeping it; learn it if empty. */
+async function switchSlot(slot: number, on: boolean): Promise<void> {
+  if (voiceProfilesBusy) return;
+  const holdsVoice = (voiceProfilesStatus.slots[slot - 1] ?? null) !== null;
+
+  if (!on && voiceProfilesStatus.enabledSlot !== slot) {
+    // The switch was already where the press puts it: nothing to write, and
+    // nothing to hold on screen.
+    renderVoiceMask();
+    return;
+  }
+
+  // The press is painted for exactly as long as the store is being asked.
+  voiceSwitchPending = { slot, on };
+  voiceProfilesBusy = true;
+  renderVoiceMask();
+  try {
+    if (!on) {
+      await writeVoiceProfiles(
+        () => apiPost<unknown>("/api/voice/disable", {}),
+        "Could not switch the voice mask off.",
+      );
+      return;
+    }
+
+    if (holdsVoice) {
+      await writeVoiceProfiles(
+        () => apiPost<unknown>(`/api/voice/profiles/${slot}/enable`, {}),
+        "Could not switch that voice on.",
+      );
+      return;
+    }
+
+    // Empty slot: the press is the recording. Six seconds of the user's
+    // voice, then the slot keeps what it heard.
+    if (await learnInto(slot, voiceLabel(slot))) {
+      voiceProfilesStatus = normalizeVoiceProfiles(
+        await apiPost<unknown>(`/api/voice/profiles/${slot}/enable`, {}),
+      );
+      voiceProfilesKnown = true;
+      setVoiceProfilesError("");
+    }
+  } catch (e) {
+    setVoiceProfilesError(sanitizeUiErrorMessage(e, "Could not switch that voice on."));
+  } finally {
+    voiceSwitchPending = null;
+    voiceProfilesBusy = false;
+    renderVoiceMask();
+  }
+}
+
+/** Put the card — and the switch that can learn — in front of the user. */
+function revealVoiceMaskCard(): void {
+  const card = document.querySelector<HTMLElement>(".card-voice");
+  card?.scrollIntoView({ block: "center" });
+  const first = document.querySelector<HTMLInputElement>(
+    "#voiceProfileSlots .voice-slot.is-empty input[type=checkbox]",
+  );
+  // `preventScroll`: the focus must not fight the scroll above, which is
+  // already putting the line to read in the middle of the window.
+  first?.focus({ preventScroll: true });
+}
+
+/** The pane's knob: the same decision, over whichever slot holds a voice. */
+async function switchMask(on: boolean): Promise<void> {
+  if (voiceProfilesBusy) return;
+  if (!on) {
+    if (voiceProfilesStatus.enabledSlot === null) {
+      renderVoiceMask();
+      return;
+    }
+    await switchSlot(voiceProfilesStatus.enabledSlot, false);
+    return;
+  }
+
+  // Nothing learned yet: a press here would open the microphone for six
+  // seconds in a pane that has no line to read and no countdown — the user
+  // would be asked to talk to a switch that turns itself back off. The knob
+  // sends them to the card instead, where the six seconds are explained, and
+  // starts nothing.
+  if (voiceProfilesStatus.slots.every((slot) => slot === null)) {
+    renderVoiceMask();
+    switchView("settings");
+    revealVoiceMaskCard();
+    setStatus("Read the line in Settings → Voice mask, then press Keep.", "info");
+    return;
+  }
+
+  const target = voiceMaskTarget(voiceProfilesStatus) ?? nextFreeSlot(voiceProfilesStatus);
+  if (target === null) {
+    // Three voices learned and none kept is not a state this card can reach,
+    // but a store edited by hand could hold it: keep the first rather than
+    // swallow the press.
+    await switchSlot(1, true);
+    return;
+  }
+  await switchSlot(target, true);
+}
+
+async function forgetSlot(slot: number, label: string): Promise<void> {
+  if (voiceProfilesBusy) return;
+  if (
+    !window.confirm(
+      `Forget ${label}?\n\nThe mask has to learn it again before it can ` +
+        "silence anyone. Your recordings stay in History.",
+    )
+  ) {
+    return;
+  }
+  await writeVoiceProfiles(
+    () => apiDelete<unknown>(`/api/voice/profiles/${slot}`),
+    "Could not forget that voice.",
+  );
+}
+
+$("voiceMaskToggle").addEventListener("change", () => {
+  void switchMask(($("voiceMaskToggle") as HTMLInputElement).checked);
 });
 
 let recordingItems: RecordingItem[] = [];
@@ -10709,12 +11252,40 @@ function syncLiveOutputFromState(): void {
   scheduleLiveOutputRender();
 }
 
+/** The last gate state this session reported, or null before any report. */
+let liveVoiceMaskState: VoiceMaskState | null = null;
+
+/**
+ * Draw §5.3's line of state.
+ *
+ * Written straight to the DOM rather than through the rAF coalescer the
+ * transcript uses: reports arrive at most once a second, ordered behind
+ * the audio they describe, and one text write per second is not the
+ * layout thrash that coalescer exists to prevent. The wording is the
+ * unit-tested pure function in ./voice-mask-note; this only decides
+ * whether there is a line at all.
+ */
+function applyVoiceMaskNote(): void {
+  const el = $("voiceMaskNote");
+  const text = liveVoiceMaskState ? voiceMaskNoteText(liveVoiceMaskState) : "";
+  if (el.textContent !== text) {
+    el.textContent = text;
+  }
+  el.hidden = text === "";
+}
+
+function resetVoiceMaskNote(): void {
+  liveVoiceMaskState = null;
+  applyVoiceMaskNote();
+}
+
 function resetLiveDraftState(): void {
   livePreviewFloorText = "";
   liveDraftText = "";
   liveDraftDisplayText = "";
   liveInterimText = "";
   liveTranscriptSegments = [];
+  resetVoiceMaskNote();
   syncLiveOutputFromState();
 }
 
@@ -11386,6 +11957,16 @@ async function startLive(): Promise<void> {
           sessionBuffer.interimSegment = msg.segment;
           if (isActiveSession) {
             projectLiveTranscriptBufferToActiveState(sessionBuffer);
+          }
+          return;
+        }
+        case "voice-mask": {
+          // The recording this belongs to is the active one: a report for
+          // a session that has already been replaced would draw a
+          // stranger's counter over a fresh pane.
+          if (isActiveSession) {
+            liveVoiceMaskState = msg;
+            applyVoiceMaskNote();
           }
           return;
         }
@@ -13410,24 +13991,43 @@ async function stopLive(
   }
 }
 
-// Recording is toggled in the main process. The global hotkey and the
-// in-window button are two ways to ask for the same thing; both land on
-// ``toggleRecordingFromShortcut`` there, which owns the microphone
-// permission prompt, the frontmost-window capture that auto-paste needs,
-// the recording capsule and the busy guard. Dispatching the renderer
-// event directly from the button would skip all of that and create a
-// second, weaker recording path.
-document.getElementById("recordToggleBtn")?.addEventListener("click", () => {
-  postTitleBridgeMessage(TITLE_BRIDGE_PREFIX.recordToggle, String(Date.now()));
-});
-
-window.addEventListener("transcriptor-hotkey-toggle", () => {
+/**
+ * Start or stop the recording this renderer owns.
+ *
+ * In the desktop shell nothing reaches this directly: the main process owns
+ * the microphone permission prompt, the frontmost-window capture that
+ * auto-paste needs, the capsule and the busy guard. The hotkey and the
+ * in-window button ask it, and it sends `transcriptor-hotkey-toggle` back —
+ * this is what answers that event, and what the button runs in a surface
+ * that has no main process on the other end of the sentinel.
+ */
+function toggleRecordingHere(): void {
   if (isRecording) {
     void stopLive(shouldAutoTranscribe(), { discard: recordingIsTooShortToKeep() });
   } else {
     void startLive();
   }
+}
+
+// The in-window button. Which path it takes is decided by the preload
+// bridge, not by the URL: `__transcriptorEngine` is exposed unconditionally
+// by desktop/preload.js and exists in no plain browser tab.
+//
+// Without that branch the button was a dead control in the browser — the
+// sentinel it posted had no consumer there, so a press changed nothing, said
+// nothing, and opened no socket. The desktop path is untouched: the main
+// process still owns the recording, the capsule and the busy guard, and
+// dispatching the event from the button instead of asking main would create
+// the second, weaker recording path this code has always warned about.
+document.getElementById("recordToggleBtn")?.addEventListener("click", () => {
+  if (window.__transcriptorEngine) {
+    postTitleBridgeMessage(TITLE_BRIDGE_PREFIX.recordToggle, String(Date.now()));
+    return;
+  }
+  toggleRecordingHere();
 });
+
+window.addEventListener("transcriptor-hotkey-toggle", toggleRecordingHere);
 
 // Dedicated stop event for main-process stops — avoids dual-path race.
 window.addEventListener("transcriptor-hotkey-stop", (ev) => {
@@ -15465,3 +16065,7 @@ function renderUploadResultPane(): void {
 // setupUploadView() immediately restores and renders persisted queue items.
 installRevealRecordingBridge();
 setupUploadView();
+// The mask's knob lives in the Live Preview pane, not in Settings, so the
+// store has to be read at boot as well as on every visit: without this the
+// first press would land on a knob the renderer had never painted.
+void refreshVoiceProfiles();

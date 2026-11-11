@@ -341,12 +341,37 @@
               <div class="pane-head-row pane-head-row-top">
                 <span class="pane-title">Live Preview</span>
                 <div class="pane-actions">
+                  <!--
+                    The mask's one control: the same knob the panes already
+                    use, in the pane whose audio it is filtering. Pressing it
+                    keeps one voice and silences the rest (§5.1); with no
+                    profile behind it the knob is disabled and its title says
+                    where to make one, because a knob that vanishes is a knob
+                    nobody finds.
+                  -->
+                  <label class="toggle-inline toggle-neutral toggle-mask" id="voiceMaskSwitch"
+                    title="Voice mask">
+                    <!-- Disabled until the store answers: the knob lives in
+                         this pane, not in Settings, so an enabled-but-
+                         unpainted knob would swallow the first press and stay
+                         visually on with nothing behind it. -->
+                    <input id="voiceMaskToggle" type="checkbox" disabled />
+                  </label>
                   <label class="toggle-inline toggle-live" title="Show live partial transcript while recording">
                     <input id="livePreviewToggle" type="checkbox" />
                   </label>
                 </div>
               </div>
             </div>
+            <!--
+              §5.3/§5.4: a refused voice is drawn, never silent. The mask
+              zeroes a window in the copy that goes to the provider, which
+              in the transcript looks exactly like speech the app lost —
+              this line is what tells the two apart, and the only writer
+              is ./src/voice-mask-note (empty text means nothing to say,
+              so the pane carries no permanent chrome).
+            -->
+            <div class="pane-note" id="voiceMaskNote" hidden></div>
             <pre class="out" id="liveOutput" data-placeholder="Waiting for audio..."></pre>
           </div>
           <div class="split-gap" id="splitGap"></div>
@@ -719,6 +744,64 @@
                   type="number" step="1" /></label>
               <label class="field"><span class="lbl">Threshold (dBFS)</span><input id="autoStopSilenceDb" type="number"
                   step="1" /></label>
+            </div>
+          </div>
+          <!--
+            Cowork mask (§5.1, §7.4). Three slots, one switch each, and a
+            Forget for every voice that was learned.
+
+            The rows are NOT written here: main.tsx builds them from
+            GET /api/voice/profiles, because the store is the only author of
+            what exists. What is *not* here is a take dropdown or a "make a
+            profile" press: a voice is learned by the switch that needs it.
+
+            What a press costs is documented here, before the press, because
+            it costs seconds of the user's attention and a sentence out loud:
+            the line below is the script, the note says how many seconds are
+            given, and `#voiceEnrolLive` is the same dot and countdown the
+            window uses while a take is running. The note is rewritten from
+            src/voice-enrol-prompt at boot so the number cannot drift from the
+            countdown; without JS it still reads correctly.
+          -->
+          <div class="card card-voice">
+            <div class="card-header">
+              <div class="card-header-copy">
+                <h2>Voice mask</h2>
+              </div>
+            </div>
+            <div class="field-stack">
+              <!-- Written by renderVoiceMask(); "Checking…" is the one frame
+                   before the store answers. -->
+              <p class="settings-note" id="voiceProfilesNote">Checking…</p>
+              <!--
+                The script, and the only text in the app the user is expected
+                to read out loud. Above the rows on purpose: the card reads as
+                "this is what a press will ask of you" before it reads as a
+                list of voices, and it is visible before anything is fetched.
+              -->
+              <p class="settings-note voice-enrol-expectation" id="voiceEnrolExpectation">
+                Press Keep on an empty row and read the line below out loud:
+                six seconds of your voice, once. The dot pulses and the seconds
+                count down while the microphone is open, exactly as they do for
+                a take. The capture is measured for the mask and thrown away —
+                it never appears in History.
+              </p>
+              <blockquote class="voice-enrol-script" id="voiceEnrolScript">“This is my voice. Keep me in the room and leave everyone else out.”</blockquote>
+              <div class="voice-slots" id="voiceProfileSlots" role="list"></div>
+              <!--
+                The recording indication, while an enrolment is really
+                recording: the window's own dot (`.record-toggle-dot`, red and
+                pulsing with `is-recording`) and a countdown, so a press is
+                never a frozen card with no evidence the microphone is open.
+                aria-live: the countdown changes once a second and a screen
+                reader should hear where it is.
+              -->
+              <div class="voice-enrol-live" id="voiceEnrolLive" hidden role="status" aria-live="polite">
+                <span class="record-toggle-dot" aria-hidden="true"></span>
+                <span id="voiceEnrolLiveText">Recording — 6 s left</span>
+              </div>
+              <div class="settings-save-status settings-save-status-warning" id="voiceProfilesError"
+                hidden></div>
             </div>
           </div>
           <div class="card card-recordings">

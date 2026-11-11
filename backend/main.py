@@ -73,6 +73,11 @@ from backend.model_catalog import (
     health_model_catalog,
 )
 from backend.audio_mime import AUDIO_EXT_TO_MIME, audio_content_type
+from backend.voice_embed import SpeakerEmbedder, SpeakerScorer, default_model_path
+from backend.voice_enrol import EnrolmentError, decode_take, enrol_take
+from backend.voice_mask import VoiceMask
+from backend.voice_mask_worker import MaskState, MaskWorker
+from backend.voice_profiles import NAME_MAX_CHARS, ProfileError, VoiceProfileStore
 from backend.audio import (
     AudioError,
     compact_audio_chunks_for_remote,
@@ -3972,6 +3977,14 @@ async def ws_transcribe(websocket: WebSocket):
         - ``{"type": "final", "text": str, "segments": [...],
              "durationSec": float}`` — the canonical transcript at end
           of session.
+        - ``{"type": "voice-mask", "state": str, "withheldSec": float,
+             "degraded": bool, "final": bool}`` — (only while a voice
+          profile is enabled) how much audio the target-speaker gate
+          zeroed before it reached the provider, sent on every change of
+          state and once more at stop (``final: true``). Drawn as a line
+          beside the pane, never merged into the transcript: a refused
+          voice is silence in the copy the provider reads, and silence
+          that nobody explains reads as lost speech (§5.3, §5.4).
         - ``{"type": "error", "error": str}`` — unrecoverable failure.
     """
     # Kick the recovery cleanup off the event loop — the websocket
@@ -4450,6 +4463,28 @@ def _finalizing_payload(budget_sec: float, expects_more: bool) -> dict:
     }
 
 
+def _voice_mask_event(snapshot: "MaskState") -> dict:
+    """The ``voice-mask`` state line, built in ONE place (§5.3, §5.4).
+
+    ``withheldSec`` is audio this gate zeroed on purpose: it never
+    reached the provider, and it is still in the recording. That pair is
+    the whole reason the message exists — without it, a transcript that
+    is missing a stranger's words *because the mask worked* reads, in the
+    pane, exactly like a transcript that lost them.
+
+    ``final`` marks the report sent at stop: the counter is then the
+    recording's total and no longer moves, so the pane can say "was
+    withheld" instead of "is being withheld".
+    """
+    return {
+        "type": "voice-mask",
+        "state": str(snapshot.state),
+        "withheldSec": float(snapshot.withheld_sec),
+        "degraded": bool(snapshot.degraded),
+        "final": bool(snapshot.final),
+    }
+
+
 def _predicted_recovery_budget_sec(session: Any, spool_sec: float) -> float:
     """The recovery budget this stop looks like it will need, announced early.
 
@@ -4628,6 +4663,60 @@ async def _run_local_live_session(
     session = LiveSession(model_name=model, language=language)
     stop = asyncio.Event()
 
+    # ---- The gate (§3.1): the same one the provider path runs --------
+    #
+    # §3.1 puts the mask in the live receive loop, before whatever consumes
+    # the bytes. On this transport the consumer is the local pipeline rather
+    # than a socket, so the gate sits in the same place: after the recovery
+    # chunk, in front of the whisper ring. §3.5 still holds — with no
+    # profile enabled there is no object and the bytes take the old route,
+    # unchanged and unqueued.
+    #
+    # The hand-off is a queue and not a task per chunk: ``emit`` runs on the
+    # loop thread in submission order, and one consumer awaiting the queue
+    # is what keeps a refused window's silence exactly where its audio was.
+    mask_worker: Optional[MaskWorker] = None
+    mask_reports: set[asyncio.Task] = set()
+    pcm_queue: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue()
+    sink: Optional[asyncio.Task] = None
+
+    def _publish_mask_state(snapshot: MaskState) -> None:
+        """Send one state line (§5.3 of COWORK_MASK). Loop thread only."""
+        try:
+            task = asyncio.get_running_loop().create_task(
+                _ws_send_json(websocket, _voice_mask_event(snapshot))
+            )
+        except RuntimeError:  # pragma: no cover - loop already gone
+            return
+        mask_reports.add(task)
+        task.add_done_callback(mask_reports.discard)
+
+    def _offer_masked(chunk: bytes) -> None:
+        pcm_queue.put_nowait(chunk)
+
+    async def pcm_sink() -> None:
+        while True:
+            chunk = await pcm_queue.get()
+            try:
+                if chunk is None:
+                    return
+                await session.append_pcm16le(chunk)
+            finally:
+                pcm_queue.task_done()
+
+    gate = recording_voice_mask()
+    if gate is not None:
+        sink = asyncio.create_task(pcm_sink(), name="ws-local-mask-sink")
+        mask_worker = MaskWorker(gate, _offer_masked, on_state=_publish_mask_state)
+        logger.info("voice-mask: on for this recording")
+
+    async def _forward_pcm(data: bytes) -> None:
+        """The one call site (§3.4): read a chunk, hand it on."""
+        if mask_worker is None:
+            await session.append_pcm16le(data)
+        else:
+            mask_worker.submit(data)
+
     async def receiver() -> None:
         try:
             while not stop.is_set():
@@ -4639,7 +4728,7 @@ async def _run_local_live_session(
                 if kind == "bytes":
                     data = msg["data"]
                     _record_recovery_chunk(recovery, data)
-                    await session.append_pcm16le(data)
+                    await _forward_pcm(data)
                     continue
                 if kind == "control":
                     if msg["payload"].get("type") == "finalize":
@@ -4697,6 +4786,25 @@ async def _run_local_live_session(
                 task.cancel()
         for task, what in ((rx, "local live receiver"), (tx, "local live transcriber")):
             await await_cancelled(task, what=what, log=logger)
+        # The gate's last window leaves here, in order and before the
+        # pipeline is asked for its tail: a byte still held when the
+        # envelope is built is the last second of the take cut off, which
+        # is §6.3's forbidden cut in a place no window test can see.
+        if mask_worker is not None:
+            try:
+                await mask_worker.close()
+                await asyncio.wait_for(pcm_queue.join(), timeout=5.0)
+                if sink is not None and not sink.done():
+                    sink.cancel()
+                    await await_cancelled(sink, what="local mask sink", log=logger)
+                if mask_reports:
+                    await asyncio.gather(*mask_reports, return_exceptions=True)
+                if mask_worker.degraded:
+                    logger.warning(
+                        "voice-mask: forwarded unmasked after falling behind"
+                    )
+            except Exception as e:  # noqa: BLE001 — the take outranks the gate
+                logger.warning("voice-mask: final flush incomplete: %s", e)
         # Best-effort final emit in case transcriber missed the tail.
         # Bounded (BUG-69): maybe_transcribe(force=True) awaits any
         # in-flight pass, and a wedged inference thread has no internal
@@ -5297,6 +5405,47 @@ async def _run_deepgram_live_session(
                 queued_bytes,
             )
 
+    # ---- The gate (§3.1): after the recovery chunk, before the queue ----
+    #
+    # ``None`` is the whole of "off" (§3.4): no object, no copy, no filter
+    # that runs and returns its input. Everything below then calls
+    # ``_offer_pcm`` exactly as it always did, on the same byte count.
+    #
+    # When a profile is enabled the gate owns the bytes between the
+    # renderer and the send queue, and it does so on one thread — one
+    # judgement of a 2 s window is 26 ms of the 50 ms hop, so inline work
+    # here would block this loop for half of every hop (§3.2's "one owner
+    # of time" is also why it is not in the sender).
+    mask_worker: Optional[MaskWorker] = None
+    # Reports are fire-and-forget frames on the socket this handler
+    # already owns: kept referenced until sent (asyncio holds only a weak
+    # reference to a task), and drained before the envelope below so the
+    # last state line is always in front of ``final``.
+    mask_reports: set[asyncio.Task] = set()
+
+    def _publish_mask_state(snapshot: MaskState) -> None:
+        """Send one state line (§5.3). Always on the loop thread."""
+        try:
+            task = asyncio.get_running_loop().create_task(
+                _ws_send_json(websocket, _voice_mask_event(snapshot))
+            )
+        except RuntimeError:  # pragma: no cover - loop already gone
+            return
+        mask_reports.add(task)
+        task.add_done_callback(mask_reports.discard)
+
+    gate = recording_voice_mask()
+    if gate is not None:
+        mask_worker = MaskWorker(gate, _offer_pcm, on_state=_publish_mask_state)
+        logger.info("voice-mask: on for this recording")
+
+    def _forward_pcm(data: bytes) -> None:
+        """The one call site (§3.4): read a chunk, hand it on."""
+        if mask_worker is None:
+            _offer_pcm(data)
+        else:
+            mask_worker.submit(data)
+
     async def _flush_frame(buf: bytearray, size: int) -> None:
         nonlocal pending_since, warm_replay_dropped
         frame = bytes(buf[:size])
@@ -5515,7 +5664,7 @@ async def _run_deepgram_live_session(
     # first or the transcript's word timings would be shifted. The queue
     # is FIFO, so enqueueing here preserves that order by construction.
     for _chunk in pending_frames:
-        _offer_pcm(_chunk)
+        _forward_pcm(_chunk)
     pending_frames.clear()
 
     if preconnect_disconnected:
@@ -5571,7 +5720,7 @@ async def _run_deepgram_live_session(
                     _record_recovery_chunk(recovery, tail_data)
                     continue
                 _record_recovery_chunk(recovery, tail_data)
-                _offer_pcm(tail_data)
+                _forward_pcm(tail_data)
                 continue
             if tail_kind == "disconnect":
                 break
@@ -5624,7 +5773,7 @@ async def _run_deepgram_live_session(
                     _record_recovery_chunk(recovery, data)
                     # Hand off and go straight back to reading the
                     # renderer's socket — the whole point of the queue.
-                    _offer_pcm(data)
+                    _forward_pcm(data)
                     continue
                 if kind == "control":
                     if msg["payload"].get("type") == "finalize":
@@ -5687,6 +5836,29 @@ async def _run_deepgram_live_session(
     finally:
         stop.set()
         await cancel_and_await(rx, what="deepgram websocket receiver", log=logger)
+
+        # §7.3's other half: the gate holds one window, so the recording's
+        # last two seconds are still inside it when the receiver stops.
+        # Flushing here — before the sentinel, which is what makes the
+        # stop's ordering a property of the queue — puts them behind
+        # every byte already forwarded and in front of ``Finalize``, so
+        # the tail is neither cut nor sent to a socket that has closed.
+        if mask_worker is not None:
+            try:
+                await mask_worker.close()
+            except Exception as e:  # pragma: no cover - teardown is best-effort
+                logger.warning("voice-mask: flush on finalize failed: %s", e)
+            if mask_worker.degraded:
+                logger.warning(
+                    "voice-mask: this recording was forwarded unmasked after "
+                    "the gate fell behind"
+                )
+            # ``close`` reports the recording's total synchronously, and
+            # that report is one frame to send: awaiting it here is what
+            # makes "how much was withheld" ordered before the envelope
+            # that is about to say what arrived (§5.3).
+            if mask_reports:
+                await asyncio.gather(*tuple(mask_reports), return_exceptions=True)
 
         # Finalize must reach Deepgram AFTER every byte the renderer
         # sent (audit §3.6). The receiver has now stopped, so everything
@@ -7014,6 +7186,236 @@ def disable_cli_access(request: Request, _auth: None = Depends(_require_api_auth
     CLI_ACCESS.disable()
     logger.info("cli access disabled; token revoked")
     return _cli_status_payload(request)
+
+
+# ── Cowork mask: three slots, one kept voice (§5.1, §7.4) ───────────────────
+#
+# Settings owns the press and nothing here owns the audio: a slot is a
+# vector, the take it came from stays in the recording archive, and this is
+# the only place the two meet (§5.5 — a take becomes a profile by an act,
+# never inferred). The mask itself will read `enabled()`; it never asks this
+# route, and the renderer therefore cannot become a second store.
+
+VOICE_PROFILES = VoiceProfileStore()
+
+
+def _voice_profiles_payload() -> dict[str, Any]:
+    """The three slots, who owns them, and whether the net's file is there."""
+    model = default_model_path()
+    return {
+        # Three entries always, ``None`` where a slot is empty: a list that
+        # shrinks is how a UI ends up renumbering the slots underneath the
+        # user's finger.
+        "slots": [
+            {"slot": profile.slot, "name": profile.name, "created_at": profile.created_at}
+            if profile is not None
+            else None
+            for profile in VOICE_PROFILES.slots()
+        ],
+        "enabled_slot": VOICE_PROFILES.enabled_slot(),
+        # §6.2: whether the one file ships is the owner's decision, so the
+        # section reports the file's presence rather than offering a press
+        # that could only fail.
+        "model_available": model.is_file(),
+        "model_name": model.name,
+    }
+
+
+@app.get("/api/voice/profiles")
+def get_voice_profiles(_auth: None = Depends(_require_api_auth)):
+    return _voice_profiles_payload()
+
+
+@app.post("/api/voice/profiles/{slot}/enrol")
+def enrol_voice_profile(
+    slot: int,
+    payload: dict = Body(...),
+    _auth: None = Depends(_require_api_auth),
+):
+    recording_name = str(payload.get("recording_name") or "").strip()
+    if not recording_name:
+        raise HTTPException(status_code=400, detail="a profile is made from a recording")
+    if not default_model_path().is_file():
+        raise HTTPException(
+            status_code=503,
+            detail="the mask's weights are not installed beside the app",
+        )
+
+    archive_dir = str(payload.get("archive_dir") or "").strip()
+    target_dir = (
+        _resolve_recordings_target_dir(archive_dir, create=False) if archive_dir else None
+    )
+    recording = _recording_path_or_404(recording_name, target_dir=target_dir)
+    audio_path = _recording_audio_path(recording.name, target_dir=target_dir)
+    if audio_path is None:
+        raise HTTPException(status_code=400, detail="this recording has no audio beside it")
+
+    # The store's label for its file. The caller may name it; the default is
+    # the recording's own stem, which is a label nobody chose and can easily
+    # be longer than the store allows ("Recovered 2026-11-13T12:06:54.364931"
+    # is 40). A label derived from a filename must never be the reason a press
+    # fails, so an over-long derivation falls back to what the UI calls the
+    # slot anyway.
+    name = str(payload.get("name") or "").strip() or Path(recording.name).stem
+    if len(name) > NAME_MAX_CHARS:
+        name = f"Voice {slot}"
+    embedder = SpeakerEmbedder()
+    try:
+        vector = enrol_take(embedder, decode_take(audio_path))
+    except EnrolmentError as e:
+        # Every refusal here is about the take the user chose, so it is a
+        # 400 with the reason: "no speech in this take" is actionable, a
+        # generic failure is not.
+        raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
+    except Exception as e:  # noqa: BLE001 — onnxruntime missing, weights corrupt
+        logger.exception("voice profile enrolment failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"enrolment failed: {_safe_error_text(e)}",
+        ) from None
+    finally:
+        # §2.2: unloaded when idle, and enrolment is the idlest this net
+        # ever is. The stage that keeps it warm during a session is §7.3's
+        # business, not a Settings press's.
+        embedder.close()
+
+    try:
+        VOICE_PROFILES.save(slot, name, vector)
+    except ProfileError as e:
+        raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
+    logger.info("voice profile saved in slot %s", slot)
+    return _voice_profiles_payload()
+
+
+#: How long the card gives a press to speak, in seconds. The mask's window is
+#: two seconds and `voice_enrol` refuses anything shorter, so six is the
+#: shortest span a person can read a sentence into without hurrying.
+ENROL_LIVE_SECONDS = 6
+#: A body longer than this is not an enrolment; it is a recording that arrived
+#: at the wrong route.
+ENROL_LIVE_MAX_SECONDS = 30
+
+
+@app.post("/api/voice/profiles/{slot}/enrol-live")
+def enrol_voice_profile_live(
+    slot: int,
+    audio: bytes = Body(..., media_type="application/octet-stream"),
+    _auth: None = Depends(_require_api_auth),
+):
+    """A profile made from the seconds the card just recorded.
+
+    The body is what the browser captured and no more: 16 kHz, mono, PCM16LE,
+    no container. Nothing is written to History — an enrolment is a
+    measurement, not a take — so the store's label is the slot's own name;
+    there is no file to derive one from. Kept `def` rather than `async` for the
+    same reason the file-based route is: the embedder is CPU work, and a
+    threadpool is where FastAPI puts it.
+    """
+    if not default_model_path().is_file():
+        raise HTTPException(
+            status_code=503,
+            detail="the mask's weights are not installed beside the app",
+        )
+    # Whole frames only: an odd trailing byte is half a sample, and slicing it
+    # here is cheaper than explaining a misaligned vector later.
+    pcm = bytes(audio[: len(audio) - (len(audio) % 2)])
+    if len(pcm) < LIVE_PCM_BYTES_PER_SEC * 2:
+        raise HTTPException(
+            status_code=400,
+            detail="the mask needs at least two seconds of speech; hold the switch a little longer",
+        )
+    if len(pcm) > LIVE_PCM_BYTES_PER_SEC * ENROL_LIVE_MAX_SECONDS:
+        # The message names the ceiling, not the span the card offers: a caller
+        # past the ceiling is not six seconds short of an enrolment, it is
+        # posting something else to this route.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"that is longer than an enrolment; this route takes at most "
+                f"{ENROL_LIVE_MAX_SECONDS} seconds"
+            ),
+        )
+
+    embedder = SpeakerEmbedder()
+    try:
+        vector = enrol_take(embedder, pcm)
+    except EnrolmentError as e:
+        # "no speech the mask could hear" is the common one: the press was
+        # held in a quiet room. It is about what was said, so it is a 400.
+        raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
+    except Exception as e:  # noqa: BLE001 — onnxruntime missing, weights corrupt
+        logger.exception("voice profile enrolment failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"enrolment failed: {_safe_error_text(e)}",
+        ) from None
+    finally:
+        embedder.close()
+
+    try:
+        VOICE_PROFILES.save(slot, f"Voice {slot}", vector)
+    except ProfileError as e:
+        raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
+    logger.info("voice profile saved in slot %s from a live capture", slot)
+    return _voice_profiles_payload()
+
+
+@app.post("/api/voice/profiles/{slot}/enable")
+def enable_voice_profile(slot: int, _auth: None = Depends(_require_api_auth)):
+    try:
+        VOICE_PROFILES.set_enabled(slot)
+    except ProfileError as e:
+        # Enabling an empty slot is the one way Settings can ask for a voice
+        # that is not there; the store refuses, and the section re-reads.
+        raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
+    return _voice_profiles_payload()
+
+
+@app.post("/api/voice/disable")
+def disable_voice_profiles(_auth: None = Depends(_require_api_auth)):
+    """Keep nobody: nothing is let through, so the gate has nothing to keep (§5.1)."""
+    VOICE_PROFILES.set_enabled(None)
+    return _voice_profiles_payload()
+
+
+@app.delete("/api/voice/profiles/{slot}")
+def delete_voice_profile(slot: int, _auth: None = Depends(_require_api_auth)):
+    VOICE_PROFILES.delete(slot)
+    return _voice_profiles_payload()
+
+
+def recording_voice_mask() -> Optional[VoiceMask]:
+    """The gate for the recording that is starting, or ``None``.
+
+    §3.4: off is no object at all, never a filter that copies. Three
+    things have to be true for a gate to exist — a profile is enabled, the
+    net's file is beside the app, and that profile's vector is whole — and
+    if any of them is not, this returns ``None`` and the receive path is
+    the one it always was.
+
+    The embedder is built per recording rather than cached: §2.2 asks for
+    weights loaded lazily and unloaded when idle, and a recording is the
+    unit of idleness here. The session opens on the worker's first
+    judgement, off the event loop, and is dropped when the recording ends.
+    """
+    slot = VOICE_PROFILES.enabled_slot()
+    if slot is None:
+        return None
+    profile = VOICE_PROFILES.enabled()
+    if profile is None:
+        return None
+    model = default_model_path()
+    if not model.is_file():
+        logger.warning(
+            "voice-mask: slot %d is enabled but %s is not beside the app; "
+            "this recording is forwarded unmasked",
+            slot,
+            model.name,
+        )
+        return None
+    embedder = SpeakerEmbedder(model)
+    scorer = SpeakerScorer(embedder, profile.vector, voiced=pcm_has_voice)
+    return VoiceMask(scorer, voiced=pcm_has_voice)
 
 
 @app.get("/api/config")

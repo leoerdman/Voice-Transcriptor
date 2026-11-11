@@ -118,3 +118,8 @@ backend/.pytest_cache/
 # during ship; never committed to git. SHA-256 in INSTALL.txt is
 # the integrity contract.
 release-*/
+
+# Cowork mask weights (§6.2): the net is a file beside the app, and whether it
+# ships is the owner's decision — never a `git add -A` away from a 27 MB blob.
+# backend/voice_embed.py::default_model_path() reads exactly this directory.
+/models/
