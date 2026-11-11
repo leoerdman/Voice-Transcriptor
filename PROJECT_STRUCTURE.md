@@ -25,7 +25,8 @@ Voice Transcriptor/
 ├── docs/                          # VERIFIED_AUDIT.md, AUDIT_2026-08.md, PRODUCT.md, VISION.md, install guides
 ├── backend/                       # FastAPI backend and transcription pipeline
 ├── frontend/                      # Vite/TypeScript renderer
-└── desktop/                       # Electron shell and package config
+├── desktop/                       # Electron shell and package config
+└── skills/                        # agent contribution desk: the installer of the cowork skill, no runtime code
 ```
 
 Removed root clutter:
