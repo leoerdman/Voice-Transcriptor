@@ -22,7 +22,7 @@ Voice Transcriptor/
 ├── BUGS_AUDIT_2026-09-03.md       # dated audit waves + fix statuses (root per audit charter)
 ├── BUGSAUDIT-2026-09-04.md        # Ultra-Audit 2026-09-04 summary: 270 findings, all P0 closed; consolidated journals
 ├── .env.example                   # user-facing environment-variable SSOT
-├── docs/                          # VERIFIED_AUDIT.md, AUDIT_2026-08.md, PRODUCT.md, VISION.md, install guides
+├── docs/                          # VERIFIED_AUDIT.md, AUDIT_2026-08.md, PRODUCT.md, VISION.md, COWORK_MASK.md (skeleton), install guides
 ├── backend/                       # FastAPI backend and transcription pipeline
 ├── frontend/                      # Vite/TypeScript renderer
 └── desktop/                       # Electron shell and package config
@@ -62,6 +62,11 @@ backend/
 ├── deepgram_language.py       # what a configured language means per Deepgram endpoint (live resolve vs REST detect_language)
 ├── deepgram_recovery.py       # re-decode of uncovered spans before the final envelope is sent (one owner of recovery)
 ├── live_envelope.py           # the `final` WebSocket envelope: one shape, one constructor
+├── voice_mask.py              # target-speaker gate: a refused window is zeroed in the forwarded copy, never a byte fewer
+├── voice_mask_worker.py       # that gate on one thread: submit never waits, close flushes, order and byte count kept
+├── voice_embed.py             # the net behind that gate: 80-dim fbank, one ONNX file, a cosine — no new dependency
+├── voice_profiles.py          # three slots of vectors on disk, one of them switched on; a fourth is refused
+├── voice_enrol.py             # a six-second capture becomes one of those vectors: cut, thinned, voiced-only, averaged
 ├── async_tasks.py             # ending started asyncio tasks without ending the awaiting coroutine (one owner of the pattern)
 ├── http_retry.py              # remote request retry handling
 ├── jobs.py                    # in-memory job store and cancellation
@@ -113,6 +118,10 @@ frontend/
     ├── gated-poll.ts                 # conditional-polling scheduler SSOT (pure, timer-injected)
     ├── error-text.ts                 # readable text for thrown values SSOT (pure)
     ├── list-window.ts                # history-list windowing policy SSOT (pure)
+    ├── voice-mask-note.ts            # the one line that says a refusal is happening: reported seconds, never a lost-take claim (pure)
+    ├── voice-profiles-section.ts     # Settings → Voice mask: three slots, one switch each, and what the line under the heading says (pure)
+    ├── voice-enrol-prompt.ts         # what a press costs: the six seconds, the line to read out loud, the countdown while it records (pure)
+    ├── enrol-audio.ts                # capture arithmetic: 16 kHz averaging decimation, PCM16LE, seconds held (pure)
     └── update-check.ts               # GitHub release detection (Level 1), version compare (pure)
 ```
 

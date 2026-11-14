@@ -997,6 +997,21 @@ textarea:focus-visible,
   flex-direction: column;
 }
 
+/* §5.3's line of state: ONE row under the pane title, drawn only while
+   the mask is holding something back (or has stopped keeping up). It is
+   deliberately quiet — 11 px, muted — because the alternative it exists
+   to prevent is not "the user missed a warning", it is "the user thinks
+   the app lost his speech". It must also be readable while the live
+   preview itself is off, which is why it lives above the <pre> rather
+   than inside it. */
+.pane-note {
+  padding: 0 14px 6px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-3);
+  flex-shrink: 0;
+}
+
 .pane-head-row {
   display: flex;
   align-items: center;
@@ -2711,6 +2726,117 @@ textarea:focus-visible,
   font-size: 11px;
   line-height: 1.45;
   color: var(--text-3);
+}
+
+/* ── Settings → Voice mask: three slots, one switch each (§5.1) ───────── */
+.voice-slots {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+/* A row is three things in a fixed order: the voice, its switch, its Forget.
+   Grid rather than flex because the first column must be *allowed* to
+   shrink — `minmax(0, 1fr)` is what keeps a long date from wrapping one
+   character per line while the controls keep their natural width. */
+.voice-slot {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 8px 12px;
+  border-radius: var(--control-radius);
+  background: var(--surface-2);
+}
+
+/* The kept row is the one that decides whether anything is forwarded at all,
+   so it carries the accent edge instead of a second label saying the same
+   thing twice. */
+.voice-slot.is-kept {
+  box-shadow: inset 2px 0 0 var(--toggle-track-on);
+}
+
+.voice-slot.is-empty {
+  color: var(--text-3);
+}
+
+.voice-slot-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.voice-slot-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: inherit;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.voice-slot-meta {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+/* "Keep" is a caption for its switch, not a settings line: the row already is
+   the surface, so the full-width bordered variant would read as a second card
+   and push Forget off the edge. */
+.voice-slot-switch,
+.voice-slot-forget {
+  flex: 0 0 auto;
+}
+
+.voice-slot-switch {
+  gap: 6px;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.voice-slot-forget {
+  height: 26px;
+  min-height: 26px;
+  padding: 0 10px;
+  font-size: 11px;
+}
+
+/* ── What a press costs, said before the press ──────────────────────── */
+/* The script is quoted, not a paragraph: it is the one text in the app the
+   user is expected to read out loud, so it reads as a line to say rather
+   than as more documentation to skim. */
+.voice-enrol-script {
+  margin: 0;
+  padding: 8px 12px;
+  border-left: 2px solid var(--control-border);
+  border-radius: 0 var(--control-radius) var(--control-radius) 0;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+/* The live line under the card. It carries the window's own dot — the same
+   red, the same pulse — so "recording" in Settings is the same fact in the
+   same colour as "recording" in the topbar, rather than a second vocabulary
+   the user has to learn. */
+.voice-enrol-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--danger-text);
+}
+
+.voice-enrol-live.is-recording .record-toggle-dot {
+  animation: record-toggle-pulse 1.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .voice-enrol-live.is-recording .record-toggle-dot { animation: none; }
 }
 
 /* ── Shortcut picker button ─────────────────────────────────────────── */
