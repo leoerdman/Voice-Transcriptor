@@ -49,20 +49,38 @@ def read_pcm(path: Path) -> Optional[bytes]:
         return None
 
 
-def _slice_for(pcm: bytes, start: float, end: float) -> Optional[bytes]:
-    """The 2 s of a segment most likely to be one voice, or ``None``."""
-    total = len(pcm) // 2
-    first = max(0, min(total, int(start * RATE)))
-    last = max(first, min(total, int(end * RATE)))
-    span = int(WINDOW_SECONDS * RATE)
-    # A segment of exactly one window is the common shape — a recogniser
-    # segments in whole seconds — and `end * RATE` lands a sample short of it
-    # after rounding. One sample is not a shorter segment.
-    if last - first < span - 1:
-        return None
-    middle = (first + last) // 2
-    head = max(first, min(last - span, middle - span // 2))
-    return pcm[head * 2 : (head + span) * 2]
+def window_scores(
+    pcm: bytes,
+    profile: np.ndarray,
+    embedder: Any,
+    *,
+    hop_seconds: float = 0.5,
+) -> List[tuple[float, float]]:
+    """``(centre_seconds, score)`` for a 2 s window every ``hop_seconds``.
+
+    A recogniser hands out two-second segments, so a decision taken from one
+    window per segment is one sample of a timbre — and one sample is what a
+    plosive, a breath, or the seam between two voices can decide. The take's
+    windows are measured here instead, and a segment is judged by the median
+    of the windows it covers.
+    """
+    span = int(WINDOW_SECONDS * RATE) * 2  # bytes
+    hop = max(1, int(hop_seconds * RATE)) * 2
+    profile_norm = float(np.linalg.norm(profile))
+    rows: List[tuple[float, float]] = []
+    if len(pcm) < span:
+        return rows
+    for start in range(0, len(pcm) - span + 1, hop):
+        vector = embedder.embed(pcm[start : start + span])
+        if vector is None:
+            continue
+        norm = float(np.linalg.norm(vector)) * profile_norm
+        if norm <= 0.0:
+            continue
+        score = float(np.dot(vector, profile) / norm)
+        if math.isfinite(score):
+            rows.append(((start + span // 2) / (RATE * 2), score))
+    return rows
 
 
 def keep_own_segments(
@@ -75,10 +93,12 @@ def keep_own_segments(
 ) -> Dict[str, Any]:
     """The segments that are the kept voice, and how many were dropped.
 
-    A segment too short to embed is kept: an answer of "no" needs evidence, and
-    a word shorter than two seconds has none to give (the same rule the gate
-    follows at its own edges).
+    Each segment is judged by the median score of the windows covering it: a
+    distribution instead of one sample. A segment with no window inside it —
+    shorter than the window, or outside the take — is kept, because an answer
+    of "no" needs evidence.
     """
+    covered = window_scores(pcm, profile, embedder)
     kept: List[Dict[str, Any]] = []
     dropped = 0
     for segment in segments:
@@ -88,17 +108,11 @@ def keep_own_segments(
         except (TypeError, ValueError):
             kept.append(segment)
             continue
-        window = _slice_for(pcm, start, end)
-        if window is None:
+        inside = [score for centre, score in covered if start <= centre <= end]
+        if not inside:
             kept.append(segment)
             continue
-        vector = embedder.embed(window)
-        if vector is None:
-            kept.append(segment)
-            continue
-        norm = float(np.linalg.norm(vector)) * float(np.linalg.norm(profile))
-        score = float(np.dot(vector, profile) / norm) if norm > 0.0 else 0.0
-        if not math.isfinite(score) or score >= floor:
+        if float(np.median(inside)) >= floor:
             kept.append(segment)
         else:
             dropped += 1
