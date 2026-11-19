@@ -99,6 +99,23 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(windows[-1], take[-len(windows[-1]) :])
 
 
+class TwoVoiceEmbedder:
+    """One direction for the first windows of a press, another for the rest."""
+
+    def __init__(self, switch_after: int):
+        self.switch_after = switch_after
+        self.calls = 0
+
+    def embed(self, pcm_bytes):
+        first = np.zeros(192, dtype=np.float32)
+        first[0] = 1.0
+        second = np.zeros(192, dtype=np.float32)
+        second[1] = 1.0
+        vector = first if self.calls < self.switch_after else second
+        self.calls += 1
+        return vector
+
+
 class EnrolTests(unittest.TestCase):
     def test_only_voiced_windows_reach_the_net(self):
         # A silence window embeds the room, and the mean must not hold the
@@ -116,6 +133,19 @@ class EnrolTests(unittest.TestCase):
         profile = enrol_take(FakeEmbedder(), pcm(1200, 4000), voiced=lambda window: True)
         self.assertEqual(profile.shape, (192,))
         self.assertAlmostEqual(float(np.linalg.norm(profile)), 1.0, places=5)
+
+    def test_a_press_holding_two_voices_is_refused_not_saved(self):
+        # A profile saved from such a press does not fail: it silently turns
+        # Solo into a filter that lets everyone through (measured: a stored
+        # vector scored 0.484 against its owner's own take).
+        with self.assertRaises(EnrolmentError) as caught:
+            enrol_take(TwoVoiceEmbedder(switch_after=2), pcm(1200, 6000), voiced=lambda window: True)
+        self.assertIn("halves", str(caught.exception))
+
+    def test_the_halves_cost_no_second_embedding_pass(self):
+        embedder = FakeEmbedder()
+        enrol_take(embedder, pcm(1200, 6000), voiced=lambda window: True)
+        self.assertEqual(embedder.calls, 5, "5 windows of a 6 s press, embedded once each")
 
 
 if __name__ == "__main__":

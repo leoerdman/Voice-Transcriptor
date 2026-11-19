@@ -26,7 +26,7 @@ from typing import Callable, List, Optional, Sequence
 import numpy as np
 
 from backend.audio_constants import LIVE_SAMPLE_RATE_HZ, pcm16_bytes_per_sec
-from backend.voice_embed import SpeakerEmbedder, SpeakerScorer
+from backend.voice_embed import SpeakerEmbedder, cosine, mean_direction, unit_vectors
 from backend.voice_mask import DEFAULT_WINDOW_MS
 
 logger = logging.getLogger(__name__)
@@ -34,6 +34,15 @@ logger = logging.getLogger(__name__)
 #: Half a window, so neighbouring windows share half their audio and a take
 #: that is "mostly the same sentence" is not one sentence counted twice.
 HOP_MS = DEFAULT_WINDOW_MS // 2
+#: Measured, not taste: one speaker's two halves agree at 0.8 and up, while a
+#: capture holding two voices — one person answering another mid-press — lands
+#: far below. §4.5's own numbers say the same thing from the other end (a 1.5 s
+#: window agrees with itself at 0.692 and a stranger sits at 0.116), so a floor
+#: of 0.6 refuses a capture nobody could use without touching a real voice.
+#: A profile saved from such a press does not fail loudly later — it silently
+#: turns Solo into a filter that lets everyone through, which is what happened
+#: on 2026-11-19: the stored vector scored 0.484 against its owner's own take.
+MIN_HALF_AGREEMENT = 0.6
 #: A mean over 40 s of speech is as good as a mean over ten minutes, and this
 #: keeps enrolment at one press rather than one coffee: 20 windows is ~0.5 s
 #: of net time (a 2 s window costs ~25 ms on two threads, see
@@ -144,7 +153,23 @@ def enrol_take(
     windows: Sequence[bytes] = [w for w in enrol_windows(pcm) if heard(w)]
     if not windows:
         raise EnrolmentError("no speech Solo could hear in this take")
-    scorer = SpeakerScorer.enrol(embedder, windows)
-    if scorer is None:
+    vectors = unit_vectors(embedder, windows)
+    profile = mean_direction(vectors)
+    if profile is None:
         raise EnrolmentError("this take gave the net nothing to embed")
-    return scorer.profile
+    if len(vectors) >= 2:
+        midpoint = len(vectors) // 2
+        first = mean_direction(vectors[:midpoint])
+        second = mean_direction(vectors[midpoint:])
+        agreement = (
+            cosine(first, second)
+            if first is not None and second is not None
+            else 0.0
+        )
+        if agreement < MIN_HALF_AGREEMENT:
+            raise EnrolmentError(
+                "the two halves of this press do not sound like one person "
+                f"(agreement {agreement:.2f}, floor {MIN_HALF_AGREEMENT:.2f}): "
+                "press again and speak alone, with nobody else talking"
+            )
+    return profile

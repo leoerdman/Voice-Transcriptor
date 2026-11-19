@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Iterable, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 import numpy as np
 
@@ -225,6 +225,36 @@ class SpeakerEmbedder:
         return vector / norm
 
 
+def unit_vectors(embedder: "SpeakerEmbedder", windows: Sequence[bytes]) -> List[np.ndarray]:
+    """Every window's direction, each embedded exactly once.
+
+    Enrolment asks the same vectors two questions — the mean that becomes the
+    profile, and the two halves that have to agree — and embedding a window
+    again per question would double the one cost a press pays.
+    """
+    vectors: List[np.ndarray] = []
+    for window in windows:
+        vector = embedder.embed(window)
+        if vector is None:
+            continue
+        norm = float(np.linalg.norm(vector))
+        if norm <= 0.0:
+            continue
+        vectors.append(np.asarray(vector, dtype=np.float32) / norm)
+    return vectors
+
+
+def mean_direction(vectors: Sequence[np.ndarray]) -> Optional[np.ndarray]:
+    """The unit mean of unit directions, or ``None`` for nothing to average."""
+    if not vectors:
+        return None
+    mean = np.mean(np.stack(vectors), axis=0)
+    norm = float(np.linalg.norm(mean))
+    if norm <= 0.0:
+        return None
+    return mean / norm
+
+
 class SpeakerScorer:
     """``bytes -> Optional[float]``: the one callable the gate wants.
 
@@ -281,15 +311,7 @@ class SpeakerScorer:
         ``None`` when not one window could be embedded — an empty profile is
         a stranger to everyone, including its owner.
         """
-        vectors: Iterable[np.ndarray] = (
-            v for v in (embedder.embed(w) for w in windows) if v is not None
-        )
-        stacked = []
-        for vector in vectors:
-            norm = float(np.linalg.norm(vector))
-            if norm <= 0.0:
-                continue
-            stacked.append(np.asarray(vector, dtype=np.float32) / norm)
-        if not stacked:
+        profile = mean_direction(unit_vectors(embedder, windows))
+        if profile is None:
             return None
-        return cls(embedder, np.mean(np.stack(stacked), axis=0), voiced=voiced)
+        return cls(embedder, profile, voiced=voiced)
