@@ -15,6 +15,7 @@ right is arithmetic and refusal order, not URL parsing:
 
 from __future__ import annotations
 
+import tempfile
 import unittest
 from unittest import mock
 
@@ -46,13 +47,20 @@ class FakeEmbedder:
 
 
 class FakeStore:
-    """The two methods the route and the payload helper touch."""
+    """The three things the route and the payload helper touch."""
 
     def __init__(self):
         self.saved = []
+        self._tmp = tempfile.TemporaryDirectory(prefix="vt-enrol-store-")
 
-    def save(self, slot, name, vector):
-        self.saved.append((slot, name, np.asarray(vector)))
+    def save(self, slot, name, vector, capture=""):
+        self.saved.append((slot, name, np.asarray(vector), capture))
+
+    @property
+    def captures_dir(self):
+        from pathlib import Path
+
+        return Path(self._tmp.name) / "voice_profiles"
 
     def slots(self):
         return [None, None, None]
@@ -88,7 +96,7 @@ class EnrolLiveRouteTests(unittest.TestCase):
             payload = self.call(2, pcm(6.0))
 
         self.assertEqual(len(self.store.saved), 1)
-        slot, name, saved = self.store.saved[0]
+        slot, name, saved, capture = self.store.saved[0]
         self.assertEqual(slot, 2)
         # No filename reached this route, so no label was derived from one.
         self.assertEqual(name, "Voice 2")
@@ -211,7 +219,7 @@ class TheSpecAndTheCardAgreeTests(unittest.TestCase):
         # part of the spec.
         self.assertIn("countdown", line)
         self.assertIn("Learning…", line)
-        self.assertIn("thrown away", line)
+        self.assertIn("kept beside the profiles", line)
 
     def test_the_numbers_in_the_spec_are_the_numbers_the_gate_runs(self):
         """§4.1 and §4.3 drifted from the code in opposite directions.

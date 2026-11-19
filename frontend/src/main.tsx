@@ -8138,10 +8138,17 @@ async function captureEnrolment(label: string): Promise<Int16Array | null> {
  * could hear…"), so it is shown as it came.
  */
 async function learnInto(slot: number, label: string): Promise<boolean> {
+  // Whose voice is being learned, asked before the microphone opens: the name
+  // is the only thing that later tells three slots apart, and a press that
+  // does not say it writes "Voice N" and leaves the analysis guessing.
+  const asked = window.prompt("Whose voice is this?", label || `Voice ${slot}`);
+  if (asked === null) return false;
+  const name = asked.trim();
   const pcm = await captureEnrolment(label);
   if (!pcm) return false;
   try {
-    const response = await fetch(`/api/voice/profiles/${slot}/enrol-live`, {
+    const query = name ? `?name=${encodeURIComponent(name)}` : "";
+    const response = await fetch(`/api/voice/profiles/${slot}/enrol-live${query}`, {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream", ...authHeaders() },
       body: pcm.buffer as ArrayBuffer,

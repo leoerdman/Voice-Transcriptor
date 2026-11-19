@@ -342,8 +342,15 @@ describe("the card's presses", () => {
     // archive. See voice-enrol-prompt.test.ts for what the card promises.
     expect(main).toContain("async function learnInto(slot: number, label: string)");
     expect(main).toContain("if (await learnInto(slot, voiceLabel(slot)))");
-    expect(main).toContain("`/api/voice/profiles/${slot}/enrol-live`");
+    expect(main).toContain("`/api/voice/profiles/${slot}/enrol-live${query}`");
     expect(main).toContain("async function captureEnrolment(label: string)");
+  });
+
+  it("asks whose voice is being learned before the microphone opens", () => {
+    // Three slots and a name each: a press that does not ask writes "Voice N"
+    // and leaves a later sweep guessing whose capture it is holding (7.4).
+    expect(main).toContain('window.prompt("Whose voice is this?"');
+    expect(main).toContain("?name=${encodeURIComponent(name)}");
   });
 
   it("no longer borrows the newest take from History", () => {

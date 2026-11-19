@@ -48,12 +48,17 @@ class RoundTripTests(StoreTestCase):
         self.assertEqual(len(again.vector), DIMENSIONS)
         np.testing.assert_allclose(again.as_vector(), vector(3), atol=1e-6)
 
-    def test_the_file_holds_vectors_and_no_audio(self):
-        # §1.3: profiles persist, audio does not. Anything that could be a
-        # take in here is a recording the store has no business keeping.
-        self.store.save(1, "Leo", vector())
+    def test_the_file_holds_vectors_and_a_path_but_no_audio(self):
+        # §1.3: profiles persist, audio does not — the capture is kept as its
+        # own WAV beside the file (7.4), so what the store holds is where it is.
+        self.store.save(1, "Leo", vector(), capture="C:/data/voice_profiles/slot1.wav")
         entry = json.loads(self.path.read_text(encoding="utf-8"))["profiles"]["1"]
-        self.assertEqual(set(entry), {"name", "vector", "created_at"})
+        self.assertEqual(set(entry), {"name", "vector", "created_at", "capture"})
+        self.assertEqual(entry["capture"], "C:/data/voice_profiles/slot1.wav")
+
+    def test_the_capture_path_survives_a_reload(self):
+        self.store.save(1, "Leo", vector(), capture="C:/x/slot1.wav")
+        self.assertEqual(VoiceProfileStore(self.path).profiles()[1].capture, "C:/x/slot1.wav")
 
     def test_three_slots_are_always_drawn(self):
         self.store.save(2, "Second", vector(2))

@@ -49,6 +49,10 @@ class VoiceProfile:
     name: str
     vector: Tuple[float, ...]
     created_at: str
+    #: Where the seconds this profile was learned from are kept, relative to
+    #: nothing but itself: an absolute path under DATA_DIR, empty when the
+    #: profile predates captures being kept.
+    capture: str = ""
 
     def as_vector(self) -> np.ndarray:
         return np.asarray(self.vector, dtype=np.float32)
@@ -148,6 +152,7 @@ class VoiceProfileStore:
                     name=_clean_name(entry.get("name")),
                     vector=_clean_vector(entry.get("vector") or []),
                     created_at=str(entry.get("created_at") or ""),
+                    capture=str(entry.get("capture") or ""),
                 )
             except ProfileError as e:
                 logger.warning("voice profile slot %r skipped: %s", key, e)
@@ -166,6 +171,16 @@ class VoiceProfileStore:
         slot = self.enabled_slot()
         return self.profiles().get(slot) if slot is not None else None
 
+    @property
+    def captures_dir(self) -> Path:
+        """Where the presses a profile was learned from are kept (7.4).
+
+        Beside the store rather than in a path of its own: a test that gives the
+        store a temporary file must give its captures the same neighbourhood,
+        and the two can never drift apart.
+        """
+        return self._path.parent / "voice_profiles"
+
     # ---- writing -----------------------------------------------------
 
     def _write(self, profiles: Dict[int, VoiceProfile], enabled: Optional[int]) -> None:
@@ -179,6 +194,7 @@ class VoiceProfileStore:
                     "name": profile.name,
                     "vector": list(profile.vector),
                     "created_at": profile.created_at,
+                    "capture": profile.capture,
                 }
                 for slot, profile in sorted(profiles.items())
             },
@@ -187,7 +203,11 @@ class VoiceProfileStore:
         atomic_write_json(self._path, payload)
 
     def save(
-        self, slot: int, name: str, vector: Sequence[float] | np.ndarray
+        self,
+        slot: int,
+        name: str,
+        vector: Sequence[float] | np.ndarray,
+        capture: str = "",
     ) -> VoiceProfile:
         """Put a profile in a slot, replacing whatever was there."""
         profile = VoiceProfile(
@@ -195,6 +215,7 @@ class VoiceProfileStore:
             name=_clean_name(name),
             vector=_clean_vector(vector),
             created_at=_now(),
+            capture=str(capture or ""),
         )
         profiles = self.profiles()
         profiles[profile.slot] = profile

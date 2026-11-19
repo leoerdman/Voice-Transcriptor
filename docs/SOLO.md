@@ -37,5 +37,5 @@ Presumptive; the person running the app decides. Off is the default.
 7.1 The gate, pure: a scorer injected, one hop out, the byte count kept — the tests are the first half.
 7.2 The embedder and a profile store: MFCC as the floor, CAM++ as the shipped file — one ONNX, loaded lazily, dropped when the recording ends.
 7.3 The call site: one line after the recovery chunk, and the flush on finalize, nothing else.
-7.4 Settings: three slots, one switch each, one Forget per voice — a press on an empty slot records six seconds of the person pressing it, saying the printed line; the countdown, the row's "Learning…" and the window's red dot say it is running, and the capture is thrown away rather than saved as a take.
+7.4 Settings: three slots, one switch each, one Forget per voice — a press on an empty slot asks whose voice it is, then records six seconds of the person pressing it, saying the printed line; the countdown, the row's "Learning…" and the window's red dot say it is running, and the capture is kept beside the profiles as the evidence the vector came from — never as a take, never in History, so a later sweep can tell whose voice landed in which slot.
 7.5 Smoke on real takes: the thresholds are measured there, and the tail is the number that sweep paid for.

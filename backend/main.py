@@ -32,6 +32,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Query,
     Request,
     UploadFile,
     WebSocket,
@@ -7299,10 +7300,28 @@ ENROL_LIVE_SECONDS = 6
 ENROL_LIVE_MAX_SECONDS = 30
 
 
+def _keep_enrolment_capture(slot: int, pcm: bytes) -> Path:
+    """Write the press to its own WAV beside the profiles, labelled by slot and time."""
+    import wave
+    from datetime import datetime, timezone
+
+    directory = VOICE_PROFILES.captures_dir
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = directory / f"slot{slot}-{stamp}.wav"
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(LIVE_SAMPLE_RATE_HZ)
+        handle.writeframes(pcm)
+    return path
+
+
 @app.post("/api/voice/profiles/{slot}/enrol-live")
 def enrol_voice_profile_live(
     slot: int,
     audio: bytes = Body(..., media_type="application/octet-stream"),
+    name: str = Query(""),
     _auth: None = Depends(_require_api_auth),
 ):
     """A profile made from the seconds the card just recorded.
@@ -7358,11 +7377,19 @@ def enrol_voice_profile_live(
     finally:
         embedder.close()
 
+    capture_path = _keep_enrolment_capture(slot, pcm)
+    # Called as a function (tests, instrumentation) `name` is the Query marker
+    # rather than a string; only a real string can be a label.
+    asked = " ".join(name.split()) if isinstance(name, str) else ""
+    label = asked or f"Voice {slot}"
     try:
-        VOICE_PROFILES.save(slot, f"Voice {slot}", vector)
+        VOICE_PROFILES.save(slot, label, vector, capture=str(capture_path))
     except ProfileError as e:
         raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
-    logger.info("voice profile saved in slot %s from a live capture", slot)
+    logger.info(
+        "voice profile %r learned into slot %s; capture kept at %s",
+        label, slot, capture_path.name,
+    )
     return _voice_profiles_payload()
 
 
