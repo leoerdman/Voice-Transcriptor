@@ -26,11 +26,11 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 
 #: Below this, a segment is not the kept voice. Measured, not chosen: the two
-#: clusters of a two-voice take sat at 0.058-0.063 and 0.418-0.487, and the
-#: window gate's own `close_at` (0.55) was above both. 0.30 sits between the
+#: clusters of a two-voice take sat at 0.058-0.063 and 0.418-0.487, and one segment in between scored 0.188-0.289, and the
+#: window gate's own `close_at` (0.55) was above both. 0.35 sits above the ambiguous band (0.188-0.289 measured) and below the kept cluster, with the most room on the side that matters
 #: clusters with the most room on the side that matters — a stranger's word
 #: must not pass.
-FOREIGN_BELOW = 0.30
+FOREIGN_BELOW = 0.35
 #: The seconds an embedding is taken from: the gate's own window, because the
 #: profile was built from that length and a cosine across two lengths measures
 #: the difference in length.
@@ -55,7 +55,10 @@ def _slice_for(pcm: bytes, start: float, end: float) -> Optional[bytes]:
     first = max(0, min(total, int(start * RATE)))
     last = max(first, min(total, int(end * RATE)))
     span = int(WINDOW_SECONDS * RATE)
-    if last - first < span:
+    # A segment of exactly one window is the common shape — a recogniser
+    # segments in whole seconds — and `end * RATE` lands a sample short of it
+    # after rounding. One sample is not a shorter segment.
+    if last - first < span - 1:
         return None
     middle = (first + last) // 2
     head = max(first, min(last - span, middle - span // 2))

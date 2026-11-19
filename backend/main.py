@@ -6288,6 +6288,50 @@ async def create_job_from_path(
     return {"job_id": job_id, "audio_source_path": str(upload_path)}
 
 
+def _voice_filtered(source: Path, result: dict) -> dict:
+    """The kept voice's words only, when Solo has one enabled (docs/SOLO.md).
+
+    The gate decides on audio and cannot separate two voices inside one window;
+    a recognised segment can be asked about its own seconds, which is what this
+    does. A source that will not decode, or a store with nobody enabled, leaves
+    the result exactly as the engine produced it — the filter never fails a
+    transcription.
+    """
+    import tempfile
+
+    from backend import voice_filter
+
+    try:
+        profile = VOICE_PROFILES.enabled()
+    except Exception:  # noqa: BLE001 — an unreadable store is not a refusal
+        logger.debug("solo: voice store unreadable; transcript left unfiltered")
+        return result
+    if profile is None or not result.get("segments"):
+        return result
+    try:
+        with tempfile.TemporaryDirectory(prefix="vt-solo-") as tmp:
+            target = Path(tmp) / "take.wav"
+            ensure_wav_16k(str(source), str(target), channels=1)
+            pcm = voice_filter.read_pcm(target)
+    except (AudioError, OSError):
+        return result
+    if pcm is None:
+        return result
+    embedder = SpeakerEmbedder()
+    try:
+        kept = voice_filter.keep_own_segments(
+            result["segments"], pcm, profile.as_vector(), embedder
+        )
+    finally:
+        embedder.close()
+    if not kept["dropped"]:
+        return result
+    segments = kept["segments"]
+    text = " ".join(str(s.get("text") or "").strip() for s in segments).strip()
+    logger.info("solo: %d segment(s) dropped as not the kept voice", kept["dropped"])
+    return {**result, "segments": segments, "text": text}
+
+
 @app.post("/api/transcribe-sync")
 async def transcribe_sync(
     _auth: None = Depends(_require_api_auth),
@@ -6323,7 +6367,7 @@ async def transcribe_sync(
                 word_timestamps=word_timestamps,
             ),
         )
-        return {"ok": True, "result": result}
+        return {"ok": True, "result": _voice_filtered(upload_path, result)}
     except AudioError as e:
         raise HTTPException(status_code=400, detail=_safe_error_text(e))
     except Exception as e:
@@ -6792,7 +6836,7 @@ async def remote_transcribe_sync(
                 cfg=cfg,
             ),
         )
-        return {"ok": True, "result": result}
+        return {"ok": True, "result": _voice_filtered(upload_path, result)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=_safe_error_text(e))
     except RemoteError as e:
@@ -6881,7 +6925,7 @@ async def transcribe_recording_on_disk(
                 cfg=cfg,
             ),
         )
-        return {"ok": True, "result": result}
+        return {"ok": True, "result": _voice_filtered(audio_path, result)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=_safe_error_text(e))
     except RemoteError as e:

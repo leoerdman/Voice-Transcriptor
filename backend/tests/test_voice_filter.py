@@ -81,7 +81,7 @@ class FilterTests(unittest.TestCase):
         self.assertEqual(result["dropped"], 0)
 
     def test_the_floor_is_the_measured_one(self):
-        self.assertAlmostEqual(FOREIGN_BELOW, 0.30)
+        self.assertAlmostEqual(FOREIGN_BELOW, 0.35)
 
 
 if __name__ == "__main__":
