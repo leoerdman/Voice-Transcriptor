@@ -14,7 +14,8 @@ repository.
    `desktop/package.json`; the Python version lives in `.python-version`
    and the Node version in `.nvmrc`; the exact dependency versions the
    shipped runtime is built with live in `requirements.runtime-lock.txt`;
-   the default hotkeys live in `desktop/shortcut-defaults.json`.
+   the default hotkeys live in `desktop/shortcut-defaults.json`; the deferred
+   work that is written down and not planned lives in `docs/BACKLOG.md`.
 5. Before edits, check `git status` and `git worktree list`, then keep changes
    atomic and commit only verified code.
 

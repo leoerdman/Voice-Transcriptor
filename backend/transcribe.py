@@ -6,6 +6,7 @@ Thread-safe model cache, empty-sequence error handling, stereo channel merge.
 import logging
 import os
 import sys
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -17,6 +18,7 @@ import soundfile as sf
 # cold-import (ctranslate2 + tokenizers + huggingface_hub, ~1 s) does NOT
 # block backend startup. /api/health becomes responsive seconds earlier,
 # and any crash-restart loop pays the import only on first transcription.
+from backend import compute_plugin
 from backend.audio_constants import LIVE_PCM_BYTES_PER_SEC, LIVE_SAMPLE_RATE_HZ
 from backend.model_catalog import GIGAAM_MODEL_PREFIX
 
@@ -521,6 +523,52 @@ _WHISPER_TRANSCRIBE_DEFAULTS = {
 }
 
 
+def _delegate_audio(
+    audio_16k_mono: np.ndarray,
+    model_name: str,
+    language: Optional[str],
+    vad_filter: bool,
+    word_timestamps: bool,
+    beam_size: int,
+    best_of: int,
+) -> Optional[Dict[str, Any]]:
+    """The compute plugin's answer for an in-memory buffer, or ``None``.
+
+    The plugin's audio contract is a 16 kHz mono WAV path, so the buffer
+    is materialised once — the same bytes the file pipeline hands over —
+    and removed whatever happens. ``None`` means "no plugin, or it did
+    not answer usefully": the caller then runs the local engine.
+    """
+    if not compute_plugin.delegate_available():
+        return None
+    fd, path = tempfile.mkstemp(prefix="vt-delegate-", suffix=".wav")
+    os.close(fd)
+    try:
+        sf.write(
+            path,
+            np.asarray(audio_16k_mono, dtype=np.float32),
+            LIVE_SAMPLE_RATE_HZ,
+            subtype="PCM_16",
+        )
+        return compute_plugin.delegate_transcribe(
+            path,
+            model_name,
+            language=language,
+            vad_filter=vad_filter,
+            word_timestamps=word_timestamps,
+            beam_size=beam_size,
+            best_of=best_of,
+        )
+    except OSError:
+        logger.exception("delegated transcription could not stage the buffer")
+        return None
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def transcribe_audio(
     audio_16k_mono: np.ndarray,
     model_name: str,
@@ -551,6 +599,19 @@ def transcribe_audio(
         )
         _touch_model(model_name)
         return result
+
+    delegated = _delegate_audio(
+        audio_16k_mono,
+        model_name,
+        language=language,
+        vad_filter=vad_filter,
+        word_timestamps=word_timestamps,
+        beam_size=beam_size,
+        best_of=best_of,
+    )
+    if delegated is not None:
+        _touch_model(model_name)
+        return delegated
 
     model = _model(model_name)
     try:
@@ -603,6 +664,19 @@ def transcribe_file(
         )
         _touch_model(model_name)
         return result
+
+    delegated = compute_plugin.delegate_transcribe(
+        path_wav_16k_mono,
+        model_name,
+        language=language,
+        vad_filter=vad_filter,
+        word_timestamps=word_timestamps,
+        beam_size=beam_size,
+        best_of=best_of,
+    )
+    if delegated is not None:
+        _touch_model(model_name)
+        return delegated
 
     model = _model(model_name)
     try:

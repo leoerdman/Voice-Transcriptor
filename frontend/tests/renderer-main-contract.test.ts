@@ -415,3 +415,65 @@ describe("the live preview defers to a resolved envelope, verbatim (B-041)", () 
     expect(ternaryCondition).toMatch(/resolvedEnvelopeText\s*!==\s*null\s*\n?\s*\?\s*$/);
   });
 });
+
+/**
+ * The in-window Record button is one control on two surfaces.
+ *
+ * In the desktop shell it posts `__app_record_toggle__` and the main process
+ * owns the microphone prompt, the capsule and the busy guard. In a plain
+ * browser tab there is no main process, the sentinel has no consumer, and the
+ * button used to do nothing at all — silently, because a title that changes
+ * and changes back throws no error.
+ *
+ * The marker that tells the two apart is `__transcriptorEngine`, exposed
+ * unconditionally by desktop/preload.js. Both halves are pinned here because
+ * each one alone is a silent failure: a renderer that stops checking records
+ * through main's path in a browser (nothing happens), and a preload that stops
+ * exposing the marker makes the desktop shell take the browser path — a
+ * recording with no permission prompt, no capsule, and no busy guard.
+ */
+describe("the in-window Record button", () => {
+  // The id appears twice: once in setRecordButton, which paints it, and once
+  // in the click handler. Only the handler is under test here.
+  const start = mainTsx.indexOf('document.getElementById("recordToggleBtn")?.addEventListener');
+  const handler = start === -1 ? "" : mainTsx.slice(start, mainTsx.indexOf("});", start) + 3);
+
+  it("has a click handler this test can read", () => {
+    expect(handler, 'recordToggleBtn handler not found in main.tsx').toBeTruthy();
+  });
+
+  it("asks the main process when there is one", () => {
+    // The exact condition, not a mention of the name: a mutated
+    // `if (false && window.__transcriptorEngine…)` still contains the string
+    // and would slip past a `toContain`, which is how the first version of
+    // this guard failed its own mutation test.
+    expect(handler).toMatch(/if \(window\.__transcriptorEngine\) \{/);
+    expect(handler).toContain("TITLE_BRIDGE_PREFIX.recordToggle");
+    // …the sentinel is posted inside that branch AND followed by a return, so
+    // the browser path below it is reachable rather than dead code.
+    const guard = handler.indexOf("window.__transcriptorEngine");
+    const sentinel = handler.indexOf("TITLE_BRIDGE_PREFIX.recordToggle");
+    const here = handler.indexOf("toggleRecordingHere()");
+    expect(guard).toBeLessThan(sentinel);
+    expect(sentinel).toBeLessThan(here);
+    expect(handler.slice(sentinel, here)).toContain("return;");
+  });
+
+  it("records here when there is none, instead of posting into the void", () => {
+    expect(handler).toContain("toggleRecordingHere()");
+    // The bridge check must come BEFORE the sentinel, or the browser path is
+    // unreachable and the button is dead again.
+    expect(handler.indexOf("window.__transcriptorEngine")).toBeLessThan(
+      handler.indexOf("TITLE_BRIDGE_PREFIX.recordToggle"),
+    );
+  });
+
+  it("is backed by a marker the preload really exposes", () => {
+    const preload = readFileSync(resolve(process.cwd(), "../desktop/preload.js"), "utf8");
+    expect(preload).toContain('contextBridge.exposeInMainWorld("__transcriptorEngine"');
+  });
+
+  it("and the hotkey event runs the same toggle, so one path cannot drift", () => {
+    expect(mainTsx).toContain('window.addEventListener("transcriptor-hotkey-toggle", toggleRecordingHere)');
+  });
+});
