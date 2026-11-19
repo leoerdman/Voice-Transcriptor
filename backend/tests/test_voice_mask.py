@@ -143,17 +143,30 @@ class MaskBoundaryTests(unittest.TestCase):
         mask = VoiceMask(peak_scorer(0.95, 0.10))
         self.assertEqual(drain(mask, data, 1600), data)
 
-    def test_a_burst_before_a_pause_is_never_cut_on_no_verdict(self):
-        # §4.4 with no verdict at all: a burst shorter than a window, then a
-        # pause long enough for the queue to start releasing. Nothing was
-        # ever scored, so nothing is refused — the same rule that keeps a
-        # recording shorter than a window whole.
+    def test_an_opening_burst_is_held_back_until_a_verdict_exists(self):
+        # The lead-in: nothing voiced leaves before the first verdict, so a
+        # stranger who speaks first is never heard. The take keeps every byte;
+        # the live copy loses its opening window, which is the price of not
+        # leaking. Room is still room (§4.6): only voiced hops wait.
         voiced = lambda hop: peak_of(hop) >= 655  # noqa: E731 — the repo's own peak test
-        data = pcm(OWNER_LEVEL, 375) + pcm(ROOM_LEVEL, 4000)
+        burst = pcm(OWNER_LEVEL, 400)  # 8 whole hops, so the slice below is a hop boundary
+        room = pcm(200, 4000)  # under the peak test's floor: unvoiced, §4.6
         mask = VoiceMask(peak_scorer(0.95, 0.10), voiced=voiced)
-        out = drain(mask, data, 1600)
+        out = drain(mask, burst + room, 1600)
+        self.assertFalse(mask.judged, "this take never completes a window of voice")
+        self.assertEqual(len(out), len(burst) + len(room), "the byte grid stands")
+        self.assertEqual(out[: len(burst)], bytes(len(burst)), "the opening is withheld")
+        self.assertEqual(out[len(burst) :], room, "room leaves untouched")
+
+    def test_a_press_shorter_than_a_window_is_released_whole(self):
+        # No verdict can ever exist for it, and "no evidence" is not a refusal:
+        # the flush is what tells a short press apart from an opening window.
+        voiced = lambda hop: peak_of(hop) >= 655  # noqa: E731
+        data = pcm(OWNER_LEVEL, 300)
+        mask = VoiceMask(peak_scorer(0.95, 0.10), voiced=voiced)
+        out = drain(mask, data, 600)
         self.assertFalse(mask.judged)
-        self.assertEqual(out, data)
+        self.assertEqual(out, data, "a press shorter than the window is not a stranger")
 
     def test_the_tail_holds_the_verdict_back_for_its_hops(self):
         # window 100 ms, hop 25 ms == four hops; tail 100 ms == four more.

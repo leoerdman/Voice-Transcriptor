@@ -24,7 +24,7 @@ Presumptive; the person running the app decides. Off is the default.
 4.5 Two thresholds, not one: open at 0.65, close at 0.55 — measured on a held-out narrator (floor 0.611, median 0.726, strangers at most 0.116), not guessed.
 4.6 A window with no voiced frame is silence already: Solo does not touch it.
 4.7 A verdict labels its own window's head: the hop leaving is the first of the second just scored.
-4.8 A flip to open relabels what is held; the first window is still held when its verdict lands.
+4.8 A flip to open relabels what is held; the first window is still held when its verdict lands, and nothing voiced leaves before one exists: the opening window is spent learning who is speaking, so a stranger who talks first is never heard. The take keeps every byte; the live copy loses its first two seconds, and a press shorter than one window has no verdict to wait for and is released whole.
 5.1 Three profiles, a fourth refused; whichever is enabled is let through, the rest is a stranger.
 5.2 A cold is one of the three, switched on like any other: no mark, no expiry, whoever runs it decides.
 5.3 A closed Solo is drawn: the refusal is visible, never silent.

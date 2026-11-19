@@ -281,7 +281,7 @@ class VoiceMask:
             hop, voiced = self._held.popleft()
             if voiced:
                 self._voiced_held -= 1
-            out.append(self._hop_out(hop, voiced, share))
+            out.append(self._hop_out(hop, voiced, share, final=True))
         self._held_bytes = 0
         self._voiced_held = 0
         if self._partial:
@@ -291,14 +291,14 @@ class VoiceMask:
 
     # -- internals ---------------------------------------------------------
 
-    def _hop_out(self, hop: bytes, voiced: bool, share: float) -> bytes:
+    def _hop_out(self, hop: bytes, voiced: bool, share: float, final: bool = False) -> bytes:
         """The one place a decision becomes bytes, counted as it happens."""
-        if self._keep(voiced, share):
+        if self._keep(voiced, share, final):
             return hop
         self._withheld_bytes += len(hop)
         return _silence(len(hop))
 
-    def _keep(self, voiced: bool, share: float) -> bool:
+    def _keep(self, voiced: bool, share: float, final: bool = False) -> bool:
         """Whether a hop leaving *now* goes through untouched (§4.7).
 
         Read at release, not at arrival: the window that scores starts at
@@ -317,10 +317,13 @@ class VoiceMask:
             # Silence carries no verdict to give (§4.6).
             return True
         if not self._judged:
-            # No verdict exists, and a recording shorter than a window will
-            # never have one: refusing on no evidence is the one mistake
-            # this ordering exists to prevent (§4.4).
-            return True
+            # The opening window is spent learning who is speaking: nothing
+            # leaves before the first verdict exists, so a stranger who talks
+            # first is never heard. It costs the owner's first two seconds of
+            # the LIVE copy and nothing else — the take keeps every byte, and
+            # a press shorter than one window has no verdict to wait for, so
+            # `flush` releases it as it stands (no evidence is not a refusal).
+            return final
         if self._verdict is None:
             # No voice in the window covering this hop: silence already.
             return True
