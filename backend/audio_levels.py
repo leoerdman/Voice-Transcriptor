@@ -32,6 +32,14 @@ FLOOR_RISE = 0.0008
 #: One 16-bit LSB. A dead pipeline reports exact zeros and four times zero
 #: is still zero, so nothing would ever be speech without this anchor.
 FLOOR_MIN_RMS = 1.0 / 32768.0
+#: The floor may not fall below this fraction of the loudest frame seen. The
+#: quietest hop of a recording is not always a room: a gate that closes between
+#: phrases reports digital silence, a floor planted on it makes every other
+#: frame speech, and the gate then measures the room instead of the voice —
+#: measured on this desk as a voiced share of 1.00 over a −53 dBFS room. A
+#: 64th of a −30 dBFS peak is −66 dBFS, an order under that room and two under
+#: speech, so the anchor never hides a real voice.
+FLOOR_ANCHOR_RATIO = 1.0 / 64.0
 
 
 def frame_levels(pcm: bytes) -> tuple[float, float]:
@@ -69,7 +77,9 @@ class SessionVoice:
         rms, peak = frame_levels(pcm)
         # Taken against the floor as it stood BEFORE this frame, so a loud
         # frame cannot lift the threshold it is being judged against.
-        threshold = max(self.floor_rms, FLOOR_MIN_RMS) * SPEECH_OVER_FLOOR_RATIO
+        threshold = max(
+            self.floor_rms, self.peak_max * FLOOR_ANCHOR_RATIO, FLOOR_MIN_RMS
+        ) * SPEECH_OVER_FLOOR_RATIO
         speech = self.frames > 0 and (
             rms >= threshold or peak >= threshold * SPEECH_PEAK_CREST_RATIO
         )
@@ -79,6 +89,7 @@ class SessionVoice:
             self.floor_rms += (rms - self.floor_rms) * FLOOR_FALL
         elif not speech:
             self.floor_rms += (rms - self.floor_rms) * FLOOR_RISE
+        self.floor_rms = max(self.floor_rms, self.peak_max * FLOOR_ANCHOR_RATIO)
         self.frames += 1
         if peak > self.peak_max:
             self.peak_max = peak
