@@ -212,13 +212,14 @@ class MaskBoundaryTests(unittest.TestCase):
             "the pause closed two windows that still held the owner's voice",
         )
 
-    def test_a_word_in_a_window_of_room_is_not_refused(self):
-        # Measured on the real net: 0.4 s of the owner's speech in a 2 s
-        # window scores 0.10-0.31, which is the range a stranger occupies,
-        # so no threshold separates them. What separates them is how much
-        # of the window is voice at all: a window that is mostly room is
-        # not evidence about the hop it heads. Without this rule, 8 of the
-        # 9 voiced hops of his short word were zeroed.
+    def test_a_word_in_a_window_of_room_is_refused_when_the_voice_is_a_stranger(self):
+        # §4.4 the other way round, by the owner's decision of 2026-11-19: with
+        # Solo on, a window at or below close_at zeroes its hops even when it is
+        # mostly room. Measured then: a stranger's profile refused 29% of a take
+        # — every spoken hop — against 1.5% for the owner's own profile. The
+        # cost is the one this test used to defend: a short word of the owner's
+        # inside a window of room can be cut; the tail, not the share, is what
+        # protects the end of his turn.
         voiced = lambda hop: peak_of(hop) >= 655  # noqa: E731 — the repo's own peak test
         stranger = pcm(OTHER_LEVEL, 400)
         word = pcm(OWNER_LEVEL, 25)
@@ -230,9 +231,21 @@ class MaskBoundaryTests(unittest.TestCase):
         at = len(stranger)
         self.assertEqual(
             out[at : at + len(word)],
-            word,
-            "the owner's word was cut for being outnumbered by the room",
+            bytes(len(word)),
+            "a stranger's word must not reach the provider, room or no room",
         )
+
+    def test_a_shrug_band_verdict_still_keeps_a_thin_window(self):
+        # 0.55 < 0.6 < 0.65: the window is neither clearly the owner nor
+        # clearly not, and zeroing on a shrug is a cut with extra steps.
+        voiced = lambda hop: peak_of(hop) >= 655  # noqa: E731
+        stranger = pcm(OTHER_LEVEL, 400)
+        word = pcm(OWNER_LEVEL, 25)
+        room = pcm(ROOM_LEVEL, 1000)
+        mask = VoiceMask(lambda _w: 0.60, voiced=voiced, window_ms=100, hop_ms=25)
+        out = drain(mask, stranger + word + room, 800)
+        at = len(stranger)
+        self.assertEqual(out[at : at + len(word)], word, "a shrug is not a refusal")
 
     def test_a_handover_never_cuts_the_arriving_voice(self):
         # The stranger talks, then the owner does, and the window that

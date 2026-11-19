@@ -34,15 +34,14 @@ logger = logging.getLogger(__name__)
 #: Half a window, so neighbouring windows share half their audio and a take
 #: that is "mostly the same sentence" is not one sentence counted twice.
 HOP_MS = DEFAULT_WINDOW_MS // 2
-#: Measured, not taste: one speaker's two halves agree at 0.8 and up, while a
+#: Measured, not taste: one speaker's two halves agree at 0.59 and up on a
+#: real press (the owner's, 2026-11-19, six seconds with pauses in it), while a
 #: capture holding two voices — one person answering another mid-press — lands
-#: far below. §4.5's own numbers say the same thing from the other end (a 1.5 s
-#: window agrees with itself at 0.692 and a stranger sits at 0.116), so a floor
-#: of 0.6 refuses a capture nobody could use without touching a real voice.
-#: A profile saved from such a press does not fail loudly later — it silently
-#: turns Solo into a filter that lets everyone through, which is what happened
-#: on 2026-11-19: the stored vector scored 0.484 against its owner's own take.
-MIN_HALF_AGREEMENT = 0.6
+#: far below. §4.5's own numbers say the same from the other end (a 1.5 s window
+#: agrees with itself at 0.692 and a stranger sits at 0.116), so 0.5 refuses a
+#: capture nobody could use while keeping a real one — a floor set at 0.6
+#: refused that press by one point.
+MIN_HALF_AGREEMENT = 0.5
 #: A mean over 40 s of speech is as good as a mean over ten minutes, and this
 #: keeps enrolment at one press rather than one coffee: 20 windows is ~0.5 s
 #: of net time (a 2 s window costs ~25 ms on two threads, see

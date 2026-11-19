@@ -116,15 +116,15 @@ DEFAULT_HOP_MS = 50
 # hops, so §4.4's "never a cut word" is measured too, not just intended.
 DEFAULT_OPEN_AT = 0.65
 DEFAULT_CLOSE_AT = 0.55
-# A refusal needs a window that is more voice than room. That is measured,
-# not taste: on the held-out take, every window with at least half its hops
-# voiced floored at 0.611 — clear of close_at by six points — while the
-# windows that dipped under 0.55 were all pause-dominated (under 40% voiced,
-# median 21%), where the score describes the room more than the speaker and
-# dips to 0.374 on the owner himself. Deciding on such a window is how a
-# single short word followed by a pause gets cut: the word is the window's
-# head, and all the gate can see behind it is silence. Judging a thin window
-# is allowed and useful; only refusing on one is not.
+# A refusal needs the arriving hop to be voiced and the standing verdict to be
+# at or below ``close_at``. The voice share of the window is NOT part of that
+# decision any more: measured on the owner's desk (2026-11-19) with a stranger's
+# profile enabled, a share requirement left 17% of a take refused and the rest
+# transcribed — Solo's whole point is that a refused voice never reaches the
+# provider. Without it the same take refused 29%, which is every spoken hop,
+# while the owner's own profile cost 1.5%. The share still decides WHEN a
+# pause is worth a verdict (``_worth_a_verdict``), where it costs nothing.
+# The tail is what protects the owner's last word (§4.3).
 MIN_VOICED_SHARE = 0.5
 # §4.3 asks for a 300 ms tail, and 300 ms is right for a lookahead of a few
 # hundred milliseconds. It is not right for two seconds, and the arithmetic
@@ -323,12 +323,6 @@ class VoiceMask:
             return True
         if self._verdict is None:
             # No voice in the window covering this hop: silence already.
-            return True
-        if share < MIN_VOICED_SHARE:
-            # The window this hop heads is mostly room, so its score is not
-            # evidence about the hop — it is evidence about the room. An
-            # owner's single short word followed by a pause is exactly this
-            # shape, and refusing it refused his word.
             return True
         if self._open:
             # The gate is standing open on the owner: keep until it closes.
