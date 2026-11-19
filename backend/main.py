@@ -73,6 +73,7 @@ from backend.model_catalog import (
     health_model_catalog,
 )
 from backend.audio_mime import AUDIO_EXT_TO_MIME, audio_content_type
+from backend.audio_levels import SessionVoice
 from backend.voice_embed import SpeakerEmbedder, SpeakerScorer, default_model_path
 from backend.voice_enrol import EnrolmentError, decode_take, enrol_take
 from backend.voice_mask import VoiceMask
@@ -7419,8 +7420,12 @@ def recording_voice_mask() -> Optional[VoiceMask]:
         )
         return None
     embedder = SpeakerEmbedder(model)
-    scorer = SpeakerScorer(embedder, profile.vector, voiced=pcm_has_voice)
-    return VoiceMask(scorer, voiced=pcm_has_voice)
+    # The frame test is the session's own level (§4.3), not a constant: a
+    # fixed floor classified this desk's speech as room and left the gate
+    # unable to refuse anything.
+    session_voice = SessionVoice()
+    scorer = SpeakerScorer(embedder, profile.vector, voiced=session_voice)
+    return VoiceMask(scorer, voiced=session_voice)
 
 
 @app.get("/api/config")

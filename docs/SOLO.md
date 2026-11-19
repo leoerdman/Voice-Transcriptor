@@ -19,7 +19,7 @@ Presumptive; the person running the app decides. Off is the default.
 3.5 Nothing on the session, nothing in stats: with the switch off the loop runs the bytes it always ran.
 4.1 Window 2 s of lookahead, the measured end of the 1-2 s range; a judgement each 50 ms — a 25 ms cadence cannot pay for a judgement that costs 25-38 ms — and a release is exactly one 1600-byte frame.
 4.2 Silence, never dropped bytes: 1600-byte chunks, bytes_sent and the grid stand; no offset map.
-4.3 Close on a voiced boundary with a tail of half a window: 300 ms cut 20 of the owner's hops on the handover fixture, 1000 ms cut none. The frame test is pcm_has_voice.
+4.3 Close on a voiced boundary with a tail of half a window: 300 ms cut 20 of the owner's hops on the handover fixture, 1000 ms cut none. The frame test is the session's own floor, not a constant: on 2026-11-19 this desk's speech sat at −23…−30 dBFS over a −53 dBFS room, the absolute floor called a quarter of the hops voiced, the 0.5 share a refusal needs was never reached, and a stranger's enabled profile forwarded the owner's every word.
 4.4 A neighbour's word leaked beats a word cut: the asymmetry is the design, not a defect.
 4.5 Two thresholds, not one: open at 0.65, close at 0.55 — measured on a held-out narrator (floor 0.611, median 0.726, strangers at most 0.116), not guessed.
 4.6 A window with no voiced frame is silence already: Solo does not touch it.
