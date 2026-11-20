@@ -17,7 +17,7 @@ desktop shell draws and captures). Their life has two stages:
    their new home. From then on the screenshots are part of the recording:
    listed with it, served with it, deleted with it, and kept or collected
    by the SAME retention rule as its audio (``AUDIO_RETENTION_POLICIES``
-   in main.py — newest five for the Screen Sessions collection).
+   in main.py, the Screen Sessions entry).
 
 A take whose app died before the save is recovered from its audio spool:
 the spool's sidecar names the screen session, and the crash-time promotion
@@ -91,15 +91,28 @@ def screens_stem(path: Path) -> str:
     return path.name[: -len(SCREENS_DIR_SUFFIX)]
 
 
-def list_screenshots(target_dir: Path, stem: str) -> list[str]:
-    """Screenshot file names of one recording, in shot order."""
+def recording_screens_dir(target_dir: Path, stem: str) -> Optional[Path]:
+    """Recording *stem*'s screenshots folder, or None — the ONE answer to
+    "does this recording have screenshots, and where" (BM-10). Listing,
+    serving and the recording payload all ask here, so a symlinked
+    ``<stem>.screens`` cannot be listed as empty by one and served by
+    another."""
     d = screens_dir(target_dir, stem)
-    if not d.is_dir() or d.is_symlink():
-        return []
+    return d if is_screens_dir(d) else None
+
+
+def screenshots_in(folder: Path) -> list[str]:
+    """Screenshot file names in a screens folder, in shot order."""
     try:
-        return sorted(p.name for p in d.iterdir() if p.is_file() and SCREENSHOT_NAME_RE.fullmatch(p.name))
+        return sorted(p.name for p in folder.iterdir() if p.is_file() and SCREENSHOT_NAME_RE.fullmatch(p.name))
     except OSError:
         return []
+
+
+def list_screenshots(target_dir: Path, stem: str) -> list[str]:
+    """Screenshot file names of one recording, in shot order."""
+    d = recording_screens_dir(target_dir, stem)
+    return screenshots_in(d) if d is not None else []
 
 
 def screenshot_path(target_dir: Path, stem: str, file_name: str) -> Optional[Path]:
@@ -108,7 +121,10 @@ def screenshot_path(target_dir: Path, stem: str, file_name: str) -> Optional[Pat
     leaf = str(file_name or "")
     if not SCREENSHOT_NAME_RE.fullmatch(leaf):
         return None
-    p = screens_dir(target_dir, stem) / leaf
+    d = recording_screens_dir(target_dir, stem)
+    if d is None:
+        return None
+    p = d / leaf
     return p if p.is_file() and not p.is_symlink() else None
 
 
@@ -118,6 +134,16 @@ def read_manifest(folder: Path) -> Optional[dict[str, Any]]:
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
+
+
+def is_app_screens_dir(path: Path) -> bool:
+    """A screens folder this app made: its manifest names a screen session
+    (the shell writes ``id`` into every ``events.json``). What lets a
+    folder whose transcript is gone be recognised as ours."""
+    if not is_screens_dir(path):
+        return False
+    manifest = read_manifest(path)
+    return bool(manifest) and is_session_id(manifest.get("id"))
 
 
 # A ``<stem>.screens`` folder being assembled or retired: ``.tmp-<hex>``

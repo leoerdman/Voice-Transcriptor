@@ -314,6 +314,83 @@ class ArchiveIntegrationTests(unittest.TestCase):
         self.assertEqual(payload["recording_collection"], self.main.RECORDING_COLLECTION_SCREEN)
 
 
+class OneRecordingOneRuleTests(unittest.TestCase):
+    """BM-07/S-05, BM-08, BM-10, BM-11/S-06: a recording's audio and its
+    screenshots are one thing to retention and to "delete all"."""
+
+    setUp = ArchiveIntegrationTests.setUp
+    tearDown = ArchiveIntegrationTests.tearDown
+    _recording = ArchiveIntegrationTests._recording
+
+    def test_a_touched_screens_folder_does_not_outrank_its_recording(self) -> None:
+        # Finder writing .DS_Store into the OLDEST take's folder made it the
+        # "newest" screens folder: its screenshots survived while a newer
+        # take's were collected, and audio/screens of one recording split.
+        for i in range(6):
+            self._recording(f"take-{i}", NOW - (6 - i) * 60)
+        touched = self.screen_dir / "take-0.screens"
+        os.utime(touched, (NOW, NOW))
+        self.main._prune_recording_audio(self.screen_dir, now=NOW)
+        kept_screens = sorted(p.name for p in self.screen_dir.glob("*.screens"))
+        kept_audio = sorted(p.name for p in self.screen_dir.glob("*.wav"))
+        self.assertEqual(kept_audio, [f"take-{i}.wav" for i in range(1, 6)])
+        self.assertEqual(kept_screens, [f"take-{i}.screens" for i in range(1, 6)])
+
+    def _app_screens_without_transcript(self, stem: str, mtime: float) -> Path:
+        folder = self.screen_dir / f"{stem}.screens"
+        folder.mkdir()
+        (folder / "shot-01.png").write_bytes(b"png")
+        (folder / "events.json").write_text(json.dumps({"version": 1, "id": SESSION, "events": []}), encoding="utf-8")
+        os.utime(folder, (mtime, mtime))
+        return folder
+
+    def test_screenshots_whose_transcript_is_gone_are_collected_after_the_grace(self) -> None:
+        stale = self._app_screens_without_transcript("deleted-in-finder", NOW - 10 * 24 * 3600)
+        fresh = self._app_screens_without_transcript("just-now", NOW - 60)
+        user = self.screen_dir / "mine.screens"
+        user.mkdir()
+        os.utime(user, (NOW - 10 * 24 * 3600,) * 2)
+        self.main._prune_recording_audio(self.screen_dir, now=NOW)
+        self.assertFalse(stale.exists())
+        self.assertTrue(fresh.exists())
+        self.assertTrue(user.exists(), "a folder without the app's manifest is not ours")
+
+    def test_delete_all_removes_screenshots_whose_transcript_is_gone(self) -> None:
+        orphan = self._app_screens_without_transcript("deleted-in-finder", NOW)
+        self.main._register_archive_dir(self.root)
+        self.main._delete_all_recordings_sync()
+        self.assertFalse(orphan.exists())
+
+    def test_delete_all_puts_everything_back_when_the_screenshots_are_locked(self) -> None:
+        from unittest import mock
+
+        self._recording("take", NOW)
+        screens = self.screen_dir / "take.screens"
+        real_replace = os.replace
+
+        def locked(src, dst, *a, **kw):
+            if Path(src) == screens:
+                raise PermissionError("locked")
+            return real_replace(src, dst, *a, **kw)
+
+        self.main._register_archive_dir(self.root)
+        with mock.patch.object(self.main.os, "replace", locked):
+            result = self.main._delete_all_recordings_sync()
+        self.assertEqual(result, {"deleted": 0, "failed": 1})
+        self.assertTrue((self.screen_dir / "take.txt").exists())
+        self.assertTrue((self.screen_dir / "take.wav").exists())
+        self.assertTrue((screens / "shot-01.png").exists())
+        self.assertEqual([p.name for p in self.screen_dir.iterdir() if ".tmp-" in p.name], [])
+
+    def test_a_symlinked_screens_folder_is_neither_listed_nor_served(self) -> None:
+        elsewhere = Path(self._tmp.name) / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "shot-01.png").write_bytes(b"png")
+        (self.screen_dir / "take.screens").symlink_to(elsewhere, target_is_directory=True)
+        self.assertEqual(screen_sessions.list_screenshots(self.screen_dir, "take"), [])
+        self.assertIsNone(screen_sessions.screenshot_path(self.screen_dir, "take", "shot-01.png"))
+
+
 class AdoptionFailureIsReportedTests(unittest.TestCase):
     """BM-05: a failed adoption is reported as such, not as "no screenshots",
     and a crash's work folder is collected on the next boot."""

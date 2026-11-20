@@ -3309,8 +3309,9 @@ def _resolve_recordings_target_dir(archive_dir: str = "", *, create: bool = True
 RECORDING_COLLECTION_LIVE = "live"
 RECORDING_COLLECTION_UPLOADS = "uploads"
 # Screen-mode recordings: dictated with drawings and screenshots over the
-# screen. Their screenshots live in the desktop shell's screen-session
-# store (desktop/screen-mode.js), which keeps the same newest-N count.
+# screen. Their screenshots are archived beside the recording as
+# ``<stem>.screens`` and owned by this backend (backend/screen_sessions.py);
+# their retention is the collection's entry in AUDIO_RETENTION_POLICIES.
 RECORDING_COLLECTION_SCREEN = "screen"
 RECORDING_COLLECTION_DIR_NAMES: dict[str, str] = {
     RECORDING_COLLECTION_LIVE: "Live Capsule",
@@ -3338,9 +3339,10 @@ _RECORDING_COLLECTION_DIR_NAME_TO_KEY: dict[str, str] = {
 #                    brought in. Worth keeping around while they are
 #                    still working with that material, but not forever,
 #                    so this is an *age* rule.
-#   Screen Sessions — screen-mode takes. The audio is kept for the
-#                    newest five, the same count the desktop shell keeps
-#                    for their screenshot batches.
+#   Screen Sessions — screen-mode takes. A count rule over the recording's
+#                    media as one thing: its audio AND its screenshots
+#                    folder are kept or collected together (default count
+#                    below, ``TRANSCRIPTOR_SCREEN_AUDIO_KEEP_COUNT``).
 #
 # What this replaced: a single global "keep audio only for the newest
 # recording in the archive" rule, written twice (once for the per-save
@@ -3711,54 +3713,101 @@ def _prune_recording_audio(
             owned_cache[stem] = text is not None and _is_app_recording_text(text)
         return owned_cache[stem]
 
-    candidates: list[tuple[float, str, Path]] = []
+    # One entry per RECORDING (stem), holding all of its media: the audio
+    # file(s) and the screen-mode screenshots folder. The policy ranks
+    # recordings, and a recording's media is kept or collected together
+    # (BM-07/S-05). Ranking audio files and ``.screens`` folders as two
+    # lists on two different timestamps (a folder's mtime moves whenever
+    # Finder writes a .DS_Store into it) let one recording keep its audio
+    # and lose its screenshots, or the reverse.
+    audio_by_stem: dict[str, list[Path]] = {}
+    screens_by_stem: dict[str, Path] = {}
+    orphan_screens: list[Path] = []
     for entry in entries:
         try:
+            if screen_sessions.is_screens_dir(entry):
+                stem = screen_sessions.screens_stem(entry)
+                if _owned(stem):
+                    screens_by_stem[stem] = entry
+                elif stem not in text_by_stem:
+                    orphan_screens.append(entry)
+                continue
             if not entry.is_file():
                 continue
             if entry.suffix.lower() not in _RECORDING_AUDIO_EXTS:
                 continue
             if not _owned(entry.stem):
                 continue
-            candidates.append((entry.stat().st_mtime, entry.name, entry))
+            audio_by_stem.setdefault(entry.stem, []).append(entry)
         except OSError as e:
             logger.debug("audio retention: skip %s: %s", _log_safe_recording_name(entry.name), e.strerror or type(e).__name__)
+    candidates: list[tuple[float, str]] = []
+    for stem in set(audio_by_stem) | set(screens_by_stem):
+        mtime = _recording_media_mtime(audio_by_stem.get(stem, []), text_by_stem[stem])
+        if mtime is not None:
+            candidates.append((mtime, stem))
     exempt = {stem for stem in keep_stems if stem}
     stamp = time.time() if now is None else now
 
     deleted = 0
-    for entry, reason in _beyond_retention_policy(candidates, effective, exempt=exempt, now=stamp):
-        try:
-            entry.unlink()
-            deleted += 1
-            logger.info("audio retention: removed %s (%s)", _log_safe_recording_name(entry.name), reason)
-        except OSError as e:
-            logger.warning("audio retention: failed to remove %s: %s", _log_safe_recording_name(entry.name), e.strerror or type(e).__name__)
-    deleted += _prune_recording_screens(entries, _owned, effective, exempt=exempt, now=stamp)
+    for stem, reason in _beyond_retention_policy(candidates, effective, exempt=exempt, now=stamp):
+        for audio in audio_by_stem.get(stem, []):
+            try:
+                audio.unlink()
+                deleted += 1
+                logger.info("audio retention: removed %s (%s)", _log_safe_recording_name(audio.name), reason)
+            except OSError as e:
+                logger.warning("audio retention: failed to remove %s: %s", _log_safe_recording_name(audio.name), e.strerror or type(e).__name__)
+        screens = screens_by_stem.get(stem)
+        if screens is not None:
+            try:
+                shutil.rmtree(screens)
+                deleted += 1
+                logger.info("screens retention: removed %s (%s)", _log_safe_recording_name(screens.name), reason)
+            except OSError as e:
+                logger.warning("screens retention: failed to remove %s: %s", _log_safe_recording_name(screens.name), e.strerror or type(e).__name__)
+    deleted += _prune_orphan_screens(orphan_screens, now=stamp)
     return deleted
 
 
+def _recording_media_mtime(audio: list[Path], text: Path) -> Optional[float]:
+    """The time one recording is ranked by: its audio's (newest, when a
+    re-save left two), else — screenshots whose audio is already gone —
+    its transcript's. Never the ``.screens`` folder's own mtime, which any
+    file written into it moves."""
+    times: list[float] = []
+    for p in audio:
+        try:
+            times.append(p.stat().st_mtime)
+        except OSError:
+            continue
+    if times:
+        return max(times)
+    try:
+        return text.stat().st_mtime
+    except OSError:
+        return None
+
+
 def _beyond_retention_policy(
-    candidates: list[tuple[float, str, Path]],
+    candidates: list[tuple[float, str]],
     policy: AudioRetentionPolicy,
     *,
     exempt: set[str],
     now: float,
-) -> list[tuple[Path, str]]:
-    """The one ranking rule for a recording's media, whatever the kind.
+) -> list[tuple[str, str]]:
+    """The one ranking rule for recordings' media.
 
-    ``candidates`` are ``(mtime, name, path)`` and are ranked newest
-    first (name descending breaks mtime ties). Returns the entries the
+    ``candidates`` are ``(mtime, stem)``, one per recording, ranked newest
+    first (stem descending breaks mtime ties, so the outcome is
+    deterministic rather than filesystem order). Returns the stems the
     policy collects with the reason, skipping exempt stems while still
     counting them toward ``max_items``.
     """
-    ranked = sorted(candidates, key=lambda item: (item[0], item[1]), reverse=True)
+    ranked = sorted(candidates, reverse=True)
     age_cutoff = now - policy.max_age_sec if policy.max_age_sec > 0 else None
-    out: list[tuple[Path, str]] = []
-    for index, (mtime, _name, entry) in enumerate(ranked):
-        stem = screen_sessions.screens_stem(entry) if entry.name.endswith(
-            screen_sessions.SCREENS_DIR_SUFFIX
-        ) else entry.stem
+    out: list[tuple[str, str]] = []
+    for index, (mtime, stem) in enumerate(ranked):
         if stem in exempt:
             continue
         over_count = policy.max_items > 0 and index >= policy.max_items
@@ -3766,43 +3815,33 @@ def _beyond_retention_policy(
         if not (over_count or over_age):
             continue
         out.append((
-            entry,
+            stem,
             "beyond newest %d" % policy.max_items if over_count else "older than %d s" % policy.max_age_sec,
         ))
     return out
 
 
-def _prune_recording_screens(
-    entries: list[Path],
-    owned: Callable[[str], bool],
-    policy: AudioRetentionPolicy,
-    *,
-    exempt: set[str],
-    now: float,
-) -> int:
-    """Screen-mode screenshot folders (``<stem>.screens``) follow their
-    recording's audio rule exactly: same policy, same ranking, same
-    exemption — a recording's media is kept or collected as one kind of
-    thing, never by a second count. Transcripts stay forever."""
-    candidates: list[tuple[float, str, Path]] = []
-    for entry in entries:
+def _prune_orphan_screens(orphans: list[Path], *, now: float) -> int:
+    """A ``<stem>.screens`` folder whose transcript is gone (deleted in
+    Finder — the archive is a visible folder) belongs to no recording any
+    more and would otherwise stay forever (BM-08). Collected only when it
+    is provably the app's (``screen_sessions.is_app_screens_dir``) and has
+    sat untouched for the recovery window, the same grace an unadopted
+    staging folder gets."""
+    if LIVE_RECOVERY_RETENTION_SEC <= 0:
+        return 0
+    cutoff = now - LIVE_RECOVERY_RETENTION_SEC
+    removed = 0
+    for entry in orphans:
         try:
-            if not screen_sessions.is_screens_dir(entry):
+            if not screen_sessions.is_app_screens_dir(entry) or entry.stat().st_mtime > cutoff:
                 continue
-            if not owned(screen_sessions.screens_stem(entry)):
-                continue
-            candidates.append((entry.stat().st_mtime, entry.name, entry))
-        except OSError as e:
-            logger.debug("screens retention: skip %s: %s", _log_safe_recording_name(entry.name), e.strerror or type(e).__name__)
-    deleted = 0
-    for entry, reason in _beyond_retention_policy(candidates, policy, exempt=exempt, now=now):
-        try:
             shutil.rmtree(entry)
-            deleted += 1
-            logger.info("screens retention: removed %s (%s)", _log_safe_recording_name(entry.name), reason)
+            removed += 1
+            logger.info("screens retention: removed %s (its transcript is gone)", _log_safe_recording_name(entry.name))
         except OSError as e:
             logger.warning("screens retention: failed to remove %s: %s", _log_safe_recording_name(entry.name), e.strerror or type(e).__name__)
-    return deleted
+    return removed
 
 
 def _register_archive_dir(path: Path) -> None:
@@ -7918,30 +7957,69 @@ def _delete_all_recordings_sync() -> dict:
             if not _is_app_recording_text(p):
                 continue
             audio_path = _recording_audio_path(p.name, target_dir=d)
-            audio_backup: Optional[Path] = None
+            screens_path = screen_sessions.recording_screens_dir(d, p.stem)
+            # Every medium is moved aside under a ``.tmp-<hex>`` name
+            # BEFORE the transcript goes, so a failure anywhere up to the
+            # transcript's unlink puts all of it back (S-06/BM-11). The
+            # screenshots used to be removed after the transcript with
+            # ``ignore_errors=True``: a locked file left them on disk with
+            # no transcript — never collectable again — while the
+            # recording was counted deleted.
+            moved_aside: list[tuple[Path, Path]] = []
             try:
-                if audio_path is not None:
-                    audio_backup = audio_path.with_name(f"{audio_path.name}.tmp-{uuid.uuid4().hex}")
-                    os.replace(audio_path, audio_backup)
+                for original in (audio_path, screens_path):
+                    if original is None:
+                        continue
+                    aside = original.with_name(f"{original.name}.tmp-{uuid.uuid4().hex}")
+                    os.replace(original, aside)
+                    moved_aside.append((original, aside))
                 p.unlink()
-                if audio_backup is not None:
-                    _best_effort_unlink(audio_backup, context="delete-all audio cleanup")
-                # A screen-mode recording's screenshots go with it.
-                screens = screen_sessions.screens_dir(d, p.stem)
-                if screen_sessions.is_screens_dir(screens):
-                    shutil.rmtree(screens, ignore_errors=True)
-                deleted += 1
             except Exception as exc:
-                if audio_backup is not None and audio_backup.exists():
+                for original, aside in reversed(moved_aside):
                     try:
-                        os.replace(audio_backup, audio_path)
+                        os.replace(aside, original)
                     except OSError as restore_err:
                         logger.warning(
-                            "delete-all audio rollback failed for %s: %s",
-                            audio_path,
-                            restore_err,
+                            "delete-all rollback failed for %s: %s",
+                            _log_safe_recording_name(original.name),
+                            restore_err.strerror or type(restore_err).__name__,
                         )
                 logger.warning("delete-all recording failed for %s: %s", _log_safe_recording_name(p.name), type(exc).__name__)
+                failed += 1
+                continue
+            deleted += 1
+            for _original, aside in moved_aside:
+                try:
+                    if aside.is_dir():
+                        shutil.rmtree(aside)
+                    else:
+                        aside.unlink()
+                except OSError as exc:
+                    # The recording is gone; what is left carries the
+                    # ``.tmp-<hex>`` name the boot sweep collects.
+                    logger.warning(
+                        "delete-all: %s left for the boot sweep: %s",
+                        _log_safe_recording_name(_original.name),
+                        exc.strerror or type(exc).__name__,
+                    )
+        # Screenshots whose transcript was already gone (deleted in
+        # Finder): no recording names them, and "delete all" means them
+        # too (BM-08). Only folders provably the app's.
+        try:
+            leftovers = [e for e in d.iterdir() if screen_sessions.is_app_screens_dir(e)]
+        except OSError:
+            leftovers = []
+        for folder in leftovers:
+            if any((d / f"{screen_sessions.screens_stem(folder)}{ext}").exists() for ext in (".txt", ".TXT")):
+                continue
+            try:
+                shutil.rmtree(folder)
+            except OSError as exc:
+                logger.warning(
+                    "delete-all: orphan screenshots %s not removed: %s",
+                    _log_safe_recording_name(folder.name),
+                    exc.strerror or type(exc).__name__,
+                )
                 failed += 1
     return {"deleted": deleted, "failed": failed}
 
@@ -7972,6 +8050,9 @@ def _read_recording_payload(p: "Path", target_dir: Optional["Path"] = None) -> d
     display = _extract_transcript_text(raw)
     source_file = _recording_source_file(raw)
     archive_dir = target_dir or p.parent
+    # Asked once per recording (H-11): the folder check, the listing and
+    # the manifest read each ran against the same path up to three times.
+    screens_folder = screen_sessions.recording_screens_dir(archive_dir, p.stem)
     return {
         "name": p.name,
         "source_file": source_file,
@@ -7990,19 +8071,11 @@ def _read_recording_payload(p: "Path", target_dir: Optional["Path"] = None) -> d
         # Screen mode: the screenshot file names, in shot order, served by
         # GET /api/recordings/{name}/screens/{file}. Empty for any other
         # recording.
-        "screens": screen_sessions.list_screenshots(archive_dir, p.stem),
+        "screens": screen_sessions.screenshots_in(screens_folder) if screens_folder else [],
         # The archived manifest: what every transcript of this recording
         # places its screen marks from (``frontend/src/screen-annotations.ts``).
-        "screens_manifest": (
-            screen_sessions.read_manifest(screen_sessions.screens_dir(archive_dir, p.stem))
-            if screen_sessions.is_screens_dir(screen_sessions.screens_dir(archive_dir, p.stem))
-            else None
-        ),
-        "screens_dir": (
-            str(screen_sessions.screens_dir(archive_dir, p.stem))
-            if screen_sessions.is_screens_dir(screen_sessions.screens_dir(archive_dir, p.stem))
-            else ""
-        ),
+        "screens_manifest": screen_sessions.read_manifest(screens_folder) if screens_folder else None,
+        "screens_dir": str(screens_folder) if screens_folder else "",
     }
 
 

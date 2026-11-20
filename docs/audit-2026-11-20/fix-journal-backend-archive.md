@@ -140,3 +140,25 @@ Proof method: SKILL §7.1 — the fixed file is put aside, `git show HEAD:<path>
 - After: `Ran 73 tests ... OK`; full suite `Ran 914 tests ... OK (skipped=2)`.
 - Note: one full-suite run under machine load failed two timing tests in `test_deepgram_finalize_budget` (not touched here); they pass alone and on the next full run.
 - BM-20 scope: `--token` is kept (removing a documented flag is a behaviour change); the env var is the non-argv path.
+
+### C8 · BM-07 = S-05, BM-08, BM-10, BM-11 = S-06, H-11, BM-09 = H-05 = S-17 (backend part) (P2) · a recording's audio and screenshots are one thing to retention and delete-all
+- Files: `backend/main.py` (`_prune_recording_audio` ranks RECORDINGS — one `(mtime, stem)` per stem, mtime = its audio's, else its transcript's, never the `.screens` folder's own — and collects audio and screenshots of the same stems; `_recording_media_mtime`; `_beyond_retention_policy` takes stems; `_prune_recording_screens` folded in; `_prune_orphan_screens` collects an app-made `.screens` whose transcript is gone after the recovery window; `_delete_all_recordings_sync` moves audio AND screenshots aside before the transcript and puts both back on failure, then removes app-made orphan `.screens`; `_read_recording_payload` asks for the screens folder once; stale comments at `RECORDING_COLLECTION_SCREEN` and in the retention table removed), `backend/screen_sessions.py` (`recording_screens_dir` — the one "does this recording have screenshots" answer used by list, serve and payload; `screenshots_in`; `is_app_screens_dir` (manifest names a session id); docstring no longer restates "newest five"), `backend/tests/test_screen_sessions.py` (new `OneRecordingOneRuleTests`).
+- Check: `python -m unittest backend.tests.test_screen_sessions.OneRecordingOneRuleTests`
+- Before (both files at HEAD):
+  ```
+  FAIL: test_a_symlinked_screens_folder_is_neither_listed_nor_served (...)
+  AssertionError: PosixPath('.../recordings/Screen Sessions/take.screens/shot-01.png') is not None
+  FAIL: test_a_touched_screens_folder_does_not_outrank_its_recording (...)
+  AssertionError: Lists differ: ['take-0.screens', 'take-2.screens', 'take-3.scr[37 chars]ens'] != ['take-1.screens', 'take-2.screens', 'take-3.scr[37 chars]ens']
+  FAIL: test_delete_all_puts_everything_back_when_the_screenshots_are_locked (...)
+  AssertionError: {'deleted': 1, 'failed': 0} != {'deleted': 0, 'failed': 1}
+  FAIL: test_delete_all_removes_screenshots_whose_transcript_is_gone (...)
+  AssertionError: True is not false
+  FAIL: test_screenshots_whose_transcript_is_gone_are_collected_after_the_grace (...)
+  AssertionError: True is not false
+  Ran 5 tests in 1.555s
+  FAILED (failures=5)
+  ```
+- After: `Ran 5 tests ... OK`; full suite `Ran 919 tests ... OK (skipped=2)`.
+- H-11 (perf, hypothesis) has no failing check: the payload now asks once instead of three times; behaviour identical (existing payload tests green).
+- Cross-domain (S-17 remainder): `frontend/src/main.tsx` ~380 comment "the backend keeps the audio of the newest five" restates an env-tunable default.
