@@ -7470,119 +7470,128 @@ async function installGigaamEngine(python, repoRoot) {
   if (!fs.existsSync(req)) {
     return { ok: false, status: "disabled", reason: "requirements-gigaam.txt missing" };
   }
+  // Single flight, claimed on THIS synchronous turn — before the first
+  // await (DM-06). The flag used to be set only after the up-to-60 s
+  // import probe, so two invokes inside that window (double click, two
+  // windows, a StrictMode double effect) both passed the check above and
+  // ran two multi-GB pip installs into the same staging directory.
+  const run = runGigaamEngineInstall(python, repoRoot, req);
+  engineInstall.inFlight = run;
+  try {
+    return await run;
+  } finally {
+    if (engineInstall.inFlight === run) engineInstall.inFlight = null;
+  }
+}
 
+async function runGigaamEngineInstall(python, repoRoot, req) {
   setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.PROBING);
 
   if (await probeGigaamImportable(python, repoRoot)
     && fs.existsSync(path.join(getEngineSiteDir(), ENGINE_INSTALL_MARKER))) {
     setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.DONE, { reason: "already installed" });
-      return { ok: true, status: "already-installed", ...engineInstallSnapshot() };
+    return { ok: true, status: "already-installed", ...engineInstallSnapshot() };
   }
 
-  engineInstall.inFlight = (async () => {
-    setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.INSTALLING);
-      appendMainLog("[engine-install] started (user request)");
+  setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.INSTALLING);
+  appendMainLog("[engine-install] started (user request)");
 
+  try {
+    // Network gate first: ~2.5 s worst case offline, versus minutes of
+    // pip retries for a result we can predict (see BUG-39).
+    if (!(await isEngineInstallNetworkAvailable())) {
+      throw Object.assign(new Error("offline"), { userReason: "no network access" });
+    }
+    // Disk gate (BUG-33): constants are the SSOT values from engine-deps.
     try {
-      // Network gate first: ~2.5 s worst case offline, versus minutes of
-      // pip retries for a result we can predict (see BUG-39).
-      if (!(await isEngineInstallNetworkAvailable())) {
-        throw Object.assign(new Error("offline"), { userReason: "no network access" });
-      }
-      // Disk gate (BUG-33): constants are the SSOT values from engine-deps.
-      try {
-        const st = fs.statfsSync(path.dirname(getEngineSiteDir()));
-        const freeBytes = BigInt(st.bavail) * BigInt(st.bsize);
-        if (freeBytes < BigInt(engineDeps.ENGINE_MIN_FREE_BYTES)) {
-          const gb = Math.floor(Number(freeBytes / (1024 * 1024 * 1024)));
-          // ONE formatting of the requirement. The message the user sees
-          // used to carry a hardcoded "8 GB" while the log line derived
-          // its number from the constant, so changing the constant would
-          // have changed the log and left the user reading the old figure.
-          const neededGb = engineDeps.ENGINE_MIN_FREE_BYTES / (1024 ** 3);
-          throw Object.assign(
-            new Error(`only ${gb} GB free, need ${neededGb} GB`),
-            { userReason: `insufficient disk space (${gb} GB free, ${neededGb} GB needed)` },
-          );
-        }
-      } catch (e) {
-        if (e.userReason) throw e;
-        appendMainLog(`[engine-install] free-space check failed (${e?.message || e}); proceeding`);
-      }
-
-      // Staging + swap (BUG-36): --target upgrades never remove replaced
-      // files; a fresh staging dir swapped in with two renames is the
-      // canonical pip pattern.
-      const engineSite = getEngineSiteDir();
-      const staging = `${engineSite}.staging`;
-      fs.rmSync(staging, { recursive: true, force: true });
-      fs.mkdirSync(staging, { recursive: true });
-      let res;
-      try {
-        res = await runCommand(python, ["-m", "pip", "install", "--target", staging, "-r", req], {
-          cwd: repoRoot, timeoutMs: 1800000, env: buildPythonEnv(python),
-        });
-      } catch (e) {
-        res = { ok: false, stderr: e?.message || String(e), stdout: "" };
-      }
-      if (!res || !res.ok) {
-        // BUG-32 class: real diagnostics come from stderr, not a phantom field.
-        throw new Error(`pip failed: ${(res?.stderr || res?.stdout || "").slice(0, 400)}`);
-      }
-
-      // BUG-46 invariant: engine-site may only ADD names. Overlap with
-      // the release-pinned bundle is pruned when provably safe and ABORTS
-      // the install when not.
-      const reconcile = await reconcileEngineSiteWithBundle(staging, python, repoRoot, "install");
-      if (!reconcile.ok) {
-        throw new Error(
-          "dependency overlap cannot be resolved safely: "
-          + reconcile.conflicts.map((c) => `${c.name} needs ${c.required}, bundle ships ${c.have}`).join("; "),
+      const st = fs.statfsSync(path.dirname(getEngineSiteDir()));
+      const freeBytes = BigInt(st.bavail) * BigInt(st.bsize);
+      if (freeBytes < BigInt(engineDeps.ENGINE_MIN_FREE_BYTES)) {
+        const gb = Math.floor(Number(freeBytes / (1024 * 1024 * 1024)));
+        // ONE formatting of the requirement. The message the user sees
+        // used to carry a hardcoded "8 GB" while the log line derived
+        // its number from the constant, so changing the constant would
+        // have changed the log and left the user reading the old figure.
+        const neededGb = engineDeps.ENGINE_MIN_FREE_BYTES / (1024 ** 3);
+        throw Object.assign(
+          new Error(`only ${gb} GB free, need ${neededGb} GB`),
+          { userReason: `insufficient disk space (${gb} GB free, ${neededGb} GB needed)` },
         );
       }
-
-      // Completion marker (BUG-76): written INTO staging so a tree is
-      // only ever considered "installed" once it is fully assembled and
-      // reconciled. A half-installed site (crash mid-pip) whose `gigaam`
-      // happens to import would otherwise pass the probe and defer its
-      // breakage to model-load time with no installer re-trigger.
-      fs.writeFileSync(path.join(staging, ENGINE_INSTALL_MARKER), new Date().toISOString());
-
-      const retired = `${engineSite}.old-${Date.now()}`;
-      if (fs.existsSync(engineSite)) fs.renameSync(engineSite, retired);
-      fs.renameSync(staging, engineSite);
-      // Retired-tree cleanup is best-effort (BUG-60): on Windows AV and
-      // indexers routinely hold handles on a just-renamed ~7 GB tree, and
-      // an rmSync failure here must NOT report the install as FAILED —
-      // the new engine is already live. Orphans are swept at next boot.
-      try {
-        fs.rmSync(retired, { recursive: true, force: true });
-      } catch (cleanupErr) {
-        appendMainLog(`[engine-install] retired-tree cleanup deferred to next boot: ${cleanupErr?.message || cleanupErr}`);
-      }
-
-      setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.DONE);
-      appendMainLog("[engine-install] ok (engine-site swapped)");
-
-      // Activate NOW: killing the backend makes the exit handler respawn
-      // it with the refreshed PYTHONPATH — no app relaunch needed.
-      if (backend && !isQuitting) {
-        appendMainLog("[engine-install] restarting backend to activate engine");
-        killBackendHard("gigaam-engine-installed");
-      }
     } catch (e) {
-      setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.FAILED, {
-        reason: e.userReason || "",
-        error: e?.message || String(e),
-      });
-      appendMainLog(`[engine-install] FAILED: ${e.userReason ? `${e.userReason} — ` : ""}${e?.message || e}`);
-      try { fs.rmSync(`${getEngineSiteDir()}.staging`, { recursive: true, force: true }); } catch { /* best effort */ }
-    } finally {
-      engineInstall.inFlight = null;
-        }
-  })();
+      if (e.userReason) throw e;
+      appendMainLog(`[engine-install] free-space check failed (${e?.message || e}); proceeding`);
+    }
 
-  return engineInstall.inFlight.then(() => ({ ok: engineInstall.phase === engineDeps.ENGINE_INSTALL_PHASES.DONE, ...engineInstallSnapshot() }));
+    // Staging + swap (BUG-36): --target upgrades never remove replaced
+    // files; a fresh staging dir swapped in with two renames is the
+    // canonical pip pattern.
+    const engineSite = getEngineSiteDir();
+    const staging = `${engineSite}.staging`;
+    fs.rmSync(staging, { recursive: true, force: true });
+    fs.mkdirSync(staging, { recursive: true });
+    let res;
+    try {
+      res = await runCommand(python, ["-m", "pip", "install", "--target", staging, "-r", req], {
+        cwd: repoRoot, timeoutMs: 1800000, env: buildPythonEnv(python),
+      });
+    } catch (e) {
+      res = { ok: false, stderr: e?.message || String(e), stdout: "" };
+    }
+    if (!res || !res.ok) {
+      // BUG-32 class: real diagnostics come from stderr, not a phantom field.
+      throw new Error(`pip failed: ${(res?.stderr || res?.stdout || "").slice(0, 400)}`);
+    }
+
+    // BUG-46 invariant: engine-site may only ADD names. Overlap with
+    // the release-pinned bundle is pruned when provably safe and ABORTS
+    // the install when not.
+    const reconcile = await reconcileEngineSiteWithBundle(staging, python, repoRoot, "install");
+    if (!reconcile.ok) {
+      throw new Error(
+        "dependency overlap cannot be resolved safely: "
+        + reconcile.conflicts.map((c) => `${c.name} needs ${c.required}, bundle ships ${c.have}`).join("; "),
+      );
+    }
+
+    // Completion marker (BUG-76): written INTO staging so a tree is
+    // only ever considered "installed" once it is fully assembled and
+    // reconciled. A half-installed site (crash mid-pip) whose `gigaam`
+    // happens to import would otherwise pass the probe and defer its
+    // breakage to model-load time with no installer re-trigger.
+    fs.writeFileSync(path.join(staging, ENGINE_INSTALL_MARKER), new Date().toISOString());
+
+    const retired = `${engineSite}.old-${Date.now()}`;
+    if (fs.existsSync(engineSite)) fs.renameSync(engineSite, retired);
+    fs.renameSync(staging, engineSite);
+    // Retired-tree cleanup is best-effort (BUG-60): on Windows AV and
+    // indexers routinely hold handles on a just-renamed ~7 GB tree, and
+    // an rmSync failure here must NOT report the install as FAILED —
+    // the new engine is already live. Orphans are swept at next boot.
+    try {
+      fs.rmSync(retired, { recursive: true, force: true });
+    } catch (cleanupErr) {
+      appendMainLog(`[engine-install] retired-tree cleanup deferred to next boot: ${cleanupErr?.message || cleanupErr}`);
+    }
+
+    setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.DONE);
+    appendMainLog("[engine-install] ok (engine-site swapped)");
+
+    // Activate NOW: killing the backend makes the exit handler respawn
+    // it with the refreshed PYTHONPATH — no app relaunch needed.
+    if (backend && !isQuitting) {
+      appendMainLog("[engine-install] restarting backend to activate engine");
+      killBackendHard("gigaam-engine-installed");
+    }
+  } catch (e) {
+    setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.FAILED, {
+      reason: e.userReason || "",
+      error: e?.message || String(e),
+    });
+    appendMainLog(`[engine-install] FAILED: ${e.userReason ? `${e.userReason} — ` : ""}${e?.message || e}`);
+    try { fs.rmSync(`${getEngineSiteDir()}.staging`, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+  return { ok: engineInstall.phase === engineDeps.ENGINE_INSTALL_PHASES.DONE, ...engineInstallSnapshot() };
 }
 
 /**
