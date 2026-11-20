@@ -85,6 +85,22 @@ function buildMigrations(manifest) {
     });
   }
 
+  // Migration 4 — the screenshot key under Escape (` ~) replaced Option+↓
+  // as the default (user, 2026-11-20: "the key under Escape, left of 1,
+  // working only in screen mode"). Settings saves every slot, so a config
+  // written while Option+↓ was the default carries it as if chosen; only
+  // that exact stored value follows the new default.
+  if (legacy.retiredScreenShot) {
+    migrations.push({
+      id: "retiredScreenShot",
+      platforms: "darwin",
+      match: (pair) => pair.screenShot === String(legacy.retiredScreenShot),
+      replace: (pair, defaults) => ({ ...pair, screenShot: defaults.screenShot }),
+      describe: () => String(legacy.retiredScreenShot),
+      result: (next) => next.screenShot,
+    });
+  }
+
   return migrations;
 }
 
@@ -95,10 +111,12 @@ function appliesTo(migration, platform) {
 }
 
 /**
- * Apply every retired-pair rule to a stored `{record, paste}`.
+ * Apply every retired-accelerator rule to a stored `{record, paste,
+ * screenShot}` (screenShot optional).
  *
- * Returns `{ record, paste, applied }` where `applied` names the migrations
- * that fired, in order — the caller logs them; nothing else reads it.
+ * Returns `{ record, paste, screenShot, applied }` where `applied` names the
+ * migrations that fired, in order — the caller logs them; nothing else
+ * reads it.
  *
  * The input is never mutated, and an unrecognised pair is returned unchanged:
  * a user's own accelerator is not a thing this module has an opinion about.
@@ -107,6 +125,7 @@ function migrateShortcutPair(stored, { manifest, defaults, platform }) {
   const pair = {
     record: String((stored && stored.record) || "").trim(),
     paste: String((stored && stored.paste) || "").trim(),
+    screenShot: String((stored && stored.screenShot) || "").trim(),
   };
   const applied = [];
   for (const migration of buildMigrations(manifest)) {
@@ -116,12 +135,13 @@ function migrateShortcutPair(stored, { manifest, defaults, platform }) {
     applied.push({
       id: migration.id,
       from: migration.describe(),
-      to: `${next.record}/${next.paste}`,
+      to: migration.result ? migration.result(next) : `${next.record}/${next.paste}`,
     });
     pair.record = next.record;
     pair.paste = next.paste;
+    pair.screenShot = next.screenShot === undefined ? pair.screenShot : next.screenShot;
   }
-  return { record: pair.record, paste: pair.paste, applied };
+  return { record: pair.record, paste: pair.paste, screenShot: pair.screenShot, applied };
 }
 
 /**

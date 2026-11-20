@@ -112,3 +112,23 @@ test("main.js reads the rule from the module instead of carrying its own copy", 
     );
   }
 });
+
+test("the old screenshot default Option+Down follows the new default on macOS, and only that slot", () => {
+  const darwin = manifest.platformDefaults.darwin;
+  const out = migrateShortcutPair(
+    { record: "Alt+Left", paste: "Alt+Shift+V", screenShot: "Alt+Down" },
+    { manifest, defaults: darwin, platform: "darwin" },
+  );
+  assert.equal(out.screenShot, "`");
+  assert.equal(out.record, "Alt+Left");
+  assert.equal(out.paste, "Alt+Shift+V");
+  assert.deepEqual(out.applied.map((a) => a.id), ["retiredScreenShot"]);
+  assert.equal(out.applied[0].to, "`");
+  // A key the user chose themselves is theirs.
+  const own = migrateShortcutPair(
+    { record: "Alt+Left", paste: "Alt+Shift+V", screenShot: "F6" },
+    { manifest, defaults: darwin, platform: "darwin" },
+  );
+  assert.equal(own.screenShot, "F6");
+  assert.equal(own.applied.length, 0);
+});

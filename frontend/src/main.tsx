@@ -7213,12 +7213,13 @@ async function loadCfg(): Promise<void> {
     const stored = {
       record: String(ui.shortcut_record || "").trim(),
       paste: String(ui.shortcut_paste || "").trim(),
+      screenShot: String(ui.shortcut_screen_shot || "").trim(),
     };
     const migrated = migrateShortcutPair(stored, {
       manifest: __SHORTCUT_DEFAULTS__,
       defaults: DEFAULT_SHORTCUTS,
       platform: _isMacRenderer ? "darwin" : "other",
-    }) as { record: string; paste: string; applied: Array<{ id: string; from: string; to: string }> };
+    }) as { record: string; paste: string; screenShot: string; applied: Array<{ id: string; from: string; to: string }> };
     const rawRecord: string = migrated.record;
     const rawPaste: string = migrated.paste;
     const didMigrate = migrated.applied.length > 0;
@@ -7227,10 +7228,8 @@ async function loadCfg(): Promise<void> {
     }
     if (rawRecord) currentShortcuts.record = rawRecord;
     if (rawPaste) currentShortcuts.paste = rawPaste;
-    // The screen-mode slots postdate every retired pair: nothing to
-    // migrate, the stored value or the platform default.
     currentShortcuts.screen = String(ui.shortcut_screen || "").trim() || DEFAULT_SHORTCUTS.screen;
-    currentShortcuts.screenShot = String(ui.shortcut_screen_shot || "").trim() || DEFAULT_SHORTCUTS.screenShot;
+    currentShortcuts.screenShot = migrated.screenShot || DEFAULT_SHORTCUTS.screenShot;
     updateAllShortcutDisplays();
     if (didMigrate) {
       // Persist + signal Electron to re-register globalShortcut with

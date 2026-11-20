@@ -9500,11 +9500,6 @@ app.whenReady().then(async () => {
         const stored = {
           record: String(ui.shortcut_record || defaults.record).trim() || defaults.record,
           paste: String(ui.shortcut_paste || defaults.paste).trim() || defaults.paste,
-        };
-        // The screen-mode slots postdate every retired pair, so there is
-        // nothing to migrate: stored value, else the platform default.
-        const screenSlots = {
-          screen: String(ui.shortcut_screen || defaults.screen).trim() || defaults.screen,
           screenShot: String(ui.shortcut_screen_shot || defaults.screenShot).trim() || defaults.screenShot,
         };
         // Retired accelerator pairs are rewritten to the platform default by
@@ -9524,7 +9519,12 @@ app.whenReady().then(async () => {
         for (const step of migrated.applied) {
           appendMainLog(`[shortcuts] migrated stale ${step.from} → ${step.to} (${step.id}) on ${process.platform}`);
         }
-        return { record: migrated.record, paste: migrated.paste, ...screenSlots };
+        return {
+          record: migrated.record,
+          paste: migrated.paste,
+          screen: String(ui.shortcut_screen || defaults.screen).trim() || defaults.screen,
+          screenShot: migrated.screenShot || defaults.screenShot,
+        };
       }
     } catch (e) {
       appendMainLog(`[shortcuts] config read error: ${e?.message || e}`);

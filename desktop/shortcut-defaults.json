@@ -4,7 +4,7 @@
       "record": "Alt+Left",
       "paste": "Alt+Shift+V",
       "screen": "Alt+Right",
-      "screenShot": "Alt+Down"
+      "screenShot": "`"
     },
     "default": {
       "record": "Control+Alt+Shift+R",
@@ -12,6 +12,7 @@
     }
   },
   "legacy": {
+    "retiredScreenShot": "Alt+Down",
     "unpressablePaste": "Alt+Shift+7",
     "macFunctionPair": {
       "record": "F9",

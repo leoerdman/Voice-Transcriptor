@@ -33,10 +33,11 @@ test("darwin defaults are unchanged (Alt+Left / Alt+Shift+V) plus the screen-mod
   assert.deepEqual(manifest.platformDefaults.darwin, {
     record: "Alt+Left",
     paste: "Alt+Shift+V",
-    // Screen mode (macOS-only): Alt+Right toggles a screen-mode take,
-    // Alt+Down saves a screenshot — bound only while screen mode runs.
+    // Screen mode (macOS-only): Alt+Right toggles a screen-mode take; the
+    // key under Escape (` ~) saves a screenshot — bound only while screen
+    // mode runs, so outside it the key types as usual (user, 2026-11-20).
     screen: "Alt+Right",
-    screenShot: "Alt+Down",
+    screenShot: "`",
   });
 });
 
