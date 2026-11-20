@@ -600,6 +600,37 @@ let backendRestartAttempts = 0;
 const BACKEND_RESTART_HEALTH_TIMEOUT_MS = 30000;
 
 /**
+ * Cold start: how long createWindow waits for the first /api/health
+ * before it shows the error page. A fresh install with the bundled
+ * runtime is typically under 5 s; this bounds the wait, it is not a
+ * target.
+ */
+const BACKEND_COLD_START_HEALTH_TIMEOUT_MS = 60_000;
+/** How long the page itself may take to load once the backend answers. */
+const MAIN_WINDOW_PAGE_LOAD_TIMEOUT_MS = 15_000;
+/**
+ * How long a reveal (tray click, second instance) waits for the first
+ * load of a window created at cold start: the backend's whole cold-start
+ * budget plus the page load (DM-20). It was 15 s against a 60 s health
+ * budget, so a reveal during a slow cold start showed the un-loaded dark
+ * window the "no blank window" design exists to prevent.
+ */
+const MAIN_WINDOW_INITIAL_LOAD_TIMEOUT_MS = BACKEND_COLD_START_HEALTH_TIMEOUT_MS + MAIN_WINDOW_PAGE_LOAD_TIMEOUT_MS;
+
+/**
+ * Crash-restart policy. After BACKEND_RESTART_MAX_ATTEMPTS restarts the
+ * shell stops and shows the boot error: a deterministically broken backend
+ * would otherwise restart forever, grow the log and hide the real failure.
+ * The backoff grows by one step per attempt up to its ceiling.
+ */
+const BACKEND_RESTART_MAX_ATTEMPTS = 8;
+const BACKEND_RESTART_BACKOFF_STEP_MS = 800;
+const BACKEND_RESTART_BACKOFF_MAX_MS = 5000;
+/** /api/health polling: pause between tries, and one request's ceiling. */
+const BACKEND_HEALTH_RETRY_MS = 250;
+const BACKEND_HEALTH_REQUEST_TIMEOUT_MS = 2000;
+
+/**
  * Bounds for the backend-down recovery poll shown in the error window.
  * 40 attempts x 3 s is two minutes: long enough for a slow cold start or
  * a user fixing a port conflict, short enough that a backend which is
@@ -1373,6 +1404,8 @@ const RECORDING_STATUS_CAPSULE = Object.freeze((() => {
   waveLevelTickMs: 220,
   waveIdleTickMs: 360,
   waveActiveStaleMs: 900,
+  // A pointer-down is reported at most once per this window.
+  pointerLockMs: 80,
   };
   // Screen mode adds the screenshot button to the right of the timer and
   // the pill grows by exactly that: one more gap and the icon.
@@ -1875,7 +1908,7 @@ function recordingStatusCapsuleHtml() {
     document.addEventListener("pointerdown", () => {
       if (pointerEmitLocked) return;
       pointerEmitLocked = true;
-      setTimeout(() => { pointerEmitLocked = false; }, 80);
+      setTimeout(() => { pointerEmitLocked = false; }, ${t.pointerLockMs});
       document.title = "__recording_capsule_pointer__" + Date.now();
     }, true);
     document.getElementById("shotBtn").addEventListener("click", (event) => {
@@ -2927,8 +2960,11 @@ async function toggleRecordingFromShortcut(mode = "voice") {
  * resolve, reject, OR timeout — and resets recording status state if the stop
  * never completed.
  */
+/** Hard ceiling on a main-process stop before its in-flight flag is freed. */
+const GUARDED_STOP_DEADLINE_MS = 12000;
+
 function guardedStopFromRecordingStatus(reason) {
-  const deadlineMs = 12000;
+  const deadlineMs = GUARDED_STOP_DEADLINE_MS;
   let settled = false;
   const finish = (why, err) => {
     if (settled) return;
@@ -7157,6 +7193,9 @@ async function isEngineInstallNetworkAvailable() {
 // across window reloads", frontend/src/main.tsx syncEngineInstallState).
 // A channel with a sender and no receiver is not a contract; it is work
 // and a name that suggests a surface which does not exist.
+/** Ceiling for the multi-GB engine pip install (a quit kills it sooner). */
+const ENGINE_PIP_INSTALL_TIMEOUT_MS = 30 * 60 * 1000;
+
 const engineInstall = {
   phase: engineDeps.ENGINE_INSTALL_PHASES.IDLE,
   reason: "",
@@ -7280,7 +7319,7 @@ async function runGigaamEngineInstall(python, repoRoot, req) {
     let res;
     try {
       res = await runCommand(python, ["-m", "pip", "install", "--target", staging, "-r", req], {
-        cwd: repoRoot, timeoutMs: 1800000, env: buildPythonEnv(python),
+        cwd: repoRoot, timeoutMs: ENGINE_PIP_INSTALL_TIMEOUT_MS, env: buildPythonEnv(python),
       });
     } catch (e) {
       res = { ok: false, stderr: e?.message || String(e), stdout: "" };
@@ -7767,14 +7806,14 @@ async function startBackend() {
       // can't escape) would otherwise restart every 5s forever, growing
       // the log file unboundedly and masking the real failure. The user
       // sees a permanent backend error in the renderer instead.
-      if (attempt > 8) {
+      if (attempt > BACKEND_RESTART_MAX_ATTEMPTS) {
         backendBootError = `Backend exited (code ${code}, signal ${signal || "none"}) after ${attempt - 1} restart attempts — giving up.`;
         setBackendBootStatus("");
         appendMainLog(`[backend-restart-giving-up] ${backendBootError}`);
         broadcastBackendBootError();
         return;
       }
-      const delay = Math.min(800 * attempt, 5000);
+      const delay = Math.min(BACKEND_RESTART_BACKOFF_STEP_MS * attempt, BACKEND_RESTART_BACKOFF_MAX_MS);
       appendMainLog(`[backend-restart-scheduled] attempt=${attempt} delayMs=${delay}`);
       backendRestartTimer = setTimeout(() => {
         // 1.1.25 fix: previously nulled ``backendRestartTimer`` BEFORE
@@ -7852,7 +7891,7 @@ function waitForBackendHealth(url, timeoutMs) {
     };
     const scheduleRetry = () => {
       if (settled) return;
-      setTimeout(tick, 250);
+      setTimeout(tick, BACKEND_HEALTH_RETRY_MS);
     };
     const tick = () => {
       if (settled) return;
@@ -7889,7 +7928,7 @@ function waitForBackendHealth(url, timeoutMs) {
       // dangling sockets against the loopback backend before the outer
       // reject fires. ``req.destroy()`` cancels the in-flight TCP
       // connection cleanly so the next tick reuses fresh sockets.
-      req.setTimeout(2000, () => {
+      req.setTimeout(BACKEND_HEALTH_REQUEST_TIMEOUT_MS, () => {
         try { req.destroy(); } catch { }
       });
       req.on("error", scheduleRetry);
@@ -7898,7 +7937,7 @@ function waitForBackendHealth(url, timeoutMs) {
   });
 }
 
-function trackMainWindowInitialLoad(browserWindow, reason = "initial-load") {
+function trackMainWindowInitialLoad(browserWindow, reason = "initial-load", timeoutMs = MAIN_WINDOW_PAGE_LOAD_TIMEOUT_MS) {
   if (!browserWindow || browserWindow.isDestroyed()) {
     mainWindowInitialLoadPromise = null;
     return null;
@@ -7933,7 +7972,7 @@ function trackMainWindowInitialLoad(browserWindow, reason = "initial-load") {
   browserWindow.webContents.once("did-finish-load", onDidFinishLoad);
   browserWindow.webContents.once("did-fail-load", onDidFailLoad);
   browserWindow.once("closed", onClosed);
-  timeoutHandle = setTimeout(() => settle("timeout"), 15000);
+  timeoutHandle = setTimeout(() => settle("timeout"), timeoutMs);
   timeoutHandle.unref?.();
   mainWindowInitialLoadPromise = promise;
   return promise;
@@ -8046,7 +8085,8 @@ async function createWindow(options = {}) {
       backgroundThrottling: false,
     }
   });
-  trackMainWindowInitialLoad(win, "create-window");
+  // The first load waits for the backend's cold start too (DM-20).
+  trackMainWindowInitialLoad(win, "create-window", MAIN_WINDOW_INITIAL_LOAD_TIMEOUT_MS);
 
   // Refuse navigation to any origin other than the backend. A
   // transcript containing an <a href="https://evil..."> that's clicked
@@ -8590,7 +8630,7 @@ async function createWindow(options = {}) {
     // 60 s ceiling: cold-start on a fresh install with bundled
     // runtime is typically <5 s; the budget just bounds the wait
     // before the catch branch surfaces a real error to the user.
-    await waitForBackendHealth(`${BASE_URL}/api/health`, 60_000);
+    await waitForBackendHealth(`${BASE_URL}/api/health`, BACKEND_COLD_START_HEALTH_TIMEOUT_MS);
     // Backend is up — clear the "Starting backend…" pill. Nothing ever
     // cleared it before, so the amber chip lingered next to the green
     // "Online" pill for the whole session (user-reported).
