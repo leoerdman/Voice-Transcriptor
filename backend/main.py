@@ -786,6 +786,15 @@ _WINDOWS_RESERVED_BASENAMES = frozenset({
 })
 
 DEFAULT_UPSCALE_PRESET_KEY = "clean"
+
+# What a preset writes in (its ``output_language``): ``""`` — the
+# language of the text it is given, as every built-in does — or one of
+# these codes, for a preset that translates. They are the languages the
+# app knows the alphabet of (the Expected-languages codes,
+# ``backend.transcript_scripts``), so a translating preset's output is
+# held to its own alphabet instead of being cut away as foreign text.
+UPSCALE_SAME_LANGUAGE = ""
+UPSCALE_OUTPUT_LANGUAGES: tuple[str, ...] = LANGUAGE_HINT_OPTIONS
 DEFAULT_UPSCALE_PRESET_ID = f"builtin_{DEFAULT_UPSCALE_PRESET_KEY}"
 MAX_UPSCALE_INPUT_CHARS = 120_000
 
@@ -4456,6 +4465,7 @@ def _ensure_builtin_upscale_presets() -> None:
             "instruction": meta["instruction"],
             "default_instruction": meta["instruction"],
             "builtin": True,
+            "output_language": UPSCALE_SAME_LANGUAGE,
         }
         if not path.exists():
             _write_upscale_preset(path, payload)
@@ -4472,6 +4482,9 @@ def _ensure_builtin_upscale_presets() -> None:
                 "instruction": current_instruction,
                 "default_instruction": payload["default_instruction"],
                 "builtin": True,
+                # The user may point a built-in at another language when
+                # they rewrite its instruction; that choice is kept.
+                "output_language": str(cur.get("output_language") or UPSCALE_SAME_LANGUAGE).strip().lower(),
             }
             if (
                 str(cur.get("id") or "").strip() != next_payload["id"]
@@ -4479,6 +4492,7 @@ def _ensure_builtin_upscale_presets() -> None:
                 or str(cur.get("instruction") or "").strip() != next_payload["instruction"]
                 or str(cur.get("default_instruction") or "").strip() != next_payload["default_instruction"]
                 or bool(cur.get("builtin")) is not True
+                or "output_language" not in cur
             ):
                 _write_upscale_preset(path, next_payload)
         except Exception:
@@ -4502,9 +4516,22 @@ def _load_upscale_preset(path: Path) -> Optional[dict[str, Any]]:
             "instruction": instruction,
             "default_instruction": default_instruction,
             "builtin": bool(raw.get("builtin")),
+            "output_language": str(raw.get("output_language") or UPSCALE_SAME_LANGUAGE).strip().lower(),
         }
     except Exception:
         return None
+
+
+def _upscale_output_language(payload: dict, current: str = UPSCALE_SAME_LANGUAGE) -> str:
+    """A preset's ``output_language`` from a create/update request: absent
+    keeps *current*; ``""`` is the text's own language; anything else must
+    be one of ``UPSCALE_OUTPUT_LANGUAGES``."""
+    if "output_language" not in (payload or {}):
+        return current
+    value = str(payload.get("output_language") or "").strip().lower()
+    if value != UPSCALE_SAME_LANGUAGE and value not in UPSCALE_OUTPUT_LANGUAGES:
+        raise HTTPException(status_code=400, detail="unsupported preset output language")
+    return value
 
 
 def _list_upscale_presets() -> list[dict[str, Any]]:
@@ -7709,8 +7736,13 @@ async def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require
         "trimmed_chars": trimmed_chars,
         # The rewrite is a transcript too, and a model can write in an
         # alphabet the speaker never used: the same rule as every other
-        # delivered transcript (``backend.transcript_scripts``).
-        "text": strip_foreign_script((out.get("text") or "").strip(), transcript_scripts(cfg)),
+        # delivered transcript (``backend.transcript_scripts``) — with the
+        # preset's own output language allowed beside the expected ones,
+        # so a preset that translates keeps its translation.
+        "text": strip_foreign_script(
+            (out.get("text") or "").strip(),
+            transcript_scripts(cfg, preset.get("output_language") or None),
+        ),
     }
 
 
@@ -7719,6 +7751,7 @@ def list_upscale_presets(_auth: None = Depends(_require_api_auth)):
     items = _list_upscale_presets()
     return {
         "default_preset_id": DEFAULT_UPSCALE_PRESET_ID,
+        "output_language_options": list(UPSCALE_OUTPUT_LANGUAGES),
         "items": [
             {
                 "id": x["id"],
@@ -7726,6 +7759,7 @@ def list_upscale_presets(_auth: None = Depends(_require_api_auth)):
                 "builtin": bool(x["builtin"]),
                 "instruction": str(x.get("instruction") or ""),
                 "default_instruction": str(x.get("default_instruction") or x.get("instruction") or ""),
+                "output_language": str(x.get("output_language") or UPSCALE_SAME_LANGUAGE),
             }
             for x in items
         ]
@@ -7743,6 +7777,7 @@ def create_upscale_preset(payload: dict = Body(...), _auth: None = Depends(_requ
         raise HTTPException(status_code=400, detail="preset name is required")
     if not instruction:
         raise HTTPException(status_code=400, detail="preset instruction is required")
+    output_language = _upscale_output_language(payload)
 
     custom_count = 0
     for item in _list_upscale_presets():
@@ -7766,18 +7801,10 @@ def create_upscale_preset(payload: dict = Body(...), _auth: None = Depends(_requ
         "instruction": instruction,
         "default_instruction": instruction,
         "builtin": False,
+        "output_language": output_language,
     }
     _write_upscale_preset(_upscale_preset_path(preset_id), payload_out)
-    return {
-        "ok": True,
-        "item": {
-            "id": payload_out["id"],
-            "name": payload_out["name"],
-            "builtin": False,
-            "instruction": payload_out["instruction"],
-            "default_instruction": payload_out["default_instruction"],
-        },
-    }
+    return {"ok": True, "item": payload_out}
 
 
 @app.put("/api/upscale/presets/{preset_id}")
@@ -7795,6 +7822,7 @@ def update_upscale_preset(preset_id: str, payload: dict = Body(...), _auth: None
         "instruction": instruction,
         "default_instruction": str(item.get("default_instruction") or item.get("instruction") or instruction).strip() or instruction,
         "builtin": bool(item.get("builtin")),
+        "output_language": _upscale_output_language(payload, item.get("output_language") or UPSCALE_SAME_LANGUAGE),
     }
     _write_upscale_preset(_upscale_preset_path(item["id"]), next_payload)
     return {"ok": True, "item": next_payload}
@@ -7813,6 +7841,10 @@ def reset_upscale_preset_default(preset_id: str, _auth: None = Depends(_require_
         "instruction": default_instruction,
         "default_instruction": default_instruction,
         "builtin": bool(item.get("builtin")),
+        # A built-in's default writes in the text's own language; a custom
+        # preset's default instruction is the one it was created with, in
+        # the language it was created for.
+        "output_language": UPSCALE_SAME_LANGUAGE if item.get("builtin") else (item.get("output_language") or UPSCALE_SAME_LANGUAGE),
     }
     _write_upscale_preset(_upscale_preset_path(item["id"]), next_payload)
     return {"ok": True, "item": next_payload}

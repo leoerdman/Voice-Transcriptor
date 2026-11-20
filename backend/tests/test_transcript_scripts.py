@@ -282,5 +282,58 @@ class DeliveredResultBoundaryTests(IsolatedBackendMainImportMixin, unittest.Test
         self.assertEqual(response["text"], "Привет мир.")
 
 
+class UpscalePresetOutputLanguageTests(IsolatedBackendMainImportMixin, unittest.TestCase):
+    """A preset says what it writes in (``output_language``); the rewrite is
+    held to the expected languages PLUS that one, so a translation is kept
+    and a stray alphabet still goes."""
+
+    def setUp(self):
+        super().setUp()
+        self.main.save_config({
+            "providers": {"openrouter": {"key": "sk-or-v1-test-upscale-key-12345678"}},
+            "preferences": {"deepgram": {"language_hints": ["ru", "en"]}},
+        })
+
+    def _rewrite(self, model_text: str, **request) -> str:
+        with mock.patch.object(self.main, "openrouter_upscale_text", return_value={"text": model_text}):
+            return asyncio.run(self.main.upscale_text({"text": "raw", **request}, _auth=None))["text"]
+
+    def test_a_preset_that_translates_to_japanese_keeps_its_translation(self):
+        created = self.main.create_upscale_preset(
+            {"name": "To Japanese", "instruction": "Translate the transcript into Japanese.", "output_language": "ja"},
+            _auth=None,
+        )["item"]
+        self.assertEqual(created["output_language"], "ja")
+        out = self._rewrite("こんにちは、世界。 Claude در OK", preset_id=created["id"])
+        self.assertEqual(out, "こんにちは、世界。 Claude OK")
+
+    def test_an_ordinary_preset_still_drops_persian_and_japanese(self):
+        self.assertEqual(self._rewrite("Привет در мир こんにちは."), "Привет мир.")
+
+    def test_every_built_in_writes_in_the_texts_own_language(self):
+        listed = self.main.list_upscale_presets(_auth=None)
+        self.assertEqual(listed["output_language_options"], list(self.main.LANGUAGE_HINT_OPTIONS))
+        builtins = [x for x in listed["items"] if x["builtin"]]
+        self.assertTrue(builtins)
+        self.assertTrue(all(x["output_language"] == "" for x in builtins))
+
+    def test_an_output_language_the_app_cannot_name_is_refused(self):
+        with self.assertRaises(self.main.HTTPException) as raised:
+            self.main.create_upscale_preset(
+                {"name": "To Klingon", "instruction": "Translate.", "output_language": "tlh"}, _auth=None,
+            )
+        self.assertEqual(raised.exception.status_code, 400)
+
+    def test_editing_the_instruction_keeps_the_output_language_unless_it_is_changed(self):
+        pid = self.main.create_upscale_preset(
+            {"name": "To Japanese", "instruction": "Translate.", "output_language": "ja"}, _auth=None,
+        )["item"]["id"]
+        kept = self.main.update_upscale_preset(pid, {"instruction": "Translate politely."}, _auth=None)["item"]
+        self.assertEqual(kept["output_language"], "ja")
+        back = self.main.update_upscale_preset(pid, {"instruction": "Clean up.", "output_language": ""}, _auth=None)["item"]
+        self.assertEqual(back["output_language"], "")
+        self.assertEqual(self._rewrite("こんにちは Привет", preset_id=pid), "Привет")
+
+
 if __name__ == "__main__":
     unittest.main()

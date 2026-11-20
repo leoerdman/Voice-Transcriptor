@@ -419,6 +419,9 @@ interface UpscalePresetItem {
   builtin: boolean;
   instruction?: string;
   default_instruction?: string;
+  /** What the preset writes in: "" — the text's own language; else a code
+   *  from the catalog's ``output_language_options`` (a translating preset). */
+  output_language?: string;
 }
 
 /**
@@ -6672,9 +6675,14 @@ async function loadUpscalePresets(preferredId = ""): Promise<void> {
   let fallbackPresetId = "";
   let loadedFromBackend = false;
   try {
-    const r = await apiGet<{ items: UpscalePresetItem[]; default_preset_id?: string }>("/api/upscale/presets");
+    const r = await apiGet<{ items: UpscalePresetItem[]; default_preset_id?: string; output_language_options?: unknown }>(
+      "/api/upscale/presets",
+    );
     items = Array.isArray(r.items) ? r.items : [];
     fallbackPresetId = String(r.default_preset_id || "").trim();
+    upscaleOutputLanguageOptions = Array.isArray(r.output_language_options)
+      ? r.output_language_options.map((code) => String(code || "").trim()).filter(Boolean)
+      : [];
     loadedFromBackend = true;
   } catch (e) {
     console.warn("loadUpscalePresets: backend preset catalog unavailable", e);
@@ -6725,6 +6733,25 @@ async function loadUpscalePresets(preferredId = ""): Promise<void> {
   syncUpscalePresetControls();
 }
 
+/** The languages a preset may write in, from the preset catalog (the backend's list). */
+let upscaleOutputLanguageOptions: string[] = [];
+
+/** Fill a preset's "Output language" select: the text's own language, then the catalog's languages. */
+function renderUpscaleOutputLanguageSelect(id: string, selected: string): void {
+  const sel = $(id) as HTMLSelectElement;
+  sel.innerHTML = "";
+  const choices = ["", ...upscaleOutputLanguageOptions];
+  // A stored value the catalog no longer offers is still shown, not silently changed.
+  if (selected && !choices.includes(selected)) choices.push(selected);
+  for (const code of choices) {
+    const o = document.createElement("option");
+    o.value = code;
+    o.textContent = code ? languageHintLabel(code) : "Same as the text";
+    sel.appendChild(o);
+  }
+  sel.value = selected;
+}
+
 function openUpscalePresetModal(): void {
   const name = $("upscalePresetNameInput") as HTMLInputElement;
   const instruction = $("upscalePresetInstructionInput") as HTMLTextAreaElement;
@@ -6732,6 +6759,7 @@ function openUpscalePresetModal(): void {
   name.value = "";
   instruction.value =
     "Improve transcript quality: keep same language as input, preserve meaning, fix punctuation and grammar. Return only final transcript text without quotes.";
+  renderUpscaleOutputLanguageSelect("upscalePresetOutputLanguage", "");
   openModal("upscalePresetModal", "#upscalePresetNameInput");
 }
 
@@ -6746,6 +6774,7 @@ function openUpscalePromptModal(): void {
   ($("upscalePromptPresetId") as HTMLInputElement).value = preset.id;
   ($("upscalePromptInstructionInput") as HTMLTextAreaElement).value =
     String(preset.instruction || preset.default_instruction || "").trim();
+  renderUpscaleOutputLanguageSelect("upscalePromptOutputLanguage", String(preset.output_language || ""));
   $("upscalePromptMsg").textContent = "";
   openModal("upscalePromptModal", "#upscalePromptInstructionInput");
 }
@@ -7568,7 +7597,8 @@ async function handleKeyAction(provider: RemoteProvider): Promise<void> {
     return;
   }
   msg.textContent = "Saving...";
-  void apiPost<{ ok: boolean; item: UpscalePresetItem }>("/api/upscale/presets", { name, instruction })
+  const outputLanguage = ($("upscalePresetOutputLanguage") as HTMLSelectElement).value;
+  void apiPost<{ ok: boolean; item: UpscalePresetItem }>("/api/upscale/presets", { name, instruction, output_language: outputLanguage })
     .then(async (r) => {
       closeUpscalePresetModal();
       await loadUpscalePresets(r.item?.id || "");
@@ -7591,7 +7621,11 @@ async function handleKeyAction(provider: RemoteProvider): Promise<void> {
     return;
   }
   msg.textContent = "Saving...";
-  void apiPut<{ ok: boolean; item: UpscalePresetItem }>(`/api/upscale/presets/${encodeURIComponent(presetId)}`, { instruction })
+  const outputLanguage = ($("upscalePromptOutputLanguage") as HTMLSelectElement).value;
+  void apiPut<{ ok: boolean; item: UpscalePresetItem }>(
+    `/api/upscale/presets/${encodeURIComponent(presetId)}`,
+    { instruction, output_language: outputLanguage },
+  )
     .then(async () => {
       await loadUpscalePresets(presetId);
       queueUiPreferencesSave();
@@ -7621,6 +7655,7 @@ async function handleKeyAction(provider: RemoteProvider): Promise<void> {
       const preset = selectedUpscalePreset();
       ($("upscalePromptInstructionInput") as HTMLTextAreaElement).value =
         String(preset?.instruction || preset?.default_instruction || "").trim();
+      renderUpscaleOutputLanguageSelect("upscalePromptOutputLanguage", String(preset?.output_language || ""));
       queueUiPreferencesSave();
       msg.textContent = "Default applied";
     })

@@ -765,3 +765,22 @@ describe("every new recording is saved with the moment it began", () => {
     expect(mainTsx).toContain("recordedAtMs: Number(draft.started_at) || 0,");
   });
 });
+
+/**
+ * A preset says what it writes in (backend ``output_language``): both
+ * preset dialogs offer the catalog's languages and send the choice, so a
+ * translating preset's output is kept by the expected-language filter.
+ */
+describe("upscale presets carry their output language", () => {
+  it("both dialogs have the select and send what it says", () => {
+    expect(html).toContain('<select id="upscalePresetOutputLanguage"></select>');
+    expect(html).toContain('<select id="upscalePromptOutputLanguage"></select>');
+    expect(mainTsx).toContain("{ name, instruction, output_language: outputLanguage }");
+    expect(mainTsx).toContain("{ instruction, output_language: outputLanguage }");
+  });
+
+  it("the choices are the catalog's own list, after the text's own language", () => {
+    expect(mainTsx).toContain("upscaleOutputLanguageOptions = Array.isArray(r.output_language_options)");
+    expect(mainTsxSlice("function renderUpscaleOutputLanguageSelect(", "\n}\n")).toContain('const choices = ["", ...upscaleOutputLanguageOptions];');
+  });
+});

@@ -889,6 +889,17 @@
         <textarea id="upscalePresetInstructionInput" rows="7"
           placeholder="System instruction for transcript improvement"></textarea>
       </label>
+      <!--
+        What the preset writes in. "Same as the text" for a rewrite; a
+        language for a preset that translates — its words are then kept
+        even when that language is not among Expected languages (the
+        backend holds the rewrite to their alphabets plus this one).
+        Options come from /api/upscale/presets (output_language_options).
+      -->
+      <label class="field">
+        <span class="lbl">Output language</span>
+        <select id="upscalePresetOutputLanguage"></select>
+      </label>
       <p class="hint" id="upscalePresetMsg"></p>
       <div class="modal-actions">
         <button class="btn btn-primary" id="upscalePresetSaveBtn" type="button">Save Preset</button>
@@ -909,6 +920,10 @@
       <label class="modal-field">
         <span>Instruction</span>
         <textarea id="upscalePromptInstructionInput" rows="8" placeholder="Instruction for this preset"></textarea>
+      </label>
+      <label class="modal-field">
+        <span>Output language</span>
+        <select id="upscalePromptOutputLanguage"></select>
       </label>
       <p class="hint" id="upscalePromptMsg"></p>
       <div class="modal-actions">
