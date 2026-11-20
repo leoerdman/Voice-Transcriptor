@@ -122,6 +122,9 @@ const {
   isPasteableTranscript,
   classifyRecordingSignal,
 } = require("./transcript-signal");
+// One lease per paste on the snapshot of the user's clipboard, released
+// exactly once (DM-02, DM-26).
+const { createClipboardLeases } = require("./clipboard-lease");
 
 // SSOT for "which system power events the app reacts to, and what each
 // one means" — subscribed exactly once from app.whenReady below.
@@ -3448,8 +3451,8 @@ function recordingStatusForPasteFailure(reason, pasteAccel = pasteLastAccelerato
 
 function recordingStatusBadgeForPasteFailure(r) {
   // The transcript is ALWAYS written to the system clipboard before
-  // the paste attempt (see ``clipboard.writeText(transcript)`` in
-  // processPostStopTask), so every failure mode below still leaves
+  // the paste attempt (runPasteLadder, right after it snapshots the
+  // user's clipboard), so every failure mode below still leaves
   // the text available via Cmd+V. We prefer a status that tells the
   // user their text is safe rather than one that just says
   // "failed" — "In Clipboard" is the clearest signal that recovery
@@ -4873,43 +4876,13 @@ function snapshotClipboard() {
   }
 }
 
-// Reference-counted snapshot of the user's REAL clipboard, captured
-// at the FIRST paste of any chained-paste sequence. Without this,
-// rapid F9-stop → F9-stop within the 1500 ms restore window has
-// paste-2's `snapshotClipboard` capture paste-1's transcript as the
-// "original" — paste-2's eventual restore then writes paste-1's
-// transcript back onto the clipboard, permanently pinning it
-// (the user's real clipboard is gone forever).
-//
-// acquireClipboardSnapshot:
-//   - First paste: snapshots the clipboard (user's real content)
-//     and stores it module-wide.
-//   - Subsequent pastes during the restore window: return the SAME
-//     snapshot. Increment depth.
-//
-// releaseClipboardSnapshot:
-//   - Decrement depth. When the LAST outstanding paste finishes
-//     (depth=0), clear the cached snapshot so the next paste-cycle
-//     starts fresh.
-//
-// Both atomic under V8's single-threaded event loop — no extra lock
-// needed, the increment/decrement pair runs synchronously between
-// awaits.
-let _clipboardSnapshotDepth = 0;
-let _clipboardSnapshotCache = null;
-function acquireClipboardSnapshot() {
-  _clipboardSnapshotDepth += 1;
-  if (_clipboardSnapshotCache === null) {
-    _clipboardSnapshotCache = snapshotClipboard();
-  }
-  return _clipboardSnapshotCache;
-}
-function releaseClipboardSnapshot() {
-  _clipboardSnapshotDepth = Math.max(0, _clipboardSnapshotDepth - 1);
-  if (_clipboardSnapshotDepth === 0) {
-    _clipboardSnapshotCache = null;
-  }
-}
+// Leases on the snapshot of the user's REAL clipboard (./clipboard-lease).
+// A chain of pastes inside one restore window shares the snapshot the
+// first one took, so paste-2 never captures paste-1's transcript as the
+// "original"; each paste holds exactly one lease, released exactly once
+// (runPasteLadder's ``finally`` is the backstop for every exit, a throw
+// included).
+const clipboardLeases = createClipboardLeases(snapshotClipboard);
 
 /**
  * Smart clipboard restore.
@@ -4960,19 +4933,23 @@ function releaseClipboardSnapshot() {
  * is what makes that status true and what makes the paste-last hotkey
  * work as the recovery it is advertised as.
  */
-function keepTranscriptOnClipboardAfterFailure(logCtx) {
+function keepTranscriptOnClipboardAfterFailure(lease, logCtx) {
   appendMainLog(
     `[${logCtx}] paste failed; transcript left on the clipboard, previous clipboard NOT restored`
   );
-  releaseClipboardSnapshot();
+  lease.release();
 }
 
-function scheduleSmartClipboardRestore(snap, writtenText, logCtx = "paste:clipboardRestore", verified = false) {
+function scheduleSmartClipboardRestore(lease, writtenText, logCtx = "paste:clipboardRestore", verified = false) {
   if (verified !== true) {
     appendMainLog(`[${logCtx}] paste not verified; leaving transcript on the clipboard instead of restoring`);
-    releaseClipboardSnapshot();
+    lease.release();
     return;
   }
+  // The restore below runs after runPasteLadder has returned, so it takes
+  // the lease over from the ladder's ``finally``.
+  const releaseLease = lease.handOff();
+  const snap = lease.snapshot;
   const INITIAL_DELAY_MS = 400;
   const POLL_INTERVAL_MS = 200;
   const MAX_WAIT_MS = 1500;
@@ -4989,14 +4966,14 @@ function scheduleSmartClipboardRestore(snap, writtenText, logCtx = "paste:clipbo
       // snapshot is forever sacrificed here — acceptable trade-off,
       // otherwise we silently overwrite user intent.
       appendMainLog(`[${logCtx}] user copied new content during paste window; skipping restore`);
-      releaseClipboardSnapshot();
+      releaseLease();
       return;
     }
     if (elapsed >= MAX_WAIT_MS) {
       // Paste is settled, clipboard still has our text, no new user
       // copy arrived — safe to restore the original snapshot.
       safeExecSync(logCtx, () => restoreClipboard(snap));
-      releaseClipboardSnapshot();
+      releaseLease();
       return;
     }
     setTimeout(tryPollOrRestore, POLL_INTERVAL_MS);
@@ -5138,16 +5115,8 @@ async function awaitModifierRelease(options = {}) {
 }
 
 async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options = {}) {
-  // Every wall-clock bound this function spends comes from ONE table
-  // (./paste-capability PASTE_BUDGET), so "how long can a paste take" has
-  // a single answer, and a test can check that answer against the
-  // deadline the user is already waiting inside.
-  const pasteBudget = pasteBudgetFor(process.platform);
-  const skipActivation = !!options.alreadyFront;
-  const originalTarget = normalizeCapturedPasteTarget(target);
-  let effectiveTarget = cloneCapturedPasteTarget(originalTarget);
   const trace = createTrace("paste", {
-    target: pasteTargetSummary(originalTarget),
+    target: pasteTargetSummary(normalizeCapturedPasteTarget(target)),
     textLen: String(text || "").length,
     textDigest: textDigest(text),
     textPreview: compactLogText(text, 120),
@@ -5158,6 +5127,44 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
     traceEnd(trace, "failed", { reason: "empty-text" });
     return { ok: false, reason: "empty-text", method: "none", verified: false };
   }
+  // The clipboard contract, in this order and in this one place (DM-02):
+  // snapshot the user's clipboard, THEN put the transcript on it. Every
+  // outcome below leaves the transcript there unless a verified paste
+  // lets the restore put the user's content back. Callers must not write
+  // the transcript themselves — a write before this snapshot is what
+  // made the "original" the restore returned the transcript itself.
+  const clipboardLease = clipboardLeases.acquire();
+  try {
+    clipboard.writeText(String(text));
+  } catch {
+    traceStep(trace, "clipboard_write_failed", {});
+    logPasteTrace("clipboard_write_failed", {});
+    traceEnd(trace, "failed", { reason: "clipboard-write-failed" });
+    safeExecSync("paste:clipboardRestore", () => restoreClipboard(clipboardLease.snapshot));
+    clipboardLease.release();
+    return { ok: false, reason: "clipboard-write-failed", method: "clipboard", verified: false };
+  }
+  traceStep(trace, "clipboard_write_ok", {});
+  logPasteTrace("clipboard_write_ok", {});
+  try {
+    return await pasteFromClipboard(text, target, options, trace, clipboardLease);
+  } finally {
+    // Backstop for every exit, a throw included (DM-26): an outcome that
+    // already released the lease, or handed it to a delayed restore,
+    // makes this a no-op.
+    clipboardLease.settle();
+  }
+}
+
+async function pasteFromClipboard(text, target, options, trace, clipboardLease) {
+  // Every wall-clock bound this function spends comes from ONE table
+  // (./paste-capability PASTE_BUDGET), so "how long can a paste take" has
+  // a single answer, and a test can check that answer against the
+  // deadline the user is already waiting inside.
+  const pasteBudget = pasteBudgetFor(process.platform);
+  const skipActivation = !!options.alreadyFront;
+  const originalTarget = normalizeCapturedPasteTarget(target);
+  let effectiveTarget = cloneCapturedPasteTarget(originalTarget);
   // Can we paste at all? ``isTrustedAccessibilityClient`` answers a
   // question about a TCC row, not about whether the events we synthesise
   // land — and after the app is re-signed and replaced, which is exactly
@@ -5166,7 +5173,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
   // same grant and looks at whether it worked. When the answer is no,
   // running the ladder anyway would spend seconds of Apple Events to end
   // up reporting a paste that never happened; the transcript is already
-  // on the clipboard (the caller wrote it there), so the honest outcome
+  // on the clipboard (runPasteLadder put it there), so the honest outcome
   // is to say so, with the click sequence that repairs it.
   const capability = await ensurePasteCapabilityForPaste();
   traceStep(trace, "paste_capability", {
@@ -5177,6 +5184,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
     const reason = `paste-capability-${capability.state}`;
     logPasteTrace("start_skip", { reason, capabilityReason: compactLogText(capability.reason, 120) });
     traceEnd(trace, "failed", { reason, method: "capability-preflight" });
+    keepTranscriptOnClipboardAfterFailure(clipboardLease, "paste:clipboardKeep:capability");
     return { ok: false, reason, method: "capability-preflight", verified: false };
   }
   const modifiers = await awaitModifierRelease(options);
@@ -5244,32 +5252,12 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
     textLen: String(text).length,
   });
   if (!hasCapturedPasteTarget(effectiveTarget)) {
-    traceStep(trace, "target_missing_before_clipboard_write", {});
+    traceStep(trace, "target_missing", {});
     logPasteTrace("failed", { reason: "no-target" });
     traceEnd(trace, "failed", { reason: "no-target", method: "target-preflight" });
+    keepTranscriptOnClipboardAfterFailure(clipboardLease, "paste:clipboardKeep:no_target");
     return { ok: false, reason: "no-target", method: "target-preflight", verified: false };
   }
-  // Acquire the depth-counted shared snapshot. First paste captures
-  // the user's REAL clipboard; subsequent pastes during the
-  // 1500 ms restore window reuse the same snapshot so a chained
-  // paste can never accidentally capture our own transcript as
-  // the "original" content. Every code path below MUST eventually
-  // call releaseClipboardSnapshot() so the cache clears when the
-  // last outstanding paste resolves.
-  const savedClipboard = acquireClipboardSnapshot();
-  try {
-    clipboard.writeText(String(text));
-  } catch {
-    traceStep(trace, "clipboard_write_failed", {});
-    logPasteTrace("clipboard_write_failed", {});
-    traceEnd(trace, "failed", { reason: "clipboard-write-failed" });
-    // Restore original clipboard.
-    safeExecSync("paste:clipboardRestore", () => restoreClipboard(savedClipboard));
-    releaseClipboardSnapshot();
-    return { ok: false, reason: "clipboard-write-failed", method: "clipboard", verified: false };
-  }
-  traceStep(trace, "clipboard_write_ok", {});
-  logPasteTrace("clipboard_write_ok", {});
   if (skipActivation) {
     // The destination already owns focus — the caret is sitting in it.
     // Activating it would cost an Apple Event round trip to change
@@ -5432,7 +5420,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
         const vbsOutcome = evaluatePasteOutcome({ method: "vbs_paste", ok: check.ok, stdout: check.stdout, stderr: check.stderr });
         if (vbsOutcome.success) {
           traceEnd(trace, "success", { method: "vbs_paste", attempt: attempt + 1, reason: vbsOutcome.reason, verified: vbsOutcome.verified });
-          scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:vbs", vbsOutcome.verified);
+          scheduleSmartClipboardRestore(clipboardLease, text, "paste:clipboardRestore:vbs", vbsOutcome.verified);
           return { ok: true, reason: vbsOutcome.reason || "OK:vbs-paste", method: "vbs_paste", verified: vbsOutcome.verified };
         }
         lastReason = (check.stderr || vbsOutcome.reason || "vbs-failed").trim();
@@ -5486,7 +5474,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
         const pwshOutcome = evaluatePasteOutcome({ method: "pwsh_paste_fallback", ok: fallback.ok, stdout: fallback.stdout });
         if (pwshOutcome.success) {
           traceEnd(trace, "success", { method: "pwsh_paste_fallback", attempt: attempt + 1, verified: pwshOutcome.verified });
-          scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:pwsh_fallback", pwshOutcome.verified);
+          scheduleSmartClipboardRestore(clipboardLease, text, "paste:clipboardRestore:pwsh_fallback", pwshOutcome.verified);
           return { ok: true, reason: pwshOutcome.reason || "OK:pwsh-paste", method: "pwsh_paste_fallback", verified: pwshOutcome.verified };
         }
         lastReason = (fallback.stderr || pwshOutcome.reason || "pwsh-fallback-failed").trim();
@@ -5600,7 +5588,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
         if (linuxOutcome.success) {
           methodOk = true;
           traceEnd(trace, "success", { method: a.method, attempt: attempt + 1, reason: `${a.method}_ok`, verified: linuxOutcome.verified });
-          scheduleSmartClipboardRestore(savedClipboard, text, `paste:clipboardRestore:${a.method}`, linuxOutcome.verified);
+          scheduleSmartClipboardRestore(clipboardLease, text, `paste:clipboardRestore:${a.method}`, linuxOutcome.verified);
           return { ok: true, reason: `OK:${a.method}`, method: a.method, verified: linuxOutcome.verified };
         }
         lastPasteErr = (res.stderr || res.stdout || `${a.method}-failed`).trim();
@@ -5720,7 +5708,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
       traceEnd(trace, "success", { method: "robust_paste", attempt: attempt + 1, reason: out, verified: macOutcome.verified, sent: !!macOutcome.sent });
       // Restore previous clipboard only when the paste was verified —
       // see scheduleSmartClipboardRestore's doc comment (§6.4/§6.6).
-      scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:robust_paste", macOutcome.verified);
+      scheduleSmartClipboardRestore(clipboardLease, text, "paste:clipboardRestore:robust_paste", macOutcome.verified);
       return { ok: true, reason: out, method: "robust_paste", verified: macOutcome.verified };
     }
     if (check.ok) {
@@ -5735,7 +5723,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
         lastReason = "ERR:no-accessibility";
         traceEnd(trace, "failed", { reason: lastReason, method: "robust_paste", attempt: attempt + 1 });
         logPasteTrace("failed", { reason: lastReason, method: "robust_paste", attempt: attempt + 1 });
-        keepTranscriptOnClipboardAfterFailure("paste:clipboardKeep:robust_paste");
+        keepTranscriptOnClipboardAfterFailure(clipboardLease, "paste:clipboardKeep:robust_paste");
         return { ok: false, reason: lastReason, method: "robust_paste", verified: false };
       } else {
         lastReason = out || "paste-return-unknown";
@@ -5756,7 +5744,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
   // to the consolidated failure path which restores the clipboard +
   // releases the snapshot symmetrically with the success branches.
   if (process.platform !== "darwin") {
-    keepTranscriptOnClipboardAfterFailure("paste:clipboardKeep:exhausted");
+    keepTranscriptOnClipboardAfterFailure(clipboardLease, "paste:clipboardKeep:exhausted");
     traceEnd(trace, "failed", { reason: lastReason || "paste-no-attempt", method: "exhausted" });
     logPasteTrace("failed", { reason: compactLogText(lastReason || "paste-no-attempt") });
     return {
@@ -5791,7 +5779,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
       // robust_paste's menu-paste-primary/robust-paste branches), so
       // verified is always false here — the restore gate correctly
       // leaves the transcript on the clipboard rather than restoring.
-      scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:menu", menuOutcome.verified);
+      scheduleSmartClipboardRestore(clipboardLease, text, "paste:clipboardRestore:menu", menuOutcome.verified);
       traceEnd(trace, "success", { method: "menu-paste", reason: out, verified: menuOutcome.verified });
       return { ok: true, reason: out, method: "menu-paste", verified: menuOutcome.verified };
     }
@@ -5799,7 +5787,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
       lastReason = out;
       traceEnd(trace, "failed", { reason: lastReason, method: "menu-paste" });
       logPasteTrace("failed", { reason: lastReason, method: "menu-paste" });
-      keepTranscriptOnClipboardAfterFailure("paste:clipboardKeep:menu_paste");
+      keepTranscriptOnClipboardAfterFailure(clipboardLease, "paste:clipboardKeep:menu_paste");
       return { ok: false, reason: lastReason, method: "menu-paste", verified: false };
     }
     lastReason = out || lastReason;
@@ -5826,7 +5814,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
     reason: compactLogText(lastReason),
     finalMethod: "failed",
   });
-  keepTranscriptOnClipboardAfterFailure("paste:clipboardKeep:failed");
+  keepTranscriptOnClipboardAfterFailure(clipboardLease, "paste:clipboardKeep:failed");
   return { ok: false, reason: lastReason, method: "failed", verified: false };
 }
 
@@ -6402,9 +6390,9 @@ async function processPostStopTask(task) {
     });
     lastTranscriptText = transcript;
     saveLastTranscriptToDisk(transcript);
-    try {
-      clipboard.writeText(transcript);
-    } catch { }
+    // No clipboard write here: runPasteLadder snapshots the user's
+    // clipboard and then writes the transcript, and leaves it there on
+    // every failure (DM-02).
 
     // Paste destination is current-focus-first — see
     // ``resolvePasteDestination``. The start target is only consulted
@@ -6660,9 +6648,8 @@ async function pasteLatestTranscriptFromShortcut() {
       digest: textDigest(text),
       preview: compactLogText(text, 140),
     });
-    try {
-      clipboard.writeText(text);
-    } catch { }
+    // The clipboard is written by runPasteLadder, after it snapshots what
+    // the user had (DM-02).
 
     // The target was just read from the frontmost app, so it already
     // owns focus — re-activating it would only cost a round trip.

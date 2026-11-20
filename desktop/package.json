@@ -54,6 +54,7 @@
       "paste-verification-policy.js",
       "recording-final-slot.js",
       "transcript-signal.js",
+      "clipboard-lease.js",
       "power-events.js",
       "child-io.js",
       "paste-protocol.js",
