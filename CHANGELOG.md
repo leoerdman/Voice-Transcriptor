@@ -3,6 +3,12 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.17] - 2026-11-21
+
+### Changed
+
+- **The capsule's waveform is twice as tall again** (5 times the original for the same voice). Display only.
+
 ## [1.6.16] - 2026-11-21
 
 ### Changed

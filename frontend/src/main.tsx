@@ -1193,10 +1193,11 @@ const UI_TOKENS = {
      * How much the capsule's waveform magnifies the input level — display
      * only: the level it scales (`__transcriptorVuLevel`) feeds nothing but
      * the capsule; the recorded audio, speech detection and auto-stop read
-     * the raw RMS. 10 = 2.5 times the first 4: at 4 ordinary speech barely
-     * moved the bars (user, 2026-11-21: "усиливать в 2 или в 3 раза").
+     * the raw RMS. 20 = 5 times the first 4: at 4 ordinary speech barely
+     * moved the bars (user, 2026-11-21: "усиливать в 2 или в 3 раза", then
+     * "ещё в 2 раза увеличим высоту" after trying 10).
      */
-    vuAmplify: 10,
+    vuAmplify: 20,
     /**
      * How long the capture graph — MediaStream, AudioContext, capture
      * worklet — stays alive after Stop, waiting for the next press.
