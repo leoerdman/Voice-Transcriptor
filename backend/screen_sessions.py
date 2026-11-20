@@ -19,10 +19,12 @@ desktop shell draws and captures). Their life has two stages:
    by the SAME retention rule as its audio (``AUDIO_RETENTION_POLICIES``
    in main.py — newest five for the Screen Sessions collection).
 
-A staging folder that was never adopted (the app died before the save,
-the save failed twice) is an orphan; ``sweep_orphan_sessions`` collects it
-on the live-recovery schedule, the same window the audio spool of such a
-take is kept for.
+A take whose app died before the save is recovered from its audio spool:
+the spool's sidecar names the screen session, and the crash-time promotion
+adopts the staged folder exactly as the save does (``_promote_live_recovery``
+in main.py). A staging folder nothing adopted and no pending recovery names
+(the take was discarded, the save failed twice) is an orphan;
+``sweep_orphan_sessions`` collects it on the live-recovery schedule.
 
 This module is dependency-free (stdlib only) so it can be tested without
 the FastAPI app.
@@ -166,9 +168,18 @@ def adopt_session(
     return manifest
 
 
-def sweep_orphan_sessions(data_dir: Path, max_age_sec: int, *, now: Optional[float] = None) -> int:
+def sweep_orphan_sessions(
+    data_dir: Path,
+    max_age_sec: int,
+    *,
+    now: Optional[float] = None,
+    keep_ids: Optional[set[str]] = None,
+) -> int:
     """Remove staged sessions no save ever adopted, once older than
-    ``max_age_sec``. ``0`` disables the sweep. Returns folders removed."""
+    ``max_age_sec``. ``0`` disables the sweep. ``keep_ids`` are sessions a
+    pending crash recovery still names (its promotion adopts them).
+    Returns folders removed."""
+    keep = keep_ids or set()
     if max_age_sec <= 0:
         return 0
     root = staging_root(data_dir)
@@ -181,6 +192,8 @@ def sweep_orphan_sessions(data_dir: Path, max_age_sec: int, *, now: Optional[flo
     for entry in entries:
         try:
             if not is_session_id(entry.name) or not entry.is_dir() or entry.is_symlink():
+                continue
+            if entry.name in keep:
                 continue
             if entry.stat().st_mtime > cutoff:
                 continue

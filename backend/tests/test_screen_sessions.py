@@ -233,6 +233,97 @@ class ArchiveIntegrationTests(unittest.TestCase):
         self.assertEqual(payload["recording_collection"], self.main.RECORDING_COLLECTION_SCREEN)
 
 
+class CrashedScreenTakeRecoveryTests(unittest.TestCase):
+    """H-01 / BM-04 / S-01: a screen take whose app died before the save is
+    promoted from its audio spool — into Screen Sessions, WITH the
+    screenshots staged for it, and those are not swept meanwhile."""
+
+    setUp = ArchiveIntegrationTests.setUp
+    tearDown = ArchiveIntegrationTests.tearDown
+
+    SID = "c0ffee00-0000-4000-8000-000000000001"
+
+    def _open(self, screen_session_id: str) -> dict:
+        from datetime import datetime
+
+        self.main.LIVE_RECOVERY_DIR.mkdir(parents=True, exist_ok=True)
+        return self.main._open_live_recovery(
+            session_id=self.SID,
+            started_at=datetime.now(),
+            provider="deepgram",
+            model="nova-3",
+            language="auto",
+            archive_dir="",
+            recording_collection=self.main.RECORDING_COLLECTION_SCREEN,
+            screen_session_id=screen_session_id,
+        )
+
+    def _crashed_screen_take(self) -> None:
+        """Spool + sidecar exactly as a screen take killed mid-way leaves
+        them (the sidecar shape ``_open_live_recovery`` writes)."""
+        from datetime import datetime
+
+        self.main.LIVE_RECOVERY_DIR.mkdir(parents=True, exist_ok=True)
+        _stage(Path(self._tmp.name))
+        stem = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{self.SID}"
+        (self.main.LIVE_RECOVERY_DIR / f"{stem}.pcm16").write_bytes(
+            b"\x00\x01" * (2 * self.main.LIVE_SAMPLE_RATE_HZ)
+        )
+        (self.main.LIVE_RECOVERY_DIR / f"{stem}.json").write_text(json.dumps({
+            "session_id": self.SID,
+            "started_at": datetime.now().isoformat(),
+            "finished_at": "",
+            "bytes": 0,
+            "status": "recording",
+            "archive_dir": "",
+            "recording_collection": self.main.RECORDING_COLLECTION_SCREEN,
+            "screen_session_id": SESSION,
+        }), encoding="utf-8")
+
+    def test_the_sidecar_names_the_screen_session(self) -> None:
+        recovery = self._open(SESSION)
+        recovery["pcm_file"].close()
+        meta = json.loads(recovery["meta_path"].read_text(encoding="utf-8"))
+        self.assertEqual(meta["screen_session_id"], SESSION)
+        self.assertEqual(meta["recording_collection"], self.main.RECORDING_COLLECTION_SCREEN)
+
+    def test_an_invalid_screen_session_id_is_never_stored(self) -> None:
+        recovery = self._open("../../etc")
+        recovery["pcm_file"].close()
+        meta = json.loads(recovery["meta_path"].read_text(encoding="utf-8"))
+        self.assertEqual(meta["screen_session_id"], "")
+
+    def test_promotion_files_the_take_under_screen_sessions_with_its_screenshots(self) -> None:
+        self._crashed_screen_take()
+        # The renderer sends no collection: the sidecar decides.
+        result = self.main._promote_live_recovery(self.SID, recording_collection="")
+        self.assertEqual(Path(result["archive_dir"]), self.screen_dir)
+        stem = Path(result["name"]).stem
+        self.assertEqual(
+            self.main.screen_sessions.list_screenshots(self.screen_dir, stem),
+            ["shot-01.png", "shot-02.png"],
+        )
+        self.assertIsNotNone(result["screens"])
+        self.assertIn("audioStartedAt", result["screens"])
+        self.assertFalse((Path(self._tmp.name) / "screen-sessions" / SESSION).exists())
+
+    def test_the_promote_route_without_a_collection_lets_the_sidecar_decide(self) -> None:
+        import asyncio
+
+        self._crashed_screen_take()
+        result = asyncio.run(self.main.promote_live_recovery(self.SID, payload={}))
+        self.assertEqual(Path(result["archive_dir"]), self.screen_dir)
+
+    def test_the_orphan_sweep_keeps_a_session_a_pending_recovery_names(self) -> None:
+        self._crashed_screen_take()
+        staged = Path(self._tmp.name) / "screen-sessions" / SESSION
+        old = NOW - 10 * 24 * 3600
+        os.utime(staged, (old, old))
+        self.main._last_cleanup_recovery_at = -1e12
+        self.main._cleanup_live_recovery_files()
+        self.assertTrue(staged.exists(), "staged screenshots of a recoverable take were swept")
+
+
 if __name__ == "__main__":
     unittest.main()
 

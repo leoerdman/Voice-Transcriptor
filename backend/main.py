@@ -1062,8 +1062,55 @@ def _cleanup_live_recovery_files() -> None:
         except OSError as e:
             logger.debug("live recovery cleanup skipped for %s: %s", p, e)
     # Screen-mode screenshots staged for a take whose save never happened
-    # are that take's recovery material too, and age out with it.
-    screen_sessions.sweep_orphan_sessions(DATA_DIR, LIVE_RECOVERY_RETENTION_SEC)
+    # are that take's recovery material too, and age out with it — but
+    # never while that take's audio spool is still here to be promoted
+    # (its staging folder may be older than the spool's last write).
+    screen_sessions.sweep_orphan_sessions(
+        DATA_DIR,
+        LIVE_RECOVERY_RETENTION_SEC,
+        keep_ids=_screen_sessions_referenced_by_recoveries(),
+    )
+
+
+def _screen_sessions_referenced_by_recoveries() -> set[str]:
+    """Screen session ids named by a recovery sidecar whose spool still
+    exists — staged screenshots a promotion will adopt."""
+    ids: set[str] = set()
+    for pcm_path in LIVE_RECOVERY_DIR.glob("*.pcm16"):
+        try:
+            meta = json.loads(pcm_path.with_suffix(".json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        sid = str(meta.get("screen_session_id") or "") if isinstance(meta, dict) else ""
+        if screen_sessions.is_session_id(sid):
+            ids.add(sid)
+    return ids
+
+
+def _adopt_screen_session_for_recording(
+    screen_session_id: str,
+    target_dir: Path,
+    stem: str,
+    *,
+    audio_started_at: Optional[float],
+) -> Optional[dict[str, Any]]:
+    """Adopt a staged screen session as recording *stem*'s screenshots —
+    the one call both the save and the crash-time promotion make. A
+    failure leaves the staged folder in place and is logged; the audio
+    and transcript are already durable."""
+    if not screen_session_id:
+        return None
+    try:
+        return screen_sessions.adopt_session(
+            DATA_DIR,
+            screen_session_id,
+            target_dir,
+            stem,
+            audio_started_at=audio_started_at,
+        )
+    except OSError as e:
+        logger.warning("screen session %s adoption failed: %s", screen_session_id, e)
+        return None
 
 
 def _normalize_live_session_id(value: str) -> str:
@@ -1428,10 +1475,27 @@ def _store_live_promote_cache(session_id: str, payload: dict) -> None:
         _live_promote_cache[session_id] = (now, dict(payload))
 
 
+def _recovery_audio_started_at_ms(pcm_path: Path) -> Optional[float]:
+    """Epoch ms of a spool's first sample, from the spool alone.
+
+    The spool is written in real time, each frame as it arrives, so its
+    last write (mtime) minus the audio it holds is when capture began —
+    the renderer's recording clock to within a frame's latency. That is
+    what a screen take's marks are placed against (``audioStartedAt``),
+    and it is available after a crash, when nothing else is."""
+    try:
+        st = pcm_path.stat()
+    except OSError:
+        return None
+    duration_ms = (st.st_size - st.st_size % 2) / float(LIVE_PCM_BYTES_PER_SEC) * 1000.0
+    started = st.st_mtime * 1000.0 - duration_ms
+    return started if started > 0 else None
+
+
 def _promote_live_recovery(
     session_id: str,
     archive_dir: str = "",
-    recording_collection: str = "live",
+    recording_collection: str = "",
 ) -> dict[str, Any]:
     # Fast path: a freshly cached success means we served this promotion
     # recently. Return the stored result so UI retries are idempotent
@@ -1574,6 +1638,16 @@ def _promote_live_recovery(
                 raise
             finally:
                 _best_effort_unlink(tmp_audio, context="live recovery tmp cleanup")
+            # A screen-mode take: its staged screenshots belong to this
+            # audio exactly as on the normal save (H-01/BM-04/S-01) —
+            # adopted beside the recovered recording BEFORE retention
+            # runs, so they are this (exempt) recording's media from now on.
+            screens_manifest = _adopt_screen_session_for_recording(
+                str(meta.get("screen_session_id") or ""),
+                target_dir,
+                stem,
+                audio_started_at=_recovery_audio_started_at_ms(pcm_path),
+            )
             # Same retention policy as ``save_recording_with_audio``. The
             # freshly promoted stem is exempt so a clock skew can never
             # collect the audio we just recovered.
@@ -1583,6 +1657,7 @@ def _promote_live_recovery(
                 "name": text_out.name,
                 "audio_name": audio_out.name,
                 "archive_dir": str(target_dir),
+                "screens": screens_manifest,
             }
             _safe_delete_live_recovery(session_id)
             _store_live_promote_cache(session_id, result)
@@ -4252,6 +4327,7 @@ async def ws_transcribe(websocket: WebSocket):
                 language=lang_opt or "auto",
                 archive_dir=archive_dir,
                 recording_collection=recording_collection,
+                screen_session_id=qp.get("screen_session_id") or "",
             )
         except Exception as e:
             recovery_ctx = None
@@ -4350,8 +4426,15 @@ def _open_live_recovery(
     language: str,
     archive_dir: str,
     recording_collection: str,
+    screen_session_id: str = "",
 ) -> dict:
     """Create a recovery PCM file + metadata for a live session.
+
+    The sidecar carries everything a crash-time promotion needs to file
+    the take where the normal save would have: the archive dir, the
+    collection and — for a screen-mode take — the staged screen session
+    whose screenshots belong to this audio (``screen_session_id``; an
+    invalid id is dropped, never stored).
 
     Ordering is critical for leak-freedom:
       1. Build ``meta_payload`` in memory (infallible).
@@ -4379,6 +4462,9 @@ def _open_live_recovery(
         "language": language,
         "archive_dir": archive_dir,
         "recording_collection": recording_collection,
+        "screen_session_id": (
+            str(screen_session_id) if screen_sessions.is_session_id(screen_session_id) else ""
+        ),
         "status": "recording",
         "provider": provider,
     }
@@ -6240,7 +6326,11 @@ async def promote_live_recovery(
     # numpy conversion and a 500 MB cap; both are gone, and the real
     # ceiling is ``MAX_RECOVERY_PROMOTE_BYTES``.)
     archive_dir = str((payload or {}).get("archive_dir") or "").strip()
-    recording_collection = str((payload or {}).get("recording_collection") or "live").strip()
+    # Empty means "where the take was recorded": the recovery sidecar holds
+    # the collection the live session was opened with (S-01). A literal
+    # "live" default here made that field dead and filed every crashed
+    # screen take under Live Capsule.
+    recording_collection = str((payload or {}).get("recording_collection") or "").strip()
     result = await asyncio.to_thread(
         _promote_live_recovery,
         session_id,
@@ -8173,18 +8263,12 @@ async def _save_recording_audio_source(
     # Screen mode: the take's screenshots become part of this recording —
     # moved beside it as ``<stem>.screens`` before retention runs, so the
     # rule below already sees them as this (exempt) recording's media.
-    screens_manifest: Optional[dict[str, Any]] = None
-    if screen_session_id:
-        try:
-            screens_manifest = screen_sessions.adopt_session(
-                DATA_DIR,
-                screen_session_id,
-                target_dir,
-                stem,
-                audio_started_at=screen_audio_started_at,
-            )
-        except OSError as e:
-            logger.warning("screen session %s adoption failed: %s", screen_session_id, e)
+    screens_manifest = _adopt_screen_session_for_recording(
+        screen_session_id,
+        target_dir,
+        stem,
+        audio_started_at=screen_audio_started_at,
+    )
     # Persist this dir only after transcript + audio are durable so startup
     # retroactive retention does not learn failed/empty archive targets.
     _register_archive_dir(target_dir)

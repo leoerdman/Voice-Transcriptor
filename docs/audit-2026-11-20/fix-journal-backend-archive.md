@@ -42,3 +42,27 @@ Proof method: SKILL §7.1 — the fixed file is put aside, `git show HEAD:<path>
   (the behavioural failure is the first: the save emptied the spool the finalize recovery reads.)
 - After: `Ran 4 tests ... OK`; full suite `Ran 889 tests ... OK (skipped=2)`.
 - BL-17: the "spool not readable at finalize" WARNING was the symptom of this race; with the race gone the line stays at WARNING because it now reports a genuinely abnormal state.
+
+### C3 · H-01 = BM-04 = S-01 (P1, backend side) · a crashed screen take is promoted into Screen Sessions with its screenshots
+- Files: `backend/main.py` (`_open_live_recovery` stores a validated `screen_session_id` in the sidecar; `ws_transcribe` passes `qp.get("screen_session_id")` — one kwarg line; new `_adopt_screen_session_for_recording` — the one adoption call for save and promote; new `_recovery_audio_started_at_ms` (spool mtime − spool duration = first sample, available after a crash); `_promote_live_recovery` adopts before retention and returns `screens`; route `promote_live_recovery` defaults the collection to "" so the sidecar decides; `_cleanup_live_recovery_files` passes `keep_ids=_screen_sessions_referenced_by_recoveries()`), `backend/screen_sessions.py` (`sweep_orphan_sessions(keep_ids=…)`, module docstring), `backend/tests/test_screen_sessions.py` (new `CrashedScreenTakeRecoveryTests`).
+- Check: `python -m unittest backend.tests.test_screen_sessions.CrashedScreenTakeRecoveryTests`
+- Before (main.py + screen_sessions.py at HEAD):
+  ```
+  ERROR: test_an_invalid_screen_session_id_is_never_stored (...)
+  TypeError: _open_live_recovery() got an unexpected keyword argument 'screen_session_id'
+  ERROR: test_the_sidecar_names_the_screen_session (...)
+  TypeError: _open_live_recovery() got an unexpected keyword argument 'screen_session_id'
+  FAIL: test_promotion_files_the_take_under_screen_sessions_with_its_screenshots (...)
+  AssertionError: Lists differ: [] != ['shot-01.png', 'shot-02.png']
+  FAIL: test_the_orphan_sweep_keeps_a_session_a_pending_recovery_names (...)
+  AssertionError: False is not true : staged screenshots of a recoverable take were swept
+  Ran 4 tests in 3.131s
+  FAILED (failures=2, errors=2)
+  ```
+  and `test_the_promote_route_without_a_collection_lets_the_sidecar_decide` at HEAD:
+  ```
+  AssertionError: Posix[52 chars]…/recordings/Live Capsule') != Posix[52 chars]…/recordings/Screen Sessions')
+  FAILED (failures=1)
+  ```
+- After: `Ran 5 tests ... OK`; full suite `Ran 894 tests ... OK (skipped=2)`.
+- Cross-domain (renderer): the WS query must carry `screen_session_id` (main.tsx `wsQuery`, ~11474) and the promote call must stop sending `recording_collection: live` (main.tsx ~5126 `recoverBackendAudioSessions`); until the renderer sends the id, the backend path is in place but inert for new takes.
