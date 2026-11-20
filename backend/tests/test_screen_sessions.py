@@ -116,6 +116,27 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(manifest["audioStartedAt"], 1795165897712)
         self.assertEqual(screen_sessions.read_manifest(self.archive / "r.screens")["audioStartedAt"], 1795165897712)
 
+    def test_a_crashed_take_gets_its_end_from_the_audio(self) -> None:
+        # The app died mid-take: the shell never wrote ``endedAt``. Without
+        # it the marks have no time frame and all land at the text's end.
+        _stage(self.data)
+        manifest = screen_sessions.adopt_session(
+            self.data, SESSION, self.archive, "r",
+            audio_started_at=1795165897000, audio_ended_at=1795165957000.6,
+        )
+        self.assertEqual(manifest["endedAt"], 1795165957000)
+        self.assertEqual(screen_sessions.read_manifest(self.archive / "r.screens")["endedAt"], 1795165957000)
+
+    def test_a_stopped_take_keeps_the_end_the_shell_wrote(self) -> None:
+        staged = _stage(self.data)
+        events = json.loads((staged / "events.json").read_text(encoding="utf-8"))
+        events["endedAt"] = 42
+        (staged / "events.json").write_text(json.dumps(events), encoding="utf-8")
+        manifest = screen_sessions.adopt_session(
+            self.data, SESSION, self.archive, "r", audio_ended_at=1795165957000,
+        )
+        self.assertEqual(manifest["endedAt"], 42)
+
     def test_nothing_to_adopt_for_unknown_or_malformed_ids(self) -> None:
         self.assertIsNone(screen_sessions.adopt_session(self.data, SESSION, self.archive, "x"))
         self.assertIsNone(screen_sessions.adopt_session(self.data, "../etc", self.archive, "x"))
@@ -494,6 +515,19 @@ class CrashedScreenTakeRecoveryTests(unittest.TestCase):
         self.assertIsNotNone(result["screens"])
         self.assertIn("audioStartedAt", result["screens"])
         self.assertFalse((Path(self._tmp.name) / "screen-sessions" / SESSION).exists())
+
+    def test_a_crashed_screen_takes_promotion_gives_its_marks_a_time_frame(self) -> None:
+        # The take never stopped, so the staged events.json has no
+        # ``endedAt``; the spool's own span is the take's time frame.
+        self._crashed_screen_take()
+        pcm = next(self.main.LIVE_RECOVERY_DIR.glob("*.pcm16"))
+        last_write = 1_795_165_957.0
+        os.utime(pcm, (last_write, last_write))
+        result = self.main._promote_live_recovery(self.SID, recording_collection="")
+        screens = result["screens"]
+        self.assertEqual(screens["endedAt"], int(last_write * 1000))
+        # Two seconds of 16 kHz PCM16 in the spool.
+        self.assertEqual(screens["endedAt"] - screens["audioStartedAt"], 2000)
 
     def test_the_promote_route_without_a_collection_lets_the_sidecar_decide(self) -> None:
         import asyncio
