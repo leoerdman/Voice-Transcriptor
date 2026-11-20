@@ -62,7 +62,7 @@ backend/
 ├── deepgram_keyterms.py       # Deepgram Nova-3 Keyterm Prompting SSOT (parse/limit/query pairs)
 ├── deepgram_warm.py           # warm Deepgram live-socket pool SSOT (KeepAlive cadence, liveness probe, replay ring)
 ├── deepgram_dual.py           # dual-stream Auto SSOT: second Deepgram session + word-timestamp merge of the two readings
-├── deepgram_language.py       # what a configured language means per Deepgram endpoint (live resolve vs REST detect_language)
+├── deepgram_language.py       # what a configured language means per Deepgram endpoint (live resolve vs REST detect_language); Nova-3 language hints (options, default ru+en)
 ├── deepgram_recovery.py       # re-decode of uncovered spans before the final envelope is sent (one owner of recovery)
 ├── screen_sessions.py         # screen-mode screenshots SSOT: staging → `<stem>.screens` beside the recording, serving, orphan sweep (retention shares the audio rule)
 ├── live_envelope.py           # the `final` WebSocket envelope: one shape, one constructor
@@ -106,6 +106,8 @@ frontend/
     ├── audio-levels.ts               # capture-level SSOT: session noise floor, relative speech threshold (pure)
     ├── capture-warm.ts               # warm-hold/pre-roll/reuse decision SSOT for held-microphone captures (pure)
     ├── deepgram-dual.ts              # dual-stream Auto preference-resolution SSOT (pure)
+    ├── language-hints.ts             # "Expected languages" (Nova-3 language hints) preference resolution (pure)
+    ├── recording-cues.ts             # recording start/stop tones (pure, fake-AudioContext tested)
     ├── live-source.ts                # live-source composition SSOT: committed + interim → preview text and draft autosave (pure)
     ├── live-pane.ts                  # Live Preview pane display contract: preview on/off, status line (pure)
     ├── live-envelope.ts              # the `final` stop-envelope wire type: one reader, matches backend/live_envelope.py

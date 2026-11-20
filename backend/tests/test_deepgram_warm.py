@@ -1242,8 +1242,13 @@ class DualStreamWarmingTests(_WarmHandlerCase):
                 await asyncio.sleep(0)
             primary = self.main.live_config(
                 model="nova-3", language="auto", diarize=False, keyterms=(),
+                language_hints=self.main.configured_language_hints(cfg),
             )
             keys = [row["configKey"] for row in pool.status()["sockets"]]
+            # Built as the session builds it — hints included, since an
+            # absent preference is the default — because the pool hands a
+            # socket only to an identical query string.
+            self.assertIn("language_hint=ru", primary.to_query_string())
             self.assertIn(primary.to_query_string(), keys)
             self.assertIn(
                 self.main.secondary_config(primary, "ru").to_query_string(),

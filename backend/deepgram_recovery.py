@@ -473,6 +473,7 @@ async def recover_spans(
     language = resolve_live_language(cfg.language)
     model = cfg.model or DEFAULT_DEEPGRAM_AUDIO_MODEL
     keyterms = tuple(cfg.keyterms or ())
+    language_hints = tuple(cfg.language_hints or ())
     deadline = budget_sec if budget_sec is not None else recovery_budget_sec(spans)
 
     languages = [language]
@@ -489,6 +490,7 @@ async def recover_spans(
             language=lang,
             diarize=False,
             keyterms=keyterms,
+            language_hints=language_hints,
         )
         return _words_from_rest_result(result, start)
 
@@ -508,7 +510,9 @@ async def recover_spans(
                 languages[1], language, partner,
             )
             return readings[0]
-        return _merge_recovery_readings(readings[0], partner, language, languages[1])
+        return _merge_recovery_readings(
+            readings[0], partner, language, languages[1], expected_languages=language_hints
+        )
 
     tasks = [
         asyncio.ensure_future(_one(i, start, end))
@@ -557,7 +561,12 @@ async def recover_spans(
 
 
 def _merge_recovery_readings(
-    primary: list[dict], secondary: list[dict], primary_language: str, secondary_language: str
+    primary: list[dict],
+    secondary: list[dict],
+    primary_language: str,
+    secondary_language: str,
+    *,
+    expected_languages: "tuple[str, ...]" = (),
 ) -> list[dict]:
     """Two re-decodes of one span, merged by the live readings' own rules."""
     def _as_segment(words: list[dict]) -> list[dict]:
@@ -575,6 +584,7 @@ def _merge_recovery_readings(
         _as_segment(secondary),
         primary_language=primary_language,
         secondary_language=secondary_language,
+        expected_languages=expected_languages,
     )
     # Provenance on the wire is "recovery" whichever reading a word came
     # from — that is what the envelope's segment ``source`` promises.

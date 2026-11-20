@@ -113,6 +113,11 @@ from backend.jobs import JobCancelledError, JobStore
 from backend.http_retry import RemoteError
 from backend.remote_openrouter import OpenRouterError, openrouter_transcribe, openrouter_upscale_text
 from backend.deepgram_keyterms import MAX_KEYTERM_TOKENS, configured_keyterms
+from backend.deepgram_language import (
+    DEFAULT_LANGUAGE_HINTS,
+    LANGUAGE_HINT_OPTIONS,
+    configured_language_hints,
+)
 from backend.remote_deepgram import DeepgramRemoteError, deepgram_transcribe
 from backend.deepgram_dual import (
     DualLiveSession,
@@ -1931,6 +1936,10 @@ def _frontend_runtime_payload() -> dict[str, Any]:
             "dual_secondary_language": DUAL_SECONDARY_LANGUAGE_DEFAULT,
             "dual_secondary_languages": list(DUAL_SECONDARY_LANGUAGE_OPTIONS),
             "keyterm_token_budget": MAX_KEYTERM_TOKENS,
+            # Nova-3 multilingual hints: what the picker may offer and
+            # what an absent preference means (backend.deepgram_language).
+            "language_hint_options": list(LANGUAGE_HINT_OPTIONS),
+            "language_hints": list(DEFAULT_LANGUAGE_HINTS),
         },
         "model_catalog": health_model_catalog(),
         "runtime_limits": {
@@ -4539,6 +4548,7 @@ async def ws_transcribe(websocket: WebSocket):
                 _mark_recovery_error(recovery_ctx)
                 return
             dg_keyterms = configured_keyterms(dg_cfg)
+            dg_language_hints = configured_language_hints(dg_cfg)
             # The dual-reading decision is made HERE, where the config
             # has just been read, and passed down — the session runner
             # takes resolved inputs, not a config to re-interpret.
@@ -4549,6 +4559,7 @@ async def ws_transcribe(websocket: WebSocket):
                 language=language,
                 diarize=diarize,
                 keyterms=dg_keyterms,
+                language_hints=dg_language_hints,
                 recovery=recovery_ctx,
                 dual_language=(
                     dual_secondary_language(dg_cfg)
@@ -5493,8 +5504,12 @@ async def _prewarm_deepgram_at_boot() -> None:
         return
     # The builder's own defaults ARE the renderer's: model, language
     # "auto", no diarization — restating them here was a third copy
-    # (BW-14). Only the keyterms come from the config.
-    primary_cfg = live_config(keyterms=configured_keyterms(cfg))
+    # (BW-14). Only the keyterms and language hints come from the config
+    # (both are part of the query string the pool keys a socket on).
+    primary_cfg = live_config(
+        keyterms=configured_keyterms(cfg),
+        language_hints=configured_language_hints(cfg),
+    )
     DEEPGRAM_WARM_POOL.rewarm(api_key, primary_cfg)
     # Both readings, when this configuration runs two. The second one is
     # a different query string and therefore a different pool key, so
@@ -5516,6 +5531,7 @@ async def _run_deepgram_live_session(
     language: str,
     diarize: bool,
     keyterms: tuple[str, ...] = (),
+    language_hints: tuple[str, ...] = (),
     recovery: Optional[dict],
     dual_language: str = "",
 ) -> None:
@@ -5560,6 +5576,7 @@ async def _run_deepgram_live_session(
         language=language,
         diarize=diarize,
         keyterms=keyterms,
+        language_hints=language_hints,
     )
     # Rebound (once, by ``_swap_warm_socket``) if an adopted warm socket
     # turns out to be dead. Every closure below reads this name rather
@@ -5785,6 +5802,7 @@ async def _run_deepgram_live_session(
                     secondary=secondary.session,
                     secondary_language=dual_language,
                     primary_language=primary_language,
+                    expected_languages=language_hints,
                 )
                 logger.info(
                     "dual-stream: second reading opened primary=%s secondary=%s "
@@ -6902,6 +6920,7 @@ def _run_remote_transcribe_once(
         dg_key = ((cfg.get("providers") or {}).get("deepgram") or {}).get("key") or ""
         model = (explicit_model or DEFAULT_DEEPGRAM_AUDIO_MODEL).strip()
         dg_keyterms = configured_keyterms(cfg)
+        dg_language_hints = configured_language_hints(cfg)
 
         def _provider_call(payload: bytes, filename: str) -> dict[str, Any]:
             out = deepgram_transcribe(
@@ -6913,6 +6932,7 @@ def _run_remote_transcribe_once(
                 diarize=bool(diarize),
                 num_speakers=num_speakers,
                 keyterms=dg_keyterms,
+                language_hints=dg_language_hints,
             )
             return {
                 "provider": "deepgram",

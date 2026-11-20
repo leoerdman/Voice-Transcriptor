@@ -71,4 +71,76 @@ def rest_language_params(language: str) -> dict[str, str]:
     return {"language": lang}
 
 
-__all__ = ["resolve_live_language", "rest_language_params"]
+# ---------------------------------------------------------------------
+# Language hints (Nova-3 multilingual, Deepgram 2026-10-23)
+# ---------------------------------------------------------------------
+#
+# On 2026-10-23 Deepgram replaced the model behind ``language=multi``: the
+# 10-language multilingual model became a 55-language one. More languages
+# to choose from is more ways to mislabel this user's Russian — Persian,
+# French, Lithuanian, Ukrainian, Bulgarian, German were all observed — and
+# a mislabelled stretch is decoded in the wrong language. The same release
+# added ``language_hint``: repeated once per language
+# (``language_hint=ru&language_hint=en``), valid only with
+# ``language=multi`` (ignored otherwise), accepted by the streaming and
+# prerecorded endpoints alike, and it BIASES detection toward the hinted
+# languages — it does not forbid the others. An unsupported code is an
+# HTTP 400 that would kill the stream, so the choice is a closed set.
+#
+# ``LANGUAGE_HINT_OPTIONS`` is the set Deepgram has documented for
+# multilingual Nova-3 since its first release (all ten are in the 55);
+# the renderer offers exactly these (published in bootstrap).
+
+#: Codes a user may hint. Order is the picker's order.
+LANGUAGE_HINT_OPTIONS: tuple[str, ...] = ("ru", "en", "es", "fr", "de", "pt", "it", "nl", "ja", "hi")
+
+#: What this app expects when the user has not chosen: Russian and English.
+DEFAULT_LANGUAGE_HINTS: tuple[str, ...] = ("ru", "en")
+
+
+def normalize_language_hints(raw: object) -> tuple[str, ...]:
+    """The hints a stored value names: known codes only, deduplicated, in
+    the user's order. Anything else — a non-list, an unknown code — is
+    dropped rather than sent, because Deepgram answers an unsupported
+    hint with a 400."""
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    out: list[str] = []
+    for item in raw:
+        code = _normalize(item) if isinstance(item, str) else ""
+        if code in LANGUAGE_HINT_OPTIONS and code not in out:
+            out.append(code)
+    return tuple(out)
+
+
+def configured_language_hints(cfg: object) -> tuple[str, ...]:
+    """``preferences.deepgram.language_hints`` from the app config.
+
+    An ABSENT preference is the default (``DEFAULT_LANGUAGE_HINTS``); a
+    present one is the user's choice, including an empty list, which
+    means "no hints"."""
+    prefs = cfg.get("preferences") if isinstance(cfg, dict) else None
+    dg = prefs.get("deepgram") if isinstance(prefs, dict) else None
+    if not isinstance(dg, dict) or "language_hints" not in dg:
+        return DEFAULT_LANGUAGE_HINTS
+    return normalize_language_hints(dg.get("language_hints"))
+
+
+def language_hint_pairs(deepgram_language: str, hints: "tuple[str, ...] | list[str]") -> list[tuple[str, str]]:
+    """The ``language_hint`` query pairs for a request whose Deepgram
+    ``language`` value is *deepgram_language* — none unless it is
+    ``multi``, the only value Deepgram reads them for."""
+    if _normalize(deepgram_language) != "multi":
+        return []
+    return [("language_hint", code) for code in normalize_language_hints(list(hints))]
+
+
+__all__ = [
+    "resolve_live_language",
+    "rest_language_params",
+    "LANGUAGE_HINT_OPTIONS",
+    "DEFAULT_LANGUAGE_HINTS",
+    "normalize_language_hints",
+    "configured_language_hints",
+    "language_hint_pairs",
+]

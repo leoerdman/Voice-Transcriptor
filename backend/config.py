@@ -49,6 +49,7 @@ from typing import Any, Dict
 
 from backend.audio_mime import AUDIO_EXT_TO_MIME
 from backend.data_dir import default_data_dir
+from backend.deepgram_language import DEFAULT_LANGUAGE_HINTS, normalize_language_hints
 from backend.model_catalog import (
     DEFAULT_OPENROUTER_AUDIO_MODEL,
     DEFAULT_REMOTE_TRANSCRIPTION_PROVIDER,
@@ -683,6 +684,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             # single language is never billed twice for one reading.
             "dual_stream": DUAL_STREAM_DEFAULT,
             "dual_secondary_language": DUAL_SECONDARY_LANGUAGE_DEFAULT,
+            # Nova-3 multilingual language hints — the languages ``multi``
+            # should expect (``backend.deepgram_language``). A list of
+            # codes from ``LANGUAGE_HINT_OPTIONS``; [] means no hints.
+            "language_hints": list(DEFAULT_LANGUAGE_HINTS),
         },
     },
 }
@@ -832,6 +837,18 @@ def _validate_config_shape(cfg: Any) -> Dict[str, Any]:
                     "non-empty string; resetting"
                 )
                 repaired["dual_secondary_language"] = dg_defaults["dual_secondary_language"]
+            hints_raw = dg_prefs.get("language_hints")
+            if hints_raw is not None and (
+                not isinstance(hints_raw, list)
+                or list(normalize_language_hints(hints_raw)) != hints_raw
+            ):
+                # Unknown codes would be a 400 from Deepgram that kills the
+                # stream; keep what is valid instead of the whole default.
+                logger.warning(
+                    "config.preferences.deepgram.language_hints must be a list of "
+                    "supported codes; keeping the valid ones"
+                )
+                repaired["language_hints"] = list(normalize_language_hints(hints_raw))
             if repaired:
                 preferences = dict(preferences)
                 dg_prefs = {**dg_prefs, **repaired}

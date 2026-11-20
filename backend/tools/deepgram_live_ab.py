@@ -67,6 +67,7 @@ from backend.async_tasks import cancel_and_await  # noqa: E402
 from backend.audio_constants import LIVE_SAMPLE_RATE_HZ  # noqa: E402
 from backend.config import load_config  # noqa: E402
 from backend.deepgram_keyterms import normalize_keyterms  # noqa: E402
+from backend.deepgram_language import LANGUAGE_HINT_OPTIONS, normalize_language_hints  # noqa: E402
 from backend.model_catalog import DEFAULT_DEEPGRAM_AUDIO_MODEL  # noqa: E402
 from backend.deepgram_dual import (  # noqa: E402
     DUAL_SECONDARY_LANGUAGE_DEFAULT,
@@ -168,12 +169,13 @@ async def _run_one(
     run_index: int,
     dual_language: str = "",
     dump_dir: "Path | None" = None,
+    language_hints: "tuple[str, ...]" = (),
 ) -> RunResult:
     # The app's own builder. Constructing a ``DeepgramLiveConfig``
     # directly here meant this tool measured a socket opened with
     # slightly different parameters than the app opens — and the warm
     # pool keys on exactly that query string.
-    cfg = live_config(model=model, language=language, keyterms=keyterms)
+    cfg = live_config(model=model, language=language, keyterms=keyterms, language_hints=language_hints)
     try:
         session = (await _POOL.acquire(api_key, cfg)).session
         if dual_language:
@@ -189,6 +191,7 @@ async def _run_one(
                 # The label the app passes (``backend.main``): the
                 # language actually on the wire, never "auto".
                 primary_language=resolve_live_language(language),
+                expected_languages=language_hints,
             )
     except DeepgramLiveError as e:
         return RunResult(
@@ -291,6 +294,7 @@ def _dump_readings(
         "file": file_label,
         "primary_language": resolve_live_language(language),
         "secondary_language": dual_language,
+        "expected_languages": list(session.expected_languages),
         "primary_segments": primary_result.get("segments") or [],
         "secondary_segments": (secondary_result or {}).get("segments") or [],
     }
@@ -321,8 +325,18 @@ def _format_row(r: RunResult, *, full: bool) -> str:
         f"connect={connect}ms finalize={finalize}ms "
         f"segs={r.segments:<3} words={r.words:<4} chars={r.chars:<5} "
         f"rec={r.recovery_spans}/{r.recovery_words}@{r.recovery_ms:.0f}ms "
-        f"uncov={r.uncovered_sec:.2f}s | {text}"
+        f"uncov={r.uncovered_sec:.2f}s langs={_language_counts(r)} | {text}"
     )
+
+
+def _language_counts(r: RunResult) -> str:
+    """How many delivered words carry each Deepgram language label —
+    the number a language-hint comparison is about."""
+    counts: dict[str, int] = {}
+    for _start, _end, _conf, lang, _source, _word in r.word_rows:
+        key = lang or "-"
+        counts[key] = counts.get(key, 0) + 1
+    return ",".join(f"{k}:{v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1])) or "-"
 
 
 async def _main_async(args: argparse.Namespace) -> int:
@@ -348,6 +362,10 @@ async def _main_async(args: argparse.Namespace) -> int:
         return 2
 
     keyterms = normalize_keyterms(args.keyterms or "")
+    language_hints = normalize_language_hints(args.language_hint or [])
+    if len(language_hints) != len(args.language_hint or []):
+        print(f"error: --language-hint accepts only {', '.join(LANGUAGE_HINT_OPTIONS)}", file=sys.stderr)
+        return 3
 
     paths = [Path(p) for p in args.wavs]
     pcm_by_path: dict[Path, bytes] = {}
@@ -382,6 +400,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                         run_index=run_index,
                         dual_language=args.dual or "",
                         dump_dir=dump_dir,
+                        language_hints=language_hints,
                     )
                 )
 
@@ -453,6 +472,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma- or newline-separated keyterms, normalised via "
              "backend.deepgram_keyterms.normalize_keyterms and applied "
              "to every language/run in this invocation.",
+    )
+    parser.add_argument(
+        "--language-hint", action="append", default=[], metavar="CODE",
+        help="Nova-3 multilingual language hint (repeat for several, e.g. "
+             "--language-hint ru --language-hint en). Sent only for "
+             "language=multi, exactly as the app sends its configured hints.",
     )
     parser.add_argument(
         "--runs", type=int, default=1,

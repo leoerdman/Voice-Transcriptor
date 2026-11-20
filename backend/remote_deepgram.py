@@ -16,7 +16,7 @@ from typing import Any, Dict, Optional, Sequence
 
 from backend.audio_mime import audio_content_type
 from backend.deepgram_keyterms import keyterm_query_pairs
-from backend.deepgram_language import rest_language_params
+from backend.deepgram_language import language_hint_pairs, rest_language_params
 from backend.deepgram_words import deepgram_word_text
 from backend.deepgram_format import shared_format_params
 from backend.http_retry import RemoteError, request_with_retry
@@ -125,6 +125,7 @@ def deepgram_transcribe(
     diarize: bool = False,
     num_speakers: Optional[str] = None,
     keyterms: Sequence[str] = (),
+    language_hints: Sequence[str] = (),
 ) -> Dict[str, Any]:
     """Transcribe audio using Deepgram's pre-recorded API.
 
@@ -189,6 +190,12 @@ def deepgram_transcribe(
     # Deepgram, written down once with its reason instead of being an
     # unexplained divergence between two files.
     params.update(rest_language_params(language))
+    # Hints apply only to ``language=multi`` (the recovery pass's reading
+    # of a live recording); "auto" here is ``detect_language`` and takes
+    # none. Repeated ``language_hint=`` like ``keyterm=``.
+    hint_pairs = language_hint_pairs(str(params.get("language") or ""), tuple(language_hints or ()))
+    if hint_pairs:
+        params["language_hint"] = [code for _, code in hint_pairs]
 
     content_type = audio_content_type(filename)
 

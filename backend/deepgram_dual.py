@@ -554,8 +554,17 @@ def _contested_runs(primary: list[dict], secondary_language: str) -> list[list[d
     return runs
 
 
+def _language_base(tag: object) -> str:
+    """``"en-US"`` → ``"en"``: the language a tag names, for comparing a
+    word's tag with the user's declared languages."""
+    return str(tag or "").strip().lower().split("-", 1)[0]
+
+
 def _settle_contested_stretches(
-    primary: list[dict], secondary: list[dict], secondary_language: str
+    primary: list[dict],
+    secondary: list[dict],
+    secondary_language: str,
+    expected_languages: "Iterable[str]" = (),
 ) -> tuple[list[dict], list[dict], list[dict], int, int]:
     """One owner for every stretch the readings hear in different languages.
 
@@ -617,9 +626,26 @@ def _settle_contested_stretches(
       just outside the stretch and drop the neighbour (measured: "Да,"
       lost to "workflow." once ``ru``'s own "workflow." was gone).
 
+    The user's declared languages (``expected_languages`` — the language
+    hints, ``backend.deepgram_language``) are evidence the confidence
+    comparison cannot replace. Since Deepgram's 2026-10-23 switch to a
+    55-language ``multi`` model it labels this user's Russian as Latvian,
+    Ukrainian, Persian with confidence up to 0.99 — higher than ``ru``'s
+    correct reading of the same words (measured 2026-11-20: "Так, так,
+    так" → ``lv`` "tak, tak, tak" 0.90 vs ``ru`` 0.85; "Так, а ещё у нас
+    пропали звуки" → ``uk`` "Так а йшов у нас пропали звуки" 0.82 vs
+    ``ru`` 0.96). The ``language_hint`` itself only biases ``multi``; it
+    did not change either reading. So: a stretch tagged with a language
+    the user did NOT declare goes to the secondary whenever the secondary
+    covers it (the coverage rule below still applies — a clause the
+    secondary skipped stays with the only reading of it). A stretch in a
+    declared language (real English) is decided by confidence exactly as
+    before, and with no declared languages nothing changes.
+
     Returns the unsettled remainder of each reading, the settled words,
     and how many stretches went to each reading.
     """
+    expected = {_language_base(code) for code in (expected_languages or ()) if _language_base(code)}
     to_secondary = 0
     to_primary = 0
     removed_primary: set[int] = set()
@@ -660,8 +686,9 @@ def _settle_contested_stretches(
         coverage = _covered_fraction(secondary_ground, start, end)
         removed_primary.update(id(w) for w in run)
         removed_secondary.update(id(w) for w in rivals)
-        to_secondary_here = (
-            coverage >= SPANLESS_SHADOW_MIN_FRACTION and secondary_conf >= primary_conf
+        undeclared = bool(expected) and _language_base(run[0].get("language")) not in expected
+        to_secondary_here = coverage >= SPANLESS_SHADOW_MIN_FRACTION and (
+            undeclared or secondary_conf >= primary_conf
         )
         if to_secondary_here:
             settled.extend(rivals)
@@ -671,10 +698,10 @@ def _settle_contested_stretches(
             to_primary += 1
         logger.info(
             "dual-stream contested %.2f-%.2fs %s(%s)=%.3f vs %s=%.3f "
-            "coverage=%.2f → %s",
+            "coverage=%.2f undeclared=%s → %s",
             start, end,
             run[0].get("source", "primary"), run[0].get("language", "?"), primary_conf,
-            secondary_language, secondary_conf, coverage,
+            secondary_language, secondary_conf, coverage, undeclared,
             secondary_language if to_secondary_here else run[0].get("source", "primary"),
         )
     return (
@@ -846,6 +873,7 @@ def merge_readings(
     *,
     primary_language: str = "multi",
     secondary_language: str = DUAL_SECONDARY_LANGUAGE_DEFAULT,
+    expected_languages: "Iterable[str]" = (),
 ) -> MergedReading:
     """Merge two readings of one recording into one transcript.
 
@@ -887,7 +915,7 @@ def merge_readings(
     # so exactly one reading owns the ground it covers.
     primary, secondary = _reconcile_spanless(primary, secondary)
     primary, secondary, settled, contested_to_secondary, contested_to_primary = (
-        _settle_contested_stretches(primary, secondary, secondary_language)
+        _settle_contested_stretches(primary, secondary, secondary_language, expected_languages)
     )
     paired, only_primary, only_secondary = _pairs(primary, secondary)
     merged = [_resolve(pw, sw) for pw, sw in paired]
@@ -994,11 +1022,15 @@ class DualLiveSession:
         *,
         secondary_language: str = DUAL_SECONDARY_LANGUAGE_DEFAULT,
         primary_language: str = "multi",
+        expected_languages: "Iterable[str]" = (),
     ) -> None:
         self.primary = primary
         self.secondary: Optional[DeepgramLiveSession] = secondary
         self._secondary_language = secondary_language
         self._primary_language = primary_language
+        # The user's declared languages (the language hints): evidence the
+        # contested-stretch rule weighs (``_settle_contested_stretches``).
+        self._expected_languages = tuple(expected_languages or ())
         self._secondary_failed = False
         # The last merge this facade produced. Coverage questions
         # asked AFTER the stop ("what is still missing?") must be
@@ -1020,6 +1052,11 @@ class DualLiveSession:
         self._secondary_closing: Optional[asyncio.Task] = None
 
     # ----- The single-session interface --------------------------------
+
+    @property
+    def expected_languages(self) -> "tuple[str, ...]":
+        """The user's declared languages this merge weighs."""
+        return self._expected_languages
 
     @property
     def stats(self) -> DeepgramLiveStats:
@@ -1420,6 +1457,7 @@ class DualLiveSession:
             secondary_segments,
             primary_language=self._primary_language,
             secondary_language=self._secondary_language,
+            expected_languages=self._expected_languages,
         )
         self._last_merged = merged
         self.last_readings = (primary_result, secondary_result)

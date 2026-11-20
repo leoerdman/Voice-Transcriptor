@@ -1360,6 +1360,13 @@ textarea:focus-visible,
   accent-color: var(--control-check-accent);
 }
 
+/* Expected languages (Settings → Deepgram, Auto): one switch per code. */
+.language-hint-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+
 .toggle-inline {
   display: inline-flex;
   align-items: center;

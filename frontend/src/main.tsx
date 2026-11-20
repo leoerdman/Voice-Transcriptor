@@ -13,6 +13,12 @@ import {
 import { decideLiveTranscriptAdoption } from "./live-coverage";
 import { playRecordingCue } from "./recording-cues";
 import {
+  languageHintLabel,
+  parseLanguageHintDefaults,
+  resolveLanguageHints,
+  type LanguageHintDefaults,
+} from "./language-hints";
+import {
   describeLiveFinalStats,
   liveCloseOwesErrorEnvelope,
   parseLiveFinalEnvelope,
@@ -282,6 +288,9 @@ interface AppConfig {
       keyterms?: string;
       dual_stream?: boolean;
       dual_secondary_language?: string;
+      // Nova-3 multilingual language hints (./language-hints): codes from
+      // live_defaults.language_hint_options; absent = backend default.
+      language_hints?: string[];
     };
     ui?: {
       provider?: string;
@@ -650,6 +659,8 @@ type BackendLiveDefaultsPayload = {
   dual_secondary_language?: unknown;
   dual_secondary_languages?: unknown;
   keyterm_token_budget?: unknown;
+  language_hint_options?: unknown;
+  language_hints?: unknown;
 };
 
 type BackendBootstrapPayload = {
@@ -2272,6 +2283,61 @@ function applyBackendLiveDefaults(raw: BackendLiveDefaultsPayload | undefined): 
   }
   const budget = Number(raw.keyterm_token_budget);
   if (Number.isFinite(budget) && budget > 0) applyKeytermBudgetNote(Math.trunc(budget));
+  const hints = parseLanguageHintDefaults(raw.language_hint_options, raw.language_hints);
+  if (hints && backendLanguageHintDefaults === null) {
+    // Once, like the dual-stream default above: the health poll reaches
+    // here too, and rebuilding the picker would undo the user's ticks.
+    backendLanguageHintDefaults = hints;
+    renderLanguageHintOptions(hints.options, pendingStoredLanguageHints === undefined
+      ? hints.defaults
+      : resolveLanguageHints(pendingStoredLanguageHints, hints));
+  }
+}
+
+/** The backend's hint offer and default; ``null`` until bootstrap lands. */
+let backendLanguageHintDefaults: LanguageHintDefaults | null = null;
+/**
+ * The stored ``language_hints`` as loadCfg read it, kept for the case
+ * where the config arrives before the bootstrap payload (``undefined`` =
+ * not read yet or absent).
+ */
+let pendingStoredLanguageHints: unknown = undefined;
+
+function languageHintsGroup(): HTMLElement | null {
+  return document.getElementById("deepgramLanguageHints");
+}
+
+function renderLanguageHintOptions(options: ReadonlyArray<string>, checked: ReadonlyArray<string>): void {
+  const group = languageHintsGroup();
+  if (!group) return;
+  group.replaceChildren();
+  for (const code of options) {
+    const label = document.createElement("label");
+    label.className = "toggle-inline language-hint-option";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.value = code;
+    input.checked = checked.includes(code);
+    input.addEventListener("change", () => queueUiPreferencesSave());
+    const text = document.createElement("span");
+    text.textContent = languageHintLabel(code);
+    label.append(input, text);
+    group.appendChild(label);
+  }
+}
+
+/**
+ * The hints the autosave will persist, or ``undefined`` before the
+ * backend's offer is known — an unknown key is not written (config.py
+ * deep-merges), so a renderer that never saw the offer cannot wipe the
+ * stored choice.
+ */
+function readDeepgramLanguageHints(): string[] | undefined {
+  const group = languageHintsGroup();
+  if (!group || backendLanguageHintDefaults === null) return undefined;
+  return Array.from(group.querySelectorAll<HTMLInputElement>("input[type=checkbox]"))
+    .filter((input) => input.checked)
+    .map((input) => input.value);
 }
 
 /**
@@ -6781,6 +6847,7 @@ function buildUiPreferencesSavePlan() {
   const nextRecordingsDir = ($("recordingsDirInput") as HTMLInputElement).value.trim();
   const dualStreamPref = readDeepgramDualStream();
   const dualSecondaryPref = readDeepgramDualSecondaryLanguage();
+  const languageHintsPref = readDeepgramLanguageHints();
   return {
     nextRecordingsDir,
     shouldRefreshRecordingsArchive: nextRecordingsDir !== configuredRecordingsDir,
@@ -6805,6 +6872,7 @@ function buildUiPreferencesSavePlan() {
           keyterms: readDeepgramKeyterms(),
           ...(dualStreamPref === undefined ? {} : { dual_stream: dualStreamPref }),
           ...(dualSecondaryPref ? { dual_secondary_language: dualSecondaryPref } : {}),
+          ...(languageHintsPref === undefined ? {} : { language_hints: languageHintsPref }),
         },
         ui: collectUiPreferences(),
       },
@@ -6925,6 +6993,13 @@ async function loadCfg(): Promise<void> {
     const deepgramPrefs = (cfg.preferences || {}).deepgram || {};
     const keytermsEl = document.getElementById("deepgramKeytermsInput") as HTMLTextAreaElement | null;
     if (keytermsEl) keytermsEl.value = String(deepgramPrefs.keyterms || "");
+    pendingStoredLanguageHints = deepgramPrefs.language_hints;
+    if (backendLanguageHintDefaults) {
+      renderLanguageHintOptions(
+        backendLanguageHintDefaults.options,
+        resolveLanguageHints(deepgramPrefs.language_hints, backendLanguageHintDefaults),
+      );
+    }
     // The options come from ``#language`` itself, so the two lists cannot
     // drift; this runs before the stored value is applied, or there would
     // be nothing to select it from.

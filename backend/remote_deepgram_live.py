@@ -66,7 +66,7 @@ from backend.audio_constants import LIVE_SAMPLE_RATE_HZ, pcm16_bytes_per_sec
 from backend.deepgram_endpoints import DEEPGRAM_LIVE_URL
 from backend.deepgram_format import shared_format_params
 from backend.deepgram_keyterms import keyterm_query_pairs
-from backend.deepgram_language import resolve_live_language
+from backend.deepgram_language import language_hint_pairs, resolve_live_language
 from backend.deepgram_words import deepgram_word_text
 from backend.model_catalog import DEFAULT_DEEPGRAM_AUDIO_MODEL
 
@@ -980,8 +980,15 @@ def insert_word_into_segment(segment: dict, word: dict) -> bool:
         "start": word.get("start"),
         "end": word.get("end"),
     }
-    if word.get("source"):
-        placed["source"] = word["source"]
+    # Deepgram's evidence about the word travels with it, exactly as on
+    # the fallback-segment path below: the dual-stream merge decides who
+    # owns a stretch from ``language`` and ``confidence``, and a spliced
+    # word that lost them was invisible to it (measured 2026-11-20: the
+    # ``uk``-tagged interim "Тобто ніби ось" survived a stretch the ``ru``
+    # reading had correctly won, because the splice had dropped the tag).
+    for key in ("source", "confidence", "language"):
+        if word.get(key) not in (None, ""):
+            placed[key] = word[key]
     seg_words.insert(index, placed)
     segment["words"] = seg_words
     # Diagnostic only (like ``source`` on the fallback segments): says
@@ -1197,6 +1204,9 @@ class DeepgramLiveConfig:
     # ``to_query_string``; silently dropped for a non-Nova-3 model via
     # ``keyterm_query_pairs``.
     keyterms: tuple[str, ...] = ()
+    # Nova-3 multilingual language hints (``backend.deepgram_language``),
+    # sent only when ``language`` resolves to ``multi``.
+    language_hints: tuple[str, ...] = ()
 
     def to_query_string(self) -> str:
         model = self.model or DEFAULT_DEEPGRAM_AUDIO_MODEL
@@ -1226,7 +1236,9 @@ class DeepgramLiveConfig:
         # and why Auto therefore runs a second, monolingual reading, is
         # owned by ``backend.deepgram_dual``'s module docstring — the
         # module that acts on it — not restated here.
-        params.append(("language", resolve_live_language(self.language)))
+        deepgram_language = resolve_live_language(self.language)
+        params.append(("language", deepgram_language))
+        params.extend(language_hint_pairs(deepgram_language, self.language_hints))
         params.extend(keyterm_query_pairs(self.keyterms, model))
         return urlencode(params)
 
@@ -1415,6 +1427,7 @@ def live_config(
     language: str = "",
     diarize: bool = False,
     keyterms: "Iterable[str]" = (),
+    language_hints: "Iterable[str]" = (),
 ) -> "DeepgramLiveConfig":
     """Build a live config — the ONE builder, for every caller.
 
@@ -1433,6 +1446,7 @@ def live_config(
         interim_results=True,
         diarize=bool(diarize),
         keyterms=tuple(keyterms or ()),
+        language_hints=tuple(language_hints or ()),
     )
 
 

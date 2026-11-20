@@ -32,13 +32,15 @@ if str(_REPO_ROOT) not in sys.path:
 from backend.deepgram_dual import merge_readings  # noqa: E402
 
 
-def replay(path: Path, *, words: bool) -> str:
+def replay(path: Path, *, words: bool, expected_languages: "list[str] | None" = None) -> str:
     data = json.loads(path.read_text(encoding="utf-8"))
+    expected = expected_languages if expected_languages is not None else data.get("expected_languages") or []
     merged = merge_readings(
         data.get("primary_segments") or [],
         data.get("secondary_segments") or [],
         primary_language=str(data.get("primary_language") or "multi"),
         secondary_language=str(data.get("secondary_language") or "ru"),
+        expected_languages=expected,
     )
     lines = [
         f"{data.get('file', path.name)}: merged={len(merged.words)} words "
@@ -68,13 +70,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("dumps", nargs="+", help="JSON file(s) written by --dump-readings")
     parser.add_argument("--words", action="store_true", help="print every merged word")
+    parser.add_argument(
+        "--expect", action="append", default=None, metavar="CODE",
+        help="declared language(s) for the merge (repeat); overrides the dump's. "
+             "--expect none replays with no declared languages.",
+    )
     return parser
 
 
 def main(argv: "list[str] | None" = None) -> int:
     args = build_parser().parse_args(argv)
     for name in args.dumps:
-        print(replay(Path(name), words=args.words))
+        expected = None if args.expect is None else [c for c in args.expect if c != "none"]
+        print(replay(Path(name), words=args.words, expected_languages=expected))
     return 0
 
 

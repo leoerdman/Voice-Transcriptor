@@ -690,6 +690,22 @@
                 </label>
                 <!-- Written at boot from dualStreamTradeOffText(). -->
                 <p class="settings-note" id="deepgramDualStreamNote"></p>
+                <!--
+                  Expected languages (Nova-3 language hints). Options and
+                  default come from the backend's bootstrap payload
+                  (live_defaults.language_hint_options / language_hints);
+                  empty until it lands, and never saved before it does.
+                -->
+                <div class="field">
+                  <span class="lbl">Expected languages</span>
+                  <div class="language-hint-options" id="deepgramLanguageHints" role="group"
+                    aria-label="Expected languages"></div>
+                </div>
+                <p class="settings-note">
+                  The languages you actually speak. Auto mode is told to
+                  expect them, and words it labels with any other language
+                  are taken from the second stream instead.
+                </p>
               </div>
               <label class="field">
                 <span class="lbl">OpenRouter</span>
