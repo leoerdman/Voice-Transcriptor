@@ -176,6 +176,7 @@ function createWorld({ displays, helperReady = true, failLoad = () => false, hit
     },
     log: (line) => world.logs.push(line),
     capsuleWindow: () => world.capsule,
+    capsuleLayout: { bottomMargin: 16, height: 30 },
     onActiveChange: (active) => world.active.push(active),
     onWarning: (kind) => world.warnings.push(kind),
     prepareCapsule: () => (world.prepareCapsule ? world.prepareCapsule() : Promise.resolve(false)),
@@ -654,4 +655,33 @@ test("every stdout line main.swift documents is understood by the controller", a
   } finally {
     world.cleanup();
   }
+});
+
+// DX-12: the palette's place without a capsule on screen follows main's
+// capsule geometry (injected), not a literal 54.
+test("the palette sits above where the capsule is, or would be, from the injected capsule layout", () => {
+  const { paletteBoundsFor } = require("./screen-mode-controller");
+  const size = { width: 100, height: 30 };
+  const workArea = { x: 0, y: 0, width: 1000, height: 800 };
+  // Today's capsule: bottom margin 16, height 30, palette margin 8 → 800 - 30 - 54.
+  assert.deepEqual(
+    paletteBoundsFor({ capsule: null, workArea, size, capsuleLayout: { bottomMargin: 16, height: 30 } }),
+    { x: 450, y: 716, width: 100, height: 30 },
+  );
+  // A taller capsule moves the palette with it (the literal did not).
+  assert.equal(
+    paletteBoundsFor({ capsule: null, workArea, size, capsuleLayout: { bottomMargin: 16, height: 40 } }).y,
+    706,
+  );
+  // On screen, the capsule's real bounds win.
+  assert.deepEqual(
+    paletteBoundsFor({ capsule: { x: 400, y: 754, width: 200, height: 30 }, workArea, size, capsuleLayout: null }),
+    { x: 450, y: 716, width: 100, height: 30 },
+  );
+});
+
+test("the overlay, palette and capsule layers are one ordered fact", () => {
+  const { SCREEN_MODE_LAYERS } = require("./screen-mode-controller");
+  assert.ok(SCREEN_MODE_LAYERS.overlay < SCREEN_MODE_LAYERS.palette);
+  assert.ok(SCREEN_MODE_LAYERS.palette < SCREEN_MODE_LAYERS.capsule);
 });

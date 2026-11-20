@@ -20,8 +20,7 @@
 //
 // Pure: returns a string; desktop/windows-paste-fallback.test.js.
 
-const ERR_ACTIVATE = "ERR:activate";
-const OK_PWSH_PASTE = "OK:pwsh-paste";
+const { PASTE_ERR_ACTIVATE: ERR_ACTIVATE, PWSH_PASTE_OK: OK_PWSH_PASTE } = require("./paste-protocol");
 
 /**
  * @param {{hwndHex?: string, pid?: number}} target

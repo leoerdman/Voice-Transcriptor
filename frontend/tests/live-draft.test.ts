@@ -4,6 +4,7 @@ import {
   LiveDraftOperationQueue,
   parsePersistedLiveDraftPayload,
   recoveredDraftProvider,
+  mayClearRecoveredDraft,
   type LiveDraftQueueDeps,
   type PersistedLiveDraft,
 } from "../src/live-draft";
@@ -128,5 +129,20 @@ describe("parsePersistedLiveDraftPayload (FG-05)", () => {
     const warnings: string[] = [];
     expect(parsePersistedLiveDraftPayload({ schema_version: 99 }, (m) => warnings.push(m))).toBeNull();
     expect(warnings.length).toBe(1);
+  });
+});
+
+describe("mayClearRecoveredDraft (FG-08)", () => {
+  it("clears an owned draft by owner, whatever this run has written", () => {
+    expect(mayClearRecoveredDraft("s1", false)).toBe(true);
+    expect(mayClearRecoveredDraft("s1", true)).toBe(true);
+  });
+
+  it("never sends an owner-less clear once a session of this run holds the slot", () => {
+    // The unconditional DELETE would wipe the live session's draft.
+    expect(mayClearRecoveredDraft("", true)).toBe(false);
+    expect(mayClearRecoveredDraft("  ", true)).toBe(false);
+    // Before any write it is what stops the stale draft coming back at every start.
+    expect(mayClearRecoveredDraft("", false)).toBe(true);
   });
 });

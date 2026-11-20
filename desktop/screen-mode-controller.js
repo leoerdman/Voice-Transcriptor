@@ -66,6 +66,44 @@ const { PRESENTER_STATE, SCREEN_SURFACE, createSurfacePresenter } = require("./s
 
 const OVERLAY_PARTITION = "screen-mode-overlay";
 const PALETTE = Object.freeze({ dot: 18, gap: 8, padX: 10, height: 30, marginAboveCapsule: 8 });
+
+/**
+ * Screen mode's stacking order, on macOS's "screen-saver" window level:
+ * the overlays (0) under the palette (1) under the capsule (2), so the
+ * controls stay clickable above the drawing surface. Owned here (DX-12);
+ * main.js lifts the capsule with ``capsule`` instead of retyping 2.
+ */
+const SCREEN_MODE_LAYERS = Object.freeze({ level: "screen-saver", overlay: 0, palette: 1, capsule: 2 });
+
+/**
+ * Where the palette goes: centred just above the capsule, or — when the
+ * capsule is not on screen — where it WOULD be above the capsule's place
+ * at the bottom of the work area. The capsule's geometry is main's
+ * (RECORDING_STATUS_CAPSULE), injected as ``capsuleLayout``; this used to
+ * be the literal 54 (= bottomMargin 16 + height 30 + margin 8), which a
+ * change to the capsule would have silently left behind (DX-12).
+ *
+ * @param {{x:number,y:number,width:number,height:number}|null} capsule  the capsule's bounds, when shown
+ * @param {{x:number,y:number,width:number,height:number}} workArea      fallback display's work area
+ * @param {{width:number,height:number}} size                            the palette's size
+ * @param {{bottomMargin:number,height:number}} capsuleLayout
+ */
+function paletteBoundsFor({ capsule, workArea, size, capsuleLayout }) {
+  if (capsule) {
+    return {
+      x: Math.round(capsule.x + (capsule.width - size.width) / 2),
+      y: Math.round(capsule.y - size.height - PALETTE.marginAboveCapsule),
+      ...size,
+    };
+  }
+  const wa = workArea;
+  const capsuleTop = wa.y + wa.height - capsuleLayout.bottomMargin - capsuleLayout.height;
+  return {
+    x: Math.round(wa.x + (wa.width - size.width) / 2),
+    y: Math.round(capsuleTop - PALETTE.marginAboveCapsule - size.height),
+    ...size,
+  };
+}
 // The helper prints `ready` right after macOS hands it the event tap; a
 // helper that has said nothing by then is not going to draw anything.
 const HELPER_READY_TIMEOUT_MS = 5000;
@@ -261,6 +299,7 @@ function paletteSize(colorCount) {
  * @param {() => string} deps.stagingRoot      directory the sessions are staged in
  * @param {(line: string) => void} deps.log
  * @param {() => (import("electron").BrowserWindow|null)} deps.capsuleWindow  the capsule, when it is on screen
+ * @param {{bottomMargin: number, height: number}} deps.capsuleLayout  the capsule's placement (main's RECORDING_STATUS_CAPSULE)
  * @param {(active: boolean) => void} deps.onActiveChange   capsule restyle / raise
  * @param {(warning: string) => void} deps.onWarning
  * @param {() => Promise<boolean>} [deps.prepareCapsule]  resolves true once the capsule is
@@ -357,7 +396,7 @@ function createScreenModeController(deps) {
       // failure means this overlay must not be shown.
       required("setIgnoreMouseEvents", () => w.setIgnoreMouseEvents(true));
       required("setContentProtection", () => w.setContentProtection(true));
-      optional("overlay setAlwaysOnTop", () => w.setAlwaysOnTop(true, "screen-saver"));
+      optional("overlay setAlwaysOnTop", () => w.setAlwaysOnTop(true, SCREEN_MODE_LAYERS.level, SCREEN_MODE_LAYERS.overlay));
       optional("overlay setVisibleOnAllWorkspaces", () => w.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }));
       await w.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(overlayHtml())}`);
       if (w.isDestroyed()) throw new Error("overlay window was destroyed while loading");
@@ -480,21 +519,13 @@ function createScreenModeController(deps) {
   }
 
   function paletteBounds() {
-    const size = paletteSize(SCREEN_MODE.colors.length);
     const capsule = capsuleBounds();
-    if (capsule) {
-      return {
-        x: Math.round(capsule.x + (capsule.width - size.width) / 2),
-        y: Math.round(capsule.y - size.height - PALETTE.marginAboveCapsule),
-        ...size,
-      };
-    }
-    const wa = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea;
-    return {
-      x: Math.round(wa.x + (wa.width - size.width) / 2),
-      y: Math.round(wa.y + wa.height - size.height - 54),
-      ...size,
-    };
+    return paletteBoundsFor({
+      capsule,
+      workArea: capsule ? null : screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea,
+      size: paletteSize(SCREEN_MODE.colors.length),
+      capsuleLayout: deps.capsuleLayout,
+    });
   }
 
   async function createPalette() {
@@ -531,7 +562,7 @@ function createScreenModeController(deps) {
       throw e;
     }
     palette = w;
-    optional("palette setAlwaysOnTop", () => w.setAlwaysOnTop(true, "screen-saver", 1));
+    optional("palette setAlwaysOnTop", () => w.setAlwaysOnTop(true, SCREEN_MODE_LAYERS.level, SCREEN_MODE_LAYERS.palette));
     optional("palette setVisibleOnAllWorkspaces", () => w.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }));
     const html = paletteHtml(SCREEN_MODE.colors, session ? session.color : SCREEN_MODE.colors[0]);
     await w.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
@@ -1046,4 +1077,6 @@ module.exports = {
   overlayHtml,
   paletteHtml,
   paletteSize,
+  paletteBoundsFor,
+  SCREEN_MODE_LAYERS,
 };

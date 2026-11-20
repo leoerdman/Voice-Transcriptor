@@ -30,8 +30,19 @@
 // own timeout, so it is exercised directly by
 // desktop/recording-final-slot.test.js.
 
-/** Longest ``source`` string kept for logging. Telemetry, not payload. */
-const MAX_SOURCE_LEN = 64;
+/**
+ * What a publish IS, stated by the renderer at the publish site — never
+ * read out of the text (DM-01): the paste-ready or best-known transcript,
+ * a status line, or an error line.
+ */
+const RECORDING_SIGNAL_KINDS = Object.freeze(["transcript", "status", "error"]);
+
+/**
+ * What the renderer is doing at this publish ("upscaling", "no-speech").
+ * A lowercase token: it is compared, never displayed, so anything else is
+ * not a phase this contract knows how to carry.
+ */
+const RECORDING_SIGNAL_PHASE = /^[a-z][a-z0-9-]{0,31}$/;
 
 /** Recordings tracked at once before the oldest slot is superseded. */
 const DEFAULT_MAX_RECORDINGS = 32;
@@ -51,11 +62,16 @@ const DEFAULT_MAX_RECORDINGS = 32;
  *     Only a real boolean counts: the truthiness of a wall-clock timer
  *     standing in for finality is the §6.8 defect.
  *
+ *   - ``kind``: one of RECORDING_SIGNAL_KINDS. It used to be the first
+ *     half of a free-form ``source`` label ("status:upscaling") that
+ *     main split on a colon; a label is not a contract, so the two
+ *     halves are fields now and a payload without a known kind is not a
+ *     hand-off.
+ *
  * Optional:
- *   - ``source``: a free-form label for the trace log. A missing or
- *     non-string source is normalized to "" rather than rejecting the
- *     payload — it carries no meaning for the decision, and dropping a
- *     transcript over a telemetry field would be the wrong trade.
+ *   - ``phase``: "" (absent) or a RECORDING_SIGNAL_PHASE token. Any other
+ *     value rejects the payload — it decides the capsule's state
+ *     (desktop/transcript-signal.js), so it is not coerced either.
  *
  * Any other key is dropped. Returns the normalized payload, or ``null``
  * if the shape does not match.
@@ -65,11 +81,10 @@ function validateRecordingFinalPayload(raw) {
   if (!Number.isSafeInteger(raw.recordingId) || raw.recordingId <= 0) return null;
   if (typeof raw.text !== "string") return null;
   if (typeof raw.final !== "boolean") return null;
-  const source =
-    typeof raw.source === "string"
-      ? raw.source.replace(/\s+/g, " ").trim().slice(0, MAX_SOURCE_LEN)
-      : "";
-  return { recordingId: raw.recordingId, text: raw.text, final: raw.final, source };
+  if (!RECORDING_SIGNAL_KINDS.includes(raw.kind)) return null;
+  const phase = raw.phase === undefined || raw.phase === "" ? "" : raw.phase;
+  if (phase !== "" && (typeof phase !== "string" || !RECORDING_SIGNAL_PHASE.test(phase))) return null;
+  return { recordingId: raw.recordingId, text: raw.text, final: raw.final, kind: raw.kind, phase };
 }
 
 /**
@@ -206,7 +221,7 @@ function createRecordingFinalSlot(options = {}) {
 }
 
 module.exports = {
-  MAX_SOURCE_LEN,
+  RECORDING_SIGNAL_KINDS,
   DEFAULT_MAX_RECORDINGS,
   validateRecordingFinalPayload,
   createRecordingFinalSlot,

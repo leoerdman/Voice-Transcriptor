@@ -13,9 +13,35 @@
  * writable"; WinError 10013 — named in this very header — matched nothing;
  * and the Python copy said "3.10+" although no 3.10 minimum exists
  * anywhere (``.python-version`` is the SSOT, and the bundled runtime is
- * what normally runs). Matching on English prose from another process
- * stays until the main process sends a code (cross-domain).
+ * what normally runs).
+ *
+ * FQ-14 (a): the main process now sends ``{ code, raw }``. Its OWN
+ * failures (no Python, runtime unavailable, spawn failure, startup
+ * crash) are told apart by ``code`` — the renderer no longer matches
+ * main's English prose. ``raw`` is still classified as text, because for
+ * a backend that exited it is Python's stderr: the OS and the
+ * interpreter speak prose, not codes.
  */
+
+/** desktop/main.js ``BACKEND_BOOT_ERROR_CODES`` — the same names (renderer-main-contract). */
+export const BOOT_ERROR_CODES = {
+  pythonMissing: "PYTHON_MISSING",
+  runtimeUnavailable: "RUNTIME_UNAVAILABLE",
+  backendExited: "BACKEND_EXITED",
+  backendSpawnFailed: "BACKEND_SPAWN_FAILED",
+  appStartupFailed: "APP_STARTUP_FAILED",
+} as const;
+
+/** What ``__setBackendBootError`` receives from desktop/main.js. */
+export interface BootFailure {
+  code?: string;
+  raw?: string;
+}
+
+const PYTHON_REQUIRED: BootErrorCopy = {
+  headline: "Python 3 is required.",
+  detail: "Install Python 3 from python.org, then reopen Transcriptor. Linux users: `sudo apt install python3 python3-venv python3-pip`.",
+};
 
 export interface BootErrorCopy {
   headline: string;
@@ -24,7 +50,8 @@ export interface BootErrorCopy {
 
 const winError = (low: string, code: number): boolean => new RegExp(`\\bwinerror ${code}\\b`).test(low);
 
-export function classifyBootError(raw: string): BootErrorCopy {
+export function classifyBootError(raw: string, code = ""): BootErrorCopy {
+  if (code === BOOT_ERROR_CODES.pythonMissing) return PYTHON_REQUIRED;
   const low = (raw || "").toLowerCase();
   if (!low) {
     return {
@@ -65,13 +92,9 @@ export function classifyBootError(raw: string): BootErrorCopy {
       detail: "The bundled runtime is incomplete. Reinstall Transcriptor from the same installer (.exe / .dmg / .AppImage) to restore it.",
     };
   }
-  if (low.includes("python 3 interpreter was not found") ||
-      low.includes("python: not found") ||
-      low.includes("python was not found")) {
-    return {
-      headline: "Python 3 is required.",
-      detail: "Install Python 3 from python.org, then reopen Transcriptor. Linux users: `sudo apt install python3 python3-venv python3-pip`.",
-    };
+  // The OS shell's own words when a spawned "python" does not exist.
+  if (low.includes("python: not found") || low.includes("python was not found")) {
+    return PYTHON_REQUIRED;
   }
   // Unknown family — generic copy + let the user open the log.
   return {

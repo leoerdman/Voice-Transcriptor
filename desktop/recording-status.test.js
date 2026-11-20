@@ -77,9 +77,9 @@ test("the renderer's status strings still exist in the renderer", () => {
   const rendererPath = path.join(__dirname, "..", "frontend", "src", "main.tsx");
   if (!fs.existsSync(rendererPath)) return; // desktop-only checkout
   const source = fs.readFileSync(rendererPath, "utf8");
-  for (const { text } of RENDERER_STATUS_VOCABULARY) {
+  for (const { text, rendererSource } of RENDERER_STATUS_VOCABULARY) {
     assert.ok(
-      source.includes(text),
+      source.includes(rendererSource || text),
       `frontend/src/main.tsx no longer contains "${text}" — update RENDERER_STATUS_VOCABULARY ` +
       "and check the capsule still classifies the new wording",
     );

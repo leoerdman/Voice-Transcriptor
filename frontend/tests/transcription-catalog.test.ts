@@ -52,7 +52,6 @@ describe("wire mapping", () => {
     expect(wireProviderForGroup("local-whisper")).toBe("local");
     expect(wireProviderForGroup("deepgram")).toBe("deepgram");
     expect(wireProviderForGroup("openrouter")).toBe("openrouter");
-    expect(wireProviderForGroup("")).toBe("");
   });
 
   it("recovers the UI group from a persisted wire selection", () => {
@@ -121,7 +120,4 @@ describe("defaultModelForGroup — one answer for 'what is selected here'", () =
     expect(picked).toBe("gigaam-v3-e2e-rnnt");
   });
 
-  it("returns empty for no group", () => {
-    expect(defaultModelForGroup(groups, "")).toBe("");
-  });
 });

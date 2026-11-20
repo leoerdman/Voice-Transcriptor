@@ -344,3 +344,20 @@ test("the paste protocol markers are defined once and shared by every reader", (
     );
   }
 });
+
+// DX-26: the Windows scripts print their markers from ./paste-protocol,
+// the same constants this parser reads — renaming a method there moves
+// the printer and the reader together.
+test("the markers the Windows scripts print are the ones the parser accepts", () => {
+  const { VBS_PASTE_SENT, VBS_PASTE_OK, PWSH_PASTE_OK } = require("./paste-protocol");
+  const { buildPwshPasteFallbackScript } = require("./windows-paste-fallback");
+  // The VBS echoes the receipt, then the verdict (main.js tryPasteToFocusedField).
+  assert.equal(isVbsPasteSuccess({ ok: true, stdout: `${VBS_PASTE_SENT}\r\n${VBS_PASTE_OK}\r\n` }), true);
+  assert.equal(pasteSentReceipt({ stdout: `${VBS_PASTE_SENT}\r\n` }), VBS_PASTE_SENT);
+  const pwsh = buildPwshPasteFallbackScript({ hwndHex: "1A2B" });
+  const printed = /Write-Output "(OK:[^"]+)"/.exec(pwsh)?.[1];
+  assert.equal(printed, PWSH_PASTE_OK);
+  assert.equal(isPwshPasteFallbackSuccess({ ok: true, stdout: `${printed}\r\n` }), true);
+  const mainSource = require("node:fs").readFileSync(require("node:path").join(__dirname, "main.js"), "utf8");
+  assert.doesNotMatch(mainSource, /"OK:(vbs|pwsh)-paste"|"ERR:activate"/, "main.js types no marker literal");
+});

@@ -22,3 +22,19 @@ test("createWindow starts the backend itself and owns the failure page", () => {
   const body = mainSource.slice(at, mainSource.indexOf("\nasync function ", at + 10));
   assert.match(body, /if \(!backend\) \{\s*await startBackend\(\);/);
 });
+
+// FQ-22(5) / FQ-14: an empty boot status means "boot finished
+// successfully" to the renderer, so only the health-OK path sends it;
+// every failure records a code and retires the status without signalling
+// success, and the error reaches the renderer as { code, raw }.
+test("only the success path sends an empty boot status; failures carry a code", () => {
+  const empties = mainSource.match(/setBackendBootStatus\(""\)/g) || [];
+  assert.equal(empties.length, 1, "exactly one success signal");
+  const success = mainSource.indexOf('setBackendBootStatus("")');
+  const health = mainSource.lastIndexOf("await waitForBackendHealth(", success);
+  assert.ok(health > 0 && success - health < 600, "the success signal follows a healthy /api/health");
+  const failures = mainSource.match(/failBackendBoot\(\s*BACKEND_BOOT_ERROR_CODES\.[A-Z_]+/g) || [];
+  assert.equal(failures.length, 5, "every boot failure names its code");
+  assert.equal((mainSource.match(/^\s*backendBootError = /gm) || []).length, 1, "only failBackendBoot writes the message");
+  assert.doesNotMatch(mainSource, /__setBackendBootError\(\$\{JSON\.stringify\(backendBootError\)\}/);
+});

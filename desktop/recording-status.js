@@ -24,12 +24,11 @@
 // mode and tone are two views of that one value — they cannot disagree.
 //
 // The text ladder does not disappear, because one producer still sends
-// text only: the RENDERER. Its user-facing copy ("Recording audio only.
-// No transcription provider is selected.", "Recording exceeds 2 hours —
-// …") was being parsed here by substring, which made UI copywriting in
-// frontend/src/main.tsx a de-facto API for the capsule's colour. That
-// ladder is now ONE function, in one place, with the renderer vocabulary
-// enumerated next to it and asserted by a test — so at least the
+// text only: the RENDERER. Its user-facing copy ("Recording with live
+// preview enabled.", "Recording exceeds 2 hours — …") was being parsed
+// here by substring, which made UI copywriting in frontend/src/main.tsx
+// a de-facto API for the capsule's colour. That ladder is now ONE
+// function, in one place, with the renderer vocabulary enumerated next to it and asserted by a test — so at least the
 // coupling is visible and checked. When the renderer starts sending its
 // own `statusKind` (it already computes one for itself), the ladder goes.
 
@@ -80,10 +79,15 @@ const LIVE_RECORDING_KINDS = Object.freeze([
  * repainting the capsule.
  */
 const RENDERER_STATUS_VOCABULARY = Object.freeze([
-  Object.freeze({ text: "Recording audio only. No transcription provider is selected.", kind: RECORDING_STATUS_KIND.RECORDING }),
   Object.freeze({ text: "Recording with live preview enabled.", kind: RECORDING_STATUS_KIND.RECORDING }),
   Object.freeze({ text: "Recording with live preview enabled. Local assist is canonical for fast stop.", kind: RECORDING_STATUS_KIND.RECORDING }),
-  Object.freeze({ text: "Recording exceeds 2 hours — the WebM fallback keeps only the last 2 h. Canonical PCM audio is unaffected.", kind: RECORDING_STATUS_KIND.RECORDING }),
+  // Built from the capture window in the renderer (FG-17); `rendererSource`
+  // is how the sentence is spelled in frontend/src/main.tsx.
+  Object.freeze({
+    text: "Recording exceeds 2 hours — the WebM fallback keeps only the last 2 hours. Canonical PCM audio is unaffected.",
+    rendererSource: "`Recording exceeds ${fallbackWindow} — the WebM fallback keeps only the last ${fallbackWindow}. Canonical PCM audio is unaffected.`",
+    kind: RECORDING_STATUS_KIND.RECORDING,
+  }),
 ]);
 
 /** Is this one of the kinds the module knows? */

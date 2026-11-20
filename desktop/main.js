@@ -46,7 +46,13 @@ const { robustPasteScript, menuPasteFallbackScript, escapeAppleScriptString } = 
 
 // SSOT for the paste wire protocol — the markers the paste scripts
 // print and every parser reads.
-const { AX_TRACE_PREFIX, PASTE_SENT_PREFIX } = require("./paste-protocol");
+const {
+  AX_TRACE_PREFIX,
+  VBS_PASTE_OK,
+  VBS_PASTE_SENT,
+  PWSH_PASTE_OK,
+  PASTE_ERR_ACTIVATE,
+} = require("./paste-protocol");
 // SSOT for "is it worth verifying a paste into THIS app" — the per-target
 // memory that stops paying for accessibility reads an app can never
 // answer (BUGS_AUDIT 2026-09-03 §6.6) — unit-tested by
@@ -136,6 +142,11 @@ const { recordingKey, createBoundedKeySet } = require("./renderer-epoch");
 // The runtime accelerator set and how a Settings update changes it
 // (S-11, DM-23).
 const { normalizeShortcutSet, applyShortcutUpdate, screenShotSlotStatus } = require("./shortcut-runtime");
+const {
+  RENDERER_REQUEST_CHANNELS,
+  parseShortcutMessage,
+  resolveRevealTarget,
+} = require("./renderer-requests");
 // The capsule window's size (one flag) and when it is placed (DM-13, DM-25).
 const { capsuleWindowSize, capsuleBoundsIn, capsuleNeedsPlacement } = require("./capsule-geometry");
 // What to do once screenMode.start() answered for a take (DM-31).
@@ -172,9 +183,10 @@ const {
 // takes screenshots. Rules in ./screen-mode, windows/helper/capture in
 // ./screen-mode-controller; the instance is `screenMode` below.
 const { SCREEN_MODE, isScreenSessionId, screenSessionId } = require("./screen-mode");
-const { createScreenModeController } = require("./screen-mode-controller");
+const { createScreenModeController, SCREEN_MODE_LAYERS } = require("./screen-mode-controller");
 // What the user is told for each screen-mode warning (D1).
 const { SCREEN_SHOT_HOTKEY_WARNING, screenModeWarningCopy } = require("./screen-mode-warnings");
+const { AUTO_STOP_OFF, parseAutoStopConfig } = require("./auto-stop-config");
 
 // SSOT for the interpreter version: `.python-version` at the repo root, the
 // same file prepare-runtime.sh builds the bundled runtime from and CI installs.
@@ -480,6 +492,10 @@ let mainWindowInitialLoadPromise = null;
 let recordingStateMonitor = null;
 let tray = null;
 let backendBootError = "";
+// What KIND of boot failure ``backendBootError`` is, for the renderer to
+// choose its copy by (FQ-14): one of BACKEND_BOOT_ERROR_CODES. Written
+// only by failBackendBoot / cleared with the message.
+let backendBootErrorCode = "";
 // Cache the last shortcut-registration status so we can replay it to
 // any renderer window created AFTER the registration happened.
 // `registerGlobalShortcuts` runs during app startup before createWindow,
@@ -534,7 +550,6 @@ const MAIN_WINDOW_STATE_FILE = "window-state.json";
 // decision applies before restoring a remembered size.
 const MAIN_WINDOW_MIN_WIDTH = 1140;
 const MAIN_WINDOW_MIN_HEIGHT = 700;
-const DEFAULT_RECORDING_AUTO_STOP_CONFIG = Object.freeze({ enabled: false, seconds: 2, thresholdDb: -42 });
 const RECORDING_STATUS_TERMINAL_DWELL_MS = 900;
 
 // ── Recording-monitor bounds ──────────────────────────────────────────
@@ -568,7 +583,7 @@ const RECORDING_AUTOSTOP_WARMUP_MS = 1500;
 const RECORDING_DEAD_PIPELINE_MS = 8000;
 
 let recordingSilenceStartedAt = 0;
-let recordingAutoStopConfig = DEFAULT_RECORDING_AUTO_STOP_CONFIG;
+let recordingAutoStopConfig = AUTO_STOP_OFF;
 let recordingAutoStopConfigRefreshAt = 0;
 // Generation counter for recordingAutoStopConfig async refreshes. Each
 // scheduled refresh captures this value; when the Promise resolves it
@@ -1329,8 +1344,9 @@ async function execRendererJsWithTimeout(code, fallback, timeoutMs = 2000) {
   }
 }
 
+// The renderer owns the setting and its numbers (UI_TOKENS.autoStopSilence);
+// main applies what it publishes, or nothing (./auto-stop-config, FU-13c).
 async function getRendererAutoStopSilenceConfig() {
-  const fallback = DEFAULT_RECORDING_AUTO_STOP_CONFIG;
   const out = await execRendererJsWithTimeout(
     `
     (() => {
@@ -1344,12 +1360,7 @@ async function getRendererAutoStopSilenceConfig() {
     `,
     null,
   );
-  if (!out) return fallback;
-  return {
-    enabled: !!out.enabled,
-    seconds: Number.isFinite(Number(out.seconds)) ? Number(out.seconds) : fallback.seconds,
-    thresholdDb: Number.isFinite(Number(out.thresholdDb)) ? Number(out.thresholdDb) : fallback.thresholdDb,
-  };
+  return parseAutoStopConfig(out);
 }
 
 function hasActivePostStopWork() {
@@ -2324,15 +2335,19 @@ function publishScreenShotHotkeyStatus() {
   publishShortcutStatusToRenderer();
 }
 
-/** Hand the current shortcut status to the main window (Settings badges). */
+/**
+ * Hand the current shortcut status to the main window (Settings badges).
+ * Pushed on the fixed "shortcut-status" channel whenever it changes and
+ * on did-finish-load; the renderer subscribes through the preload
+ * (onShortcutStatus) instead of polling a window global (DM-14 / S-10).
+ */
 function publishShortcutStatusToRenderer() {
   if (!lastShortcutStatus || !win || win.isDestroyed() || !win.webContents) return;
-  win.webContents
-    .executeJavaScript(
-      `window.__transcriptorShortcutStatus = ${JSON.stringify(lastShortcutStatus)};`,
-      true,
-    )
-    .catch(() => { });
+  try {
+    win.webContents.send("shortcut-status", lastShortcutStatus);
+  } catch (e) {
+    appendMainLog(`[shortcuts] status push failed: ${e?.message || e}`);
+  }
 }
 
 // The capsule stays the user's control surface in screen mode, so it is
@@ -2342,7 +2357,7 @@ function applyCapsuleScreenModeLayer(active) {
   if (!recordingStatusWindow || recordingStatusWindow.isDestroyed()) return;
   try { recordingStatusWindow.setContentProtection(!!active); } catch { }
   try {
-    if (active) recordingStatusWindow.setAlwaysOnTop(true, "screen-saver", 2);
+    if (active) recordingStatusWindow.setAlwaysOnTop(true, SCREEN_MODE_LAYERS.level, SCREEN_MODE_LAYERS.capsule);
     else recordingStatusWindow.setAlwaysOnTop(true, "floating");
   } catch { }
   try { if (active) recordingStatusWindow.moveTop(); } catch { }
@@ -2350,7 +2365,10 @@ function applyCapsuleScreenModeLayer(active) {
 
 function screenModeHelperPath() {
   if (app.isPackaged) return path.join(process.resourcesPath, "runtime", "bin", "screen-input");
-  return path.join(__dirname, "native", "build", `mac-${process.arch}`, "screen-input");
+  // A dev run uses what `build-native.sh mac-arm64` built — the only macOS
+  // target that script builds (DX-25); `mac-${process.arch}` named a
+  // directory no script ever creates on an Intel Mac.
+  return path.join(__dirname, "native", "build", "mac-arm64", "screen-input");
 }
 
 // Where a take's screenshots are staged until its recording is saved; the
@@ -2392,6 +2410,10 @@ const screenMode = createScreenModeController({
   stagingRoot: screenModeStagingRoot,
   log: (line) => appendMainLog(line),
   capsuleWindow: () => recordingStatusWindow,
+  capsuleLayout: {
+    bottomMargin: RECORDING_STATUS_CAPSULE.bottomMargin,
+    height: RECORDING_STATUS_CAPSULE.height,
+  },
   onActiveChange: (active) => {
     if (active) bindScreenShotHotkey();
     else unbindScreenShotHotkey();
@@ -2587,7 +2609,7 @@ function startRecordingStateMonitor() {
             }
           }
         }
-        const cfg = recordingAutoStopConfig || DEFAULT_RECORDING_AUTO_STOP_CONFIG;
+        const cfg = recordingAutoStopConfig || AUTO_STOP_OFF;
         if (safeLastFrameAt > 0) recordingSeenAudioFrames = true;
         if (now - recordingAutoStopConfigRefreshAt > RECORDING_AUTOSTOP_CONFIG_REFRESH_MS) {
           recordingAutoStopConfigRefreshAt = now;
@@ -2684,7 +2706,7 @@ async function beginRecordingStatusSession() {
   recordingStatusCapsuleLastLevelSent = -1;
   recordingStatusCapsuleLastLevelSentAt = 0;
   recordingSeenAudioFrames = false;
-  recordingAutoStopConfig = DEFAULT_RECORDING_AUTO_STOP_CONFIG;
+  recordingAutoStopConfig = AUTO_STOP_OFF;
   startRecordingStateMonitor();
   await setRecordingStatus("Recording", RECORDING_STATUS_KIND.RECORDING);
   // Guarded by the same generation counter the monitor's own refresh
@@ -3785,7 +3807,7 @@ async function activateLinuxWindowById(windowId) {
     timeoutMs: activationTimeoutMs(),
   });
   if (wmctrlRes.ok) {
-    await sleep(WINDOW_ACTIVATION_SETTLE_MS);
+    await sleep(activationSettleMs("window"));
     return true;
   }
   const decimalId = linuxWindowIdToDecimal(normalizedId);
@@ -3794,7 +3816,7 @@ async function activateLinuxWindowById(windowId) {
     timeoutMs: activationTimeoutMs(),
   });
   if (!xdotoolRes.ok) return false;
-  await sleep(WINDOW_ACTIVATION_SETTLE_MS);
+  await sleep(activationSettleMs("window"));
   return true;
 }
 
@@ -4132,17 +4154,16 @@ async function getFrontmostAppInfoWithTimeout(timeoutMs = 1200) {
 }
 
 // How long an activation is given to take effect before the caller acts
-// on it, named by what is activated rather than by one platform (DM-16:
-// the "WIN_" value also served macOS, the "X11_" value Windows hwnds).
-// Activating an APP (by process name or pid: Win32 SetForegroundWindow
-// of its main window, macOS `activate`) is asynchronous and the shell
-// needs a moment to repaint; activating one specific WINDOW by id (an
-// X11 window id, a Win32 hwnd) is acknowledged far sooner.
-const APP_ACTIVATION_SETTLE_MS = 350;
-// Auto-send re-raises the target before firing its chord; this is the
-// pause between that activation and the keystroke.
-const AUTO_SEND_ACTIVATION_SETTLE_MS = 110;
-const WINDOW_ACTIVATION_SETTLE_MS = 180;
+// on it lives in PASTE_BUDGET with every other paste-path wall-clock
+// number (DM-16/DM-20): ``appActivationSettleMs`` after activating an app
+// by name or pid, ``windowActivationSettleMs`` after activating one
+// window by id, ``autoSendActivationSettleMs`` before auto-send's chord.
+function activationSettleMs(kind) {
+  const budget = pasteBudgetFor(process.platform);
+  if (kind === "app") return budget.appActivationSettleMs;
+  if (kind === "window") return budget.windowActivationSettleMs;
+  return budget.autoSendActivationSettleMs;
+}
 
 /** Wall-clock bound for one target-activation child, from PASTE_BUDGET. */
 function activationTimeoutMs() {
@@ -4200,7 +4221,7 @@ async function activateAppByName(name) {
     // usually Transcriptor itself.
     if (!res.ok) return false;
     if (String(res.stdout || "").trim() !== "1") return false;
-    await sleep(APP_ACTIVATION_SETTLE_MS);
+    await sleep(activationSettleMs("app"));
     return true;
   }
   if (process.platform === "linux") {
@@ -4213,7 +4234,7 @@ async function activateAppByName(name) {
     timeoutMs: activationTimeoutMs(),
   });
   if (!res.ok) return false;
-  await sleep(APP_ACTIVATION_SETTLE_MS);
+  await sleep(activationSettleMs("app"));
   return true;
 }
 
@@ -4300,7 +4321,7 @@ async function activateWindowsWindowByHwnd(hwnd) {
     timeoutMs: activationTimeoutMs(),
   });
   if (!res.ok) return false;
-  await sleep(WINDOW_ACTIVATION_SETTLE_MS);
+  await sleep(activationSettleMs("window"));
   return String(res.stdout || "").trim() === "1";
 }
 
@@ -5496,7 +5517,7 @@ async function pasteFromClipboard(text, target, options, trace, clipboardLease) 
         // to be foreground (often Transcriptor itself).
         if (effectiveTarget.pid > 0) {
           vbsLines.push(`If Not WshShell.AppActivate(${Math.trunc(effectiveTarget.pid)}) Then`);
-          vbsLines.push('  WScript.Echo "ERR:activate"');
+          vbsLines.push(`  WScript.Echo "${PASTE_ERR_ACTIVATE}"`);
           vbsLines.push('  WScript.Quit 2');
           vbsLines.push('End If');
           vbsLines.push('WScript.Sleep 80');
@@ -5513,7 +5534,7 @@ async function pasteFromClipboard(text, target, options, trace, clipboardLease) 
             .replace(/[\x00-\x1f\x7f]/g, "")
             .replace(/"/g, '""');
           vbsLines.push(`If Not WshShell.AppActivate("${sanitizedName}") Then`);
-          vbsLines.push('  WScript.Echo "ERR:activate"');
+          vbsLines.push(`  WScript.Echo "${PASTE_ERR_ACTIVATE}"`);
           vbsLines.push('  WScript.Quit 2');
           vbsLines.push('End If');
           vbsLines.push('WScript.Sleep 80');
@@ -5528,8 +5549,8 @@ async function pasteFromClipboard(text, target, options, trace, clipboardLease) 
         // kill before the keystroke, which made the ladder retry and
         // paste the transcript a second time. Same protocol the macOS
         // script uses, from the same constant.
-        vbsLines.push(`WScript.Echo "${PASTE_SENT_PREFIX}vbs-paste"`);
-        vbsLines.push('WScript.Echo "OK:vbs-paste"');
+        vbsLines.push(`WScript.Echo "${VBS_PASTE_SENT}"`);
+        vbsLines.push(`WScript.Echo "${VBS_PASTE_OK}"`);
 
         // Write as UTF-16 LE with BOM. Windows cscript/wscript decode
         // .vbs files using the system's ANSI code page (CP-1251 / CP-932
@@ -5565,7 +5586,7 @@ async function pasteFromClipboard(text, target, options, trace, clipboardLease) 
         if (vbsOutcome.success) {
           traceEnd(trace, "success", { method: "vbs_paste", attempt: attempt + 1, reason: vbsOutcome.reason, verified: vbsOutcome.verified });
           scheduleSmartClipboardRestore(clipboardLease, text, "paste:clipboardRestore:vbs", vbsOutcome.verified);
-          return { ok: true, reason: vbsOutcome.reason || "OK:vbs-paste", method: "vbs_paste", verified: vbsOutcome.verified };
+          return { ok: true, reason: vbsOutcome.reason || VBS_PASTE_OK, method: "vbs_paste", verified: vbsOutcome.verified };
         }
         lastReason = (check.stderr || vbsOutcome.reason || "vbs-failed").trim();
       } catch (e) {
@@ -5602,7 +5623,7 @@ async function pasteFromClipboard(text, target, options, trace, clipboardLease) 
           if (pwshOutcome.success) {
             traceEnd(trace, "success", { method: "pwsh_paste_fallback", attempt: attempt + 1, verified: pwshOutcome.verified });
             scheduleSmartClipboardRestore(clipboardLease, text, "paste:clipboardRestore:pwsh_fallback", pwshOutcome.verified);
-            return { ok: true, reason: pwshOutcome.reason || "OK:pwsh-paste", method: "pwsh_paste_fallback", verified: pwshOutcome.verified };
+            return { ok: true, reason: pwshOutcome.reason || PWSH_PASTE_OK, method: "pwsh_paste_fallback", verified: pwshOutcome.verified };
           }
           lastReason = (fallback.stderr || pwshOutcome.reason || "pwsh-fallback-failed").trim();
         }
@@ -5950,7 +5971,7 @@ async function sendCommandEnterToFocusedApp(target = emptyCapturedPasteTarget())
   const normalized = normalizeCapturedPasteTarget(target);
   if (hasCapturedPasteTarget(normalized)) {
     await activateCapturedPasteTarget(normalized);
-    await sleep(AUTO_SEND_ACTIVATION_SETTLE_MS);
+    await sleep(activationSettleMs("auto-send"));
   }
   
   if (process.platform === "win32") {
@@ -7117,10 +7138,49 @@ function setBackendBootStatus(msg) {
   }
 }
 
+/**
+ * Boot failure codes the renderer chooses its copy by (FQ-14). The raw
+ * text still rides along for "Show technical details" and, for a backend
+ * that exited, is the Python stderr the renderer classifies; but main's
+ * OWN failures no longer make the renderer match main's English prose.
+ * frontend/src/boot-error.ts holds the same names (renderer-main-contract).
+ */
+const BACKEND_BOOT_ERROR_CODES = Object.freeze({
+  PYTHON_MISSING: "PYTHON_MISSING",
+  RUNTIME_UNAVAILABLE: "RUNTIME_UNAVAILABLE",
+  BACKEND_EXITED: "BACKEND_EXITED",
+  BACKEND_SPAWN_FAILED: "BACKEND_SPAWN_FAILED",
+  APP_STARTUP_FAILED: "APP_STARTUP_FAILED",
+});
+
+/** Record a boot failure (code + raw text). Broadcasting is the caller's. */
+function failBackendBoot(code, raw) {
+  backendBootErrorCode = code;
+  backendBootError = String(raw || "");
+}
+
+/**
+ * Retire the boot progress line on a FAILURE path. Not an empty
+ * ``setBackendBootStatus``: the renderer reads an empty status as
+ * "boot finished successfully" and paints "Ready" before the error
+ * arrives (FQ-22(5)). Only the replayed copy is dropped here.
+ */
+function retireBackendBootStatusAfterFailure() {
+  backendBootStatus = "";
+}
+
+/** The ``__setBackendBootError`` argument: ``{ code, raw }``. */
+function backendBootErrorJs() {
+  return `window.__setBackendBootError && window.__setBackendBootError(${JSON.stringify({
+    code: backendBootErrorCode,
+    raw: backendBootError,
+  })});`;
+}
+
 function broadcastBackendBootError() {
   if (!backendBootError || !win || win.isDestroyed() || !win.webContents) return;
   win.webContents.executeJavaScript(
-    `window.__setBackendBootError && window.__setBackendBootError(${JSON.stringify(backendBootError)});`,
+    backendBootErrorJs(),
     true
   ).catch((e) => {
     appendMainLog(`[backend-boot-error-broadcast] failed: ${e?.message || e}`);
@@ -7808,16 +7868,19 @@ async function startBackend() {
   const python = await resolvePython(repoRoot);
 
   if (!python) {
-    backendBootError = "Python 3 interpreter was not found. Please install Python 3 from python.org.";
-    setBackendBootStatus("");
+    failBackendBoot(
+      BACKEND_BOOT_ERROR_CODES.PYTHON_MISSING,
+      "Python 3 interpreter was not found. Please install Python 3 from python.org.",
+    );
+    retireBackendBootStatusAfterFailure();
     broadcastBackendBootError();
     throw new Error(backendBootError);
   }
 
   const runtime = await ensureBackendRuntime(python, repoRoot);
   if (!runtime.ok) {
-    backendBootError = runtime.details || "Backend runtime is unavailable.";
-    setBackendBootStatus("");
+    failBackendBoot(BACKEND_BOOT_ERROR_CODES.RUNTIME_UNAVAILABLE, runtime.details || "Backend runtime is unavailable.");
+    retireBackendBootStatusAfterFailure();
     broadcastBackendBootError();
     throw new Error(backendBootError);
   }
@@ -7968,8 +8031,11 @@ async function startBackend() {
       // the log file unboundedly and masking the real failure. The user
       // sees a permanent backend error in the renderer instead.
       if (attempt > BACKEND_RESTART_MAX_ATTEMPTS) {
-        backendBootError = `Backend exited (code ${code}, signal ${signal || "none"}) after ${attempt - 1} restart attempts — giving up.`;
-        setBackendBootStatus("");
+        failBackendBoot(
+          BACKEND_BOOT_ERROR_CODES.BACKEND_EXITED,
+          `Backend exited (code ${code}, signal ${signal || "none"}) after ${attempt - 1} restart attempts — giving up.`,
+        );
+        retireBackendBootStatusAfterFailure();
         appendMainLog(`[backend-restart-giving-up] ${backendBootError}`);
         broadcastBackendBootError();
         return;
@@ -8017,7 +8083,7 @@ async function startBackend() {
   });
 
   child.on("error", (err) => {
-    backendBootError = err.message;
+    failBackendBoot(BACKEND_BOOT_ERROR_CODES.BACKEND_SPAWN_FAILED, err.message);
     appendMainLog(`[backend-error] ${err.message}`);
     // A spawn error (missing python binary, EACCES, EMFILE) leaves the
     // ChildProcess object dead but still truthy, so startBackend's
@@ -8267,152 +8333,6 @@ async function createWindow(options = {}) {
       try { shell.openExternal(url); } catch { }
     }
     return { action: "deny" };
-  });
-  // Renderer → main IPC over the document-title channel. The renderer
-  // (sandbox: true, contextIsolation: true) cannot use ipcRenderer;
-  // the canonical workaround used elsewhere in this file
-  // is to set ``document.title = "__app_<verb>__<payload>"`` and have
-  // the main process intercept the page-title-updated event. We
-  // restrict accepted verbs to a closed list and decode the payload
-  // back to a known recordings dir + filename, so a malicious
-  // transcript cannot smuggle arbitrary paths into shell.showItemInFolder.
-  win.webContents.on("page-title-updated", (event, title) => {
-    const raw = String(title || "");
-    if (!raw.startsWith("__app_")) return;
-    event.preventDefault();
-    if (raw.startsWith("__app_shortcuts__")) {
-      let payload;
-      try {
-        payload = JSON.parse(decodeURIComponent(raw.slice("__app_shortcuts__".length)));
-      } catch (e) {
-        appendMainLog(`[shortcuts-bridge] bad payload: ${e?.message || e}`);
-        return;
-      }
-      const action = String(payload?.action || "").trim();
-      if (!["capture-start", "capture-cancel", "update"].includes(action)) {
-        appendMainLog(`[shortcuts-bridge] rejected action=${compactLogText(action, 40)}`);
-        return;
-      }
-      const message = {
-        action,
-        record: String(payload?.record || "").trim().slice(0, 96),
-        paste: String(payload?.paste || "").trim().slice(0, 96),
-        screen: String(payload?.screen || "").trim().slice(0, 96),
-        screenShot: String(payload?.screenShot || "").trim().slice(0, 96),
-      };
-      if (shortcutBridgeHandler) {
-        shortcutBridgeHandler(message);
-      } else {
-        pendingShortcutBridgeMessages.push(message);
-        pendingShortcutBridgeMessages = pendingShortcutBridgeMessages.slice(-8);
-      }
-      return;
-    }
-    if (raw.startsWith("__app_record_toggle__")) {
-      // The in-window Record/Stop button. Routed to the very same
-      // function the global hotkey calls so there is one recording
-      // toggle, not two: same microphone-permission prompt, same
-      // frontmost-window capture for auto-paste, same capsule, same
-      // single-capsule busy guard, same trace. The renderer deliberately
-      // does NOT dispatch its own toggle event for this.
-      appendMainLog("[record-toggle] requested from the in-window button");
-      toggleRecordingFromShortcut().catch((e) => {
-        appendMainLog(`[record-toggle] failed: ${e?.message || e}`);
-      });
-      return;
-    }
-    if (raw.startsWith("__app_reveal_recording__")) {
-      let payload;
-      try {
-        payload = JSON.parse(decodeURIComponent(raw.slice("__app_reveal_recording__".length)));
-      } catch (e) {
-        appendMainLog(`[reveal-recording] bad payload: ${e?.message || e}`);
-        return;
-      }
-      // 1.1.25: path-traversal defense. Previous form stripped only
-      // path separators, leaving ``..`` intact. Combined with
-      // shell.showItemInFolder, a renderer compromise could enumerate
-      // the user's home parent (e.g. /Users) by repeatedly revealing
-      // dotted names. Reject any name containing ``..`` OR a path
-      // separator outright — recording filenames produced by the
-      // backend never need either character.
-      const rawName = String(payload?.name || "");
-      if (!rawName || rawName.includes("..") || /[\\/]/.test(rawName)) return;
-      const safeName = rawName;
-      if (!safeName.toLowerCase().endsWith(".txt")) {
-        appendMainLog(`[reveal-recording] rejected non-transcript name: ${safeName}`);
-        return;
-      }
-      const archiveDirRaw = String(payload?.archiveDir || "").trim();
-      // Resolve the transcript path under the SAME archive dir we wrote to.
-      // archiveDir comes back from saveRecordingText which already
-      // sanitises it via _resolve_recordings_target_dir on the backend
-      // side, but defence-in-depth: only accept absolute paths under
-      // the data directory's recordings/ or the configured recordings root.
-      const pathContains = (root, candidate) => {
-        const rel = path.relative(root, candidate);
-        return rel === "" || (!!rel && !rel.startsWith("..") && !path.isAbsolute(rel));
-      };
-      const appDataDir = dataDir();
-      const recordingsRoot = path.resolve(appDataDir, "recordings");
-      const allowedRecordingRoots = [recordingsRoot];
-      try {
-        const cfgPath = path.join(appDataDir, "config.json");
-        if (fs.existsSync(cfgPath)) {
-          const rawCfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
-          const configuredRoot = String(rawCfg?.preferences?.recordings_dir || "").trim();
-          if (configuredRoot) {
-            allowedRecordingRoots.push(
-              path.isAbsolute(configuredRoot)
-                ? path.resolve(configuredRoot)
-                : path.resolve(appDataDir, configuredRoot)
-            );
-          }
-        }
-      } catch (e) {
-        appendMainLog(`[reveal-recording] config allowlist read failed: ${e?.message || e}`);
-      }
-      const archiveDir = archiveDirRaw && path.isAbsolute(archiveDirRaw)
-        ? path.resolve(archiveDirRaw)
-        : recordingsRoot;
-      // Walk up to make sure the resolved path is still under the
-      // user's home — block any symlink-shenanigans that would point
-      // at /etc/shadow or similar.
-      //
-      // Plain ``startsWith(home)`` has the classic prefix-bypass bug:
-      // when home = "/Users/foo", any sibling like "/Users/foobar/x"
-      // also matches because "/Users/foobar" starts with "/Users/foo".
-      // A compromised renderer could pass an archive_dir like
-      // "<home>~unrelated/whatever" and reveal arbitrary files via
-      // shell.showItemInFolder. Anchor the check on a path-separator
-      // boundary (or exact equality) so only descendants of home pass.
-      const home = path.resolve(app.getPath("home"));
-      const isInsideHome =
-        archiveDir === home || archiveDir.startsWith(home + path.sep);
-      if (!isInsideHome) {
-        appendMainLog(`[reveal-recording] archive_dir outside home: ${archiveDir}`);
-        return;
-      }
-      // Reveal means "show the transcript file". Never substitute the
-      // adjacent audio/video recording: the History and Upload panes
-      // already have dedicated playback, and selecting the media file
-      // made the user think the transcription had been saved under the
-      // wrong name.
-      const target = path.resolve(archiveDir, safeName);
-      const isAllowedRecordingPath = allowedRecordingRoots.some((root) =>
-        pathContains(root, archiveDir) && pathContains(root, target)
-      );
-      if (!isAllowedRecordingPath) {
-        appendMainLog(`[reveal-recording] archive_dir outside recording roots: ${archiveDir}`);
-        return;
-      }
-      try {
-        shell.showItemInFolder(target);
-      } catch (e) {
-        appendMainLog(`[reveal-recording] shell.showItemInFolder failed: ${e?.message || e}`);
-      }
-      return;
-    }
   });
 
   win.webContents.on("will-navigate", (e, url) => {
@@ -8692,7 +8612,7 @@ async function createWindow(options = {}) {
     if (backendBootError && win && !win.isDestroyed() && win.webContents) {
       try {
         await win.webContents.executeJavaScript(
-          `window.__setBackendBootError && window.__setBackendBootError(${JSON.stringify(backendBootError)});`,
+          backendBootErrorJs(),
           true,
         );
       } catch (e) {
@@ -8800,7 +8720,7 @@ async function createWindow(options = {}) {
     // closes that regression window.
     if (backendBootError) {
       appendMainLog(`[backend-recovery] clearing prior backendBootError (was: ${backendBootError.slice(0, 80)}...)`);
-      backendBootError = "";
+      failBackendBoot("", "");
     }
     await refreshWindowForFrontendBuild(true);
     await win.loadURL(url);
@@ -9204,9 +9124,9 @@ app.whenReady().then(async () => {
   // raw ipcRenderer and cannot initiate arbitrary channels.
   // Every channel the preload exposes answers only the main window's own
   // webContents (DM-28). Only that window has the preload today, so
-  // nothing else can reach these channels — but the rule was enforced by
-  // two handlers (screen-mode:finish, recording-final, which spell the
-  // same condition inline) and missing from the other four.
+  // nothing else can reach these channels — but the rule once lived in
+  // two handlers only, spelled inline; every handler now asks this one
+  // predicate.
   const isFromMainWindow = (event) =>
     !!win && !win.isDestroyed() && event?.sender === win.webContents;
   const refusedSender = (channel) => {
@@ -9330,7 +9250,7 @@ app.whenReady().then(async () => {
   // dead-pipeline fail-safe). Main owns the session; the renderer asks
   // for it back and writes it into the transcript.
   ipcMain.handle("screen-mode:finish", async (event, payload) => {
-    if (!win || win.isDestroyed() || event.sender !== win.webContents) return { ok: false, error: "sender" };
+    if (!isFromMainWindow(event)) return refusedSender("screen-mode:finish");
     const p = payload && typeof payload === "object" ? payload : {};
     try {
       const id = String(p.id || "");
@@ -9344,7 +9264,7 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.on("recording-final", (event, payload) => {
-    if (!win || win.isDestroyed() || event.sender !== win.webContents) return;
+    if (!isFromMainWindow(event)) { refusedSender("recording-final"); return; }
     const signal = recordingFinalSlot.set(payload);
     if (!signal) {
       appendMainLog(
@@ -9357,8 +9277,76 @@ app.whenReady().then(async () => {
     }
     appendMainLog(
       `[recording-final] rec=${signal.recordingId} final=${signal.final ? "1" : "0"} ` +
-      `len=${signal.text.length} source="${signal.source}" seq=${signal.seq}`,
+      `len=${signal.text.length} kind=${signal.kind} phase=${signal.phase || "-"} seq=${signal.seq}`,
     );
+  });
+
+  // The main window's own requests (DM-10): Settings → Shortcuts, the
+  // in-window Record/Stop button, "Reveal in folder". Fixed preload
+  // channels with the same sender rule as every channel above; what each
+  // request may do is decided in ./renderer-requests from the payload
+  // alone, so a renderer cannot name a verb or a path main did not allow.
+  ipcMain.on(RENDERER_REQUEST_CHANNELS.SHORTCUTS, (event, payload) => {
+    if (!isFromMainWindow(event)) { refusedSender(RENDERER_REQUEST_CHANNELS.SHORTCUTS); return; }
+    const parsed = parseShortcutMessage(payload);
+    if (!parsed.message) {
+      appendMainLog(`[shortcuts-bridge] ${compactLogText(parsed.error, 60)}`);
+      return;
+    }
+    if (shortcutBridgeHandler) {
+      shortcutBridgeHandler(parsed.message);
+    } else {
+      pendingShortcutBridgeMessages.push(parsed.message);
+      pendingShortcutBridgeMessages = pendingShortcutBridgeMessages.slice(-8);
+    }
+  });
+  ipcMain.on(RENDERER_REQUEST_CHANNELS.RECORD_TOGGLE, (event) => {
+    if (!isFromMainWindow(event)) { refusedSender(RENDERER_REQUEST_CHANNELS.RECORD_TOGGLE); return; }
+    // Routed to the very same function the global hotkey calls so there
+    // is one recording toggle, not two: same microphone-permission
+    // prompt, same frontmost-window capture for auto-paste, same capsule,
+    // same single-capsule busy guard, same trace. The renderer
+    // deliberately does NOT dispatch its own toggle event for this.
+    appendMainLog("[record-toggle] requested from the in-window button");
+    toggleRecordingFromShortcut().catch((e) => {
+      appendMainLog(`[record-toggle] failed: ${e?.message || e}`);
+    });
+  });
+  ipcMain.on(RENDERER_REQUEST_CHANNELS.REVEAL_RECORDING, (event, payload) => {
+    if (!isFromMainWindow(event)) { refusedSender(RENDERER_REQUEST_CHANNELS.REVEAL_RECORDING); return; }
+    const appDataDir = dataDir();
+    const recordingsRoot = path.resolve(appDataDir, "recordings");
+    const allowedRoots = [recordingsRoot];
+    try {
+      const cfgPath = path.join(appDataDir, "config.json");
+      if (fs.existsSync(cfgPath)) {
+        const rawCfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+        const configuredRoot = String(rawCfg?.preferences?.recordings_dir || "").trim();
+        if (configuredRoot) {
+          allowedRoots.push(
+            path.isAbsolute(configuredRoot)
+              ? path.resolve(configuredRoot)
+              : path.resolve(appDataDir, configuredRoot),
+          );
+        }
+      }
+    } catch (e) {
+      appendMainLog(`[reveal-recording] config allowlist read failed: ${e?.message || e}`);
+    }
+    const reveal = resolveRevealTarget(payload, {
+      home: app.getPath("home"),
+      recordingsRoot,
+      allowedRoots,
+    });
+    if (!reveal.ok) {
+      appendMainLog(`[reveal-recording] rejected ${reveal.reason}${reveal.detail ? `: ${reveal.detail}` : ""}`);
+      return;
+    }
+    try {
+      shell.showItemInFolder(reveal.target);
+    } catch (e) {
+      appendMainLog(`[reveal-recording] shell.showItemInFolder failed: ${e?.message || e}`);
+    }
   });
 
   lastTranscriptText = loadLastTranscriptFromDisk();
@@ -9872,8 +9860,8 @@ app.whenReady().then(async () => {
   // either retry or quit instead of force-killing.
   const msg = err && err.message ? err.message : String(err);
   try { appendMainLog(`[whenReady-fatal] ${msg}`); } catch { }
-  backendBootError = `App startup failed: ${msg}`;
-  setBackendBootStatus("");
+  failBackendBoot(BACKEND_BOOT_ERROR_CODES.APP_STARTUP_FAILED, `App startup failed: ${msg}`);
+  retireBackendBootStatusAfterFailure();
   // Surface to whichever surface is alive: an existing window's
   // boot-overlay first (renderer is up but backend died), tray
   // notification second, dialog last (final fallback when the
@@ -9881,7 +9869,7 @@ app.whenReady().then(async () => {
   if (win && !win.isDestroyed() && win.webContents) {
     try {
       win.webContents.executeJavaScript(
-        `window.__setBackendBootError && window.__setBackendBootError(${JSON.stringify(backendBootError)});`,
+        backendBootErrorJs(),
         true,
       ).catch(() => { });
     } catch { }

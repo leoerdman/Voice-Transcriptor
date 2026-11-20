@@ -743,6 +743,18 @@ function parseBundleIdentity(text) {
 //   autoSendTimeoutMs  — bound for the one auto-send child (Cmd+Enter /
 //                        Ctrl+Enter), which runs after a successful
 //                        paste when the user enabled auto-send.
+//   appActivationSettleMs / windowActivationSettleMs — how long an
+//                        activation is given to take effect before the
+//                        caller acts on it (DM-16/DM-20: these lived in
+//                        main.js as constants named for one platform and
+//                        used by another). Activating an APP (by name or
+//                        pid) is asynchronous and the shell needs a
+//                        moment to repaint; activating one WINDOW by id
+//                        (an X11 window id, a Win32 hwnd) is acknowledged
+//                        far sooner. One successful activation per
+//                        attempt pays one of them.
+//   autoSendActivationSettleMs — the pause between auto-send re-raising
+//                        the target and firing its chord.
 //
 // These last three used to be bare 5000 / 2000 literals scattered across
 // main.js while the comment above pasteBudgetWorstCaseMs claimed every
@@ -764,6 +776,17 @@ const PASTE_MAX_ATTEMPTS = 5;
 // message. Declared here rather than as a literal at the call site so it
 // sits with every other wall-clock number the paste path spends.
 const AUTO_SEND_SETTLE_MS = 380;
+
+// The activation settles, the same on every platform that activates (see
+// the field notes above); one declaration each, referenced by every row.
+const APP_ACTIVATION_SETTLE_MS = 350;
+const WINDOW_ACTIVATION_SETTLE_MS = 180;
+const AUTO_SEND_ACTIVATION_SETTLE_MS = 110;
+const ACTIVATION_SETTLES = Object.freeze({
+  appActivationSettleMs: APP_ACTIVATION_SETTLE_MS,
+  windowActivationSettleMs: WINDOW_ACTIVATION_SETTLE_MS,
+  autoSendActivationSettleMs: AUTO_SEND_ACTIVATION_SETTLE_MS,
+});
 
 const PASTE_BUDGET = Object.freeze({
   darwin: Object.freeze({
@@ -787,6 +810,7 @@ const PASTE_BUDGET = Object.freeze({
     activationLadderSteps: 0,
     autoSendTimeoutMs: 5000,
     autoSendSettleMs: AUTO_SEND_SETTLE_MS,
+    ...ACTIVATION_SETTLES,
   }),
   win32: Object.freeze({
     // Two, not three. With the target-activation ladder finally counted
@@ -814,6 +838,7 @@ const PASTE_BUDGET = Object.freeze({
     activationLadderSteps: 3,
     autoSendTimeoutMs: 2000,
     autoSendSettleMs: AUTO_SEND_SETTLE_MS,
+    ...ACTIVATION_SETTLES,
   }),
   linux: Object.freeze({
     maxAttempts: 3,
@@ -832,6 +857,7 @@ const PASTE_BUDGET = Object.freeze({
     activationLadderSteps: 3,
     autoSendTimeoutMs: 2000,
     autoSendSettleMs: AUTO_SEND_SETTLE_MS,
+    ...ACTIVATION_SETTLES,
   }),
 });
 
@@ -883,7 +909,10 @@ function pasteBudgetWorstCaseMs(platform) {
   // platforms that re-activate per attempt, and it is real wall clock
   // the user waits through. Leaving it out is what made the "one table,
   // one answer" claim above false.
-  const perAttemptActivation = b.activationLadderSteps * b.activationTimeoutMs;
+  // The rung that succeeds then sleeps its settle before the attempt goes
+  // on — the longer of the two kinds, since either may be the one.
+  const perAttemptActivation = b.activationLadderSteps * b.activationTimeoutMs
+    + (b.activationLadderSteps > 0 ? Math.max(b.appActivationSettleMs, b.windowActivationSettleMs) : 0);
   return (
     b.preflightMs +
     b.preflightSettleMs +

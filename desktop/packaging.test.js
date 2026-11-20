@@ -615,4 +615,8 @@ test("the helper's place in the bundle is one fact across build-native.sh, packa
   const main = fs.readFileSync(path.join(DESKTOP_DIR, "main.js"), "utf8");
   const segments = entry.to.split("/").concat(name).map((s) => `"${s}"`).join(", ");
   assert.ok(main.includes(`path.join(process.resourcesPath, ${segments})`), "main.js runs the helper from where the bundle has it");
+  // DX-25: a dev run reads the one macOS target build-native.sh builds.
+  const macTargets = Array.from(buildNative.matchAll(/^\s*(mac-[a-z0-9]+)\)/gm)).map((m) => m[1]);
+  assert.deepEqual(macTargets, ["mac-arm64"]);
+  assert.ok(main.includes(`path.join(__dirname, "native", "build", "${macTargets[0]}", "${name}")`), "dev helper path");
 });

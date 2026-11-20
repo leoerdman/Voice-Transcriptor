@@ -67,7 +67,8 @@ contextBridge.exposeInMainWorld("__transcriptorPasteCapability", {
 //     recordingId,          // the renderer's monotonic recording id
 //     text,                 // best-known text (false) / paste-ready text (true)
 //     final,                // true ONLY for the paste-ready text
-//     source,               // free-form label, trace log only
+//     kind,                 // "transcript" | "status" | "error"
+//     phase,                // "" or what the renderer is doing ("upscaling", "no-speech")
 //   })
 //
 // `final:false` is published with the status-only output (pre-upscale
@@ -163,8 +164,75 @@ contextBridge.exposeInMainWorld("transcriptor", {
         recordingId: p.recordingId,
         text: p.text,
         final: p.final,
-        source: p.source,
+        kind: p.kind,
+        phase: p.phase,
       });
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  /**
+   * Subscribe to the shortcut registration status (Settings badges):
+   *
+   *   const off = window.transcriptor.onShortcutStatus((status) => …)
+   *
+   * Main sends it whenever registration changes (and replays it when the
+   * page loads), so the renderer neither polls nor reads a window global
+   * main wrote with executeJavaScript (DM-14 / S-10). The status is
+   * main's plain JSON object, structured-cloned across the bridge.
+   */
+  onShortcutStatus: (callback) => {
+    if (typeof callback !== "function") return () => { };
+    const listener = (_event, payload) => {
+      try {
+        callback(payload && typeof payload === "object" ? payload : {});
+      } catch {
+        // A subscriber's failure is not main's problem.
+      }
+    };
+    ipcRenderer.on("shortcut-status", listener);
+    return () => {
+      try {
+        ipcRenderer.removeListener("shortcut-status", listener);
+      } catch {
+        // Already removed, or the bridge is torn down.
+      }
+    };
+  },
+  /**
+   * The main window's three requests (DM-10). They used to be written
+   * into document.title for main to intercept; main now validates each
+   * one in desktop/renderer-requests.js. Fields are copied onto fresh
+   * plain objects, as for recordingFinal.
+   */
+  shortcuts: (message) => {
+    try {
+      const m = message && typeof message === "object" ? message : {};
+      ipcRenderer.send("shortcuts:message", {
+        action: m.action,
+        record: m.record,
+        paste: m.paste,
+        screen: m.screen,
+        screenShot: m.screenShot,
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  recordToggle: () => {
+    try {
+      ipcRenderer.send("record:toggle");
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  revealRecording: (payload) => {
+    try {
+      const p = payload && typeof payload === "object" ? payload : {};
+      ipcRenderer.send("recording:reveal", { name: p.name, archiveDir: p.archiveDir });
       return true;
     } catch {
       return false;

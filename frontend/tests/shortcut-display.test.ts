@@ -4,22 +4,29 @@ import { normalizeAcceleratorForDisplay, acceleratorToDisplayTokens, shortcutBad
 
 describe("shortcutBadge (FU-26: the conflict rule had no test)", () => {
   it("flags a registration the OS refused, with its reason", () => {
-    expect(shortcutBadge("record", { desired: "Alt+Left", error: "taken" }, false)).toEqual({
+    expect(shortcutBadge({ desired: "Alt+Left", error: "taken" }, false)).toEqual({
       conflict: true,
       title: "Not registered: taken",
     });
   });
 
   it("treats an inactive screenshot key at rest as normal, but its error as a conflict", () => {
-    expect(shortcutBadge("screenShot", { desired: "Alt+Down" }, false).conflict).toBe(false);
-    expect(shortcutBadge("screenShot", { desired: "Alt+Down", error: "x" }, false).conflict).toBe(true);
-    expect(shortcutBadge("record", { desired: "Alt+Left" }, false).conflict).toBe(true);
+    expect(shortcutBadge({ desired: "Alt+Down" }, false).conflict).toBe(false);
+    expect(shortcutBadge({ desired: "Alt+Down", error: "x" }, false).conflict).toBe(true);
+  });
+
+  it("S-09: decides every slot by one rule — an error main reported — so it needs no slot id", () => {
+    // An optional slot the user left empty registers nothing and is not
+    // refused; the old rule (`!!active` for every slot but the
+    // screenshot key) badged it "Not registered: unknown reason".
+    expect(shortcutBadge({ desired: "", active: "", error: "" }, false).conflict).toBe(false);
+    expect(shortcutBadge({ desired: "Alt+Left", active: "Alt+Left" }, false).conflict).toBe(false);
   });
 
   it("flags F1–F12 only when macOS treats them as media keys", () => {
-    expect(shortcutBadge("record", { active: "F9", desired: "F9" }, true).conflict).toBe(true);
-    expect(shortcutBadge("record", { active: "F9", desired: "F9" }, false)).toEqual({ conflict: false, title: "" });
-    expect(shortcutBadge("record", { active: "F13", desired: "F13" }, true).conflict).toBe(false);
+    expect(shortcutBadge({ active: "F9", desired: "F9" }, true).conflict).toBe(true);
+    expect(shortcutBadge({ active: "F9", desired: "F9" }, false)).toEqual({ conflict: false, title: "" });
+    expect(shortcutBadge({ active: "F13", desired: "F13" }, true).conflict).toBe(false);
   });
 });
 
