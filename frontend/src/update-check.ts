@@ -156,6 +156,29 @@ export async function checkForUpdate(
 
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
+/** Who asked for a check: the user's button, or the passive boot check. */
+export type UpdateCheckTrigger = "user" | "boot";
+
+/**
+ * What the renderer does with a finished check (FU-17).
+ *
+ *   • `stamp` — whether it counts against the once-a-day throttle. Only
+ *     an ANSWER does. Stamping every result meant an offline start (or a
+ *     GitHub 403) switched the background check off for 24 hours having
+ *     learned nothing.
+ *   • `render` — whether the result is shown. The passive boot check is
+ *     meant to be silent when it could not tell ("an offline start never
+ *     nags"); it used to write "Couldn't check for updates (…)" into
+ *     Settings like the button does.
+ */
+export function updateCheckOutcome(
+  result: UpdateCheckResult,
+  trigger: UpdateCheckTrigger,
+): { stamp: boolean; render: boolean } {
+  const answered = result.status !== "unknown";
+  return { stamp: answered, render: answered || trigger === "user" };
+}
+
 /**
  * Throttle rule for the passive boot-time check: at most once per day.
  *
