@@ -54,10 +54,11 @@ export interface FlashOptions {
  * Flash the outcome of a Copy. The outcome is a boolean, and the
  * label and the visual state are both derived from it.
  *
- * The outcome used to be encoded in the label: `flashButtonFeedback`
- * chose the success or failure style by comparing its text argument to
- * the literal "Copied", so any rewording (or translation) of that word
- * would have turned every success into the failure style.
+ * The outcome used to be encoded in the label: the label-only entry
+ * point (deleted with its last callers, the Upload Copy buttons) chose
+ * the success or failure style by comparing its text argument to the
+ * literal "Copied", so any rewording (or translation) of that word would
+ * have turned every success into the failure style.
  */
 export function flashCopyOutcome(
   btn: HTMLButtonElement,
@@ -66,20 +67,6 @@ export function flashCopyOutcome(
   options: FlashOptions,
 ): void {
   flash(btn, ok, ok ? UI_COPY.copyFeedback.ok : UI_COPY.copyFeedback.failed, restingLabel, options);
-}
-
-/**
- * The label-only entry point, kept for the two Upload call sites outside
- * this module's lane until they move to `flashCopyOutcome`; the outcome
- * is read against the ui-copy token, not a literal.
- */
-export function flashButtonFeedback(
-  btn: HTMLButtonElement,
-  flashLabel: string,
-  restingLabel: string,
-  options: FlashOptions,
-): void {
-  flash(btn, flashLabel === UI_COPY.copyFeedback.ok, flashLabel, restingLabel, options);
 }
 
 function flash(

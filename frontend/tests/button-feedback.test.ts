@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { flashButtonFeedback, flashCopyOutcome } from "../src/button-feedback";
+import { flashCopyOutcome } from "../src/button-feedback";
 import { UI_COPY } from "../src/ui-copy";
 
 describe("flashCopyOutcome (FU-12)", () => {
@@ -78,8 +78,11 @@ function fakeClock(): FakeClock {
 let clock: FakeClock;
 let btn: HTMLButtonElement;
 
-function flash(label: string, opts: { swapLabel?: boolean } = {}): void {
-  flashButtonFeedback(btn, label, "Copy transcript", {
+const COPIED = UI_COPY.copyFeedback.ok;
+const COPY_FAILED = UI_COPY.copyFeedback.failed;
+
+function flash(ok: boolean, opts: { swapLabel?: boolean } = {}): void {
+  flashCopyOutcome(btn, ok, "Copy transcript", {
     durationMs: 900,
     setTimer: clock.set,
     clearTimer: clock.clear,
@@ -95,22 +98,23 @@ beforeEach(() => {
   btn.title = "Copy transcript";
 });
 
-describe("flashButtonFeedback", () => {
+describe("the flash mechanism", () => {
   it("announces the outcome and marks it visually", () => {
-    flash("Copied");
-    expect(btn.getAttribute("aria-label")).toBe("Copied");
-    expect(btn.title).toBe("Copied");
+    flash(true);
+    expect(btn.getAttribute("aria-label")).toBe(COPIED);
+    expect(btn.title).toBe(COPIED);
     expect(btn.classList.contains("is-copy-ok")).toBe(true);
   });
 
   it("distinguishes a failure from a success", () => {
-    flash("Copy failed");
+    flash(false);
+    expect(btn.getAttribute("aria-label")).toBe(COPY_FAILED);
     expect(btn.classList.contains("is-copy-failed")).toBe(true);
     expect(btn.classList.contains("is-copy-ok")).toBe(false);
   });
 
   it("restores the resting labels when the flash ends", () => {
-    flash("Copied");
+    flash(true);
     clock.runAll();
     expect(btn.getAttribute("aria-label")).toBe("Copy transcript");
     expect(btn.title).toBe("Copy transcript");
@@ -118,20 +122,20 @@ describe("flashButtonFeedback", () => {
   });
 
   it("swaps the visible label only when asked, and puts it back", () => {
-    flash("Copied");
+    flash(true);
     expect(btn.textContent).toBe("Copy");
     clock.runAll();
 
-    flash("Copied", { swapLabel: true });
-    expect(btn.textContent).toBe("Copied");
+    flash(true, { swapLabel: true });
+    expect(btn.textContent).toBe(COPIED);
     clock.runAll();
     expect(btn.textContent).toBe("Copy");
   });
 
   it("restores the ORIGINAL labels after a second click inside the window", () => {
-    flash("Copied", { swapLabel: true });
+    flash(true, { swapLabel: true });
     // The user clicks again while "Copied" is still on the button.
-    flash("Copy failed", { swapLabel: true });
+    flash(false, { swapLabel: true });
     clock.runAll();
     expect(btn.textContent).toBe("Copy");
     expect(btn.getAttribute("aria-label")).toBe("Copy transcript");
@@ -139,15 +143,15 @@ describe("flashButtonFeedback", () => {
   });
 
   it("cancels the previous restore instead of leaving two in flight", () => {
-    flash("Copied");
+    flash(true);
     expect(clock.pending()).toBe(1);
-    flash("Copied");
+    flash(true);
     expect(clock.pending()).toBe(1);
   });
 
   it("falls back to the resting label when the element carries none", () => {
     const bare = document.createElement("button");
-    flashButtonFeedback(bare, "Copied", "Copy result text", {
+    flashCopyOutcome(bare, true, "Copy result text", {
       durationMs: 900,
       setTimer: clock.set,
       clearTimer: clock.clear,
@@ -161,8 +165,8 @@ describe("flashButtonFeedback", () => {
     const other = document.createElement("button");
     other.textContent = "Copy";
     other.setAttribute("aria-label", "Copy result text");
-    flash("Copied", { swapLabel: true });
-    flashButtonFeedback(other, "Copied", "Copy result text", {
+    flash(true, { swapLabel: true });
+    flashCopyOutcome(other, true, "Copy result text", {
       durationMs: 900,
       setTimer: clock.set,
       clearTimer: clock.clear,

@@ -61,7 +61,7 @@ import {
   type DualStreamDefaults,
 } from "./deepgram-dual";
 import { UI_COPY, applyStaticUiCopy, renderAcceptedFormatsHint, resultPaneTitle } from "./ui-copy";
-import { flashButtonFeedback, flashCopyOutcome } from "./button-feedback";
+import { flashCopyOutcome } from "./button-feedback";
 import { acceleratorToDisplayTokens, shortcutBadge, type ShortcutSlotStatus } from "./shortcut-display";
 // D-015: the ONE retired-shortcut-pair rule, shared with desktop/main.js
 // rather than re-derived here. See the module's own docstring for why —
@@ -111,7 +111,7 @@ import {
   richerTranscript,
 } from "./transcript-merge";
 import { mergeInterim } from "./live-source";
-import { checkForUpdate, shouldAutoCheck } from "./update-check";
+import { checkForUpdate, shouldAutoCheck, updateCheckOutcome, type UpdateCheckTrigger } from "./update-check";
 import { catalogChoiceForSave, mayAutosaveUiPreferences } from "./settings-autosave";
 import {
   CLI_ACCESS_OFF,
@@ -146,6 +146,7 @@ import {
   LiveDraftOperationQueue,
   parsePersistedLiveDraftPayload,
   recoveredDraftProvider,
+  mayClearRecoveredDraft,
   type LiveDraftOperation,
   type PersistedLiveDraft,
 } from "./live-draft";
@@ -1010,6 +1011,14 @@ const UI_TOKENS = {
      * finished dictation to be recovered again on the next start.
      */
     clearRetryDelaysMs: [500, 2_000, 5_000],
+    /**
+     * Longest a recording start waits for the one read of the previous
+     * run's draft (FG-08). The read is a GET to the local backend that
+     * normally answers in milliseconds and was started at boot; the bound
+     * only keeps a wedged backend from holding the hotkey. Past it the
+     * start goes on — the read still completes for the recovery.
+     */
+    staleReadWaitMs: 1_500,
   },
   timer: {
     tickMs: 200,
@@ -1024,8 +1033,8 @@ const UI_TOKENS = {
    * How long a button shows that it did the thing.
    *
    * One number, because it is one gesture: the two Copy buttons of
-   * History and the Result pane flashed for 900 ms through
-   * ``flashButtonFeedback`` while Upload's own Copy swapped its label
+   * History and the Result pane flashed for 900 ms through the class
+   * mechanism (now ``flashCopyOutcome``) while Upload's own Copy swapped its label
    * for 1200 ms — two mechanics and two durations for one feedback.
    */
   feedback: {
@@ -5836,7 +5845,11 @@ function persistLiveDraftPayload(payload: PersistedLiveDraft): Promise<void> {
   return enqueueLiveDraftOperation({ kind: "put", payload });
 }
 
+/** Has a session of this run written the draft slot? (FG-08, see mayClearRecoveredDraft.) */
+let liveDraftSlotWrittenThisRun = false;
+
 function persistLiveDraft(recording: boolean): void {
+  liveDraftSlotWrittenThisRun = true;
   try {
     void persistLiveDraftPayload(buildLiveDraftPayload(recording));
   } catch (e) {
@@ -5906,19 +5919,40 @@ function readLegacyLiveDraft(): PersistedLiveDraft | null {
   return draft;
 }
 
-async function recoverLiveDraftIfAny(): Promise<void> {
-  let draft = await readBackendLiveDraft();
-  if (!draft) {
-    draft = readLegacyLiveDraft();
-    if (draft) void persistLiveDraftPayload(draft);
+/**
+ * The draft a previous run left behind, read ONCE per page (FG-08).
+ *
+ * The backend keeps one draft slot and a session's first autosave
+ * replaces it. Recovery is a late step of the boot (after the History
+ * load and the audio-spool recovery), so a recording started before it
+ * ran used to overwrite the crash draft before anything had read it.
+ * Now the boot starts this read first, startLive awaits it before its
+ * first write, and the recovery works from the copy it captured.
+ */
+let staleLiveDraftRead: Promise<{ draft: PersistedLiveDraft | null; legacy: boolean }> | null = null;
+function readStaleLiveDraftOnce(): Promise<{ draft: PersistedLiveDraft | null; legacy: boolean }> {
+  if (!staleLiveDraftRead) {
+    staleLiveDraftRead = readBackendLiveDraft().then((draft) => {
+      if (draft) return { draft, legacy: false };
+      const legacy = readLegacyLiveDraft();
+      return { draft: legacy, legacy: !!legacy };
+    });
   }
+  return staleLiveDraftRead;
+}
+
+async function recoverLiveDraftIfAny(): Promise<void> {
+  const { draft, legacy } = await readStaleLiveDraftOnce();
   if (!draft) return;
+  // A localStorage-era draft moves to the backend slot — unless a session
+  // of this run has already taken the slot, which it must not lose.
+  if (legacy && !liveDraftSlotWrittenThisRun) void persistLiveDraftPayload(draft);
   try {
     const sourceText = String(draft.source_text || "").trim();
     const transcriptText = String(draft.transcript_text || "").trim();
     const sessionId = String(draft.session_id || "").trim();
     if (!sourceText && !transcriptText) {
-      await clearLiveDraft(sessionId);
+      if (mayClearRecoveredDraft(sessionId, liveDraftSlotWrittenThisRun)) await clearLiveDraft(sessionId);
       return;
     }
     const stamp = Number(draft.updated_at || Date.now());
@@ -5951,7 +5985,7 @@ async function recoverLiveDraftIfAny(): Promise<void> {
       UI_TOKENS.notice.longMs,
     );
     setStatus("Recovered " + new Date(stamp).toLocaleTimeString());
-    await clearLiveDraft(sessionId);
+    if (mayClearRecoveredDraft(sessionId, liveDraftSlotWrittenThisRun)) await clearLiveDraft(sessionId);
   } catch (e) {
     console.warn("Live draft recovery failed; keeping draft for next startup", e);
   }
@@ -9067,12 +9101,10 @@ $("deleteAllCancelBtn").addEventListener("click", () => {
 });
 $("deleteAllConfirmBtn").addEventListener("click", async () => {
   try {
-    // Use Authorization header instead of ?token= query param: query
-    // params are logged by uvicorn's access log at INFO level, which
-    // leaks the API token into plaintext logs on every delete.
-    const r = await fetch("/api/recordings", { method: "DELETE", headers: authHeaders() });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const data = (await r.json()) as { deleted?: unknown; failed?: unknown };
+    // apiDelete sends the token in the Authorization header (never a
+    // ?token= query param, which uvicorn's access log would record) and
+    // reports the backend's own error text, not a bare "HTTP 500".
+    const data = await apiDelete<{ deleted?: unknown; failed?: unknown }>("/api/recordings");
     setLatestSavedAudio(null);
     if (currentRecordingSummary?.savedName) {
       patchCurrentRecordingSummary({
@@ -9089,18 +9121,14 @@ $("deleteAllConfirmBtn").addEventListener("click", async () => {
     // the user was told "success" while N files silently survived.
     const deletedCount = Math.max(0, Number.isFinite(Number(data?.deleted)) ? Number(data.deleted) : 0);
     const failedCount = Math.max(0, Number.isFinite(Number(data?.failed)) ? Number(data.failed) : 0);
-    const tone = failedCount > 0 ? "error" : "warning";
     const summary = failedCount > 0
       ? `Deleted ${deletedCount} recording(s) — ${failedCount} failed (see main.log).`
       : `Deleted ${deletedCount} recording(s).`;
     // Reported through the status pill, which is visible from every
-    // view. ``showRecordSessionNotice`` writes into ``#recordSessionNotice``,
-    // which lives inside the Record view — hidden at the moment this
-    // button can be pressed — and the viewer body it also wrote to was
-    // wiped one line later by ``loadRecordings`` → ``resetRecordingViewer``.
-    // So a partial failure the backend does count was reported to nobody.
-    setStatus(summary, tone === "error" ? "error" : "done");
-    showRecordSessionNotice(summary, tone);
+    // view — once. The Record-view notice banner is hidden while this
+    // button can be pressed, and since FU-03 it would write the pill a
+    // second time.
+    setStatus(summary, failedCount > 0 ? "error" : "done");
     $("recordingMeta").textContent = "";
     await loadRecordings(true);
     // After the reload, so it survives ``resetRecordingViewer``.
@@ -9108,7 +9136,9 @@ $("deleteAllConfirmBtn").addEventListener("click", async () => {
   } catch (e: unknown) {
     const msg = sanitizeUiErrorMessage(e, "Could not delete the archive.");
     setStatus(`Delete all failed: ${msg}`, "error");
-    $("recordingContent").textContent = msg;
+    // Never into the viewer body (that is what "Copy recording text"
+    // copies): the placeholder when nothing is open, the pill otherwise.
+    if (historyFailureSurfaces(!!selectedRecordingName).placeholder) resetRecordingViewer(msg);
   } finally {
     closeModal("deleteAllModal");
   }
@@ -11126,6 +11156,10 @@ async function startLive(
     patchCurrentRecordingSummary({ status: message, tone: "error" });
     return;
   }
+  // FG-08: the previous run's draft is captured before this session's
+  // first autosave can replace it (memoized: free after the first start).
+  await Promise.race([readStaleLiveDraftOnce(), sleepUnlessAborted(UI_TOKENS.draft.staleReadWaitMs, undefined)]);
+  markStartPhase("staleDraftRead");
   liveStartAbortReason = "";
   const throwIfStartCancelled = (): void => {
     if (startAttemptSeq === liveStartAttemptSeq) return;
@@ -11510,10 +11544,13 @@ async function startLive(
               // expected and don't need to spam the user. PCM canonical
               // audio (the OPFS spool) is unaffected; only the WebM
               // fallback container is rolling-windowed.
+              // The window is UI_TOKENS.capture.fallbackWindowSec, named
+              // by the same label the capture's own notice uses (FG-17).
+              const fallbackWindow = capturedHoursLabel(UI_TOKENS.capture.fallbackWindowSec);
               showRecordSessionNotice(
-                "Recording exceeds 2 hours — the WebM fallback keeps only the last 2 h. Canonical PCM audio is unaffected.",
+                `Recording exceeds ${fallbackWindow} — the WebM fallback keeps only the last ${fallbackWindow}. Canonical PCM audio is unaffected.`,
                 "warning",
-                9000
+                UI_TOKENS.notice.longMs,
               );
             }
           }
@@ -13339,6 +13376,9 @@ window.addEventListener("transcriptor-hotkey-stop", (ev) => {
 
 async function initRecordingsBootstrap(): Promise<void> {
   recordingsBootstrapReady = false;
+  // First, before anything slower: capture the previous run's draft so a
+  // recording started during the boot cannot overwrite it (FG-08).
+  void readStaleLiveDraftOnce();
   // Each failure was console-only: the History pane just stayed empty
   // and an unrecovered interrupted recording said nothing (FQ-15).
   const failed: string[] = [];
@@ -13396,7 +13436,9 @@ const UPDATE_CHECK_CACHE_KEY = "transcriptor.updateCheck.lastCheckedAt.v1";
 const updateStatusEl = document.getElementById("updateCheckStatus");
 const updateBtnEl = document.getElementById("updateCheckBtn") as HTMLButtonElement | null;
 
-function renderUpdateStatus(text: string, tone: "neutral" | "ok" | "new" | "error"): void {
+type UpdateStatusTone = "neutral" | "ok" | "new" | "error";
+
+function renderUpdateStatus(text: string, tone: UpdateStatusTone): void {
   if (!updateStatusEl) return;
   // Every piece of this element's state is written here — including the
   // link class. It was added by the "update available" branch below and
@@ -13408,20 +13450,32 @@ function renderUpdateStatus(text: string, tone: "neutral" | "ok" | "new" | "erro
   updateStatusEl.classList.remove("update-check-status-link");
 }
 
-async function runUpdateCheck(): Promise<void> {
+async function runUpdateCheck(trigger: UpdateCheckTrigger): Promise<void> {
   if (!updateBtnEl) return;
   updateBtnEl.disabled = true;
+  // What the line said before "Checking…", for a check that ends up
+  // showing nothing (the passive boot check that could not tell).
+  const idleText = updateStatusEl?.textContent || "";
+  const idleTone = (updateStatusEl?.dataset.tone || "neutral") as UpdateStatusTone;
   renderUpdateStatus("Checking…", "neutral");
   const result = await checkForUpdate(__APP_UPDATE_META__, fetch);
-  // Only a check that got an answer counts as "checked today". Stamping
-  // the failed one too meant an offline launch silenced the daily check
-  // for 24 h (FQ-13).
-  if (result.status !== "unknown") {
+  // Whether it counts as "checked today" and whether it is shown are
+  // decided in ./update-check (FU-17 / FQ-13): only an answer stamps the
+  // daily throttle (stamping a failure silenced the check for 24 h after
+  // an offline launch), and the passive boot check stays silent when it
+  // could not tell; the button always answers.
+  const outcome = updateCheckOutcome(result, trigger);
+  if (outcome.stamp) {
     try {
       localStorage.setItem(UPDATE_CHECK_CACHE_KEY, String(Date.now()));
     } catch {
       /* quota/private-mode: the throttle just resets each launch */
     }
+  }
+  if (!outcome.render) {
+    renderUpdateStatus(idleText, idleTone);
+    updateBtnEl.disabled = false;
+    return;
   }
   switch (result.status) {
     case "update-available": {
@@ -13453,12 +13507,12 @@ async function runUpdateCheck(): Promise<void> {
 
 if (updateBtnEl) {
   updateBtnEl.addEventListener("click", () => {
-    void runUpdateCheck();
+    void runUpdateCheck("user");
   });
 }
 // Passive boot check at most once per day, a few seconds after launch
-// so it never competes with the backend boot. A failure is shown in
-// Settings and not stamped, so the next launch tries again.
+// so it never competes with the backend boot. A failure is neither shown
+// nor stamped (updateCheckOutcome), so the next launch tries again.
 const UPDATE_CHECK_BOOT_DELAY_MS = 4_000;
 (() => {
   let lastChecked = 0;
@@ -13469,7 +13523,7 @@ const UPDATE_CHECK_BOOT_DELAY_MS = 4_000;
   }
   if (!shouldAutoCheck(Date.now(), lastChecked)) return;
   window.setTimeout(() => {
-    void runUpdateCheck();
+    void runUpdateCheck("boot");
   }, UPDATE_CHECK_BOOT_DELAY_MS);
 })();
 
@@ -15243,7 +15297,7 @@ function renderUploadQueue(): void {
         ev.stopPropagation();
         void (async () => {
           const ok = await writeTextToClipboard(uploadItemResultText(item));
-          flashButtonFeedback(copyBtn, ok ? "Copied" : "Copy failed", "Copy transcript", {
+          flashCopyOutcome(copyBtn, ok, "Copy transcript", {
             durationMs: UI_TOKENS.feedback.flashMs,
             swapLabel: true,
           });
@@ -15278,7 +15332,7 @@ function renderUploadQueue(): void {
           ev.stopPropagation();
           void (async () => {
             const ok = await writeTextToClipboard(view.transcript);
-            flashButtonFeedback(copyBtn, ok ? "Copied" : "Copy failed", "Copy transcript", {
+            flashCopyOutcome(copyBtn, ok, "Copy transcript", {
               durationMs: UI_TOKENS.feedback.flashMs,
               swapLabel: true,
             });
@@ -15365,7 +15419,7 @@ function renderUploadResultPane(): void {
       copyBtn.onclick = () => {
         void (async () => {
           const ok = await writeTextToClipboard(uploadItemResultText(item!));
-          flashButtonFeedback(copyBtn, ok ? "Copied" : "Copy failed", "Copy transcript", {
+          flashCopyOutcome(copyBtn, ok, "Copy transcript", {
             durationMs: UI_TOKENS.feedback.flashMs,
           });
         })();
@@ -15394,7 +15448,7 @@ function renderUploadResultPane(): void {
       copyBtn.onclick = () => {
         void (async () => {
           const ok = await writeTextToClipboard(view.transcript);
-          flashButtonFeedback(copyBtn, ok ? "Copied" : "Copy failed", "Copy transcript", {
+          flashCopyOutcome(copyBtn, ok, "Copy transcript", {
             durationMs: UI_TOKENS.feedback.flashMs,
           });
         })();

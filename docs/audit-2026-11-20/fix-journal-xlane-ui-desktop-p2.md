@@ -133,3 +133,41 @@ intermediate state would have needed its own full verification run on a shared, 
   match → depth + behaviour), not a behaviour change.
 - After: desktop `ℹ tests 441 · pass 441 · fail 0`; frontend `Test Files 47 passed · Tests 603 passed`; typecheck,
   lint, build clean; `node --check` OK.
+
+## Commit 3 · FU-03/FU-04 (delete-all), FU-12 (Upload copy), M1/FU-17/FQ-13 (update check wiring), FG-17 (2-hour copy), FG-08
+
+- **Delete all** — dead `showRecordSessionNotice(summary, tone)` removed (the status pill reports once); the raw
+  `fetch` + `r.ok` is `apiDelete<{deleted, failed}>("/api/recordings")` (backend error text, header auth); the catch
+  writes the placeholder via `historyFailureSurfaces(!!selectedRecordingName)` instead of the viewer body.
+- **FU-12** — the Upload Copy buttons (four call sites now, not two: queue row and result pane, each in two render
+  branches) use `flashCopyOutcome(copyBtn, ok, …)`; `flashButtonFeedback` is deleted and its mechanism tests run
+  through `flashCopyOutcome` (labels from `UI_COPY.copyFeedback`).
+- **M1 / FU-17 / FQ-13** — `runUpdateCheck(trigger)` asks `updateCheckOutcome(result, trigger)`: stamps only when
+  `outcome.stamp`, and when `!outcome.render` restores the line it showed before "Checking…" and re-enables the
+  button. The button passes "user", the boot IIFE "boot" — the passive check no longer writes "Couldn't check…".
+- **FG-17** — the WebM-window notice is built from `capturedHoursLabel(UI_TOKENS.capture.fallbackWindowSec)` and shown
+  for `UI_TOKENS.notice.longMs` (was `9000`). Copy changes from "…only the last 2 h." to "…only the last 2 hours.";
+  `desktop/recording-status.js`'s renderer vocabulary entry carries the rendered sentence plus a `rendererSource`
+  (how main.tsx spells it) for its existence test.
+- **FG-08** — `readStaleLiveDraftOnce()` (memoized) captures the previous run's draft; `initRecordingsBootstrap`
+  starts it first, `startLive` awaits it (bounded by `UI_TOKENS.draft.staleReadWaitMs` = 1.5 s so a wedged backend
+  cannot hold the hotkey) before its first `persistLiveDraft(true)`, and `recoverLiveDraftIfAny` works from the
+  captured copy. The empty-owner half: new pure `mayClearRecoveredDraft(owner, slotWrittenThisRun)` in
+  `live-draft.ts` — an owner-less clear is sent only while no session of this run has written the slot (otherwise
+  it would wipe that session's draft); the legacy→backend migration put is skipped in that case too.
+- Files: `frontend/src/{main.tsx,button-feedback.ts,live-draft.ts}`, `frontend/tests/{button-feedback,live-draft,
+  renderer-main-contract}.test.ts`, `desktop/recording-status.js`, `desktop/recording-status.test.js`.
+- Before (HEAD e1bd1d6 sources, new tests), exit 1:
+  ```
+  live-draft.test.ts           Tests 2 failed | 20 passed (22)
+    × clears an owned draft by owner, whatever this run has written
+    × never sends an owner-less clear once a session of this run holds the slot
+  renderer-main-contract.test.ts   Tests 3 failed | 60 passed (63)
+    × FU-03/FU-04: Delete all reports once, through apiDelete, and never writes the viewer body
+    × FG-08: the previous run's draft is read once, first, and before a session's first autosave
+    × FQ-13 / FU-17 (M1): the update check stamps and renders by updateCheckOutcome, per trigger
+  ```
+  `updateCheckOutcome` itself was already behaviour-tested (update-check.test.ts, 02c3508); this commit is its
+  wiring. The button-feedback suite passes on HEAD too (refactor onto the surviving entry point).
+- After: frontend `Test Files 47 passed · Tests 607 passed`; desktop `ℹ tests 441 · pass 441 · fail 0`; typecheck,
+  lint, build clean; `node --check` OK.

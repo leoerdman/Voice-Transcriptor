@@ -502,12 +502,39 @@ describe("live half: one rule per fact, no dead state (FL-05/06/09/14/15/16/17/1
 });
 
 describe("boot, update check and History bootstrap (FQ-13/FQ-14/FQ-15/FQ-22)", () => {
-  it("FQ-13: a failed update check is not stamped as 'checked today'", () => {
-    const fn = mainTsxSlice("async function runUpdateCheck(): Promise<void> {", "\n}\n");
-    const guard = fn.indexOf('if (result.status !== "unknown") {');
-    const stamp = fn.indexOf("localStorage.setItem(UPDATE_CHECK_CACHE_KEY");
-    expect(guard).toBeGreaterThan(0);
-    expect(stamp).toBeGreaterThan(guard);
+  it("FU-03/FU-04: Delete all reports once, through apiDelete, and never writes the viewer body", () => {
+    const handler = mainTsxSlice('$("deleteAllConfirmBtn").addEventListener("click", async () => {', "\n});\n");
+    expect(handler).toContain('await apiDelete<{ deleted?: unknown; failed?: unknown }>("/api/recordings")');
+    expect(handler).not.toContain("showRecordSessionNotice(");
+    expect(handler).not.toContain('$("recordingContent").textContent');
+    expect(handler).toContain("historyFailureSurfaces(!!selectedRecordingName).placeholder");
+  });
+
+  it("FG-08: the previous run's draft is read once, first, and before a session's first autosave", () => {
+    const boot = mainTsxSlice("async function initRecordingsBootstrap(): Promise<void> {", "\n}\n");
+    expect(boot.indexOf("void readStaleLiveDraftOnce();")).toBeGreaterThan(0);
+    expect(boot.indexOf("void readStaleLiveDraftOnce();")).toBeLessThan(boot.indexOf("await loadRecordings(false);"));
+    const start = mainTsxSlice("async function startLive(", "\nasync function ");
+    const read = start.indexOf("readStaleLiveDraftOnce()");
+    expect(read).toBeGreaterThan(0);
+    expect(start.indexOf("persistLiveDraft(true);")).toBeGreaterThan(read);
+    const recover = mainTsxSlice("async function recoverLiveDraftIfAny(): Promise<void> {", "\n}\n");
+    expect(recover).toContain("await readStaleLiveDraftOnce();");
+    expect(recover).not.toContain("readBackendLiveDraft(");
+    expect(recover.match(/mayClearRecoveredDraft\(sessionId, liveDraftSlotWrittenThisRun\)/g) || []).toHaveLength(2);
+  });
+
+  it("FQ-13 / FU-17 (M1): the update check stamps and renders by updateCheckOutcome, per trigger", () => {
+    // The decision is behaviour-tested in update-check.test.ts; this pins
+    // that the one caller asks it instead of restating the rule inline.
+    const fn = mainTsxSlice("async function runUpdateCheck(trigger: UpdateCheckTrigger): Promise<void> {", "\n}\n");
+    const decide = fn.indexOf("const outcome = updateCheckOutcome(result, trigger);");
+    expect(decide).toBeGreaterThan(0);
+    expect(fn.indexOf("if (outcome.stamp) {")).toBeGreaterThan(decide);
+    expect(fn.indexOf("if (!outcome.render) {")).toBeGreaterThan(decide);
+    expect(fn).not.toContain('result.status !== "unknown"');
+    expect(mainTsx).toContain('void runUpdateCheck("user");');
+    expect(mainTsx).toContain('void runUpdateCheck("boot");');
     expect(mainTsx).not.toMatch(/\}, 4000\);/);
   });
 

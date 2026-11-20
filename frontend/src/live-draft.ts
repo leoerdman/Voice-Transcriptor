@@ -112,6 +112,22 @@ export function recoveredDraftProvider(draft: PersistedLiveDraft): string {
 }
 
 /**
+ * FG-08: may the recovery clear the draft slot after saving a recovered
+ * draft?
+ *
+ * The slot holds ONE draft and every put replaces it wholesale. An owned
+ * draft is cleared by owner (the backend refuses a clear for another
+ * owner), so that is always safe. An owner-less clear is unconditional:
+ * once a session of THIS run has written the slot, the slot holds that
+ * session's draft, not the stale one, and an owner-less clear would wipe
+ * it. Before any write, the clear is what stops the same stale draft
+ * being offered at every start.
+ */
+export function mayClearRecoveredDraft(ownerSessionId: string, slotWrittenThisRun: boolean): boolean {
+  return !!String(ownerSessionId || "").trim() || !slotWrittenThisRun;
+}
+
+/**
  * What a put changes on the backend. The clock fields move every tick
  * and are not content: the recovery reads neither the timer nor a
  * fresher `updated_at` than the last change of the text.

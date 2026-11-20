@@ -81,7 +81,13 @@ const LIVE_RECORDING_KINDS = Object.freeze([
 const RENDERER_STATUS_VOCABULARY = Object.freeze([
   Object.freeze({ text: "Recording with live preview enabled.", kind: RECORDING_STATUS_KIND.RECORDING }),
   Object.freeze({ text: "Recording with live preview enabled. Local assist is canonical for fast stop.", kind: RECORDING_STATUS_KIND.RECORDING }),
-  Object.freeze({ text: "Recording exceeds 2 hours — the WebM fallback keeps only the last 2 h. Canonical PCM audio is unaffected.", kind: RECORDING_STATUS_KIND.RECORDING }),
+  // Built from the capture window in the renderer (FG-17); `rendererSource`
+  // is how the sentence is spelled in frontend/src/main.tsx.
+  Object.freeze({
+    text: "Recording exceeds 2 hours — the WebM fallback keeps only the last 2 hours. Canonical PCM audio is unaffected.",
+    rendererSource: "`Recording exceeds ${fallbackWindow} — the WebM fallback keeps only the last ${fallbackWindow}. Canonical PCM audio is unaffected.`",
+    kind: RECORDING_STATUS_KIND.RECORDING,
+  }),
 ]);
 
 /** Is this one of the kinds the module knows? */
