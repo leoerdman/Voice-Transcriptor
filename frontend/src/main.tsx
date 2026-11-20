@@ -36,8 +36,12 @@ import {
 } from "./stop-epilogue";
 import {
   isUploadClearable,
+  pickNextQueuedUpload,
   uploadErrorView,
+  uploadItemRetryable,
+  uploadQueueTitle,
   uploadRetryPlan,
+  uploadSourceValidationError,
 } from "./upload-item";
 import { UPLOAD_QUEUE_SAVE_FAILED_STATUS, nextQueueSaveRetry } from "./upload-queue-persist";
 import {
@@ -14049,12 +14053,6 @@ interface UploadQueueItem {
   //   none      → status's own label (done/error/cancelled)
   status: UploadQueueStatus;
   stage?: "queued" | "uploading" | "processing" | "saving" | "done";
-  /**
-   * 0..1 fraction of known upload progress. Browser fetch does not
-   * expose request-body progress, so this remains undefined for the
-   * job-based Upload flow and the UI uses stage labels instead.
-   */
-  uploadProgress?: number;
   text?: string;
   error?: string;
   startedAt?: number;
@@ -14113,26 +14111,18 @@ function uploadFileSizeCap(): number {
 // JS level once the backend-owned set is known.
 const UPLOAD_ALLOWED_EXTS = ACCEPTED_AUDIO_VIDEO_EXTS;
 
-function uploadExtensionFromName(name: string): string {
-  const leaf = String(name || "").split(/[\\/]/).filter(Boolean).pop() || "";
-  const dot = leaf.lastIndexOf(".");
-  if (dot <= 0 || dot >= leaf.length - 1) return "";
-  return leaf.slice(dot + 1).toLowerCase();
+function uploadSourceError(name: string, sizeBytes: number): string {
+  return uploadSourceValidationError({
+    name,
+    sizeBytes,
+    capBytes: uploadFileSizeCap(),
+    allowedExts: UPLOAD_ALLOWED_EXTS,
+    formatBytes: fmtBytes,
+  });
 }
 
 function uploadFileValidationError(file: File): string {
-  const cap = uploadFileSizeCap();
-  if (cap > 0 && file.size > cap) {
-    return `File too large (${fmtBytes(file.size)} > ${fmtBytes(cap)} cap).`;
-  }
-  const ext = uploadExtensionFromName(file.name);
-  if (!ext) {
-    return "Unsupported file type. Drop an audio or video file with a supported extension.";
-  }
-  if (UPLOAD_ALLOWED_EXTS.size > 0 && !UPLOAD_ALLOWED_EXTS.has(ext)) {
-    return `Unsupported file type ".${ext}". Drop an audio or video file.`;
-  }
-  return "";
+  return uploadSourceError(file.name, file.size);
 }
 
 function normalizeUploadSourcePath(rawPath: unknown): string {
@@ -14155,9 +14145,9 @@ function uploadSourcePathFromFile(file: File): string {
   } catch (e) {
     console.debug("Upload source path bridge failed", e);
   }
-  // Development/older-Electron fallback. Browser File does not define
-  // this field; Electron historically did on selected files.
-  return normalizeUploadSourcePath((file as unknown as { path?: string }).path);
+  // No ``File.path`` fallback: Electron removed it in 32 (this app ships
+  // 42), so the preload bridge is the only source of a path (FQ-22).
+  return "";
 }
 
 function uploadPathBasename(sourcePath: string): string {
@@ -14168,18 +14158,7 @@ function uploadPathBasename(sourcePath: string): string {
 function uploadSourcePathValidationError(sourcePath: string, sizeBytes = 0): string {
   const path = normalizeUploadSourcePath(sourcePath);
   if (!path) return "Source file path is missing. Choose the file again.";
-  const cap = uploadFileSizeCap();
-  if (cap > 0 && sizeBytes > cap) {
-    return `File too large (${fmtBytes(sizeBytes)} > ${fmtBytes(cap)} cap).`;
-  }
-  const ext = uploadExtensionFromName(uploadPathBasename(path));
-  if (!ext) {
-    return "Unsupported file type. Choose an audio or video file with a supported extension.";
-  }
-  if (UPLOAD_ALLOWED_EXTS.size > 0 && !UPLOAD_ALLOWED_EXTS.has(ext)) {
-    return `Unsupported file type ".${ext}". Drop an audio or video file.`;
-  }
-  return "";
+  return uploadSourceError(uploadPathBasename(path), sizeBytes);
 }
 
 function uploadItemName(item: UploadQueueItem): string {
@@ -14191,11 +14170,10 @@ function uploadItemSize(item: UploadQueueItem): number {
   return Number.isFinite(size) && size > 0 ? size : 0;
 }
 
+/** The provider enum is ``normalizeProviderSelection``'s; uploads only
+ *  add that "none" means the upload default (FQ-10). */
 function normalizeUploadProvider(value: unknown): Provider {
-  const provider = String(value || "").trim();
-  return provider === "local" || provider === "openrouter" || provider === "deepgram"
-    ? provider
-    : UI_TOKENS.upload.defaultProvider;
+  return normalizeProviderSelection(value, UI_TOKENS.upload.defaultProvider) || UI_TOKENS.upload.defaultProvider;
 }
 
 function currentUploadTranscriptionOptions(): {
@@ -14383,12 +14361,8 @@ function isUploadTerminalStatus(status: UploadQueueStatus): boolean {
   return status === "done" || status === "error" || status === "cancelled";
 }
 
-function isUploadPastItem(item: UploadQueueItem): boolean {
-  return isUploadTerminalStatus(item.status);
-}
-
 function isUploadVisibleUnderCurrentFilter(item: UploadQueueItem): boolean {
-  return !uploadHideFinished || !isUploadPastItem(item);
+  return !uploadHideFinished || !isUploadTerminalStatus(item.status);
 }
 
 function uploadQueueSnapshotItem(item: UploadQueueItem): UploadQueueSnapshotItem {
@@ -14651,7 +14625,19 @@ function afterUploadQueueSnapshotLoaded(action: () => void): void {
     action();
     return;
   }
-  void beginUploadQueueSnapshotRestore().then(action);
+  // The restore promise resolves after a FAILED read too. Running the
+  // action then would process work no save can persist (every save is a
+  // no-op until the latch is up), and a later successful restore would
+  // splice those live rows away under their running processors (FQ-09).
+  // Unknown server state blocks writes — the restore module's rule —
+  // and the restore-failed status is already on screen.
+  void beginUploadQueueSnapshotRestore().then(() => {
+    if (uploadQueueSnapshotLoaded) {
+      action();
+    } else {
+      setStatus(UPLOAD_QUEUE_RESTORE_FAILED_STATUS, "warning");
+    }
+  });
 }
 
 function flushUploadQueueSnapshotBestEffort(): void {
@@ -14689,6 +14675,9 @@ function enqueueUploadFiles(files: File[]): void {
   window.addEventListener(ev, (e) => {
     // Inside the drop zone the per-element listeners already handle it.
     if ((e.target as HTMLElement)?.closest("#uploadLargeDrop")) return;
+    // Only FILE drags navigate the window. Cancelling every drag also
+    // disabled moving selected text inside a textarea (FQ-20).
+    if (!Array.from((e as DragEvent).dataTransfer?.types || []).includes("Files")) return;
     e.preventDefault();
     e.stopPropagation();
   });
@@ -14899,7 +14888,7 @@ function runUploadProcessor(): void {
   queueMicrotask(() => {
     uploadProcessorPumpScheduled = false;
     while (uploadActiveProcessors < uploadQueueMaxParallel) {
-      const next = uploadQueue.find((it) => it.status === "queued");
+      const next = pickNextQueuedUpload(uploadQueue);
       if (!next) break;
       uploadActiveProcessors += 1;
       void processUploadItem(next).finally(() => {
@@ -14929,7 +14918,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
   if (!sourceFile && !useSourcePath) {
     item.status = "error";
     item.error = pathValidationError || "Source file is no longer available. Choose the file again to retry.";
-    item.endedAt = performance.now();
+    item.endedAt = Date.now();
     item.completedAt = Date.now();
     saveUploadQueueSnapshot();
     renderUploadQueue();
@@ -14938,7 +14927,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
   item.status = "transcribing";
   item.stage = useSourcePath ? "processing" : "uploading";
   item.cancelRequested = false;
-  item.startedAt = performance.now();
+  item.startedAt = Date.now();
   // Per-item AbortController. Threaded through every fetch so
   // the user's Stop button can yank the in-flight request even
   // if the network is mid-stream. We attach it to the item so
@@ -15032,10 +15021,12 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
         // for upload + ffmpeg + provider processing. Large videos can
         // legitimately run past the old 5-minute XHR ceiling; the
         // backend job owns the long work and this renderer only polls.
+        // Every poll tick (0.9 s, then 3 s) lands here; only the first
+        // changes anything. Re-rendering on each tick rebuilt the whole
+        // queue DOM and dropped focus/hover once a second (FQ-07).
         onProcessingProgress: () => {
-          if (item.status !== "transcribing") return;
+          if (item.status !== "transcribing" || item.stage === "processing") return;
           item.stage = "processing";
-          item.uploadProgress = undefined;
           renderUploadQueue();
         },
       };
@@ -15054,7 +15045,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
     if (item.cancelRequested) {
       item.status = "cancelled";
       item.stage = undefined;
-      item.endedAt = performance.now();
+      item.endedAt = Date.now();
       item.completedAt = Date.now();
       return;
     }
@@ -15077,7 +15068,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
       item.stage = undefined;
       item.error = sanitizeUiErrorMessage(e, "Transcription failed.");
     }
-    item.endedAt = performance.now();
+    item.endedAt = Date.now();
     item.completedAt = Date.now();
   } finally {
     clearTimeout(_stageTimer);
@@ -15144,7 +15135,7 @@ async function saveUploadItemToHistory(
       "Could not save this upload to History.",
     )}`;
   } finally {
-    item.endedAt = performance.now();
+    item.endedAt = Date.now();
     item.completedAt = Date.now();
   }
 }
@@ -15158,18 +15149,12 @@ function uploadStatusLabel(item: UploadQueueItem): string {
       // Three labelled phases inside the outer "transcribing" status:
       //   uploading  → request body is being handed to the backend.
       //                fetch does not expose browser upload progress,
-      //                so this is a stage label unless a future transport
-      //                supplies a determinate fraction.
+      //                so this is a stage label, never a percentage.
       //   processing → backend is decoding video / running provider
       //                ("Processing…" — better than a stuck percentage).
       //   none       → fallback when neither stage was set (transient
       //                window between latch and first progress event).
-      if (item.stage === "uploading") {
-        const pct = typeof item.uploadProgress === "number"
-          ? Math.round(item.uploadProgress * 100)
-          : null;
-        return pct !== null ? `Uploading · ${pct}%` : "Uploading…";
-      }
+      if (item.stage === "uploading") return "Uploading…";
       if (item.stage === "processing") return "Processing…";
       if (item.stage === "saving") return "Saving to History…";
       return "Transcribing…";
@@ -15211,7 +15196,7 @@ function cancelUploadItem(id: string): void {
   if (item.status === "queued") {
     // Not started yet — just drop it.
     item.status = "cancelled";
-    item.endedAt = performance.now();
+    item.endedAt = Date.now();
     item.completedAt = Date.now();
     saveUploadQueueSnapshot();
     renderUploadQueue();
@@ -15271,7 +15256,7 @@ function assignUploadRetryFile(item: UploadQueueItem, file: File): void {
 
 async function retryUploadItem(id: string): Promise<void> {
   const item = uploadQueue.find((it) => it.id === id);
-  if (!item || item.status !== "error") return;
+  if (!item || !uploadItemRetryable(item.status)) return;
   if (uploadRetryPlan(item) === "save") {
     // The transcript exists; only the History save failed (FQ-05). The
     // audio goes with it when its source is still at hand, else the
@@ -15280,7 +15265,7 @@ async function retryUploadItem(id: string): Promise<void> {
     const pathUsable = !!keptPath && !uploadSourcePathValidationError(keptPath, uploadItemSize(item));
     item.status = "transcribing";
     item.error = "";
-    item.startedAt = performance.now();
+    item.startedAt = Date.now();
     item.endedAt = undefined;
     uploadSelectedId = item.id;
     await saveUploadItemToHistory(item, String(item.text || ""), {
@@ -15311,7 +15296,6 @@ async function retryUploadItem(id: string): Promise<void> {
   const uploadOptions = currentUploadTranscriptionOptions();
   item.status = "queued";
   item.stage = "queued";
-  item.uploadProgress = undefined;
   item.text = "";
   item.error = "";
   item.startedAt = undefined;
@@ -15327,12 +15311,9 @@ async function retryUploadItem(id: string): Promise<void> {
   item.requestedDiarize = uploadOptions.diarize;
   item.savedName = "";
   item.savedArchiveDir = "";
-  try { item.abortController?.abort(); } catch { /* idempotent */ }
-  item.abortController = undefined;
   uploadSelectedId = item.id;
   saveUploadQueueSnapshot();
   renderUploadQueue();
-  renderUploadResultPane();
   runUploadProcessor();
 }
 
@@ -15372,9 +15353,7 @@ function renderUploadQueue(): void {
   const hideBtn = document.getElementById("uploadQueueHideBtn") as HTMLButtonElement | null;
   const titleEl = document.getElementById("uploadQueueTitle");
   if (!list || !empty || !clearBtn) return;
-  const visibleItems = uploadHideFinished
-    ? uploadQueue.filter((it) => !isUploadPastItem(it))
-    : uploadQueue;
+  const visibleItems = uploadQueue.filter(isUploadVisibleUnderCurrentFilter);
   renderUploadPersistenceNote();
   if (uploadQueue.length === 0) {
     // The result pane is rendered at the END of this function, and this
@@ -15393,7 +15372,7 @@ function renderUploadQueue(): void {
     applyStaticUiCopy(document);
     clearBtn.hidden = true;
     if (hideBtn) hideBtn.hidden = true;
-    if (titleEl) titleEl.textContent = "Queue";
+    if (titleEl) titleEl.textContent = uploadQueueTitle([]);
     renderUploadResultPane();
     return;
   }
@@ -15404,10 +15383,7 @@ function renderUploadQueue(): void {
     hideBtn.textContent = uploadHideFinished ? "Show past" : "Hide past";
     hideBtn.setAttribute("aria-pressed", uploadHideFinished ? "true" : "false");
   }
-  if (titleEl) {
-    const total = uploadQueue.length;
-    titleEl.textContent = `Queue · ${finished}/${total} done`;
-  }
+  if (titleEl) titleEl.textContent = uploadQueueTitle(uploadQueue.map((it) => it.status));
   empty.hidden = visibleItems.length > 0;
   if (visibleItems.length === 0) {
     const emptyTitle = empty.querySelector(".upload-empty-state-title");
@@ -15415,7 +15391,6 @@ function renderUploadQueue(): void {
     if (emptyTitle) emptyTitle.textContent = UI_COPY.upload.hiddenPastTitle;
     if (emptySub) emptySub.textContent = UI_COPY.upload.hiddenPastSub;
   }
-  renderUploadPersistenceNote();
   // Clear + rebuild. Queue length is bounded by user clicks (rarely
   // > 50); full re-render is fine and avoids stale-DOM state issues
   // (per-item refs, status class drift across status transitions).
@@ -15427,10 +15402,22 @@ function renderUploadQueue(): void {
     // Click anywhere on the item swaps the result-pane to it. The
     // per-item Stop / × button stops propagation so they don't double-
     // trigger the selection.
-    li.addEventListener("click", () => {
+    // A row is a button for the keyboard too: it was mouse-only, so the
+    // result pane could not be reached without a pointer (FQ-16).
+    const selectRow = (): void => {
       uploadSelectedId = item.id;
       renderUploadQueue();
-      renderUploadResultPane();
+    };
+    li.tabIndex = 0;
+    li.setAttribute("role", "button");
+    li.setAttribute("aria-pressed", item.id === uploadSelectedId ? "true" : "false");
+    li.addEventListener("click", selectRow);
+    li.addEventListener("keydown", (ev: KeyboardEvent) => {
+      if (ev.target !== li) return;
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        selectRow();
+      }
     });
 
     const header = document.createElement("div");
@@ -15482,7 +15469,7 @@ function renderUploadQueue(): void {
       });
       tail.appendChild(stopBtn);
     } else {
-      if (item.status === "error") {
+      if (uploadItemRetryable(item.status)) {
         const retrySourcePath = normalizeUploadSourcePath(item.sourcePath || "");
         const retryBlockReason = item.file
           ? uploadFileValidationError(item.file)
@@ -15517,20 +15504,12 @@ function renderUploadQueue(): void {
     li.appendChild(header);
 
     if (item.status === "transcribing") {
-      // Determinate bar only when a transport supplied a real fraction;
-      // otherwise use the indeterminate animation for both upload and
-      // processing so the UI does not invent progress.
+      // Indeterminate for every stage: no transport reports a real
+      // fraction, and the UI does not invent one.
       const progress = document.createElement("div");
       progress.className = "upload-queue-item-progress";
       const bar = document.createElement("div");
-      const hasPct = item.stage === "uploading"
-        && typeof item.uploadProgress === "number";
-      if (hasPct) {
-        bar.className = "upload-queue-item-progress-bar is-determinate";
-        bar.style.width = `${Math.max(2, Math.round((item.uploadProgress || 0) * 100))}%`;
-      } else {
-        bar.className = "upload-queue-item-progress-bar";
-      }
+      bar.className = "upload-queue-item-progress-bar";
       progress.appendChild(bar);
       li.appendChild(progress);
     }

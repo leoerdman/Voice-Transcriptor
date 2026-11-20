@@ -564,6 +564,55 @@ describe("upload queue wiring for a failed History save (FQ-01/FQ-05/FQ-18)", ()
     expect(mainTsx).not.toContain('window.addEventListener("beforeunload", flushUploadQueueSnapshotBestEffort');
   });
 
+  it("FQ-06/FQ-07: no invented progress, and a poll tick re-renders only when the stage changes", () => {
+    expect(mainTsx).not.toContain("uploadProgress");
+    expect(mainTsx).toContain('if (item.status !== "transcribing" || item.stage === "processing") return;');
+  });
+
+  it("FQ-08: the pump starts the oldest queued item", () => {
+    const pump = mainTsxSlice("function runUploadProcessor(): void {", "\nasync function processUploadItem(");
+    expect(pump).toContain("pickNextQueuedUpload(uploadQueue)");
+    expect(pump).not.toContain('uploadQueue.find((it) => it.status === "queued")');
+  });
+
+  it("FQ-09: nothing is enqueued while the server queue is unknown", () => {
+    const fn = mainTsxSlice("function afterUploadQueueSnapshotLoaded(", "\nfunction flushUploadQueueSnapshotBestEffort(");
+    expect(fn).toMatch(/\.then\(\(\) => \{\s*if \(uploadQueueSnapshotLoaded\) \{\s*action\(\);/);
+  });
+
+  it("FQ-10/FQ-11: one provider normaliser and one source validator", () => {
+    const norm = mainTsxSlice("function normalizeUploadProvider(", "\n}\n");
+    expect(norm).toContain("normalizeProviderSelection(value, UI_TOKENS.upload.defaultProvider)");
+    expect(mainTsx).not.toMatch(/function uploadExtensionFromName\(/);
+    expect(mainTsx.match(/uploadSourceValidationError\(\{/g) || []).toHaveLength(1);
+  });
+
+  it("FQ-16/FQ-19: rows are keyboard buttons, the title counts done only, one filter rule, one pane render", () => {
+    const row = mainTsxSlice("function renderUploadQueue(): void {", "\nfunction renderUploadResultPane(");
+    expect(row).toContain('li.setAttribute("role", "button");');
+    expect(row).toContain("li.tabIndex = 0;");
+    expect(row).toContain("uploadQueueTitle(uploadQueue.map((it) => it.status))");
+    expect(row).toContain("uploadQueue.filter(isUploadVisibleUnderCurrentFilter)");
+    expect(row.match(/renderUploadPersistenceNote\(\);/g) || []).toHaveLength(1);
+    expect(mainTsx).not.toContain("isUploadPastItem");
+  });
+
+  it("FQ-20: the window-level drop blocker cancels file drags only", () => {
+    expect(mainTsx).toContain('.includes("Files")) return;');
+  });
+
+  it("FQ-21: upload timings are one clock (epoch ms)", () => {
+    const upload = mainTsx.slice(mainTsx.indexOf("async function processUploadItem("), mainTsx.indexOf("function renderUploadPersistenceNote("));
+    expect(upload).not.toMatch(/(startedAt|endedAt) = performance\.now\(\)/);
+  });
+
+  it("FQ-22: no dead File.path fallback, no abort of a settled item, Retry for cancelled items", () => {
+    expect(mainTsx).not.toContain("{ path?: string }).path");
+    const retry = mainTsxSlice("async function retryUploadItem(", "\n}\n");
+    expect(retry).not.toContain("abortController?.abort()");
+    expect(retry).toContain("uploadItemRetryable(item.status)");
+  });
+
   it("the save stage cannot be 'stopped': cancel ignores it and the Stop button is disabled", () => {
     expect(mainTsx).toContain('if (item.cancelRequested || item.stage === "saving") return;');
     expect(mainTsx).toContain('stopBtn.disabled = item.cancelRequested === true || item.stage === "saving";');
