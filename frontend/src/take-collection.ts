@@ -54,6 +54,30 @@ export function liveTakeAfterVoiceTakeNotice(take: LiveTake, screenSessionId: st
 }
 
 /**
+ * The collection a STOPPED take is saved under. A screen take is a Screen
+ * Sessions recording only if its screen session actually produced a
+ * manifest: a take stopped before its session started (the controller's
+ * ENDED answer), or whose session failed, has no screenshots and no
+ * marks — it is a voice take, kept under Live's retention rather than
+ * Screen Sessions' keep-few (D3 residue).
+ */
+export function stoppedTakeCollection(mode: LiveRecordingMode, screenManifest: unknown): RecordingCollection {
+  return liveRecordingCollection(mode === "screen" && screenManifest ? "screen" : "voice");
+}
+
+/** The live-socket control message type for a changed take (contracts/live-socket.json). */
+export const LIVE_TAKE_CONTROL_TYPE = "take";
+
+/**
+ * What the renderer tells the live socket when the take changed after it
+ * opened, so the backend re-files the take's recovery sidecar — a crash
+ * after a screen take was demoted must recover it under Live.
+ */
+export function liveTakeUpdateMessage(take: LiveTake): { type: typeof LIVE_TAKE_CONTROL_TYPE; recording_collection: RecordingCollection } {
+  return { type: LIVE_TAKE_CONTROL_TYPE, recording_collection: liveRecordingCollection(take.mode) };
+}
+
+/**
  * The collection a crash-time draft was written for. A draft from before
  * the draft carried it, or with a value this build does not know, is a
  * Live take — what every draft was filed as until now.

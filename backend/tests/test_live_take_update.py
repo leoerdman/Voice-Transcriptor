@@ -101,3 +101,16 @@ class StaleApiTokenFileTests(unittest.TestCase):
                     mock.patch.dict("os.environ", env, clear=True):
                 self.assertEqual(backend_main._load_or_create_api_token(), "file-token")
             self.assertTrue(path.exists())
+
+
+class LiveSocketContractTests(unittest.TestCase):
+    def test_take_update_matches_the_shared_contract(self):
+        contract = json.loads(
+            (Path(__file__).resolve().parents[2] / "contracts" / "live-socket.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(backend_main.LIVE_TAKE_CONTROL_TYPE, contract["takeUpdate"]["type"])
+        with tempfile.TemporaryDirectory() as d:
+            rec = _recovery(Path(d))
+            payload = {k: v for k, v in contract["takeUpdate"].items() if not k.startswith("_")}
+            backend_main._apply_live_take_update(rec, payload)
+            self.assertEqual(rec["meta"]["recording_collection"], "live")

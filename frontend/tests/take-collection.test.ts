@@ -10,6 +10,9 @@ import {
   liveTakeFromRequest,
   recordingCollectionFromDraft,
   recoveryPromoteBody,
+  LIVE_TAKE_CONTROL_TYPE,
+  liveTakeUpdateMessage,
+  stoppedTakeCollection,
 } from "../src/take-collection";
 
 const SID = "screen-20261120-100000-000";
@@ -86,5 +89,36 @@ describe("main.tsx files every take through ./take-collection", () => {
     );
     expect(body).toContain("liveTakeAfterVoiceTakeNotice(");
     expect(mainTsx).toMatch(/\nsubscribeToScreenVoiceTake\(\);/);
+  });
+});
+
+describe("liveTakeUpdateMessage — the live socket's take update (S-04)", () => {
+  const contract = JSON.parse(
+    readFileSync(resolve(__dirname, "..", "..", "contracts", "live-socket.json"), "utf8"),
+  ) as { takeUpdate: { type: string; recording_collection: string } };
+
+  it("matches contracts/live-socket.json, which the backend checks too", () => {
+    expect(LIVE_TAKE_CONTROL_TYPE).toBe(contract.takeUpdate.type);
+    expect(liveTakeUpdateMessage(VOICE_TAKE)).toEqual({
+      type: contract.takeUpdate.type,
+      recording_collection: contract.takeUpdate.recording_collection,
+    });
+  });
+
+  it("names the collection of the take it describes", () => {
+    expect(liveTakeUpdateMessage({ mode: "screen", screenSessionId: "screen-20261120-100000-000" }).recording_collection)
+      .toBe("screen");
+  });
+});
+
+describe("stoppedTakeCollection — where a stopped take is saved (D3)", () => {
+  it("a screen take with a manifest is a Screen Sessions recording", () => {
+    expect(stoppedTakeCollection("screen", { id: SID })).toBe("screen");
+  });
+  it("a screen take whose session never started (no manifest) is a voice take", () => {
+    expect(stoppedTakeCollection("screen", null)).toBe("live");
+  });
+  it("a voice take is a voice take", () => {
+    expect(stoppedTakeCollection("voice", { id: SID })).toBe("live");
   });
 });

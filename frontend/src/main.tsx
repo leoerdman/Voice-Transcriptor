@@ -150,6 +150,8 @@ import {
   liveRecordingCollection,
   liveTakeAfterVoiceTakeNotice,
   liveTakeFromRequest,
+  liveTakeUpdateMessage,
+  stoppedTakeCollection,
   recordingCollectionFromDraft,
   recoveryPromoteBody,
   type LiveRecordingMode,
@@ -9604,6 +9606,18 @@ function subscribeToScreenVoiceTake(): void {
       console.warn(`[trace screen] session ${screenSessionId} did not start; the take goes on as a voice take`);
       liveRecordingMode = take.mode;
       liveScreenSessionId = take.screenSessionId;
+      // The live socket was opened as a screen take, and its recovery
+      // sidecar says so: re-file it, or a crash from here on recovers
+      // the take into Screen Sessions with no screenshots. A socket still
+      // connecting gets it on open; one not yet created will be opened
+      // with the voice collection already.
+      const socket = ws;
+      const message = JSON.stringify(liveTakeUpdateMessage(take));
+      if (socket?.readyState === WebSocket.OPEN) {
+        socket.send(message);
+      } else if (socket?.readyState === WebSocket.CONNECTING) {
+        socket.addEventListener("open", () => socket.send(message), { once: true });
+      }
     }) ?? null;
   } catch (e) {
     console.debug("screen mode: voice-take bridge unavailable", e);
@@ -11937,11 +11951,16 @@ async function stopLive(
   // the overlays leave the screen with the stop, not after transcription;
   // its manifest is awaited only where the transcript is composed.
   const recordingMode = liveRecordingMode;
-  const recordingCollection = liveRecordingCollection(recordingMode);
   const recordingClockStartAt = startAt;
   const screenSessionPromise = recordingMode === "screen"
     ? finishScreenSession(liveScreenSessionId, discarding)
     : Promise.resolve(null);
+  // Where this take is filed is known only once its screen session has
+  // answered: a screen take with no manifest is a voice take (D3). Every
+  // save below reads this one decision.
+  const recordingCollectionPromise = screenSessionPromise.then(
+    (manifest) => stoppedTakeCollection(recordingMode, manifest),
+  );
   liveRecordingMode = "voice";
   liveScreenSessionId = "";
   const liveSessionId = activeLiveSessionId;
@@ -12561,11 +12580,11 @@ async function stopLive(
     target: () => ({ name: persistedRecordingName, archiveDir: persistedRecordingArchiveDir }),
     liveSourceText: latestSourceForSave,
     fallbackTitle: defaultTitle,
-    save: (request) => saveRecordingText({
+    save: async (request) => saveRecordingText({
       ...request,
       model: modelValue,
       language: languageValue,
-      recordingCollection,
+      recordingCollection: await recordingCollectionPromise,
     }),
     classify: {
       isConflict: isArchiveMutationConflict,
@@ -12643,6 +12662,7 @@ async function stopLive(
   // then written from the archived manifest, so the paths in the
   // transcript are the screenshots' permanent ones.
   const stagedScreenManifest = await screenSessionPromise;
+  const recordingCollection = await recordingCollectionPromise;
   let screenManifest = stagedScreenManifest;
   if (savedAudioFile) {
     // Two-attempt save: first with the configured archive dir, then

@@ -1,0 +1,8 @@
+{
+  "_comment": "Control messages the renderer sends on the live socket (/ws/transcribe) besides audio frames. The backend (backend/main.py LIVE_TAKE_CONTROL_TYPE, _ws_recv_live) and the renderer (frontend/src/take-collection.ts) each check their constants against this file, so a rename on one side fails its suite instead of silently dropping the message.",
+  "takeUpdate": {
+    "_comment": "The take's collection changed after the socket opened: a screen take whose screen session could not start is a voice take (desktop screen-mode:voice-take). The backend re-files the recovery sidecar; leaving 'screen' drops the screen session id.",
+    "type": "take",
+    "recording_collection": "live"
+  }
+}
