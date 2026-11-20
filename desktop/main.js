@@ -125,6 +125,8 @@ const {
 // What a main-process stop does with the renderer's answer — or its
 // silence (DM-03, DM-22).
 const { STOP_ACTION, decideMainProcessStop } = require("./recording-stop");
+// The Windows PowerShell paste fallback: activate, verify, then Ctrl+V (DM-04).
+const { buildPwshPasteFallbackScript } = require("./windows-paste-fallback");
 // One lease per paste on the snapshot of the user's clipboard, released
 // exactly once (DM-02, DM-26).
 const { createClipboardLeases } = require("./clipboard-lease");
@@ -5431,11 +5433,13 @@ async function pasteFromClipboard(text, target, options, trace, clipboardLease) 
         lastReason = `vbs-error: ${e?.message || e}`;
       }
 
-      // Fallback: lightweight PowerShell (no C# compilation).
-      // Activate the captured target PID FIRST via SetForegroundWindow
-      // — otherwise SendKeys fires at whatever has focus when the
-      // hotkey was pressed (often Transcriptor itself), and the
-      // text lands in the wrong window.
+      // Fallback: PowerShell SetForegroundWindow + SendKeys (it compiles
+      // a small C# P/Invoke class with Add-Type, so it is not free). The
+      // script activates the captured window FIRST and refuses to send
+      // the keystroke if the OS did not bring it forward (DM-04) —
+      // otherwise SendKeys fires at whatever has focus (often Transcriptor
+      // itself) and the text lands in the wrong window. The rule and the
+      // script live in ./windows-paste-fallback.
       //
       // Runs right after EVERY VBS failure now (BUGS_AUDIT §6.4), not
       // only when attempt === 2. Gating it to the last attempt meant a
@@ -5443,43 +5447,25 @@ async function pasteFromClipboard(text, target, options, trace, clipboardLease) 
       // before this — the actually-different fallback method — ever
       // ran, which is most of how the retry ladder reached ~30 s.
       {
-        const pidNum = Number.parseInt(String(effectiveTarget.pid || 0), 10) || 0;
-        const safePid = (Number.isFinite(pidNum) && pidNum > 0 && pidNum < 2 ** 31) ? Math.trunc(pidNum) : 0;
         const safeHwnd = normalizeWindowsHwnd(effectiveTarget.hwnd || "");
-        const hwndHex = safeHwnd ? safeHwnd.slice(2) : "";
-        // Inside a JS template literal (backtick-delimited), `"` is not
-        // a special character and MUST NOT be escaped. The over-escaped
-        // `\\"user32.dll\\"` version produced literal `\"user32.dll\"`
-        // in the PowerShell source, which was then invalid C# inside
-        // Add-Type (CS1056: unexpected character '\'). See the sibling
-        // PowerShell blocks in getFrontmostAppInfo / getFrontmostAppName
-        // for the correct unescaped form.
-        const activateBlock = safeHwnd ? (
-          `Add-Type @"\n` +
-          `using System;\n` +
-          `using System.Runtime.InteropServices;\n` +
-          `public class W { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr h, int cmd); }\n` +
-          `"@;\n` +
-          `try { $h = [IntPtr]::new([Int64]::Parse('${hwndHex}', [System.Globalization.NumberStyles]::AllowHexSpecifier)); [W]::ShowWindowAsync($h, 5) | Out-Null; [W]::SetForegroundWindow($h) | Out-Null; Start-Sleep -Milliseconds 120 } catch {};`
-        ) : safePid > 0 ? (
-          `Add-Type @"\n` +
-          `using System;\n` +
-          `using System.Runtime.InteropServices;\n` +
-          `public class W { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); }\n` +
-          `"@;\n` +
-          `try { $p = Get-Process -Id ${safePid} -ErrorAction Stop; [W]::SetForegroundWindow($p.MainWindowHandle) | Out-Null; Start-Sleep -Milliseconds 120 } catch {};`
-        ) : "";
-        const pwshSimple = `${activateBlock}Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait("^{v}"); Write-Output "OK:pwsh-paste"`;
-        const fallback = await runCommand("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", pwshSimple], {
-          timeoutMs: pasteMethodTimeoutMs(process.platform, 1),
+        const pwshScript = buildPwshPasteFallbackScript({
+          hwndHex: safeHwnd ? safeHwnd.slice(2) : "",
+          pid: Number.parseInt(String(effectiveTarget.pid || 0), 10) || 0,
         });
-        const pwshOutcome = evaluatePasteOutcome({ method: "pwsh_paste_fallback", ok: fallback.ok, stdout: fallback.stdout });
-        if (pwshOutcome.success) {
-          traceEnd(trace, "success", { method: "pwsh_paste_fallback", attempt: attempt + 1, verified: pwshOutcome.verified });
-          scheduleSmartClipboardRestore(clipboardLease, text, "paste:clipboardRestore:pwsh_fallback", pwshOutcome.verified);
-          return { ok: true, reason: pwshOutcome.reason || "OK:pwsh-paste", method: "pwsh_paste_fallback", verified: pwshOutcome.verified };
+        if (!pwshScript) {
+          lastReason = "pwsh-fallback-no-window-to-activate";
+        } else {
+          const fallback = await runCommand("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", pwshScript], {
+            timeoutMs: pasteMethodTimeoutMs(process.platform, 1),
+          });
+          const pwshOutcome = evaluatePasteOutcome({ method: "pwsh_paste_fallback", ok: fallback.ok, stdout: fallback.stdout });
+          if (pwshOutcome.success) {
+            traceEnd(trace, "success", { method: "pwsh_paste_fallback", attempt: attempt + 1, verified: pwshOutcome.verified });
+            scheduleSmartClipboardRestore(clipboardLease, text, "paste:clipboardRestore:pwsh_fallback", pwshOutcome.verified);
+            return { ok: true, reason: pwshOutcome.reason || "OK:pwsh-paste", method: "pwsh_paste_fallback", verified: pwshOutcome.verified };
+          }
+          lastReason = (fallback.stderr || pwshOutcome.reason || "pwsh-fallback-failed").trim();
         }
-        lastReason = (fallback.stderr || pwshOutcome.reason || "pwsh-fallback-failed").trim();
       }
     }
   } else if (process.platform === "linux") {
