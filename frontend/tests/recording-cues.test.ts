@@ -61,10 +61,23 @@ describe("recording cues", () => {
     expect(created).toBe(1);
   });
 
-  it("resumes a suspended context", () => {
-    const { ctx } = fakeContext("suspended");
-    createRecordingCuePlayer(() => ctx)("start");
+  it("resumes a suspended context and schedules the tone only once it runs", async () => {
+    // A suspended context's clock stands still: a tone scheduled on it
+    // before the resume lands in the past and is cut or dropped.
+    const { ctx, calls } = fakeContext("suspended");
+    expect(createRecordingCuePlayer(() => ctx)("start")).toBe("resuming");
     expect(ctx.resumed).toBe(1);
+    expect(calls).not.toContain("osc.start@10");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(calls).toContain("osc.start@10");
+  });
+
+  it("says what it did, for the renderer's log line", () => {
+    const { ctx } = fakeContext();
+    expect(createRecordingCuePlayer(() => ctx)("start")).toBe("played");
+    expect(createRecordingCuePlayer(() => null)("start")).toBe("unavailable");
+    expect(createRecordingCuePlayer(() => { throw new Error("no device"); })("stop")).toBe("failed");
   });
 
   it("never throws: no audio support, or a context that fails", () => {

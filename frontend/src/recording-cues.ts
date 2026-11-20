@@ -8,16 +8,25 @@
  * moments that matter, whatever started or stopped the take (hotkey,
  * button, auto-stop):
  *
- *  - start — it is safe to speak: at the press when the warm microphone
- *    is adopted (it has been capturing all along), else when the first
- *    audio frame arrives;
+ *  - start — the take started (at the press);
  *  - stop  — the take stopped (at the press).
+ *
+ * Both sound at the press, whatever the microphone. The start tone used
+ * to wait for the first audio frame on a cold start, and a cold start is
+ * every take on a Bluetooth headset (the warm hold refuses Bluetooth):
+ * that frame lands while the headset is switching from its music profile
+ * to its call profile, when its output is re-routed and muted, so the
+ * 75 ms tone was never heard (user, 2026-11-20 15:36, "Leo Liberty 5 BT").
+ * At the press the output has not started switching yet.
  *
  * The tone shapes are the overlay's original ones — a 75 ms rising
  * triangle for start, a 90 ms falling one for stop — at a gain the user
- * can actually hear. Start sounds at the press when the warm microphone
- * is adopted (it has been capturing all along), else at the first frame;
- * stop sounds at the press.
+ * can actually hear.
+ *
+ * A suspended context is resumed BEFORE the tone is scheduled: its clock
+ * stands still while suspended, so a tone scheduled on it lands in the
+ * past once it runs and is cut or dropped. The player returns what it
+ * did, for the renderer's log line — the cue leaves no other trace.
  *
  * Best effort by design: a cue never throws and never delays the
  * recording path. Tested with a fake AudioContext —
@@ -55,13 +64,31 @@ type CueAudioContext = Pick<AudioContext, "currentTime" | "state" | "destination
  */
 export function createRecordingCuePlayer(
   createContext: () => CueAudioContext | null = defaultCueContext,
-): (kind: RecordingCueKind) => void {
+): (kind: RecordingCueKind) => RecordingCueResult {
   let ctx: CueAudioContext | null = null;
   return (kind) => {
     try {
       if (!ctx) ctx = createContext();
-      if (!ctx) return;
-      if (ctx.state === "suspended") ctx.resume().catch(() => {});
+      if (!ctx) return "unavailable";
+      const live = ctx;
+      if (live.state === "suspended") {
+        live.resume().then(() => scheduleCue(live, kind), () => {});
+        return "resuming";
+      }
+      scheduleCue(live, kind);
+      return "played";
+    } catch {
+      // A cue is feedback, never a reason for a recording to fail.
+      return "failed";
+    }
+  };
+}
+
+/** What a cue did: sounded now, sounds once the output resumes, or could not. */
+export type RecordingCueResult = "played" | "resuming" | "unavailable" | "failed";
+
+function scheduleCue(ctx: CueAudioContext, kind: RecordingCueKind): void {
+  try {
       const cue = RECORDING_CUES[kind];
       const now = ctx.currentTime;
       const osc = ctx.createOscillator();
@@ -76,10 +103,9 @@ export function createRecordingCuePlayer(
       gain.connect(ctx.destination);
       osc.start(now);
       osc.stop(now + cue.durationSec + CUE_RELEASE_TAIL_SEC);
-    } catch {
-      // A cue is feedback, never a reason for a recording to fail.
-    }
-  };
+  } catch {
+    // A cue is feedback, never a reason for a recording to fail.
+  }
 }
 
 function defaultCueContext(): CueAudioContext | null {
