@@ -3,6 +3,12 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.13] - 2026-11-21
+
+### Removed
+
+- **No red frame around the screen in screen mode.** The capsule and the drawing bar already show that screen mode is on; the frame only got in the way (and was cut off at a MacBook's rounded corners).
+
 ## [1.6.12] - 2026-11-21
 
 ### Added

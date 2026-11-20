@@ -45,8 +45,6 @@ const SCREEN_MODE = Object.freeze({
   tools: Object.freeze(["rect", "pen"]),
   // 1.5 times thinner than the first 4 (user, 2026-11-21).
   strokeWidth: 2.5,
-  borderColor: "#ff3b30",
-  borderWidth: 3,
   // The number in a circle of the stroke's colour (DIP); the digit is
   // always black — every palette colour is bright (user, 2026-11-21).
   badge: Object.freeze({ digitColor: "#000000", radius: 10, gap: 3, fontSize: 12, fontWeight: 700, fontFamily: "-apple-system, system-ui, sans-serif" }),

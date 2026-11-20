@@ -155,7 +155,7 @@ desktop/
 ├── power-events.js                 # powerMonitor subscription SSOT: each handler subscribed exactly once at startup (pure, node --test)
 ├── recording-status.js             # recording-capsule status classification SSOT: one ladder both sides read (pure, node --test)
 ├── screen-mode.js                  # screen-mode rules SSOT: session record, stroke position, manifest, shared names (pure, node --test)
-├── screen-mode-controller.js       # screen-mode I/O: overlays + red frame, palette, native helper (its taps on our controls delivered in-process), display hot-plug, screencapture + compositing
+├── screen-mode-controller.js       # screen-mode I/O: drawing overlays (no frame), palette, native helper (its taps on our controls delivered in-process), display hot-plug, screencapture + compositing
 ├── native/screen-input/            # CGEventTap helper (main.swift) + PressClassifier.swift, the one click-vs-stroke rule (built by scripts/build-native.sh)
 ├── child-io.js                     # child-process text-output decoding SSOT (UTF-16LE on win32) (pure, node --test)
 ├── backend-runtime-check.js        # boot import check verdict: a timeout blames nobody, a real failure is attributed engine-site vs bundle (pure, node --test)

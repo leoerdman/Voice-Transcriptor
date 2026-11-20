@@ -1053,3 +1053,10 @@ test("the stopping take ends a live session under another id: its drawings and p
     world.cleanup();
   }
 });
+
+test("screen mode draws no frame around the screen: the overlay is the strokes' canvas only (user, 2026-11-21)", () => {
+  const { overlayHtml } = require("./screen-mode-controller");
+  const html = overlayHtml();
+  assert.doesNotMatch(html, /id="frame"|#frame|border:/);
+  assert.match(html, /<canvas id="cv"><\/canvas>/);
+});

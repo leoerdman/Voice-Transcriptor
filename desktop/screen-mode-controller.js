@@ -5,8 +5,10 @@
  *
  * Owns, for the length of one screen-mode recording:
  *
- *   * one transparent overlay window per display — a red frame around the
- *     screen and a canvas the strokes are drawn on. The overlays never
+ *   * one transparent overlay window per display — a canvas the strokes
+ *     are drawn on, and nothing else: no frame around the screen (the
+ *     capsule and the palette already say screen mode is on; user,
+ *     2026-11-21). The overlays never
  *     receive the mouse (`setIgnoreMouseEvents(true)`): clicks, scrolls and
  *     hovers reach the apps underneath as if the overlay were not there;
  *   * the tool palette — a small floating pill above the capsule: the
@@ -47,7 +49,7 @@
  *
  * Starting is all or nothing: `start` answers ok only once the helper
  * reports its tap is live and at least one overlay is on screen; anything
- * less is torn down and reported (`onWarning`) instead of a red frame
+ * less is torn down and reported (`onWarning`) instead of a palette
  * that draws nothing. What the user SEES is one moment: the overlays, the
  * palette and the capsule in its screen shape are prepared hidden and
  * shown together (./screen-surfaces.js) — without waiting for the helper,
@@ -121,7 +123,7 @@ function paletteBoundsFor({ capsule, workArea, size, capsuleLayout }) {
 // helper that has said nothing by then is not going to draw anything.
 const HELPER_READY_TIMEOUT_MS = 5000;
 // How long the picture may wait for its slowest surface (a window whose
-// page never loads). A frame not ready by then fails the start; a capsule
+// page never loads). An overlay not ready by then fails the start; a capsule
 // or palette not ready by then is left out of the picture.
 const SURFACES_READY_TIMEOUT_MS = 3000;
 const PNG_DATA_URL_PREFIX = "data:image/png;base64,";
@@ -168,19 +170,17 @@ const SCREEN_START_OUTCOME = Object.freeze({
 });
 
 function overlayHtml() {
-  const border = SCREEN_MODE.borderWidth;
   const badge = SCREEN_MODE.badge;
   return `<!doctype html>
 <html><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
 <style>
   html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; }
-  #frame { position: fixed; inset: 0; border: ${border}px solid ${SCREEN_MODE.borderColor}; box-sizing: border-box; pointer-events: none; }
   #flash { position: fixed; inset: 0; background: #fff; opacity: 0; pointer-events: none; }
   canvas { position: fixed; inset: 0; width: 100%; height: 100%; }
 </style></head>
 <body>
-<canvas id="cv"></canvas><div id="frame"></div><div id="flash"></div>
+<canvas id="cv"></canvas><div id="flash"></div>
 <script>
   const cv = document.getElementById("cv");
   const ctx = cv.getContext("2d");
@@ -592,7 +592,7 @@ function createScreenModeController(deps) {
   }
 
   // Displays come and go during a take (a projector plugged in, a lid
-  // closed, the arrangement changed). Every display gets a frame; a
+  // closed, the arrangement changed). Every display gets an overlay; a
   // stroke already on a display that leaves stays in the session record.
   function watchDisplays() {
     const added = (_e, display) => {
@@ -1309,7 +1309,7 @@ function createScreenModeController(deps) {
       const helperDone = startHelper().catch((e) => {
         helperError = e;
         // A helper that cannot tap means a take that cannot draw: nothing
-        // is shown rather than a frame that is taken down again.
+        // is shown rather than surfaces that are taken down again.
         presenter.abort();
       });
       const prepareCapsule = typeof deps.prepareCapsule === "function" ? deps.prepareCapsule() : Promise.resolve(false);
