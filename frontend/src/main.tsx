@@ -60,8 +60,8 @@ import {
   type DualStreamDefaults,
 } from "./deepgram-dual";
 import { UI_COPY, applyStaticUiCopy, renderAcceptedFormatsHint, resultPaneTitle } from "./ui-copy";
-import { flashButtonFeedback } from "./button-feedback";
-import { acceleratorToDisplayTokens } from "./shortcut-display";
+import { flashButtonFeedback, flashCopyOutcome } from "./button-feedback";
+import { acceleratorToDisplayTokens, shortcutBadge } from "./shortcut-display";
 // D-015: the ONE retired-shortcut-pair rule, shared with desktop/main.js
 // rather than re-derived here. See the module's own docstring for why —
 // two hand-written copies of "this stored pair is retired" drifted when
@@ -77,6 +77,8 @@ import {
   explainNetworkError,
   installErrorAwareConsole,
   isGenericFetchFailure,
+  formatErrorDetail,
+  isPermissionRefusal,
 } from "./error-text";
 import {
   RECORDINGS_WINDOW_MINIMUM,
@@ -109,7 +111,7 @@ import {
 } from "./transcript-merge";
 import { mergeInterim } from "./live-source";
 import { checkForUpdate, shouldAutoCheck } from "./update-check";
-import { mayAutosaveUiPreferences } from "./settings-autosave";
+import { catalogChoiceForSave, mayAutosaveUiPreferences } from "./settings-autosave";
 import {
   CLI_ACCESS_OFF,
   cliSectionView,
@@ -118,6 +120,34 @@ import {
 } from "./cli-section";
 import { recordingOutputIsPasteReady } from "./recording-output";
 import { smartRecordingTitle } from "./recording-title";
+import { historyFailureSurfaces, noticeSurfaces } from "./notice-surface";
+import { recoverySummary } from "./recovery-summary";
+import { networkVerdict, type NetworkProbeOutcome } from "./network-probe";
+import { keyEventToAccelerator } from "./shortcut-capture";
+import { keyAction, performKeyAction, type KeyAction } from "./key-action";
+import { keepaliveFor } from "./keepalive";
+import { parseRuntimeLimits } from "./runtime-limits";
+import { screenThumbLabel, screensStripNote } from "./screens-strip";
+import { fallbackSourceKey, isCurrentPlayerSource } from "./player-source";
+import { parseRecordingSaveResponse, planRecordingSave, recordingSaveFormEntries } from "./recording-save";
+import {
+  PROVIDER_DISPLAY_ORDER,
+  isRemoteProvider,
+  normalizeProviderSelection,
+  providerKeyErrorMessage,
+  providerLabel,
+  requireRemoteProvider,
+} from "./providers";
+import { waitForJob } from "./job-poll";
+import {
+  LIVE_DRAFT_SCHEMA_VERSION,
+  LiveDraftOperationQueue,
+  parsePersistedLiveDraftPayload,
+  recoveredDraftProvider,
+  type LiveDraftOperation,
+  type PersistedLiveDraft,
+} from "./live-draft";
+import { BoundedChunkWindow, capturedHoursLabel, pcmWavDurationSec } from "./pcm-capture";
 import {
   annotateTranscript,
   parseScreenManifest,
@@ -897,19 +927,13 @@ function installAppearanceStateClasses(): void {
     root.dataset.colorScheme = scheme;
   };
 
+  // ``MediaQueryList.addEventListener`` exists in every Chromium the shell
+  // ships (the build targets chrome142); the ``addListener`` branch that
+  // stood here for older engines could not run.
   const bindMedia = (mql: MediaQueryList) => {
     const listener = () => apply();
-    if (typeof mql.addEventListener === "function") {
-      mql.addEventListener("change", listener);
-      cleanupFns.push(() => mql.removeEventListener("change", listener));
-      return;
-    }
-    const legacy = mql as MediaQueryList & {
-      addListener?: (listener: () => void) => void;
-      removeListener?: (listener: () => void) => void;
-    };
-    legacy.addListener?.(listener);
-    cleanupFns.push(() => legacy.removeListener?.(listener));
+    mql.addEventListener("change", listener);
+    cleanupFns.push(() => mql.removeEventListener("change", listener));
   };
 
   for (const { mql } of media) bindMedia(mql);
@@ -988,9 +1012,22 @@ let LIVE_SAMPLE_RATE_HZ = 16_000;
 const UI_TOKENS = {
   polling: {
     remoteChunkSettleTimeoutMs: 3_000,
+    /** Waiting for a backend job: see ./job-poll for what each field decides. */
+    backendJob: {
+      fastMs: 900,
+      slowMs: 3_000,
+      slowAfterMs: 30_000,
+      maxConsecutiveFailures: 3,
+    },
   },
   draft: {
     autosaveIntervalMs: 1_200,
+    /**
+     * Waits before each retry of a failed draft clear (backend restart,
+     * the endpoint's rate limiter). A clear that never lands leaves the
+     * finished dictation to be recovered again on the next start.
+     */
+    clearRetryDelaysMs: [500, 2_000, 5_000],
   },
   timer: {
     tickMs: 200,
@@ -1036,6 +1073,12 @@ const UI_TOKENS = {
   recordings: {
     /** Longest wait for a <audio> element to report itself playable. */
     viewerAudioReadyTimeoutMs: 1_500,
+    /**
+     * How long a downloaded recording's blob URL outlives the click, so
+     * the browser's download stream finishes reading it first. Generous
+     * for a multi-MB recording.
+     */
+    downloadRevokeDelayMs: 30_000,
     /** Cap on the first archive read, after which the view opens empty. */
     bootstrapTimeoutMs: 15_000,
     /** Coalescing window after a save, before the archive is re-read. */
@@ -1239,6 +1282,11 @@ const UI_TOKENS = {
      *   defaultEmptyRecoveryMs — the same for a recording of any length.
      */
     smallAudioUiMs: 13_000,
+    /**
+     * Longest wait for an <audio> element to report the captured
+     * container's duration while the stop picks the canonical audio.
+     */
+    containerProbeTimeoutMs: 2_500,
     shortEmptyRecoveryMs: 8_000,
     defaultEmptyRecoveryMs: 20_000,
   },
@@ -1435,8 +1483,8 @@ function invalidateTranscriptionCatalog(): void {
 /**
  * Render BOTH toolbars (Transcribe + Upload mirror) from the single
  * state. Idempotent rebuild (BUG-58 pattern): options are rewritten only
- * when their value:availability signature changes, so the 2 s health
- * poll never closes an open dropdown.
+ * when their value:availability signature changes, so the 10 s health
+ * poll (``_networkPoll``) never closes an open dropdown.
  */
 function renderTranscriptionSelectors(): void {
   const groups = transcriptionCatalog();
@@ -2260,19 +2308,15 @@ function applyKeytermBudgetNote(budget: number): void {
   note.textContent = base + sentence;
 }
 
+/** The backend owns these numbers (./runtime-limits); a rejected one is logged. */
 function applyRuntimeLimits(limits: unknown): void {
-  if (!limits || typeof limits !== "object") return;
-  const root = limits as {
-    upload_queue_max_parallel?: unknown;
-    upload_queue_max_persisted_items?: unknown;
-  };
-  const uploadParallel = Number(root.upload_queue_max_parallel);
-  if (Number.isFinite(uploadParallel) && uploadParallel >= 1 && uploadParallel <= 8) {
-    uploadQueueMaxParallel = Math.trunc(uploadParallel);
+  const parsed = parseRuntimeLimits(limits);
+  if (parsed.uploadQueueMaxParallel !== undefined) uploadQueueMaxParallel = parsed.uploadQueueMaxParallel;
+  if (parsed.uploadQueueMaxPersistedItems !== undefined) {
+    uploadQueueMaxPersistedItems = parsed.uploadQueueMaxPersistedItems;
   }
-  const persistedItems = Number(root.upload_queue_max_persisted_items);
-  if (Number.isFinite(persistedItems) && persistedItems >= 1 && persistedItems <= 1000) {
-    uploadQueueMaxPersistedItems = Math.trunc(persistedItems);
+  if (parsed.rejected.length) {
+    console.warn(`runtime_limits: ignored ${parsed.rejected.join(", ")} (not a positive integer)`);
   }
 }
 
@@ -2394,12 +2438,7 @@ function base64UrlEncodeUtf8(value: string): string {
  * nothing.
  */
 function cssEscape(value: string): string {
-  const nativeEscape = globalThis.CSS?.escape;
-  if (typeof nativeEscape === "function") return nativeEscape(String(value));
-  // Quoted attribute-selector context: a backslash before every
-  // character that could end the string or the selector is sufficient
-  // and, unlike the previous attempt, cannot lose one.
-  return String(value).replace(/["'\\\]]/g, (char) => `\\${char}`);
+  return CSS.escape(String(value));
 }
 
 function websocketAuthProtocols(): string[] {
@@ -2409,11 +2448,15 @@ function websocketAuthProtocols(): string[] {
   ];
 }
 
+/**
+ * A session id: an OPFS spool filename and the backend's session key.
+ * `crypto.randomUUID` ships in every Chromium the shell runs on; the
+ * `Date.now()+Math.random()` fallback that stood here was unreachable,
+ * and the one property it would have weakened — uniqueness — is the one
+ * both consumers rely on (see `cssEscape` for why such fallbacks go).
+ */
 function createClientSessionId(): string {
-  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
-    return globalThis.crypto.randomUUID();
-  }
-  return `live-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+  return crypto.randomUUID();
 }
 
 function revokeCurrentRecordingAudioUrl(): void {
@@ -2691,12 +2734,16 @@ async function renderLatestSavedAudio(): Promise<void> {
   // setCurrentRecordingAudio call (post-save, with savedName) was
   // forced through a full re-render, revoking + re-creating an
   // unused ObjectURL on every save tick.
+  // The in-memory fallback attached after a failed backend fetch counts
+  // as "this recording's source" too (./player-source).
   if (
     latestSavedAudioState
     && latestSavedAudioState.savedName
-    && desiredBackendKey
-    && currentRecordingAudioSourceKey === desiredBackendKey
-    && !!audioEl.getAttribute("src")
+    && isCurrentPlayerSource({
+      desiredBackendKey,
+      attachedKey: currentRecordingAudioSourceKey,
+      hasSrc: !!audioEl.getAttribute("src"),
+    })
   ) {
     row.hidden = false;
     const retranscribeBtn = document.getElementById("retranscribeBtn");
@@ -2779,7 +2826,7 @@ async function renderLatestSavedAudio(): Promise<void> {
   if (!playbackUrl && latestSavedAudioState.file) {
     playbackUrl = URL.createObjectURL(latestSavedAudioState.file);
     playbackSourceKey = latestSavedAudioState.savedName
-      ? `${desiredBackendKey}\nfallback-file`
+      ? fallbackSourceKey(desiredBackendKey)
       : "session-file";
   }
   if (!playbackUrl) {
@@ -2935,18 +2982,21 @@ function setCurrentRecordingAudio(file: File | null, savedName = "", archiveDir 
     document.body.removeChild(a);
     if (revokeAfter) {
       // Defer revoke so the browser's download stream finishes reading
-      // the blob first. 30 s is generous for a multi-MB recording.
+      // the blob first.
       window.setTimeout(() => {
         try { URL.revokeObjectURL(url); } catch { /* idempotent */ }
-      }, 30_000);
+      }, UI_TOKENS.recordings.downloadRevokeDelayMs);
     }
   });
 })();
 
 // Audio element error handler — Windows users reported playback fails
-// on the just-recorded clip. Without this hook the failure was silent;
-// now any media-element error is logged so we can diagnose codec /
-// MIME / blob-revocation issues from the support bundle.
+// on the just-recorded clip: the in-memory fallback can be an OPFS-lazy
+// blob whose spool was already destroyed (error code=4). Logging alone
+// left the controls enabled over a player that plays nothing; the
+// failure is now reported like every other audio-load failure in this
+// pane, and the source key is dropped so the next refresh tries the
+// backend again instead of keeping the dead source.
 (() => {
   const audioEl = document.getElementById("currentRecordingAudio") as HTMLAudioElement | null;
   if (!audioEl) return;
@@ -2957,26 +3007,12 @@ function setCurrentRecordingAudio(file: File | null, savedName = "", archiveDir 
     const src = audioEl.currentSrc || audioEl.src || "";
     const fileType = latestSavedAudioState?.file?.type || "";
     console.warn(`[currentRecordingAudio] media error code=${code} msg=${msg} mime=${fileType} src=${src.slice(0, 120)}`);
+    if (!audioEl.getAttribute("src")) return;
+    currentRecordingAudioSourceKey = "";
+    setPlayerEnabled(false, AUDIO_LOAD_FAILED_TEXT);
+    showRecordSessionNotice(AUDIO_LOAD_FAILED_TEXT, "warning", UI_TOKENS.notice.briefMs);
   });
 })();
-
-function providerLabel(provider: string): string {
-  const value = String(provider || "").trim().toLowerCase();
-  if (!value || value === "unknown") return "Unknown";
-  if (value === "none") return "None";
-  if (value === "local") return "Local";
-  if (value === "openrouter") return "OpenRouter";
-  if (value === "deepgram") return "Deepgram";
-  return provider;
-}
-
-/**
- * The order the three providers are shown in, wherever a list of them
- * is shown. Was written out twice in a row inside the stats renderer,
- * three lines apart, as the third copy of a fact already stated by
- * ``providerLabel`` and by the ``Provider`` type.
- */
-const PROVIDER_DISPLAY_ORDER: ReadonlyArray<string> = ["local", "openrouter", "deepgram"];
 
 /**
  * Whether a provider name recorded in the archive is one this build has.
@@ -2993,22 +3029,10 @@ function isKnownProviderName(name: string): boolean {
   return !!key && !RETIRED_PROVIDER_NAMES.has(key);
 }
 
-function normalizeProviderSelection(value: unknown, fallback: Provider = "local"): Provider {
-  const provider = String(value ?? "").trim();
-  if (provider === "" || provider === "local" || provider === "openrouter" || provider === "deepgram") {
-    return provider;
-  }
-  return fallback;
-}
-
 const REMOTE_SMALL_AUDIO_BYTES = 1 * 1024 * 1024;
 const DEEPGRAM_SMALL_AUDIO_UI_TIMEOUT_MS = UI_TOKENS.finalize.smallAudioUiMs;
 const LIVE_SHORT_EMPTY_RECOVERY_TIMEOUT_MS = UI_TOKENS.finalize.shortEmptyRecoveryMs;
 const LIVE_DEFAULT_EMPTY_RECOVERY_TIMEOUT_MS = UI_TOKENS.finalize.defaultEmptyRecoveryMs;
-function isRemoteProvider(provider: Provider): provider is RemoteProvider {
-  return provider === "openrouter" || provider === "deepgram";
-}
-
 function isRemoteProviderReachable(provider: Provider, providerReachabilityHint = false): boolean {
   return isRemoteProvider(provider) && (providerReachabilityHint || isNetworkOnline);
 }
@@ -3109,6 +3133,9 @@ function sanitizeUiErrorMessage(error: unknown, fallback: string): string {
     /failed to fetch dynamically imported module/i.test(cleaned) ||
     /unexpected token/i.test(cleaned)
   ) {
+    // The cause is replaced by a generic sentence on screen; keep it in
+    // the log so the replaced text is not lost along with the jargon.
+    console.warn(`sanitizeUiErrorMessage: showing "${fallback}" instead of:`, raw);
     return fallback;
   }
   // Length cap raised from 160 → 800 chars. The 160 cap was a defensive
@@ -3123,7 +3150,11 @@ function sanitizeUiErrorMessage(error: unknown, fallback: string): string {
   // is plenty for any actionable backend message; raw stack traces
   // are filtered by the regex tests above (which trigger the fallback
   // before we ever reach the length comparison).
-  return cleaned.length > 800 ? fallback : cleaned;
+  if (cleaned.length > 800) {
+    console.warn(`sanitizeUiErrorMessage: showing "${fallback}" instead of an ${cleaned.length}-char message:`, raw);
+    return fallback;
+  }
+  return cleaned;
 }
 
 function normalizeTranscriptSegment(raw: unknown, timeOffsetSec = 0): TranscriptSegment | null {
@@ -3310,6 +3341,12 @@ function showRecordSessionNotice(
     recordSessionNoticeTimer = window.setTimeout(() => {
       resetRecordSessionNotice();
     }, timeoutMs);
+  }
+  // The banner lives inside the Live view; from any other view the
+  // status pill is the surface the user can see (./notice-surface).
+  const visibleView = (["record", "upload", "recordings", "settings"] as const).find(isViewVisible) ?? null;
+  if (noticeSurfaces(visibleView).status) {
+    setStatus(text, toneToStatusKind(tone, text));
   }
 }
 
@@ -3856,16 +3893,18 @@ function clearMaskedKeyOnEdit(provider: RemoteProvider): void {
   el.readOnly = false;
 }
 
+function currentKeyAction(provider: RemoteProvider): KeyAction {
+  const input = keyInput(provider);
+  return keyAction({ saved: keySavedState[provider], masked: isMaskedKeyInput(input), value: input.value });
+}
+
 function syncKeyActionButton(provider: RemoteProvider): void {
   const btn = keyActionButton(provider);
-  const input = keyInput(provider);
-  const masked = isMaskedKeyInput(input);
-  const hasTyped = !masked && !!input.value.trim();
-  const canDelete = keySavedState[provider] && !hasTyped;
-  const canSave = hasTyped;
+  const action = currentKeyAction(provider);
+  const canDelete = action === "delete";
   btn.classList.toggle("delete", canDelete);
   btn.classList.toggle("save", !canDelete);
-  btn.disabled = !(canDelete || canSave);
+  btn.disabled = action === "none";
   btn.title = canDelete ? "Delete key" : "Save key";
   btn.setAttribute("aria-label", canDelete ? "Delete key" : "Save key");
 }
@@ -3874,13 +3913,9 @@ function syncKeyActionButton(provider: RemoteProvider): void {
 // process recording-state monitor. The frontend only publishes VU/RMS samples.
 
 /**
- * Translate a raw fetch/network error into a user-actionable message.
- *
- * The native "Failed to fetch" / "NetworkError when attempting to
- * fetch" / "ECONNREFUSED" strings are developer jargon. End users need
- * to know: (1) is the internet down, (2) is the provider blocked, or
- * (3) is our local backend dead. This helper inspects the error and
- * surfaces one of those three actionable diagnoses.
+ * The message of a non-ok backend response: its status line plus the
+ * body's ``detail`` (./error-text ``formatErrorDetail``) or raw text.
+ * (Turning network failures into advice is ``explainNetworkError``.)
  */
 async function parseError(r: Response): Promise<string> {
   // 1.1.25 fix: previously called ``await r.json()`` then on failure
@@ -3903,9 +3938,7 @@ async function parseError(r: Response): Promise<string> {
   try {
     const j: unknown = JSON.parse(trimmed);
     if (typeof j === "object" && j && "detail" in j) {
-      const detail = (j as { detail?: unknown }).detail;
-      const detailRaw = typeof detail === "string" ? detail : JSON.stringify(j);
-      return `${status}: ${detailRaw}`;
+      return `${status}: ${formatErrorDetail((j as { detail?: unknown }).detail)}`;
     }
     return `${status}: ${JSON.stringify(j)}`;
   } catch {
@@ -3921,24 +3954,21 @@ async function apiGet<T>(url: string, signal?: AbortSignal): Promise<T> {
   return (await r.json()) as T;
 }
 
-async function apiPost<T>(url: string, body: unknown): Promise<T> {
+async function apiPost<T>(
+  url: string,
+  body: unknown,
+  options: { keepalive?: boolean } = {},
+): Promise<T> {
+  const payload = JSON.stringify(body);
   const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeaders() },
-    body: JSON.stringify(body),
+    body: payload,
+    keepalive: keepaliveFor(payload, !!options.keepalive),
   });
   if (!r.ok) throw new Error(await parseError(r));
   return (await r.json()) as T;
 }
-
-/**
- * Browsers cap the body of a ``keepalive`` request at 64 KiB across all
- * in-flight keepalive requests; over that the fetch rejects outright.
- * A queue snapshot carrying two hundred transcripts can exceed it, and
- * a rejected save is worse than an interrupted one, so the flag is
- * dropped for a payload that would not fit.
- */
-const KEEPALIVE_MAX_BODY_BYTES = 60_000;
 
 async function apiPut<T>(
   url: string,
@@ -3946,16 +3976,21 @@ async function apiPut<T>(
   options: { keepalive?: boolean } = {},
 ): Promise<T> {
   const payload = JSON.stringify(body);
-  const keepalive = !!options.keepalive
-    && new TextEncoder().encode(payload).length <= KEEPALIVE_MAX_BODY_BYTES;
   const r = await fetch(url, {
     method: "PUT",
     headers: { "Content-Type": "application/json", ...authHeaders() },
     body: payload,
-    keepalive,
+    keepalive: keepaliveFor(payload, !!options.keepalive),
   });
   if (!r.ok) throw new Error(await parseError(r));
   return (await r.json()) as T;
+}
+
+/** The ``apiGet`` of a binary resource: same auth, same error text. */
+async function apiGetBlob(url: string, signal?: AbortSignal): Promise<Blob> {
+  const r = await fetch(url, { headers: authHeaders(), signal });
+  if (!r.ok) throw new Error(await parseError(r));
+  return r.blob();
 }
 
 async function apiDelete<T>(url: string): Promise<T> {
@@ -4035,7 +4070,8 @@ function downsample(buf: Float32Array, inRate: number, outRate: number): Float32
 //
 // The factory ``createPcmSink`` tries OPFS first and gracefully
 // degrades to memory on any failure, so callers never have to
-// branch. ``isDiskBacked`` lets the UI report which mode is active.
+// branch. A failed disk write is reported to the user by the OPFS sink
+// itself (it is the only party that sees it, at the moment it happens).
 //
 // Orphan cleanup: if the app crashes mid-recording, a ``.pcm16`` file
 // is left in ``pcm-spool/`` inside OPFS. ``cleanupOrphanPcmSpool``
@@ -4047,8 +4083,6 @@ interface PcmSink {
   finalize(sampleRate: number, name?: string): Promise<File>;
   destroy(): Promise<void>;
   readonly totalSamples: number;
-  readonly isDiskBacked: boolean;
-  readonly lastWriteError: Error | null;
 }
 
 function floatSamplesToInt16LE(samples: Float32Array): Int16Array {
@@ -4158,8 +4192,13 @@ class OpfsPcmSink implements PcmSink {
   private dir: OpfsFileSystemDirectoryHandle;
   private fileHandle: OpfsFileSystemFileHandle;
   private writable: OpfsFileSystemWritableFileStream | null;
-  private pendingChunks: Int16Array[] = [];
-  private pendingBytes = 0;
+  /**
+   * Samples not yet on disk. Normally a microtask's worth; after a failed
+   * write it is the whole rest of the recording, so it is bounded by the
+   * same window as every other RAM fallback (see ./pcm-capture).
+   */
+  private pending = new BoundedChunkWindow(UI_TOKENS.capture.fallbackWindowSec * LIVE_SAMPLE_RATE_HZ);
+  private ramTruncationReported = false;
   private flushInProgress = false;
   /** Awaitable handle for the currently-running flush; resolves when done. */
   private flushDone: Promise<void> = Promise.resolve();
@@ -4180,8 +4219,7 @@ class OpfsPcmSink implements PcmSink {
   /** Samples that arrived after the finalize drain barrier. */
   private strandedAfterDrain = 0;
   totalSamples = 0;
-  readonly isDiskBacked = true;
-  lastWriteError: Error | null = null;
+  private lastWriteError: Error | null = null;
 
   constructor(
     dir: OpfsFileSystemDirectoryHandle,
@@ -4234,8 +4272,7 @@ class OpfsPcmSink implements PcmSink {
       return;
     }
     const int16 = floatSamplesToInt16LE(samples);
-    this.pendingChunks.push(int16);
-    this.pendingBytes += int16.byteLength;
+    if (this.pending.push(int16)) this.reportRamTruncation();
     this.totalSamples += int16.length;
     if (this.lastWriteError) return;
     this.scheduleFlush();
@@ -4258,15 +4295,13 @@ class OpfsPcmSink implements PcmSink {
     // cannot be the test for "may I still write".
     if (this.closing) return;
     if (!this.writable) return;
-    if (!this.pendingChunks.length) return;
+    if (!this.pending.samples) return;
     this.flushInProgress = true;
     // Record a promise that outer callers (finalize) can await instead
     // of polling flushInProgress with a bounded busy-wait.
     let _resolveDone!: () => void;
     this.flushDone = new Promise<void>((r) => { _resolveDone = r; });
-    const chunks = this.pendingChunks;
-    this.pendingChunks = [];
-    this.pendingBytes = 0;
+    const chunks = this.pending.take();
     try {
       const totalBytes = chunks.reduce((a, c) => a + c.byteLength, 0);
       const merged = new Uint8Array(totalBytes);
@@ -4277,21 +4312,40 @@ class OpfsPcmSink implements PcmSink {
       }
       await this.writable.write(merged);
     } catch (e) {
+      const firstFailure = !this.lastWriteError;
       this.lastWriteError = e instanceof Error ? e : new Error(String(e));
       // Re-enqueue the failed chunks so finalize() can still produce a
       // WAV from in-memory data via the WebM fallback path. Without this
       // the samples in ``chunks`` are GC'd and permanently lost.
-      this.pendingChunks = [...chunks, ...this.pendingChunks];
-      this.pendingBytes = this.pendingChunks.reduce((a, c) => a + c.byteLength, 0);
+      const truncatedNow = this.pending.restoreHead(chunks);
       console.warn("OpfsPcmSink: write failed — disk may be full or permissions revoked", e);
+      // From here every sample lives in RAM until stop. The member
+      // existed "so the UI can report it" and nothing read it: the user
+      // kept dictating with no idea the disk copy had stopped.
+      if (firstFailure) {
+        showRecordSessionNotice(
+          `Could not write the recording to disk — it continues in memory, and only the last ${capturedHoursLabel(UI_TOKENS.capture.fallbackWindowSec)} are kept.`,
+          "warning",
+          UI_TOKENS.notice.longMs,
+        );
+      } else if (truncatedNow) {
+        this.reportRamTruncation();
+      }
     } finally {
       this.flushInProgress = false;
       _resolveDone();
       this.flushDone = Promise.resolve();
-      if (this.pendingChunks.length && !this.lastWriteError) {
+      if (this.pending.samples && !this.lastWriteError) {
         this.scheduleFlush();
       }
     }
+  }
+
+  /** Once per session: the RAM tail reached the window and lost its oldest audio. */
+  private reportRamTruncation(): void {
+    if (this.ramTruncationReported) return;
+    this.ramTruncationReported = true;
+    console.warn(`OpfsPcmSink: RAM tail exceeded the capture window; ${this.pending.droppedSamples} sample(s) dropped`);
   }
 
   async finalize(sampleRate: number, name = `live-${Date.now()}.wav`): Promise<File> {
@@ -4321,7 +4375,12 @@ class OpfsPcmSink implements PcmSink {
       try {
         await this.writable.close();
       } catch (e) {
-        console.debug("OpfsPcmSink: close failed", e);
+        // ``close()`` is the commit of everything written so far; its
+        // failure can leave the spool without the bytes the writes
+        // reported. The duration that picks the canonical audio is read
+        // off the file (``pcmWavDurationSec``), so a short spool loses to
+        // the container on coverage instead of passing as complete.
+        console.warn("OpfsPcmSink: close failed — the disk spool may be incomplete", e);
       }
       this.writable = null;
     }
@@ -4332,16 +4391,19 @@ class OpfsPcmSink implements PcmSink {
     if (this.lastWriteError) {
       // 1.1.25 fix: previously returned an empty WAV here even though
       // ``flushPending``'s catch branch deliberately
-      // re-enqueues failed chunks into ``pendingChunks`` so finalize
+      // re-enqueues failed chunks into ``pending`` so finalize
       // can salvage them from RAM. Returning empty discarded the bytes
       // and forced the lower-fidelity WebM fallback for what was
       // typically a transient disk hiccup. Now we splice the in-memory
       // chunks together with whatever DID land on the OPFS spool: the
-      // spool prefix + the unwritten tail = a complete WAV.
+      // spool prefix + the unwritten tail. Complete only if close()
+      // committed the prefix and the tail never reached the window;
+      // otherwise the file is shorter than the counter, which is why
+      // its duration is read off the file.
       try {
         const spoolFile = await this.fileHandle.getFile();
         const spoolBytes = spoolFile.size;
-        const tailChunks = this.pendingChunks;
+        const tailChunks = this.pending.take();
         const tailBytes = tailChunks.reduce((a, c) => a + c.byteLength, 0);
         const totalDataBytes = spoolBytes + tailBytes;
         if (totalDataBytes === 0) {
@@ -4387,8 +4449,7 @@ class OpfsPcmSink implements PcmSink {
     } catch (e) {
       console.debug("OpfsPcmSink: destroy remove failed", e);
     }
-    this.pendingChunks = [];
-    this.pendingBytes = 0;
+    this.pending.clear();
   }
 }
 
@@ -4403,43 +4464,33 @@ class OpfsPcmSink implements PcmSink {
  * false of this one, which is the only sink a machine without OPFS gets.
  */
 class MemoryPcmSink implements PcmSink {
-  private chunks: Int16Array[] = [];
-  private bufferedSamples = 0;
-  private truncationWarned = false;
+  private window = new BoundedChunkWindow(UI_TOKENS.capture.fallbackWindowSec * LIVE_SAMPLE_RATE_HZ);
   private destroyed = false;
   totalSamples = 0;
-  readonly isDiskBacked = false;
-  lastWriteError: Error | null = null;
 
   append(samples: Float32Array): void {
     if (this.destroyed) return;
     if (!samples.length) return;
     const int16 = floatSamplesToInt16LE(samples);
-    this.chunks.push(int16);
-    this.bufferedSamples += int16.length;
     this.totalSamples += int16.length;
-    const cap = UI_TOKENS.capture.fallbackWindowSec * LIVE_SAMPLE_RATE_HZ;
-    while (this.bufferedSamples > cap && this.chunks.length > 1) {
-      const dropped = this.chunks.shift();
-      this.bufferedSamples -= dropped ? dropped.length : 0;
-      if (!this.truncationWarned) {
-        this.truncationWarned = true;
-        // Once per session, and said out loud: silently dropping the
-        // start of a recording reads as data loss, which is what it is.
-        showRecordSessionNotice(
-          "Recording exceeds 2 hours and this system has no disk spool — only the last 2 h of audio is kept.",
-          "warning",
-          9000,
-        );
-      }
+    if (this.window.push(int16)) {
+      // Once per session, and said out loud: silently dropping the
+      // start of a recording reads as data loss, which is what it is.
+      const span = capturedHoursLabel(UI_TOKENS.capture.fallbackWindowSec);
+      showRecordSessionNotice(
+        `Recording exceeds ${span} and this system has no disk spool — only the last ${span} of audio is kept.`,
+        "warning",
+        UI_TOKENS.notice.longMs,
+      );
     }
   }
 
   async finalize(sampleRate: number, name = `live-${Date.now()}.wav`): Promise<File> {
-    const totalBytes = this.chunks.reduce((a, c) => a + c.byteLength, 0);
+    const chunks = this.window.chunks;
+    const totalBytes = this.window.bytes;
     const merged = new Uint8Array(totalBytes);
     let offset = 0;
-    for (const c of this.chunks) {
+    for (const c of chunks) {
       merged.set(new Uint8Array(c.buffer, c.byteOffset, c.byteLength), offset);
       offset += c.byteLength;
     }
@@ -4450,8 +4501,7 @@ class MemoryPcmSink implements PcmSink {
 
   async destroy(): Promise<void> {
     this.destroyed = true;
-    this.chunks = [];
-    this.bufferedSamples = 0;
+    this.window.clear();
     this.totalSamples = 0;
   }
 }
@@ -4466,8 +4516,9 @@ async function createPcmSink(sessionId: string): Promise<PcmSink> {
 async function probeAudioFileDuration(file: File): Promise<number | null> {
   if (!(file instanceof File) || file.size <= 0) return null;
   const url = URL.createObjectURL(file);
+  const audio = document.createElement("audio");
+  let timer = 0;
   try {
-    const audio = document.createElement("audio");
     audio.preload = "metadata";
     const duration = await new Promise<number | null>((resolve) => {
       let settled = false;
@@ -4481,11 +4532,19 @@ async function probeAudioFileDuration(file: File): Promise<number | null> {
         finish(Number.isFinite(value) && value > 0 ? value : null);
       };
       audio.onerror = () => finish(null);
-      window.setTimeout(() => finish(null), 2500);
+      timer = window.setTimeout(() => finish(null), UI_TOKENS.finalize.containerProbeTimeoutMs);
       audio.src = url;
     });
     return duration;
   } finally {
+    // Detach before revoking: an element still loading metadata from a
+    // revoked URL keeps a dead source (and its decoder) until GC, and
+    // the timer outlived every probe that finished first.
+    window.clearTimeout(timer);
+    audio.onloadedmetadata = null;
+    audio.onerror = null;
+    audio.removeAttribute("src");
+    audio.load();
     URL.revokeObjectURL(url);
   }
 }
@@ -4527,9 +4586,11 @@ async function selectCanonicalCapturedAudio(opts: {
    *  or an in-memory Int16 buffer. Either way it's already a valid
    *  WAV — no encoding happens here. */
   pcmFile: File | null;
-  /** Total sample count reported by the sink. Used to derive
-   *  duration without loading the file back into an
-   *  ``HTMLAudioElement``. */
+  /** Total sample count reported by the sink. The duration is the
+   *  smaller of this and what the file holds (``pcmWavDurationSec``):
+   *  the counter includes samples a bounded RAM window dropped or a
+   *  failed disk commit lost. Neither needs the file loaded back into
+   *  an ``HTMLAudioElement``. */
   pcmSampleCount: number;
   pcmSampleRate: number;
   recordedChunks: Blob[];
@@ -4541,8 +4602,10 @@ async function selectCanonicalCapturedAudio(opts: {
   // A valid WAV from the sink has header (44 bytes) + payload. Empty
   // or header-only files indicate a sink write error; skip them and
   // fall back to the WebM container candidate below.
-  if (opts.pcmFile && opts.pcmFile.size > 44 && opts.pcmSampleCount > 0) {
-    const pcmDurationSec = opts.pcmSampleCount / opts.pcmSampleRate;
+  const pcmDurationSec = opts.pcmFile
+    ? pcmWavDurationSec(opts.pcmFile.size, opts.pcmSampleCount, opts.pcmSampleRate)
+    : 0;
+  if (opts.pcmFile && pcmDurationSec > 0) {
     const pcmFile = opts.pcmFile;
     // FAST PATH: a PCM capture that covers essentially all of the
     // expected duration skips the slow WebM probe altogether — the sink
@@ -4631,11 +4694,9 @@ async function stopMediaRecorderAndFlush(): Promise<void> {
     };
     recorder.addEventListener("stop", finish, { once: true });
     window.setTimeout(finish, MEDIA_RECORDER_STOP_FALLBACK_MS);
-    try {
-      recorder.requestData();
-    } catch (e) {
-      console.debug("MediaRecorder requestData rejected (harmless)", e);
-    }
+    // No ``requestData()`` first: ``stop()`` itself emits the final
+    // ``dataavailable`` before ``stop`` (MediaRecorder spec), so the
+    // extra call only split the last chunk in two.
     try {
       recorder.stop();
     } catch (e) {
@@ -4658,23 +4719,22 @@ function getRemoteModelValue(provider: Provider): string {
   return selectedLocalModel();
 }
 
+/**
+ * The remote model travels as ``model`` — the name every backend endpoint
+ * reads first. It used to be sent three times (``model``,
+ * ``remote_model``, ``openrouter_model``, the last two "legacy aliases
+ * kept for older clients"), although renderer and backend ship in one
+ * bundle and no older client exists; the backend side of the alias is
+ * listed for removal in the audit journal.
+ */
 function appendRemoteModelFormFields(fd: FormData, provider: Provider, model: string | undefined): void {
   if (!isRemoteProvider(provider)) return;
-  const value = String(model || "").trim();
-  fd.set("model", value);
-  fd.set("remote_model", value);
-  // Legacy backend alias. Keep it derived here so there is still one caller-side SSOT.
-  fd.set("openrouter_model", value);
+  fd.set("model", String(model || "").trim());
 }
 
 function remoteModelJsonFields(provider: Provider, model: string | undefined): Record<string, string> {
   if (!isRemoteProvider(provider)) return {};
-  const value = String(model || "").trim();
-  return {
-    model: value,
-    remote_model: value,
-    openrouter_model: value,
-  };
+  return { model: String(model || "").trim() };
 }
 
 async function remoteJob(
@@ -4683,7 +4743,7 @@ async function remoteJob(
 ): Promise<BackendJobCreated> {
   const fd = new FormData();
   fd.append("file", file, file.name || "audio.wav");
-  fd.set("provider", opts.provider || "openrouter");
+  fd.set("provider", requireRemoteProvider(opts.provider));
   fd.set("language", opts.language || "auto");
   fd.set("diarize", String(!!opts.diarize));
   appendRemoteModelFormFields(fd, opts.provider, opts.remoteModel);
@@ -4727,7 +4787,7 @@ async function remoteJobFromPath(
     signal: opts.signal,
     body: JSON.stringify({
       source_path: sourcePath,
-      provider: opts.provider || "openrouter",
+      provider: requireRemoteProvider(opts.provider),
       language: opts.language || "auto",
       diarize: !!opts.diarize,
       ...remoteModelJsonFields(opts.provider, opts.remoteModel),
@@ -4768,6 +4828,26 @@ async function cancelBackendJob(jobId: string): Promise<void> {
   }
 }
 
+function sleepUnlessAborted(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let timer = 0;
+    const cleanup = () => {
+      window.clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    timer = window.setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/** How a job wait reacts to failures and when it gives up: ./job-poll. */
 async function waitForBackendJob<T>(
   jobId: string,
   opts: {
@@ -4775,47 +4855,25 @@ async function waitForBackendJob<T>(
     onProgress?: (job: BackendJobState<T>) => void;
   } = {},
 ): Promise<T> {
-  const startedAt = performance.now();
-  while (true) {
-    if (opts.signal?.aborted) {
-      throw new DOMException("Aborted", "AbortError");
-    }
-    const r = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
-      headers: authHeaders(),
-      signal: opts.signal,
-    });
-    if (!r.ok) throw new Error(await parseError(r));
-    const job = (await r.json()) as BackendJobState<T>;
-    opts.onProgress?.(job);
-    if (job.status === "done") {
-      if (!job.result) throw new Error("Job finished without a result.");
-      return job.result;
-    }
-    if (job.status === "error") {
-      throw new Error(String(job.error || "Transcription failed."));
-    }
-    if (job.status === "cancelled") {
-      throw new DOMException("Aborted", "AbortError");
-    }
-    const pollMs = performance.now() - startedAt > 30_000 ? 3_000 : 900;
-    await new Promise<void>((resolve, reject) => {
-      const signal = opts.signal;
-      let timer = 0;
-      const cleanup = () => {
-        window.clearTimeout(timer);
-        signal?.removeEventListener("abort", onAbort);
-      };
-      const onAbort = () => {
-        cleanup();
-        reject(new DOMException("Aborted", "AbortError"));
-      };
-      timer = window.setTimeout(() => {
-        cleanup();
-        resolve();
-      }, pollMs);
-      signal?.addEventListener("abort", onAbort, { once: true });
-    });
-  }
+  return waitForJob<T>(
+    {
+      fetchJob: async (signal) => {
+        const r = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
+          headers: authHeaders(),
+          signal,
+        });
+        if (!r.ok) throw new Error(await parseError(r));
+        return (await r.json()) as BackendJobState<T>;
+      },
+      sleep: sleepUnlessAborted,
+      cancel: () => cancelBackendJob(jobId),
+      now: () => performance.now(),
+      onProgress: (job) => opts.onProgress?.(job as BackendJobState<T>),
+      onTransientFailure: (e, n) => console.warn(`job ${jobId}: poll failed (${n} in a row), retrying`, e),
+    },
+    UI_TOKENS.polling.backendJob,
+    opts.signal,
+  );
 }
 
 async function waitForQueuedRemoteJob(
@@ -4950,7 +5008,7 @@ async function remoteJobSync(
   const abortSignal = createLinkedAbortSignal(opts.signal, timeoutMs);
   const fd = new FormData();
   fd.append("file", file, file.name || "audio.wav");
-  fd.set("provider", opts.provider || "openrouter");
+  fd.set("provider", requireRemoteProvider(opts.provider));
   fd.set("language", opts.language || "auto");
   fd.set("diarize", String(!!opts.diarize));
   appendRemoteModelFormFields(fd, opts.provider, opts.remoteModel);
@@ -4962,7 +5020,7 @@ async function remoteJobSync(
       signal: abortSignal.signal,
     });
     if (!r.ok) throw new Error(await parseError(r));
-    const js = (await r.json()) as { ok?: boolean; result?: { text?: string; provider?: string; model?: string } };
+    const js = (await r.json()) as { result?: { text?: string; provider?: string; model?: string } };
     return {
       text: String(js?.result?.text || "").trim(),
       provider: String(js?.result?.provider || opts.provider || ""),
@@ -4978,25 +5036,14 @@ async function remoteJobSync(
   }
 }
 
-function isProviderKeyConfigured(provider: Provider): boolean {
-  if (provider === "local" || !provider) return true;
-  if (provider === "openrouter") {
-    return hasOpenrouterKey;
-  }
-  if (provider === "deepgram") {
-    return hasDeepgramKey;
-  }
-  return true;
-}
+/** Keyed by the remote set (./providers), so a new provider must say where its key lives. */
+const REMOTE_PROVIDER_KEY_CONFIGURED: Record<RemoteProvider, () => boolean> = {
+  openrouter: () => hasOpenrouterKey,
+  deepgram: () => hasDeepgramKey,
+};
 
-function providerKeyErrorMessage(provider: Provider): string {
-  if (provider === "deepgram") {
-    return "Deepgram API key is not configured. Add it in Settings -> API Keys.";
-  }
-  if (provider === "openrouter") {
-    return "OpenRouter API key is not configured. Add it in Settings -> API Keys.";
-  }
-  return "Provider API key is not configured.";
+function isProviderKeyConfigured(provider: Provider): boolean {
+  return !isRemoteProvider(provider) || REMOTE_PROVIDER_KEY_CONFIGURED[provider]();
 }
 
 function syncRecordingsSearchControls(): void {
@@ -5151,29 +5198,19 @@ async function recoverBackendAudioSessions(): Promise<void> {
       console.warn(`Recovery promote exception for ${sessionId}:`, e);
     }
   }
+  const summary = recoverySummary(succeeded, failed);
+  if (!summary) return;
+  showRecordSessionNotice(summary.text, summary.tone, UI_TOKENS.notice.longMs);
   if (succeeded > 0) {
-    showRecordSessionNotice(
-      `Recovered ${succeeded} interrupted recording${succeeded === 1 ? "" : "s"} into Recordings.`,
-      "success",
-      9000,
-    );
     void loadRecordings(true).catch((e) => {
       console.warn("Recovery History refresh failed", e);
       const msg = sanitizeUiErrorMessage(e, "Could not refresh the archive.");
-      setStatus(`Recovery saved. History refresh failed: ${msg}`, "warning");
       showRecordSessionNotice(
-        `Recovered ${succeeded} interrupted recording${succeeded === 1 ? "" : "s"}, but History refresh failed: ${msg}`,
+        `${summary.text} History refresh failed: ${msg}`,
         "warning",
-        9000,
+        UI_TOKENS.notice.longMs,
       );
     });
-  }
-  if (failed > 0 && succeeded === 0) {
-    showRecordSessionNotice(
-      `Could not recover ${failed} interrupted recording${failed === 1 ? "" : "s"}. Check the Recordings folder manually.`,
-      "warning",
-      9000,
-    );
   }
 }
 
@@ -5299,6 +5336,17 @@ function setNetworkState(online: boolean, latencyMs: number | null = null): void
   pill.setAttribute("title", latencyMs != null ? `Internet is available (${latencyMs} ms)` : "Internet is available");
 }
 
+/**
+ * The app's own backend did not answer the liveness probe. Not
+ * "Offline": the internet state is unknown and the last known one keeps
+ * deciding provider routing (./network-probe).
+ */
+function setBackendUnreachable(): void {
+  $("netDot").className = "net-dot offline";
+  $("netText").textContent = "No backend";
+  $("netPill").setAttribute("title", "The app's backend is not responding");
+}
+
 function parseViewName(value: string): ViewName {
   return value === "upload" || value === "recordings" || value === "settings" || value === "record"
     ? value
@@ -5308,6 +5356,10 @@ function parseViewName(value: string): ViewName {
 function switchView(view: ViewName): void {
   if (view === "settings") {
     void refreshLocalModels();
+    // Read the shortcut status now rather than on the gated poll's first
+    // tick 2 s later: the screen-mode rows are un-hidden by it, and they
+    // popped in after the form had already been laid out.
+    refreshShortcutConflictState();
     // Cheap, and the answer moves without the renderer touching it:
     // the backend rewrites the connection file when its port changes,
     // and the defaults line follows the Upload tab. Re-read on every
@@ -5392,7 +5444,7 @@ function localFallbackReason(preferred: Provider): string {
   return "Transcribing locally.";
 }
 
-async function refreshNetworkState(): Promise<void> {
+async function probeNetwork(): Promise<NetworkProbeOutcome> {
   try {
     // The one request that does NOT go through ``apiGet``, on purpose:
     // /api/health is the liveness probe, it is answered before the API
@@ -5411,33 +5463,41 @@ async function refreshNetworkState(): Promise<void> {
       // Non-JSON or shape mismatch — keep prior backend runtime config.
       console.debug("health body parse skipped", e);
     }
-    // First successful /api/health means the Python backend is up and
-    // serving — drop the boot overlay. hideBootOverlayOnce is idempotent
-    // so later refreshes don't re-trigger work after the first success.
-    hideBootOverlayOnce();
-    // A renderer that started before the backend did has its settings
-    // marked "never loaded", and stays that way — and refuses to save —
-    // until they are actually read. The backend is answering now.
-    void loadCfgOnce();
+  } catch (e) {
+    console.warn("backend health probe failed", e);
+    return { kind: "health-failed" };
+  }
+  // First successful /api/health means the Python backend is up and
+  // serving — drop the boot overlay. hideBootOverlayOnce is idempotent
+  // so later refreshes don't re-trigger work after the first success.
+  hideBootOverlayOnce();
+  // A renderer that started before the backend did has its settings
+  // marked "never loaded", and stays that way — and refuses to save —
+  // until they are actually read. The backend is answering now.
+  void loadCfgOnce();
+  try {
     // /api/network performs outbound probes, so it stays behind the same
     // token + rate-limit guard as the rest of the API.
     const netResp = await fetch("/api/network", { headers: authHeaders() });
-    if (!netResp.ok) {
-      setNetworkState(true, null);
-      return;
-    }
+    if (!netResp.ok) return { kind: "network-not-ok" };
     const s = (await netResp.json()) as NetworkStatusResponse;
-    // Honor the backend's ``online`` field instead of forcing true.
-    // The old hardcoded ``true`` ignored the backend's connectivity
-    // probe entirely — even when /api/network reported the network
-    // unreachable, ``resolveEffectiveProvider`` kept routing to remote
-    // providers, which then timed out with a confusing "remote
-    // provider unreachable" error instead of falling back to local
-    // Whisper as the offline indicator was supposed to enforce.
-    setNetworkState(s.online !== false, s.latency_ms ?? null);
-  } catch {
-    setNetworkState(false, null);
+    // Honor the backend's ``online`` field instead of forcing true: a
+    // hard-coded ``true`` kept routing to remote providers that then
+    // timed out instead of falling back to local Whisper.
+    return { kind: "network", online: s.online, latencyMs: s.latency_ms ?? null };
+  } catch (e) {
+    console.warn("network probe failed after the backend answered", e);
+    return { kind: "network-failed" };
   }
+}
+
+async function refreshNetworkState(): Promise<void> {
+  const verdict = networkVerdict(await probeNetwork());
+  if (!verdict.backendReachable) {
+    setBackendUnreachable();
+    return;
+  }
+  setNetworkState(verdict.internetOnline ?? isNetworkOnline, verdict.latencyMs);
 }
 
 // Idempotent boot-overlay-hide hook. Called from ``refreshNetworkState``
@@ -5678,9 +5738,8 @@ async function acquireMicStream(deviceId: string): Promise<MediaStream> {
       lastError = new Error("microphone opened with no live audio track");
     } catch (e) {
       lastError = e;
-      const msg = String((e as Error)?.message || e || "").toLowerCase();
       // A permission refusal will not become a yes on retry.
-      if (msg.includes("notallowed") || msg.includes("permission denied")) throw e;
+      if (isPermissionRefusal(e)) throw e;
     }
     console.warn(
       `[trace startLive] microphone acquire attempt ${i + 1}/${attempts.length} failed: ` +
@@ -5770,38 +5829,26 @@ function applyMicHealthStatus(snap: MicHealthSnapshot): void {
 
 micHealth.subscribe(applyMicHealthStatus);
 
-interface PersistedLiveDraft {
-  /**
-   * Payload schema version (BUG-12). The backend stores this blob
-   * opaquely; bump on any breaking field change and branch the reader
-   * on it instead of minting another LEGACY_* storage key.
-   */
-  schema_version: number;
-  session_id?: string;
-  started_at?: number;
-  recording?: boolean;
-  timer?: string;
-  title?: string;
-  source_text?: string;
-  transcript_text?: string;
-  provider?: string;
-  provider_present?: boolean;
-  model?: string;
-  language?: string;
-  archive_dir?: string;
-  recording_collection?: string;
-  updated_at?: number;
-}
-
-/** Bump on any breaking change to PersistedLiveDraft. */
-const LIVE_DRAFT_SCHEMA_VERSION = 2;
-
-type LiveDraftOperation =
-  | { kind: "put"; payload: PersistedLiveDraft }
-  | { kind: "clear"; sessionToken: string };
-
-const liveDraftOperationQueue: LiveDraftOperation[] = [];
-let liveDraftOperationRunner: Promise<void> | null = null;
+const liveDraftQueue = new LiveDraftOperationQueue({
+  put: (payload) => apiPut<{ ok?: boolean }>("/api/ui/live-draft", payload),
+  clear: (sessionToken) => {
+    const query = sessionToken ? `?session_id=${encodeURIComponent(sessionToken)}` : "";
+    return apiDelete<{ ok?: boolean }>(`/api/ui/live-draft${query}`);
+  },
+  sleep: (ms) => new Promise<void>((resolve) => window.setTimeout(resolve, ms)),
+  clearRetryDelaysMs: UI_TOKENS.draft.clearRetryDelaysMs,
+  onPutUnavailable: (e) => {
+    console.warn("live draft: autosave failed; the recording is not crash-protected until it succeeds", e);
+    showRecordSessionNotice(
+      "Draft autosave is unavailable — if the app quits now, this recording's text cannot be recovered.",
+      "warning",
+      UI_TOKENS.notice.longMs,
+    );
+  },
+  onClearAbandoned: (e) => {
+    console.warn("live draft: clearing the finished draft failed; the next start may offer it as a recovered recording", e);
+  },
+});
 
 function buildLiveDraftPayload(recording: boolean): PersistedLiveDraft {
   const provider = activeLiveSessionSnapshot?.provider ?? readProviderSelection();
@@ -5823,46 +5870,8 @@ function buildLiveDraftPayload(recording: boolean): PersistedLiveDraft {
   };
 }
 
-async function drainLiveDraftOperations(): Promise<void> {
-  try {
-    while (liveDraftOperationQueue.length) {
-      const op = liveDraftOperationQueue.shift();
-      if (!op) continue;
-      try {
-        if (op.kind === "put") {
-          await apiPut<{ ok?: boolean }>("/api/ui/live-draft", op.payload);
-        } else {
-          const query = op.sessionToken ? `?session_id=${encodeURIComponent(op.sessionToken)}` : "";
-          await apiDelete<{ ok?: boolean }>(`/api/ui/live-draft${query}`);
-        }
-      } catch (e) {
-        console.debug(`live draft ${op.kind} skipped`, e);
-      }
-    }
-  } finally {
-    liveDraftOperationRunner = null;
-    if (liveDraftOperationQueue.length) {
-      void startLiveDraftOperationRunner();
-    }
-  }
-}
-
-function startLiveDraftOperationRunner(): Promise<void> {
-  if (!liveDraftOperationRunner) {
-    liveDraftOperationRunner = drainLiveDraftOperations();
-  }
-  return liveDraftOperationRunner;
-}
-
 function enqueueLiveDraftOperation(op: LiveDraftOperation): Promise<void> {
-  const lastIndex = liveDraftOperationQueue.length - 1;
-  const last = lastIndex >= 0 ? liveDraftOperationQueue[lastIndex] : null;
-  if (op.kind === "put" && last?.kind === "put") {
-    liveDraftOperationQueue[lastIndex] = op;
-  } else {
-    liveDraftOperationQueue.push(op);
-  }
-  return startLiveDraftOperationRunner();
+  return liveDraftQueue.enqueue(op);
 }
 
 function persistLiveDraftPayload(payload: PersistedLiveDraft): Promise<void> {
@@ -5898,59 +5907,13 @@ function clearLiveDraft(sessionToken = ""): Promise<void> {
   return enqueueLiveDraftOperation({ kind: "clear", sessionToken });
 }
 
-function parsePersistedLiveDraftPayload(parsed: unknown): PersistedLiveDraft | null {
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return null;
-  }
-  // Schema gate (BUG-73): a payload written by a NEWER schema version
-  // must not be fed through the old reader — structural coercion would
-  // silently misread fields instead of taking the corrupt-quarantine
-  // path. Missing version = pre-versioning legacy, accepted as v1.
-  const rawVersion = (parsed as Record<string, unknown>).schema_version;
-  const storedVersion = typeof rawVersion === "number" ? rawVersion : 1;
-  if (!Number.isFinite(storedVersion) || storedVersion > LIVE_DRAFT_SCHEMA_VERSION) {
-    console.warn(
-      `live draft: schema_version ${storedVersion} > supported ${LIVE_DRAFT_SCHEMA_VERSION}, discarding`,
-    );
-    return null;
-  }
-  // Structural type guard: every field that we use is coerced to its
-  // expected type; anything unparseable degrades to empty string /
-  // zero. This is stricter than a bare ``as`` cast and guarantees
-  // downstream code never sees ``null`` / ``undefined`` / arrays /
-  // wrong types in fields we promise are strings.
-  const obj = parsed as Record<string, unknown>;
-  const pickString = (key: string): string => {
-    const v = obj[key];
-    return typeof v === "string" ? v : "";
-  };
-  const pickNumber = (key: string): number => {
-    const v = obj[key];
-    const n = typeof v === "number" ? v : Number(v);
-    return Number.isFinite(n) ? n : 0;
-  };
-  return {
-    schema_version: LIVE_DRAFT_SCHEMA_VERSION,
-    session_id: pickString("session_id"),
-    started_at: pickNumber("started_at"),
-    recording: obj.recording === true,
-    timer: pickString("timer"),
-    title: pickString("title"),
-    source_text: pickString("source_text"),
-    transcript_text: pickString("transcript_text"),
-    provider: pickString("provider"),
-    provider_present: Object.prototype.hasOwnProperty.call(obj, "provider"),
-    model: pickString("model"),
-    language: pickString("language"),
-    archive_dir: pickString("archive_dir"),
-    recording_collection: pickString("recording_collection"),
-    updated_at: pickNumber("updated_at"),
-  };
+function parseStoredLiveDraft(parsed: unknown): PersistedLiveDraft | null {
+  return parsePersistedLiveDraftPayload(parsed, (message) => console.warn(message));
 }
 
 function parsePersistedLiveDraft(raw: string): PersistedLiveDraft | null {
   try {
-    return parsePersistedLiveDraftPayload(JSON.parse(raw));
+    return parseStoredLiveDraft(JSON.parse(raw));
   } catch (e) {
     console.warn("live draft: invalid JSON, discarding", e);
     return null;
@@ -5960,7 +5923,7 @@ function parsePersistedLiveDraft(raw: string): PersistedLiveDraft | null {
 async function readBackendLiveDraft(): Promise<PersistedLiveDraft | null> {
   try {
     const state = await apiGet<{ draft?: unknown }>("/api/ui/live-draft");
-    return parsePersistedLiveDraftPayload(state.draft);
+    return parseStoredLiveDraft(state.draft);
   } catch (e) {
     console.debug("live draft: backend read failed", e);
     return null;
@@ -6006,9 +5969,7 @@ async function recoverLiveDraftIfAny(): Promise<void> {
       title: String(draft.title || "Recovered recording") + " (Recovered)",
       sourceText,
       transcriptText,
-      provider: draft.provider_present
-        ? (String(draft.provider || "").trim() || "none")
-        : "local",
+      provider: recoveredDraftProvider(draft),
       model: String(draft.model || "-"),
       language: String(draft.language || "auto"),
       recordingCollection: RECORDING_COLLECTIONS.live,
@@ -6200,96 +6161,6 @@ function renderShortcutCapturePrompt(container: Element): void {
   container.setAttribute("aria-label", "Press keys");
 }
 
-/** Convert KeyboardEvent → Electron accelerator string */
-function keyEventToAccelerator(e: KeyboardEvent): string | null {
-  // Ignore standalone modifier keys (still being held down).
-  if (["Alt", "Control", "Meta", "Shift"].includes(e.key)) return null;
-  // Standalone (no-modifier) keys are allowed when the key is a
-  // function-row key (F1–F12), an arrow / nav key, or another
-  // dedicated control key. These are safe to bind alone because
-  // they don't conflict with normal text input. Letter / digit /
-  // punctuation standalone bindings would steal user typing in
-  // the renderer, so those still REQUIRE at least one modifier.
-  // Without this gate the Settings → Shortcuts capture refused
-  // every press of F9/F10/Arrow/etc. and silently never bound.
-  const hasModifier = e.altKey || e.ctrlKey || e.metaKey || e.shiftKey;
-  const code = String(e.code || "").trim();
-  const key = String(e.key || "").trim();
-  const isFunctionKey = /^F\d{1,2}$/.test(key) || /^F\d{1,2}$/.test(code);
-  const isStandaloneAllowed = (
-    isFunctionKey
-    || key === "ArrowLeft" || key === "ArrowRight" || key === "ArrowUp" || key === "ArrowDown"
-    || code === "ArrowLeft" || code === "ArrowRight" || code === "ArrowUp" || code === "ArrowDown"
-    || key === "Home" || key === "End" || key === "PageUp" || key === "PageDown"
-    || key === "Insert" || key === "Delete"
-    || code === "Home" || code === "End" || code === "PageUp" || code === "PageDown"
-    || code === "Insert" || code === "Delete"
-  );
-  if (!hasModifier && !isStandaloneAllowed) return null;
-
-  const parts: string[] = [];
-  // Separate Control (Ctrl) from Command (Meta/Cmd) unless BOTH are
-  // held (extremely rare; fall back to the generic CommandOrControl).
-  // The old `ctrlKey || metaKey → CommandOrControl` collapse silently
-  // hijacked Cmd+X bindings on macOS users who meant Ctrl+X, and vice
-  // versa. Electron accepts all three forms; this produces the most
-  // precise binding the user actually pressed.
-  if (e.ctrlKey && e.metaKey) parts.push("CommandOrControl");
-  else if (e.metaKey) parts.push("Command");
-  else if (e.ctrlKey) parts.push("Control");
-  if (e.altKey) parts.push("Alt");
-  if (e.shiftKey) parts.push("Shift");
-
-  // Prefer KeyboardEvent.code for layout-stable keys so the shortcut
-  // survives non-Latin keyboard layouts and remains consistent across
-  // macOS / Windows / Linux. For punctuation we still accept the
-  // actual emitted ASCII symbol first because Electron accelerators
-  // are defined in terms of symbols, not DOM code names.
-  // (`code` and `key` already declared above for the standalone-allowed
-  // gate; reuse those values here.)
-  let mapped: string | null = null;
-  if (/^Key[A-Z]$/.test(code)) mapped = code.slice(3);
-  else if (/^Digit[0-9]$/.test(code)) mapped = code.slice(5);
-  else if (/^Numpad[0-9]$/.test(code)) mapped = `num${code.slice(6)}`;
-  else if (code === "NumpadDecimal") mapped = "numdec";
-  else if (code === "NumpadAdd") mapped = "numadd";
-  else if (code === "NumpadSubtract") mapped = "numsub";
-  else if (code === "NumpadMultiply") mapped = "nummult";
-  else if (code === "NumpadDivide") mapped = "numdiv";
-  else if (key === "ArrowLeft" || code === "ArrowLeft") mapped = "Left";
-  else if (key === "ArrowRight" || code === "ArrowRight") mapped = "Right";
-  else if (key === "ArrowUp" || code === "ArrowUp") mapped = "Up";
-  else if (key === "ArrowDown" || code === "ArrowDown") mapped = "Down";
-  else if (key === " " || code === "Space") mapped = "Space";
-  else if (key === "Enter" || code === "Enter" || code === "NumpadEnter") mapped = "Enter";
-  else if (key === "Backspace" || code === "Backspace") mapped = "Backspace";
-  else if (key === "Delete" || code === "Delete") mapped = "Delete";
-  else if (key === "Insert" || code === "Insert") mapped = "Insert";
-  else if (key === "Home" || code === "Home") mapped = "Home";
-  else if (key === "End" || code === "End") mapped = "End";
-  else if (key === "PageUp" || code === "PageUp") mapped = "PageUp";
-  else if (key === "PageDown" || code === "PageDown") mapped = "PageDown";
-  else if (key === "Tab" || code === "Tab") mapped = "Tab";
-  else if (key === "Escape" || code === "Escape") mapped = "Escape";
-  else if (/^F\d{1,2}$/.test(key)) mapped = key.toUpperCase();
-  else if (key.length === 1 && /^[!@#$%^&*()_+\-=\]{}\\|;:'",.<>/?`~]$/.test(key)) mapped = key;
-  else if (code === "Backquote") mapped = "`";
-  else if (code === "Minus") mapped = "-";
-  else if (code === "Equal") mapped = "=";
-  else if (code === "BracketLeft") mapped = "[";
-  else if (code === "BracketRight") mapped = "]";
-  else if (code === "Backslash") mapped = "\\";
-  else if (code === "Semicolon") mapped = ";";
-  else if (code === "Quote") mapped = "'";
-  else if (code === "Comma") mapped = ",";
-  else if (code === "Period") mapped = ".";
-  else if (code === "Slash") mapped = "/";
-  if (!mapped) return null;
-  parts.push(mapped);
-
-  return parts.join("+");
-}
-
 function shortcutSlot(id: string | undefined): (typeof SHORTCUT_SLOTS)[number] | undefined {
   return SHORTCUT_SLOTS.find((slot) => slot.id === id);
 }
@@ -6304,6 +6175,12 @@ function updateShortcutDisplay(btnId: string, accelerator: string): void {
   const keysSpan = btn.querySelector(".shortcut-keys");
   if (keysSpan) renderShortcutKeys(keysSpan, accelerator);
 }
+
+// Paint the platform defaults now. They are known at module load (from
+// desktop/shortcut-defaults.json, through vite.config.ts); waiting for a
+// successful /api/config showed the markup's macOS keycaps on every
+// platform until then, and forever when the load failed.
+updateAllShortcutDisplays();
 
 /**
  * Poll `window.__transcriptorShortcutStatus` (published by Electron main
@@ -6327,35 +6204,14 @@ function refreshShortcutConflictState(): void {
   // succeeds but the handler never fires. Badge the affected shortcut
   // button with a hint so the user can diagnose.
   const isMacFnCollision = status.platform === "darwin" && status.macFnState === false;
-  const isFKeyAccel = (accel: string | undefined): boolean => !!accel && /^F([1-9]|1[0-2])$/.test(accel);
   for (const slot of SHORTCUT_SLOTS) {
-    const id = slot.id;
-    const entry = status[id];
+    const entry = status[slot.id];
     if (!entry) continue;
     const btn = document.getElementById(slot.buttonId) as HTMLButtonElement | null;
     if (!btn) continue;
-    // The screenshot key is bound only while screen mode runs, so "not
-    // active" is its normal state at rest, not a conflict.
-    const active = id === "screenShot" ? !entry.error : !!entry.active;
-    const desired = entry.desired || "";
-    // A shortcut is "conflicted" if (a) registration failed OR (b)
-    // registration succeeded but macOS is going to intercept it as a
-    // media key. Case (b) is invisible without this extra check.
-    const macBlocked = isMacFnCollision && isFKeyAccel(desired);
-    const hasConflict = !active || macBlocked;
-    btn.classList.toggle("shortcut-conflict", hasConflict);
-    if (!active) {
-      btn.title = `Not registered: ${entry.error || "unknown reason"}`;
-    } else if (macBlocked) {
-      btn.title = (
-        `macOS is intercepting ${desired} as a media key. ` +
-        `Either enable System Settings → Keyboard → Keyboard Shortcuts → Function Keys → "Use F1, F2 as standard function keys", ` +
-        `or hold Fn while pressing ${desired}, ` +
-        `or pick a non-F-key accelerator here.`
-      );
-    } else {
-      btn.title = "";
-    }
+    const badge = shortcutBadge(slot.id, entry, isMacFnCollision);
+    btn.classList.toggle("shortcut-conflict", badge.conflict);
+    btn.title = badge.title;
   }
 }
 // Conflict-state badge on Settings → Shortcuts. The badge only exists
@@ -6471,7 +6327,7 @@ function handleShortcutKeydown(e: KeyboardEvent): void {
     showRecordSessionNotice(
       `That shortcut is already bound to "${taken.label}". Pick a different combination.`,
       "warning",
-      6000,
+      UI_TOKENS.notice.briefMs,
     );
     stopShortcutRecording(true);
     return;
@@ -6487,10 +6343,10 @@ function handleShortcutKeydown(e: KeyboardEvent): void {
   // Persist to config
   queueUiPreferencesSave();
 
-  // Signal the Electron main process to reload shortcuts immediately.
-  // The window flag remains as a fallback for older/polling paths, but
-  // the title bridge is the durable transport: it avoids the debounce
-  // race with /api/config writes and temporarily-suspended hotkeys are
+  // Signal the Electron main process to reload shortcuts immediately,
+  // through the title bridge (there is no window-flag fallback any more,
+  // see publishShortcutUpdateToMain): it avoids the debounce race with
+  // /api/config writes, and temporarily-suspended hotkeys are
   // re-registered in the same path that received the captured keys.
   publishShortcutUpdateToMain();
   void flushUiPreferencesSaveNow();
@@ -6531,7 +6387,10 @@ function setAutoSendEnterEnabled(enabled: boolean): void {
 }
 
 function upscalePresetId(): string {
-  return (($("upscalePresetSelect") as HTMLSelectElement).value || "").trim();
+  return catalogChoiceForSave(
+    ($("upscalePresetSelect") as HTMLSelectElement).value,
+    pendingUpscalePresetId,
+  );
 }
 
 function selectedUpscalePreset(): UpscalePresetItem | undefined {
@@ -6951,7 +6810,10 @@ function buildUiPreferencesSavePlan() {
   };
 }
 
-function enqueueUiPreferencesSave(plan: ReturnType<typeof buildUiPreferencesSavePlan>): Promise<void> {
+function enqueueUiPreferencesSave(
+  plan: ReturnType<typeof buildUiPreferencesSavePlan>,
+  options: { keepalive?: boolean } = {},
+): Promise<void> {
   // Chain each save after the previous one's completion (success
   // or failure — we don't want one transient 500 to block all
   // future saves). The ``Promise.resolve()`` tail guarantees the
@@ -6960,7 +6822,7 @@ function enqueueUiPreferencesSave(plan: ReturnType<typeof buildUiPreferencesSave
     .catch(() => { })
     .then(async () => {
       try {
-        await apiPost<{ ok: boolean }>("/api/config", plan.payload);
+        await apiPost<{ ok: boolean }>("/api/config", plan.payload, options);
         configuredRecordingsDir = plan.nextRecordingsDir;
         if (!plan.shouldRefreshRecordingsArchive) return;
         setSettingsArchiveStatus("Archive folder saved.", "success");
@@ -7014,7 +6876,7 @@ function queueUiPreferencesSave(): void {
   }, UI_TOKENS.settings.saveDebounceMs);
 }
 
-function flushUiPreferencesSaveNow(): Promise<void> {
+function flushUiPreferencesSaveNow(options: { keepalive?: boolean } = {}): Promise<void> {
   if (uiPrefSaveTimer) {
     clearTimeout(uiPrefSaveTimer);
     uiPrefSaveTimer = null;
@@ -7023,11 +6885,16 @@ function flushUiPreferencesSaveNow(): Promise<void> {
     return uiPrefInFlightChain.catch(() => { });
   }
   uiPrefPendingSave = false;
-  return enqueueUiPreferencesSave(buildUiPreferencesSavePlan());
+  return enqueueUiPreferencesSave(buildUiPreferencesSavePlan(), options);
 }
 
+/**
+ * On the way out (``pagehide``/``beforeunload``): a setting changed less
+ * than the debounce before quitting is sent as a keepalive request, which
+ * the page's teardown does not cancel (./keepalive).
+ */
 function flushUiPreferencesSaveBestEffort(): void {
-  void flushUiPreferencesSaveNow();
+  void flushUiPreferencesSaveNow({ keepalive: true });
 }
 
 window.addEventListener("pagehide", flushUiPreferencesSaveBestEffort, { capture: true });
@@ -7094,8 +6961,9 @@ async function loadCfg(): Promise<void> {
     syncAutoLanguageUi();
     // Restore the unified selection from persisted wire values
     // (provider + local_model + per-provider remote models). The UI
-    // group is DERIVED (gigaam-* local model ⇒ gigaam group), never
-    // persisted — the wire format stays backward compatible.
+    // group is DERIVED here (gigaam-* local model ⇒ gigaam group);
+    // ``collectUiPreferences`` does persist ``provider_group``, but only
+    // for the CLI (backend/cli_access.py) — this reader ignores it.
     {
       const hasStoredProvider = Object.prototype.hasOwnProperty.call(ui, "provider");
       const wire = hasStoredProvider
@@ -7111,8 +6979,9 @@ async function loadCfg(): Promise<void> {
       }
       uiModelByGroup.deepgram = remoteModelByProvider.deepgram;
       uiModelByGroup.openrouter = remoteModelByProvider.openrouter;
-      // The "None" provider option was removed: transcription always has
-      // a provider now, so a legacy stored "" coerces to Whisper.
+      // A stored "" (the Live toolbar's "None") is read back as Whisper
+      // by ``groupFromWire``, so a None chosen in the toolbar does not
+      // survive a restart.
       uiProviderGroup = group;
     }
     const auto = $("autoTranscribeToggle") as HTMLInputElement;
@@ -7228,7 +7097,7 @@ async function loadCfg(): Promise<void> {
     showRecordSessionNotice(
       `Settings could not be loaded: ${msg}. Your saved preferences are intact, but changes made now will not be saved.`,
       "error",
-      9000,
+      UI_TOKENS.notice.longMs,
     );
     try {
       await loadUpscalePresets(pendingUpscalePresetId);
@@ -7343,12 +7212,18 @@ async function deleteProviderKey(provider: RemoteProvider): Promise<void> {
 }
 
 async function handleKeyAction(provider: RemoteProvider): Promise<void> {
-  const btn = keyActionButton(provider);
-  if (btn.classList.contains("delete")) {
-    await deleteProviderKey(provider);
-    return;
-  }
-  await saveProviderKey(provider);
+  // Decided from state (./key-action), not from the button's CSS class;
+  // a delete asks first.
+  const input = keyInput(provider);
+  await performKeyAction(
+    { saved: keySavedState[provider], masked: isMaskedKeyInput(input), value: input.value },
+    {
+      providerName: providerLabel(provider),
+      confirm: (message) => window.confirm(message),
+      save: () => saveProviderKey(provider),
+      remove: () => deleteProviderKey(provider),
+    },
+  );
 }
 
 ($("recordingsDirInput") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
@@ -7469,8 +7344,8 @@ async function handleKeyAction(provider: RemoteProvider): Promise<void> {
       await loadUpscalePresets(r.item?.id || "");
       queueUiPreferencesSave();
     })
-    .catch((e: Error) => {
-      msg.textContent = e.message;
+    .catch((e: unknown) => {
+      msg.textContent = sanitizeUiErrorMessage(e, "Could not save the preset.");
     });
 });
 ($("upscalePromptSaveBtn") as HTMLButtonElement).addEventListener("click", () => {
@@ -7501,8 +7376,8 @@ async function handleKeyAction(provider: RemoteProvider): Promise<void> {
         closeUpscalePromptModal();
       }, 220);
     })
-    .catch((e: Error) => {
-      msg.textContent = e.message;
+    .catch((e: unknown) => {
+      msg.textContent = sanitizeUiErrorMessage(e, "Could not save the instruction.");
     });
 });
 ($("upscalePromptDefaultBtn") as HTMLButtonElement).addEventListener("click", () => {
@@ -7519,8 +7394,8 @@ async function handleKeyAction(provider: RemoteProvider): Promise<void> {
       queueUiPreferencesSave();
       msg.textContent = "Default applied";
     })
-    .catch((e: Error) => {
-      msg.textContent = e.message;
+    .catch((e: unknown) => {
+      msg.textContent = sanitizeUiErrorMessage(e, "Could not restore the default instruction.");
     });
 });
 ($("upscalePresetDeleteBtn") as HTMLButtonElement).addEventListener("click", () => {
@@ -7538,17 +7413,16 @@ async function handleKeyAction(provider: RemoteProvider): Promise<void> {
     `Delete the upscale preset “${presetLabel}”?\n\nThis cannot be undone.`,
   );
   if (!confirmed) return;
-  void fetch(`/api/upscale/presets/${encodeURIComponent(cur.id)}`, {
-    method: "DELETE",
-    headers: authHeaders(),
-  })
-    .then(async (r) => {
-      if (!r.ok) throw new Error(await parseError(r));
+  void apiDelete<{ ok?: boolean }>(`/api/upscale/presets/${encodeURIComponent(cur.id)}`)
+    .then(async () => {
       await loadUpscalePresets("");
       queueUiPreferencesSave();
     })
-    .catch((e: Error) => {
-      $("upscaleOutput").textContent = `Preset delete failed: ${e.message}`;
+    .catch((e: unknown) => {
+      // Not into ``#upscaleOutput``: that pane holds the user's upscaled
+      // text, and an error written there replaced it.
+      console.warn("upscale preset delete failed", e);
+      setStatus(`Preset delete failed: ${sanitizeUiErrorMessage(e, "Could not delete the preset.")}`, "error");
     });
 });
 ($("pickRecordingsDirBtn") as HTMLButtonElement).addEventListener("click", () => {
@@ -7677,7 +7551,7 @@ function renderCliSection(): void {
 
 async function copyCliCard(btn: HTMLButtonElement, text: string, title: string): Promise<void> {
   const ok = await writeTextToClipboard(text);
-  flashButtonFeedback(btn, ok ? "Copied" : "Copy failed", `Copy: ${title}`, {
+  flashCopyOutcome(btn, ok, `Copy: ${title}`, {
     durationMs: UI_TOKENS.feedback.flashMs,
     // A text button: the visible label swaps too, not only the one a
     // screen reader hears.
@@ -7847,34 +7721,55 @@ async function showRecordingViewerScreens(
   const params = new URLSearchParams();
   if (archiveDir) params.set("archive_dir", archiveDir);
   const suffix = params.toString() ? `?${params.toString()}` : "";
-  for (const file of screens) {
-    try {
-      const resp = await fetch(
-        `/api/recordings/${encodeURIComponent(name)}/screens/${encodeURIComponent(file)}${suffix}`,
-        { headers: authHeaders() },
-      );
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const url = URL.createObjectURL(await resp.blob());
-      if (!stillCurrent()) {
-        URL.revokeObjectURL(url);
-        return;
-      }
-      recordingViewerScreenUrls.push(url);
-      const img = document.createElement("img");
-      img.src = url;
-      img.alt = file;
-      img.title = screensDir ? `${screensDir}/${file}` : file;
-      img.setAttribute("role", "listitem");
-      img.addEventListener("click", () => {
-        const expanded = img.classList.toggle("expanded");
-        row.classList.toggle("has-expanded", expanded || !!row.querySelector("img.expanded"));
-      });
-      row.appendChild(img);
-      row.hidden = false;
-    } catch (e) {
-      console.warn(`Screenshot ${file} could not be loaded`, e);
+  // All at once, painted in order: one at a time made every screenshot
+  // wait for the slowest before it.
+  const results = await Promise.allSettled(
+    screens.map((file) =>
+      apiGetBlob(`/api/recordings/${encodeURIComponent(name)}/screens/${encodeURIComponent(file)}${suffix}`),
+    ),
+  );
+  if (!stillCurrent()) return;
+  let failed = 0;
+  results.forEach((result, index) => {
+    const file = screens[index];
+    if (result.status === "rejected") {
+      failed += 1;
+      console.warn(`Screenshot ${file} could not be loaded`, result.reason);
+      return;
     }
+    const url = URL.createObjectURL(result.value);
+    recordingViewerScreenUrls.push(url);
+    const item = document.createElement("span");
+    item.setAttribute("role", "listitem");
+    item.className = "screen-thumb-item";
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "screen-thumb";
+    btn.setAttribute("aria-expanded", "false");
+    btn.setAttribute("aria-label", screenThumbLabel(index, screens.length, false));
+    btn.title = screensDir ? `${screensDir}/${file}` : file;
+    const img = document.createElement("img");
+    img.src = url;
+    img.alt = "";
+    btn.appendChild(img);
+    btn.addEventListener("click", () => {
+      const expanded = btn.classList.toggle("expanded");
+      btn.setAttribute("aria-expanded", String(expanded));
+      btn.setAttribute("aria-label", screenThumbLabel(index, screens.length, expanded));
+      row.classList.toggle("has-expanded", !!row.querySelector(".screen-thumb.expanded"));
+    });
+    item.appendChild(btn);
+    row.appendChild(item);
+  });
+  const note = screensStripNote(failed, screens.length);
+  if (note) {
+    const el = document.createElement("span");
+    el.className = "recording-screens-note";
+    el.setAttribute("role", "listitem");
+    el.textContent = note;
+    row.appendChild(el);
   }
+  row.hidden = !row.childElementCount;
 }
 
 function resetRecordingViewer(placeholder: string = UI_COPY.recordings.viewerPlaceholder): void {
@@ -8044,7 +7939,7 @@ async function copyRecordingText(): Promise<void> {
   if (!text) return;
   const btn = $("recordingCopyBtn") as HTMLButtonElement;
   const ok = await writeTextToClipboard(text);
-  flashButtonFeedback(btn, ok ? "Copied" : "Copy failed", "Copy recording text", {
+  flashCopyOutcome(btn, ok, "Copy recording text", {
     durationMs: UI_TOKENS.feedback.flashMs,
   });
 }
@@ -8055,9 +7950,9 @@ async function copyTextContent(text: string, btnId = ""): Promise<void> {
   const ok = await writeTextToClipboard(value);
   if (btnId) {
     const btn = $(btnId) as HTMLButtonElement;
-    flashButtonFeedback(
+    flashCopyOutcome(
       btn,
-      ok ? "Copied" : "Copy failed",
+      ok,
       btnId === "resultCopyBtn" ? "Copy result text" : "Copy upscale text",
       { durationMs: UI_TOKENS.feedback.flashMs },
     );
@@ -8695,6 +8590,11 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
           player.removeAttribute("src");
           player.load();
           setRecordingViewerAudioRowVisible(false);
+          // The list says "Audio" for this item; a player that simply
+          // vanished said nothing. The Live player reports the same
+          // failure with the same sentence.
+          const meta = $("recordingMeta");
+          meta.textContent = `${meta.textContent} · ${AUDIO_LOAD_FAILED_TEXT}`;
         }
       }
     } else {
@@ -8783,82 +8683,47 @@ async function saveRecordingText(opts: {
   if (!sourceText && !transcriptText && !audioFile && !audioSourcePath) {
     return { name: existingName, archiveDir };
   }
-  let savedName = existingName;
-  let savedArchiveDir = archiveDir;
+  // One request plan and one response parser for the three routes
+  // (./recording-save); a screen session without an audio file is
+  // refused there instead of being dropped.
+  const plan = planRecordingSave({
+    hasAudioFile: !!audioFile,
+    audioSourcePath,
+    consumeAudioSourcePath: !!opts.consumeAudioSourcePath,
+    existingName,
+    archiveDir,
+    recordingCollection,
+    requireExisting,
+    title: opts.title,
+    sourceText,
+    transcriptText,
+    provider: opts.provider,
+    model: opts.model,
+    language: opts.language,
+    liveSessionId: opts.liveSessionId,
+    screenSessionId: opts.screenSessionId,
+    screenAudioStartedAt: opts.screenAudioStartedAt,
+  });
+  let response: unknown;
+  if (plan.route === "save-with-audio" && audioFile) {
+    const fd = new FormData();
+    fd.append("file", audioFile, audioFile.name || "recording.wav");
+    for (const [key, value] of recordingSaveFormEntries(plan.fields)) fd.set(key, value);
+    const r = await fetch("/api/recordings/save-with-audio", { method: "POST", body: fd, headers: authHeaders() });
+    if (!r.ok) throw new Error(await parseError(r));
+    response = await r.json();
+  } else {
+    response = await apiPost<unknown>(`/api/recordings/${plan.route}`, plan.fields);
+  }
   // Audio-retention observability (BUG-02): the backend deletes older
   // recordings' audio on every save (policy: newest keeps audio,
   // transcripts are forever). The count comes back in every save
   // response; surface it so the deletion is never silent.
-  let prunedAudioCount = 0;
-  let screensManifest: unknown = undefined;
-  if (audioFile) {
-    const fd = new FormData();
-    fd.append("file", audioFile, audioFile.name || "recording.wav");
-    if (existingName) fd.set("name", existingName);
-    if (archiveDir) fd.set("archive_dir", archiveDir);
-    if (recordingCollection) fd.set("recording_collection", recordingCollection);
-    if (requireExisting) fd.set("require_existing", "true");
-    fd.set("title", opts.title);
-    fd.set("source_text", sourceText);
-    fd.set("transcript_text", transcriptText);
-    fd.set("provider", opts.provider);
-    fd.set("model", opts.model);
-    fd.set("language", opts.language);
-    if (opts.liveSessionId) fd.set("live_session_id", opts.liveSessionId);
-    if (opts.screenSessionId) {
-      fd.set("screen_session_id", opts.screenSessionId);
-      if (opts.screenAudioStartedAt && opts.screenAudioStartedAt > 0) {
-        fd.set("screen_audio_started_at", String(opts.screenAudioStartedAt));
-      }
-    }
-    const r = await fetch("/api/recordings/save-with-audio", { method: "POST", body: fd, headers: authHeaders() });
-    if (!r.ok) throw new Error(await parseError(r));
-    const js = (await r.json()) as { name?: string; archive_dir?: string; pruned_audio_count?: number; screens?: unknown };
-    savedName = String(js.name || existingName || "").trim();
-    savedArchiveDir = String(js.archive_dir || archiveDir || "").trim();
-    prunedAudioCount = Math.max(0, Math.trunc(Number(js.pruned_audio_count) || 0));
-    screensManifest = js.screens ?? undefined;
-  } else if (audioSourcePath) {
-    const payload: Record<string, unknown> = {
-      source_path: audioSourcePath,
-      name: existingName,
-      recording_collection: recordingCollection,
-      require_existing: requireExisting,
-      title: opts.title,
-      source_text: sourceText,
-      transcript_text: transcriptText,
-      provider: opts.provider,
-      model: opts.model,
-      language: opts.language,
-      consume_source_path: !!opts.consumeAudioSourcePath,
-    };
-    if (archiveDir) payload.archive_dir = archiveDir;
-    const js = await apiPost<{ ok: boolean; name: string; archive_dir?: string; pruned_audio_count?: number }>("/api/recordings/save-from-path", {
-      ...payload,
-    });
-    savedName = String(js.name || existingName || "").trim();
-    savedArchiveDir = String(js.archive_dir || archiveDir || "").trim();
-    prunedAudioCount = Math.max(0, Math.trunc(Number(js.pruned_audio_count) || 0));
-  } else {
-    const payload: Record<string, unknown> = {
-      name: existingName,
-      recording_collection: recordingCollection,
-      require_existing: requireExisting,
-      title: opts.title,
-      source_text: sourceText,
-      transcript_text: transcriptText,
-      provider: opts.provider,
-      model: opts.model,
-      language: opts.language,
-    };
-    if (archiveDir) payload.archive_dir = archiveDir;
-    const js = await apiPost<{ ok: boolean; name: string; archive_dir?: string; pruned_audio_count?: number }>("/api/recordings/save", {
-      ...payload,
-    });
-    savedName = String(js.name || existingName || "").trim();
-    savedArchiveDir = String(js.archive_dir || archiveDir || "").trim();
-    prunedAudioCount = Math.max(0, Math.trunc(Number(js.pruned_audio_count) || 0));
-  }
+  const saved = parseRecordingSaveResponse(response, { name: existingName, archiveDir });
+  const savedName = saved.name;
+  const savedArchiveDir = saved.archiveDir;
+  const prunedAudioCount = saved.prunedAudioCount;
+  const screensManifest = saved.screensManifest;
   // Fire-and-forget, coalesced through a background queue. Live saves
   // happen while the single recording capsule is still busy; direct
   // loadRecordings() here made History redraw during finalization and
@@ -8889,8 +8754,11 @@ async function saveRecordingText(opts: {
 
 $("recordingsRefreshBtn").addEventListener("click", () =>
   void loadRecordings(true).catch((e: Error) => {
-    $("recordingContent").textContent = sanitizeUiErrorMessage(e, "Could not refresh the archive.");
-    updateRecordingCopyState();
+    console.warn("History refresh failed", e);
+    const msg = sanitizeUiErrorMessage(e, "Could not refresh the archive.");
+    const surfaces = historyFailureSurfaces(!!selectedRecordingName);
+    if (surfaces.status) setStatus(`Refresh failed: ${msg}`, "warning");
+    if (surfaces.placeholder) resetRecordingViewer(msg);
   })
 );
 // Window growth. Passive: the handler only reads geometry and never

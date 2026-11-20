@@ -5,8 +5,26 @@ import {
   compareVersions,
   parseLatestRelease,
   shouldAutoCheck,
+  updateCheckOutcome,
   type UpdateMeta,
 } from "../src/update-check";
+
+describe("updateCheckOutcome (FU-17)", () => {
+  const unknown = { status: "unknown" as const, reason: "offline" };
+  it("does not stamp the daily throttle for a check that learned nothing", () => {
+    expect(updateCheckOutcome(unknown, "boot").stamp).toBe(false);
+    expect(updateCheckOutcome(unknown, "user").stamp).toBe(false);
+  });
+
+  it("keeps the passive boot check silent when it could not tell, but answers the button", () => {
+    expect(updateCheckOutcome(unknown, "boot").render).toBe(false);
+    expect(updateCheckOutcome(unknown, "user").render).toBe(true);
+  });
+
+  it("stamps and shows a real answer either way", () => {
+    expect(updateCheckOutcome({ status: "up-to-date" }, "boot")).toEqual({ stamp: true, render: true });
+  });
+});
 
 const meta: UpdateMeta = { version: "1.3.0", repoSlug: "owner/repo" };
 

@@ -44,6 +44,15 @@ describe("the markup carries no copy of its own", () => {
     expect(input?.getAttribute("accept")).toBeNull();
   });
 
+  it("leaves the shortcut keycaps to the renderer (desktop/shortcut-defaults.json is their source) (FU-09)", () => {
+    const rows = Array.from(markup().querySelectorAll(".shortcut-btn .shortcut-keys"));
+    expect(rows.length).toBe(4);
+    for (const row of rows) {
+      expect(row.children.length).toBe(0);
+      expect(row.getAttribute("aria-label")).toBeNull();
+    }
+  });
+
   it("does not claim a list of accepted formats the backend has not reported", () => {
     expect(html).not.toContain("WAV · MP3");
     const el = markup().getElementById("uploadAcceptedFormats");

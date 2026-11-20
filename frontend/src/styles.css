@@ -2921,6 +2921,13 @@ canvas {
   }
 }
 
+/*
+ * Reduced motion, stated once. A `:root.reduce-motion` copy of this block
+ * stood below it with the same declarations: the class is only ever set
+ * by main.tsx mirroring this very media query, so the two were always
+ * true together and drifted apart on every edit. The media query also
+ * covers the boot overlay before any script runs.
+ */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -2942,27 +2949,6 @@ canvas {
   .shortcut-btn.recording {
     animation: none;
   }
-}
-
-:root.reduce-motion *,
-:root.reduce-motion *::before,
-:root.reduce-motion *::after {
-  transition: none !important;
-  transition-delay: 0ms !important;
-  animation-duration: 0.01ms !important;
-  animation-iteration-count: 1 !important;
-  scroll-behavior: auto !important;
-}
-
-:root.reduce-motion .btn:active,
-:root.reduce-motion .upload-droplarge.drag {
-  transform: none;
-}
-
-:root.reduce-motion .boot-overlay-spinner,
-:root.reduce-motion .icon-btn.is-busy .reload-ico,
-:root.reduce-motion .shortcut-btn.recording {
-  animation: none;
 }
 
 @media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
@@ -4310,19 +4296,38 @@ canvas {
   overflow-x: auto;
   flex-wrap: nowrap;
 }
-.recording-screens img {
+.recording-screens .screen-thumb-item {
+  display: contents;
+}
+/* Each thumbnail is a button (keyboard and screen readers can open it). */
+.recording-screens .screen-thumb {
+  flex: 0 0 auto;
+  padding: 0;
+  border: 1px solid var(--control-border);
+  border-radius: var(--radius-xs);
+  background: none;
+  cursor: zoom-in;
+  line-height: 0;
+}
+.recording-screens .screen-thumb img {
   height: 72px;
   width: auto;
-  flex: 0 0 auto;
-  border-radius: var(--radius-xs);
-  border: 1px solid var(--control-border);
-  cursor: zoom-in;
+  border-radius: inherit;
 }
-.recording-screens img.expanded {
-  height: auto;
-  max-width: 100%;
+.recording-screens .screen-thumb.expanded {
   flex: 1 1 100%;
   cursor: zoom-out;
+}
+/* Bounded: a tall screenshot must not push the transcript out of the pane. */
+.recording-screens .screen-thumb.expanded img {
+  height: auto;
+  max-width: 100%;
+  max-height: 70vh;
+}
+.recording-screens-note {
+  align-self: center;
+  font-size: 12px;
+  color: var(--text-muted);
 }
 .recording-screens.has-expanded {
   flex-wrap: wrap;
