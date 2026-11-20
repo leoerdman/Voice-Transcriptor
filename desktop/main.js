@@ -6146,6 +6146,13 @@ async function processPostStopTask(task) {
     } else if (verdict.outcome === SIGNAL_OUTCOME.PROVISIONAL) {
       // Best-known text only (§6.8/§6.9) — keep waiting for the final.
       bestKnownText = verdict.text;
+      // The renderer's explicit phase: it has the transcript and is
+      // running the paste upscale — the only signal of that state.
+      if (verdict.upscaling) {
+        void setRecordingStatus("Upscaling", RECORDING_STATUS_KIND.UPSCALING).catch((e) => {
+          appendMainLog(`[post-stop] upscaling-status failed: ${compactLogText(e?.message || e)}`);
+        });
+      }
     } else {
       // A publish with nothing to paste (no speech, error, auto-transcribe
       // off): the recording is over and there will be no final.

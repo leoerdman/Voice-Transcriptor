@@ -80,10 +80,15 @@ function parseSignalSource(source) {
 /**
  * Classify one validated hand-off signal ({ final, text, source }).
  *
- * Returns ``{ outcome, text, status }``:
+ * Returns ``{ outcome, text, status, upscaling }``:
  *   - FINAL: ``text`` is what to paste.
  *   - PROVISIONAL: ``text`` is the best-known text (never pasted).
  *   - TERMINAL: ``status`` is what the capsule should say.
+ *   - ``upscaling``: the renderer has its transcript and is running the
+ *     paste upscale now — the capsule shows "Upscaling" until the final
+ *     arrives. True only on a PROVISIONAL verdict; this explicit phase is
+ *     the one signal of that state since the main process stopped
+ *     polling the renderer for it (DM-15).
  */
 function classifyRecordingSignal(signal) {
   const s = signal && typeof signal === "object" ? signal : {};
@@ -91,21 +96,22 @@ function classifyRecordingSignal(signal) {
   const { kind, phase } = parseSignalSource(s.source);
   const noSpeech = !text || phase === "no-speech" || isNoSpeechPlaceholder(text);
   if (s.final === true) {
-    if (!noSpeech) return { outcome: SIGNAL_OUTCOME.FINAL, text, status: "" };
-    return { outcome: SIGNAL_OUTCOME.TERMINAL, text: "", status: NO_SPEECH_STATUS };
+    if (!noSpeech) return { outcome: SIGNAL_OUTCOME.FINAL, text, status: "", upscaling: false };
+    return { outcome: SIGNAL_OUTCOME.TERMINAL, text: "", status: NO_SPEECH_STATUS, upscaling: false };
   }
   // Not paste-ready. The renderer marks the pre-upscale publish with the
   // "upscaling" phase, and a transcript-kind publish that is not final is
   // transcript text the renderer has not declared paste-ready — both are
   // best-known text to wait past, not an ending.
   if (!noSpeech && (phase === "upscaling" || kind === "transcript")) {
-    return { outcome: SIGNAL_OUTCOME.PROVISIONAL, text, status: "" };
+    return { outcome: SIGNAL_OUTCOME.PROVISIONAL, text, status: "", upscaling: phase === "upscaling" };
   }
   // A status/error publish with nothing to paste: the recording is over.
   return {
     outcome: SIGNAL_OUTCOME.TERMINAL,
     text: "",
     status: noSpeech ? NO_SPEECH_STATUS : text,
+    upscaling: false,
   };
 }
 
