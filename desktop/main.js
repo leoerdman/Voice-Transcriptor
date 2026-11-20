@@ -125,7 +125,7 @@ const { createRecordingFinalSlot } = require("./recording-final-slot");
 // decided from the renderer's explicit fields — never from the words the
 // user dictated (Ultra-Audit 2026-11-20 DM-01).
 const {
-  normalizeTranscriptText,
+  pasteTranscriptText,
   isPasteableTranscript,
 } = require("./transcript-signal");
 // Which stopped recordings get a post-stop task, and how that task waits
@@ -6305,7 +6305,7 @@ async function processPostStopTask(task) {
         elapsedMs: Date.now() - stopRequestedAt,
         recordingId: signal.recordingId,
         source: signal.source,
-        textLen: normalizeTranscriptText(signal.text).length,
+        textLen: pasteTranscriptText(signal.text).length,
         outcome: verdict.outcome,
       });
       // The renderer's explicit phase: it has the transcript and is
@@ -6498,7 +6498,7 @@ async function processPostStopTask(task) {
  * nothing.
  */
 async function handlePostStopTranscriptTimeout(trace, bestKnownText = "") {
-  const best = normalizeTranscriptText(bestKnownText);
+  const best = pasteTranscriptText(bestKnownText);
   const fromBestKnown = isPasteableTranscript(best);
   const recovered = fromBestKnown ? best : await getLatestTranscriptText();
   const pasteAccel = pasteLastAccelerator();
@@ -6547,14 +6547,14 @@ async function handlePostStopTranscriptTimeout(trace, bestKnownText = "") {
 
 async function getLatestTranscriptText() {
   const s = await queryRendererState();
-  const finished = normalizeTranscriptText(s?.finishedText || "");
+  const finished = pasteTranscriptText(s?.finishedText || "");
   if (isPasteableTranscript(finished)) {
     lastTranscriptText = finished;
     saveLastTranscriptToDisk(finished);
     return finished;
   }
   const uiFinalKind = String(s?.uiFinalKind || "").trim().toLowerCase();
-  const uiFinalText = normalizeTranscriptText(s?.uiFinalText || "");
+  const uiFinalText = pasteTranscriptText(s?.uiFinalText || "");
   if (uiFinalKind === "transcript" && isPasteableTranscript(uiFinalText)) {
     lastTranscriptText = uiFinalText;
     saveLastTranscriptToDisk(uiFinalText);

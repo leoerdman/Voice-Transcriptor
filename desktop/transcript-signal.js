@@ -48,8 +48,26 @@ const SIGNAL_OUTCOME = Object.freeze({
   TERMINAL: "terminal",
 });
 
+/** For COMPARING texts (emptiness, placeholders, equality): whitespace collapsed. Never what is pasted. */
 function normalizeTranscriptText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * The text as it is handed to the user. Runs of spaces inside a line
+ * become one and trailing spaces go, but line breaks, blank lines and a
+ * line's leading indent are content — a screen take's header, marks and
+ * per-shot summary are lines (frontend/src/screen-annotations.ts), and
+ * collapsing them for the paste ran the whole take into one line
+ * (2026-11-21).
+ */
+function pasteTranscriptText(value) {
+  return String(value || "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/(\S)[^\S\n]+/g, "$1 ")
+    .replace(/ +\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 function isNoSpeechPlaceholder(value) {
@@ -85,7 +103,7 @@ function isPasteableTranscript(value) {
  */
 function classifyRecordingSignal(signal) {
   const s = signal && typeof signal === "object" ? signal : {};
-  const text = normalizeTranscriptText(s.text);
+  const text = pasteTranscriptText(s.text);
   const kind = String(s.kind || "");
   const phase = String(s.phase || "");
   const noSpeech = !text || phase === "no-speech" || isNoSpeechPlaceholder(text);
@@ -113,6 +131,7 @@ module.exports = {
   NO_SPEECH_STATUS,
   SIGNAL_OUTCOME,
   normalizeTranscriptText,
+  pasteTranscriptText,
   isNoSpeechPlaceholder,
   isPasteableTranscript,
   classifyRecordingSignal,
