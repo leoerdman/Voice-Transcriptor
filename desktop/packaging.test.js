@@ -545,6 +545,47 @@ test("BUILD.command quits a running duplicate bundle before deleting it", () => 
   assert.ok(quit < body.indexOf('cleanup_path "$duplicate_app"'), "before it is deleted");
 });
 
+test("prepare-runtime never installs a native runtime with the release host's pip", () => {
+  // pip_runner_python is lifted out of prepare-runtime.sh as written and
+  // run against three bundled interpreters.
+  const os = require("node:os");
+  const { spawnSync } = require("node:child_process");
+  const script = fs.readFileSync(path.join(DESKTOP_DIR, "scripts", "prepare-runtime.sh"), "utf8");
+  const start = script.indexOf("pip_runner_python() {");
+  const fn = script.slice(start, script.indexOf("\n}\n", start) + 2);
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "pip-runner-"));
+  const interpreter = (name, body, mode) => {
+    const dir = path.join(work, name, "python", "bin");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "python3"), body, { mode });
+    return path.join(work, name);
+  };
+  const run = (outDir) => spawnSync("bash", ["-c", `set -euo pipefail
+ROOT_DIR=/
+log() { echo "$*" >&2; }
+warn() { echo "$*" >&2; }
+die() { echo "$*" >&2; exit 1; }
+${fn}
+pip_runner_python "$1"`, "bash", outDir], { encoding: "utf8" });
+  try {
+    // Native, with pip: its own interpreter.
+    const good = interpreter("good", "#!/bin/sh\nexit 0\n", 0o755);
+    assert.equal(run(good).stdout.trim(), path.join(good, "python", "bin", "python3"));
+    // Native, without pip: an error — not the host's pip.
+    const nopip = interpreter("nopip", '#!/bin/sh\n[ "$1" = "-m" ] && exit 1\nexit 0\n', 0o755);
+    const broken = run(nopip);
+    assert.equal(broken.status, 1, broken.stdout);
+    assert.match(broken.stderr, /has no pip/);
+    // Cross (cannot run here): the host's python3, said in the log.
+    const cross = interpreter("cross", "MZ not a script", 0o644);
+    const crossRun = run(cross);
+    assert.equal(crossRun.stdout.trim(), "python3");
+    assert.match(crossRun.stderr, /cross build/);
+  } finally {
+    fs.rmSync(work, { recursive: true, force: true });
+  }
+});
+
 test("the TestFlight upload keeps the app-specific password off the command line", () => {
   // A value in argv is readable by every local user through `ps` for the
   // whole upload; altool reads `@env:<name>` from its own environment.

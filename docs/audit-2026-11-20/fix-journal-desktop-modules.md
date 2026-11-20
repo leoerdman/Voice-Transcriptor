@@ -293,3 +293,44 @@ exit=0
 DX-23 manifest half: `app_id=` in the manifest beside the installer is written by
 BUILD.command into the same kit as the DMG; whoever can replace the manifest can replace
 the DMG, so it is not a trust boundary — left as is (see Not done).
+
+### C8 — DX-26
+Files: `desktop/paste-result.js`, `desktop/paste-protocol.js`, `desktop/paste-result.test.js`.
+Check: `node --test desktop/paste-result.test.js`.
+Before (paste-result.js, paste-protocol.js at HEAD of C7):
+```
+exit=1
+✖ windows: the verdict is the last line, as on macOS — a marker inside other text is not an OK (0.860583ms)
+ℹ pass 30
+ℹ fail 1
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+    actual: true,
+```
+After:
+```
+exit=0
+ℹ pass 31
+ℹ fail 0
+```
+The method names `vbs-paste` / `pwsh-paste` now live in paste-protocol.js
+(`VBS_PASTE_METHOD`, `PWSH_PASTE_METHOD`); main.js still types them in the scripts it
+builds (L5416-5417, L5453, L5499, L5507) — Cross-domain.
+
+### C9 — DX-30, DX-24 (H-8)
+Files: `desktop/scripts/prepare-runtime.sh`, `desktop/packaging.test.js`.
+Check: `node --test --test-name-pattern="host's pip" desktop/packaging.test.js`.
+Before (prepare-runtime.sh at HEAD of C8):
+```
+exit=1
+✖ prepare-runtime never installs a native runtime with the release host's pip (186.566917ms)
+  AssertionError [ERR_ASSERTION]: python3
+    actual: 0,
+```
+After:
+```
+exit=0
+✔ prepare-runtime never installs a native runtime with the release host's pip (124.534667ms)
+```
+H-8: the python-build-standalone URL now names its current home (astral-sh); checked
+`curl -sIL` → `200` for the pinned 20260414 / 3.12.13 aarch64 tarball. The download is still
+verified by the pinned SHA256 in `fetch`, so the bytes cannot differ.
