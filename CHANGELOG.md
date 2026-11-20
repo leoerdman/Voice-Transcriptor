@@ -3,6 +3,20 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.18] - 2026-11-21
+
+### Added
+
+- **Delete a stroke by its number.** Hover over a stroke's number and it turns into ×; click it and the stroke is gone — from the screen, the next screenshot and the text. The strokes left are renumbered 1, 2, 3… The click does not reach the app underneath and is never recorded as a click.
+
+### Changed
+
+- **A rectangle's number sits at its top-right corner**, outside the box; a pen stroke's stays beside where it began.
+
+### Fixed
+
+- With two displays, a stroke's number no longer shows up at the edge of the other display.
+
 ## [1.6.17] - 2026-11-21
 
 ### Changed
