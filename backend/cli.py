@@ -335,6 +335,10 @@ def create_job(conn: Connection, source_path: str, options: dict, args: argparse
         if args.speakers:
             payload["num_speakers"] = str(args.speakers)
         route = "/api/remote/jobs/from-path"
+    # The backend snapshots the file for the job; only --save uses that
+    # copy afterwards (it becomes the recording's audio). Otherwise the
+    # app deletes it when the job ends instead of keeping it for 24 h.
+    payload["keep_source"] = bool(getattr(args, "save", False))
     created = _request(conn, "POST", route, payload)
     job_id = str((created or {}).get("job_id") or "").strip()
     if not job_id:

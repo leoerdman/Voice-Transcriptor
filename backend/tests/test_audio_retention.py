@@ -460,11 +460,27 @@ class SweepFanOutTests(AudioRetentionTestBase):
             key: disabled for key in self.main.AUDIO_RETENTION_POLICIES
         }
         self.main.DEFAULT_AUDIO_RETENTION_POLICY = disabled
+        # The timer also owns the job results' age limit (BL-18); with that
+        # off too, there is nothing for it to enforce.
+        self.main.RESULT_RETENTION_SEC = 0
         self.main._audio_retention_sweeper_thread = None
 
         self.main.start_audio_retention_sweeper()
 
         self.assertIsNone(self.main._audio_retention_sweeper_thread)
+
+    def test_sweeper_thread_still_starts_for_the_results_limit_alone(self) -> None:
+        disabled = self.main.AudioRetentionPolicy()
+        self.main.AUDIO_RETENTION_POLICIES = {
+            key: disabled for key in self.main.AUDIO_RETENTION_POLICIES
+        }
+        self.main.DEFAULT_AUDIO_RETENTION_POLICY = disabled
+        self.main.RESULT_RETENTION_SEC = 3600
+        self.main._audio_retention_sweeper_thread = None
+
+        self.main.start_audio_retention_sweeper()
+
+        self.assertIsNotNone(self.main._audio_retention_sweeper_thread)
 
 
 class RetentionLogTests(AudioRetentionTestBase):

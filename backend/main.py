@@ -80,8 +80,8 @@ from backend.audio_mime import AUDIO_EXT_TO_MIME, audio_content_type
 from backend.audio import (
     AudioError,
     compact_audio_chunks_for_remote,
+    FfmpegMissingError,
     ensure_wav_16k,
-    ensure_wav_16k_preserve_channels,
     split_channels,
     write_wav_from_pcm16_stream,
 )
@@ -2091,22 +2091,22 @@ async def network_status(_auth: None = Depends(_require_api_auth)):
     )
 
     def _probe_sync() -> dict:
-        best_latency_ms: Optional[int] = None
-        online = False
+        # The answer is a boolean plus one latency: the first host that
+        # answers settles it (BM-25). Probing all three on every poll
+        # (~every 10 s) tripled the work and sent two third-party hosts a
+        # request each time for nothing; the later hosts are fallbacks
+        # for when an earlier one is down or blocked.
         for url in probes:
             started = time.perf_counter()
             try:
                 with urlopen(url, timeout=2.5) as resp:
                     code = getattr(resp, "status", 200) or 200
                     ok = int(code) < 500
-                elapsed_ms = int((time.perf_counter() - started) * 1000)
-                if ok:
-                    online = True
-                    if best_latency_ms is None or elapsed_ms < best_latency_ms:
-                        best_latency_ms = elapsed_ms
             except Exception:
                 continue
-        return {"online": online, "latency_ms": best_latency_ms if online else None}
+            if ok:
+                return {"online": True, "latency_ms": int((time.perf_counter() - started) * 1000)}
+        return {"online": False, "latency_ms": None}
 
     return await asyncio.to_thread(_probe_sync)
 
@@ -2405,6 +2405,16 @@ def _copy_source_media_file(source_path: Path, target: Path) -> int:
         raise
 
 
+def _job_snapshot_is_kept(payload: Optional[dict]) -> bool:
+    """Whether a from-path job keeps its snapshot of the source after it
+    ends (``keep_source``, default true). The renderer and ``--save`` file
+    the snapshot as the recording's audio afterwards (save-from-path), so
+    they keep it; a plain CLI transcription never uses it again, and
+    without this the full copy of every file (up to 2 GB each) sat in
+    uploads/ until the 24 h sweep (BM-19)."""
+    return _payload_bool(payload, "keep_source", True)
+
+
 def _snapshot_source_media_for_job(source_path: Path, job_id: str) -> Path:
     orig_name = _normalize_filename(source_path.name)
     target = _upload_snapshot_path(job_id, orig_name)
@@ -2635,7 +2645,7 @@ def _run_local_transcribe_once(
         if split_stereo:
             wav_path = str(RESULTS_DIR / f"{run_id}.16k.wav")
             temp_paths.append(wav_path)
-            ensure_wav_16k_preserve_channels(str(upload_path), wav_path)
+            ensure_wav_16k(str(upload_path), wav_path, channels=None)
             set_progress(0.15)
             # Register the channel files BEFORE split_channels writes
             # them (BUG-64): the paths are deterministic, and if the ch2
@@ -3523,20 +3533,33 @@ def _recordings_scan_dirs(root: Path) -> list[Path]:
         child = root / folder_name
         if child.exists() and child.is_dir():
             candidates.append(child)
-    seen: set[str] = set()
+    seen: set[object] = set()
     dirs: list[Path] = []
     for candidate in candidates:
         try:
             resolved = candidate.resolve()
-            key = str(resolved)
         except OSError:
             resolved = candidate
-            key = str(candidate)
+        key = _dir_identity(resolved)
         if key in seen:
             continue
         seen.add(key)
         dirs.append(resolved)
     return dirs
+
+
+def _dir_identity(path: Path) -> object:
+    """What makes two spellings of a directory the same directory: the
+    file system's (device, inode). ``resolve()`` keeps the spelling it was
+    given, so on a case-insensitive volume ".../Transcriptor/recordings"
+    and ".../transcriptor/recordings" were two archive dirs — swept,
+    scanned and counted twice (BL-14, both are in the registry on the
+    user's machine)."""
+    try:
+        st = path.stat()
+        return (st.st_dev, st.st_ino)
+    except OSError:
+        return str(path)
 
 
 def _iter_recording_files_by_suffix(directory: Path, suffixes: set[str]) -> list[Path]:
@@ -3587,14 +3610,11 @@ def _recordings_scan_cache_key(root: Path) -> tuple:
 
 
 def _recordings_storage_dirs_for_roots(roots: Iterable[Path]) -> list[Path]:
-    seen: set[str] = set()
+    seen: set[object] = set()
     dirs: list[Path] = []
     for root in roots:
         for d in _recordings_scan_dirs(root):
-            try:
-                key = str(d.resolve())
-            except OSError:
-                key = str(d)
+            key = _dir_identity(d)
             if key in seen:
                 continue
             seen.add(key)
@@ -3956,14 +3976,11 @@ def _get_known_archive_dirs() -> list[Path]:
                 candidates.append(p)
         except Exception:
             continue
-    # Deduplicate by resolved absolute path.
-    seen: set[str] = set()
+    # Deduplicate by identity on disk, not by spelling (BL-14).
+    seen: set[object] = set()
     result: list[Path] = []
     for d in candidates:
-        try:
-            key = str(d.resolve())
-        except Exception:
-            key = str(d)
+        key = _dir_identity(d)
         if key not in seen:
             seen.add(key)
             result.append(d)
@@ -4011,6 +4028,22 @@ def _any_audio_retention_enabled() -> bool:
     return any(policy.enabled for policy in AUDIO_RETENTION_POLICIES.values())
 
 
+def _periodic_housekeeping() -> None:
+    """One tick of the timer: recorded-audio retention AND the job results /
+    upload snapshots age limit. The latter used to run only when a new job
+    was created (BL-18: results and a CLI snapshot sat on disk 42 h past a
+    24 h limit because no job followed them)."""
+    if _any_audio_retention_enabled():
+        try:
+            _sweep_recording_audio_retention()
+        except Exception:
+            logger.exception("periodic audio retention sweep failed")
+    try:
+        _cleanup_expired_files()
+    except Exception:
+        logger.exception("periodic results/uploads cleanup failed")
+
+
 def start_audio_retention_sweeper() -> None:
     """Run the audio-retention sweep on a timer, once per process.
 
@@ -4021,7 +4054,7 @@ def start_audio_retention_sweeper() -> None:
     threads.
     """
     global _audio_retention_sweeper_thread
-    if not _any_audio_retention_enabled():
+    if not _any_audio_retention_enabled() and RESULT_RETENTION_SEC <= 0:
         return
     with _audio_retention_sweeper_lock:
         if (
@@ -4033,10 +4066,7 @@ def start_audio_retention_sweeper() -> None:
         def _loop() -> None:
             while True:
                 time.sleep(AUDIO_RETENTION_SWEEP_INTERVAL_SEC)
-                try:
-                    _sweep_recording_audio_retention()
-                except Exception:
-                    logger.exception("periodic audio retention sweep failed")
+                _periodic_housekeeping()
 
         _audio_retention_sweeper_thread = threading.Thread(
             target=_loop, daemon=True, name="audio-retention-sweep"
@@ -6535,6 +6565,7 @@ async def create_job_from_path(
     split_stereo = _payload_bool(payload, "split_stereo", True)
     word_timestamps = _payload_bool(payload, "word_timestamps", False)
 
+    keep_source = _job_snapshot_is_kept(payload)
     job_id = str(uuid.uuid4())
     upload_path = await asyncio.to_thread(_snapshot_source_media_for_job, source_path, job_id)
     jobs.create(job_id)
@@ -6545,9 +6576,9 @@ async def create_job_from_path(
         language=lang_opt,
         split_stereo=split_stereo,
         word_timestamps=word_timestamps,
-        cleanup_upload_path=False,
+        cleanup_upload_path=not keep_source,
     )
-    return {"job_id": job_id, "audio_source_path": str(upload_path)}
+    return {"job_id": job_id, "audio_source_path": str(upload_path) if keep_source else ""}
 
 
 @app.post("/api/transcribe-sync")
@@ -6742,9 +6773,8 @@ def _run_remote_transcribe_once(
             _raise_if_cancelled()
             _set_progress(0.30)
         except AudioError as e:
-            err_text = str(e).lower()
             native_exts = {"wav", "mp3", "m4a", "mp4", "aac"}
-            if "ffmpeg is not installed" not in err_text:
+            if not isinstance(e, FfmpegMissingError):
                 raise RemoteError(f"audio compression failed: {e}") from e
             if orig_ext not in native_exts or source_size > REMOTE_RAW_FALLBACK_MAX_BYTES:
                 raise RemoteError(
@@ -6991,6 +7021,7 @@ async def create_remote_job_from_path(
     orig_name = _normalize_filename(source_path.name)
     lang_opt = _normalize_language(str((payload or {}).get("language") or "auto"))
 
+    keep_source = _job_snapshot_is_kept(payload)
     job_id = str(uuid.uuid4())
     upload_path = await asyncio.to_thread(_snapshot_source_media_for_job, source_path, job_id)
     jobs.create(job_id)
@@ -7003,9 +7034,9 @@ async def create_remote_job_from_path(
         diarize=_payload_bool(payload, "diarize", False),
         num_speakers=str((payload or {}).get("num_speakers") or ""),
         remote_model=_remote_model_from_payload(payload),
-        cleanup_upload_path=False,
+        cleanup_upload_path=not keep_source,
     )
-    return {"job_id": job_id, "audio_source_path": str(upload_path)}
+    return {"job_id": job_id, "audio_source_path": str(upload_path) if keep_source else ""}
 
 
 @app.post("/api/remote/transcribe-sync")
@@ -8395,8 +8426,12 @@ async def _save_recording_audio_source(
             ) from backup_err
     new_audio_placed = False
     save_completed = False
-    try:
-        await write_tmp_audio(tmp_audio)
+
+    def _place_audio_and_text() -> None:
+        # Blocking file work (an fsync of up to 2 GB, the transcript's
+        # fsync) runs on a worker thread, never on the event loop that
+        # carries live WebSocket frames (BM-12).
+        nonlocal new_audio_placed
         atomic_promote_file(tmp_audio, out_audio)
         new_audio_placed = True
         _write_recording_text_file(
@@ -8409,6 +8444,10 @@ async def _save_recording_audio_source(
             model=safe_model,
             language=safe_language,
         )
+
+    try:
+        await write_tmp_audio(tmp_audio)
+        await asyncio.to_thread(_place_audio_and_text)
         save_completed = True
     except BaseException:
         # Any failure after the prior audio backup was moved aside must
@@ -8444,25 +8483,31 @@ async def _save_recording_audio_source(
         # backup only survives here on the happy path (no rollback).
         if save_completed and audio_backup is not None and audio_backup.exists():
             _best_effort_unlink(audio_backup, context="recording audio backup cleanup")
-    if existing_audio is not None and existing_audio.resolve() != out_audio.resolve():
-        _best_effort_unlink(existing_audio, context="recording superseded audio cleanup")
-    # Screen mode: the take's screenshots become part of this recording —
-    # moved beside it as ``<stem>.screens`` before retention runs, so the
-    # rule below already sees them as this (exempt) recording's media.
-    screens_manifest, screens_error = _adopt_screen_session_for_recording(
-        screen_session_id,
-        target_dir,
-        stem,
-        audio_started_at=screen_audio_started_at,
-    )
-    # Persist this dir only after transcript + audio are durable so startup
-    # retroactive retention does not learn failed/empty archive targets.
-    _register_archive_dir(target_dir)
-    # Audio retention, per the collection's own policy (voice notes keep
-    # the newest N, uploaded media ages out); transcripts stay forever.
-    # The stem we just wrote is exempt — a save must never be able to
-    # delete its own audio — but it still counts toward a count limit.
-    pruned = _prune_recording_audio(target_dir, keep_stems=(stem,))
+    def _file_the_saved_recording() -> tuple[Optional[dict[str, Any]], str, int]:
+        # Same thread rule as above (BM-12): moving screenshots (a copy
+        # across volumes), the retention scan of the whole folder and the
+        # registry write are file work, not event-loop work.
+        if existing_audio is not None and existing_audio.resolve() != out_audio.resolve():
+            _best_effort_unlink(existing_audio, context="recording superseded audio cleanup")
+        # Screen mode: the take's screenshots become part of this recording —
+        # moved beside it as ``<stem>.screens`` before retention runs, so the
+        # rule below already sees them as this (exempt) recording's media.
+        manifest, adopt_error = _adopt_screen_session_for_recording(
+            screen_session_id,
+            target_dir,
+            stem,
+            audio_started_at=screen_audio_started_at,
+        )
+        # Persist this dir only after transcript + audio are durable so startup
+        # retroactive retention does not learn failed/empty archive targets.
+        _register_archive_dir(target_dir)
+        # Audio retention, per the collection's own policy (voice notes keep
+        # the newest N, uploaded media ages out); transcripts stay forever.
+        # The stem we just wrote is exempt — a save must never be able to
+        # delete its own audio — but it still counts toward a count limit.
+        return manifest, adopt_error, _prune_recording_audio(target_dir, keep_stems=(stem,))
+
+    screens_manifest, screens_error, pruned = await asyncio.to_thread(_file_the_saved_recording)
     _invalidate_recordings_cache()
     # Atomically discard the live recovery spool now that the audio is
     # safely on disk. This closes the race window between a successful

@@ -62,6 +62,12 @@ class AudioError(RuntimeError):
     pass
 
 
+class FfmpegMissingError(AudioError):
+    """The conversion needs ffmpeg and it is not installed. A type, so
+    callers decide on the fact (fall back to a raw upload, say what to
+    install) instead of on a substring of this module's prose (BM-13)."""
+
+
 def _ffmpeg_stderr_has_decode_error(stderr_text: str) -> bool:
     low = str(stderr_text or "").lower()
     return any(pattern in low for pattern in _FFMPEG_DECODE_ERROR_PATTERNS)
@@ -323,7 +329,7 @@ def compact_audio_chunks_for_remote(
     nobody built.)
     """
     if not _has_ffmpeg():
-        raise AudioError(
+        raise FfmpegMissingError(
             "ffmpeg is not installed. Install it (e.g. `brew install ffmpeg` "
             "or `winget install Gyan.FFmpeg`) — required for remote-provider "
             "audio compression."
@@ -368,24 +374,61 @@ def _copy_file_atomic(path_in: str, path_out: str) -> None:
         raise
 
 
-def ensure_wav_16k(path_in: str, path_out: str, channels: int = 1) -> str:
-    """Ensure 16k WAV PCM output using ffmpeg when needed.
+def _wav16k_cmd(path_in: str, path_out: str, channels: Optional[int]) -> list[str]:
+    """The ONE argv for "make a 16 kHz PCM16 WAV" (BM-14).
 
-    Fast-path: if input is already a WAV at 16kHz with the right channel count,
-    skip ffmpeg entirely (saves ~200-500ms subprocess overhead).
+    ``-map 0:a:0 -vn -sn -dn``: always the FIRST audio track and nothing
+    else. Without it ffmpeg picks the "best" stream (most channels), so a
+    multi-track video was transcribed from one track on the split-stereo
+    path and from another on the mono path. ``channels=None`` keeps the
+    source's channel count (``-ac`` omitted)."""
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-nostdin",
+        "-loglevel",
+        "error",
+        "-i",
+        path_in,
+        "-map",
+        "0:a:0",
+        "-vn",
+        "-sn",
+        "-dn",
+        "-ar",
+        str(LIVE_SAMPLE_RATE_HZ),
+    ]
+    if channels is not None:
+        cmd += ["-ac", str(int(channels))]
+    cmd += ["-c:a", "pcm_s16le", path_out]
+    return cmd
+
+
+def ensure_wav_16k(path_in: str, path_out: str, channels: Optional[int] = 1) -> str:
+    """Ensure a 16 kHz PCM16 WAV at *path_out*; ``channels=None`` keeps the
+    source's channel count (the split-stereo path).
+
+    Fast-path: an input that is already a 16 kHz PCM16 WAV with the wanted
+    channel count skips ffmpeg entirely (saves ~200-500 ms of subprocess
+    overhead) and is copied atomically. Without ffmpeg only such a WAV can
+    be accepted; anything else raises ``FfmpegMissingError`` or names what
+    is wrong with the WAV.
     """
     ext = os.path.splitext(path_in)[1].lower()
+
+    def _channels_fit(count: int) -> bool:
+        return count >= 1 if channels is None else count == int(channels)
 
     # Fast-path: check if WAV is already in the right format.
     if ext == ".wav":
         try:
             info = sf.info(path_in)
-            if info.samplerate == LIVE_SAMPLE_RATE_HZ and info.channels == channels and info.subtype == "PCM_16":
+            if info.samplerate == LIVE_SAMPLE_RATE_HZ and _channels_fit(info.channels) and info.subtype == "PCM_16":
                 # Already perfect — copy atomically via tmp+rename so a
                 # disk-full mid-copy leaves the destination untouched
-                # (the fallback path below already does this; symmetry
-                # prevents truncated-WAV transcribe silently succeeding
-                # with garbage audio).
+                # (truncated-WAV transcribe would silently succeed with
+                # garbage audio).
                 if os.path.abspath(path_in) != os.path.abspath(path_out):
                     _copy_file_atomic(path_in, path_out)
                 return path_out
@@ -393,26 +436,9 @@ def ensure_wav_16k(path_in: str, path_out: str, channels: int = 1) -> str:
             pass  # Fall through to ffmpeg conversion
 
     if _has_ffmpeg():
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-nostdin",
-            "-loglevel",
-            "error",
-            "-i",
-            path_in,
-            "-ar",
-            str(LIVE_SAMPLE_RATE_HZ),
-            "-ac",
-            str(int(channels)),
-            "-c:a",
-            "pcm_s16le",
-            path_out,
-        ]
         try:
             _run_ffmpeg(
-                cmd,
+                _wav16k_cmd(path_in, path_out, channels),
                 timeout_sec=_LOCAL_CONVERT_TIMEOUT_SEC,
                 fail_on_decode_error=True,
             )
@@ -425,7 +451,7 @@ def ensure_wav_16k(path_in: str, path_out: str, channels: int = 1) -> str:
         return path_out
 
     if ext != ".wav":
-        raise AudioError(
+        raise FfmpegMissingError(
             "ffmpeg is not installed. Install it (e.g. `brew install ffmpeg`) or upload a WAV file."
         )
 
@@ -434,11 +460,13 @@ def ensure_wav_16k(path_in: str, path_out: str, channels: int = 1) -> str:
     except Exception as exc:
         raise AudioError("Unable to inspect WAV file without ffmpeg") from exc
     if int(info.samplerate) != LIVE_SAMPLE_RATE_HZ:
-        raise AudioError(
+        raise FfmpegMissingError(
             f"ffmpeg is not installed. Please upload a {LIVE_SAMPLE_RATE_HZ} Hz WAV "
             "(or install ffmpeg for auto-convert)."
         )
-    if int(info.channels) != int(channels):
+    if channels is None and int(info.channels) < 1:
+        raise AudioError("Audio has no readable channels")
+    if channels is not None and int(info.channels) != int(channels):
         raise AudioError(
             f"Audio has {info.channels} channel(s), but {channels} required (install ffmpeg to convert)."
         )
@@ -449,82 +477,6 @@ def ensure_wav_16k(path_in: str, path_out: str, channels: int = 1) -> str:
     # Copy atomically: write to tmp then rename. A raw copyfile()
     # leaves the destination truncated on ENOSPC, and a subsequent
     # transcribe would silently use the fragment.
-    _copy_file_atomic(path_in, path_out)
-    return path_out
-
-
-def ensure_wav_16k_preserve_channels(path_in: str, path_out: str) -> str:
-    """Ensure 16k PCM WAV while preserving the source channel count."""
-    ext = os.path.splitext(path_in)[1].lower()
-    if ext == ".wav":
-        try:
-            info = sf.info(path_in)
-            if (
-                info.samplerate == LIVE_SAMPLE_RATE_HZ
-                and info.channels >= 1
-                and info.subtype == "PCM_16"
-            ):
-                if os.path.abspath(path_in) != os.path.abspath(path_out):
-                    _copy_file_atomic(path_in, path_out)
-                return path_out
-        except Exception:
-            pass
-
-    if _has_ffmpeg():
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-nostdin",
-            "-loglevel",
-            "error",
-            "-i",
-            path_in,
-            "-map",
-            "0:a:0",
-            "-vn",
-            "-sn",
-            "-dn",
-            "-ar",
-            str(LIVE_SAMPLE_RATE_HZ),
-            "-c:a",
-            "pcm_s16le",
-            path_out,
-        ]
-        try:
-            _run_ffmpeg(
-                cmd,
-                timeout_sec=_LOCAL_CONVERT_TIMEOUT_SEC,
-                fail_on_decode_error=True,
-            )
-        except AudioError:
-            try:
-                os.unlink(path_out)
-            except OSError:
-                pass
-            raise
-        return path_out
-
-    if ext != ".wav":
-        raise AudioError(
-            "ffmpeg is not installed. Install it (e.g. `brew install ffmpeg`) or upload a WAV file."
-        )
-
-    try:
-        info = sf.info(path_in)
-    except Exception as exc:
-        raise AudioError("Unable to inspect WAV file without ffmpeg") from exc
-    if int(info.samplerate) != LIVE_SAMPLE_RATE_HZ:
-        raise AudioError(
-            f"ffmpeg is not installed. Please upload a {LIVE_SAMPLE_RATE_HZ} Hz WAV "
-            "(or install ffmpeg for auto-convert)."
-        )
-    if int(info.channels) < 1:
-        raise AudioError("Audio has no readable channels")
-    if str(info.subtype or "").upper() != "PCM_16":
-        raise AudioError(
-            "Audio WAV subtype is not PCM_16; install ffmpeg to normalize it."
-        )
     _copy_file_atomic(path_in, path_out)
     return path_out
 

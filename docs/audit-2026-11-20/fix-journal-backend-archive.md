@@ -194,3 +194,31 @@ Proof method: SKILL §7.1 — the fixed file is put aside, `git show HEAD:<path>
 - After: every named check OK; full suite `Ran 929 tests ... OK (skipped=2)`.
 - BM-24 naming part (`retries` means attempts): the callers are engine modules (`remote_deepgram.py`, `remote_openrouter.py`); renaming the parameter needs them changed in the same commit → Cross-domain.
 - BM-21, non-empty invalid keyfile: kept as is — `test_a_keyfile_with_content_is_never_replaced` pins "a keyfile with content is never replaced" (B-020 decision); only the misleading "regenerating" message was fixed.
+
+### C10 · BM-12, BM-13 (ffmpeg part), BM-14, BM-19, BM-25, BL-14, BL-18 (sweep part) (P2) · save off the loop, one conversion, snapshots and results age out, one dir per inode, one probe
+- Files: `backend/main.py` (`_save_recording_audio_source` runs promote + transcript write and the post-save filing — superseded-audio cleanup, adoption, registry, retention — via `asyncio.to_thread`; the remote path's ffmpeg fallback decides on `isinstance(e, FfmpegMissingError)` instead of a substring; `_job_snapshot_is_kept` / `keep_source` on both from-path routes (default true; false → the job deletes its snapshot and answers `audio_source_path: ""`); `_periodic_housekeeping` = retention + `_cleanup_expired_files` on the hourly timer, which now also starts when only the results limit is set; `_dir_identity` (st_dev, st_ino) dedupes `_recordings_scan_dirs`, `_recordings_storage_dirs_for_roots`, `_get_known_archive_dirs`; `network_status` returns at the first host that answers), `backend/audio.py` (`FfmpegMissingError(AudioError)` raised by every "ffmpeg is not installed" site; one `ensure_wav_16k(path_in, path_out, channels: Optional[int] = 1)` with one argv builder `_wav16k_cmd` that always maps the first audio track — `ensure_wav_16k_preserve_channels` removed, its one caller passes `channels=None`), `backend/cli.py` (`create_job` sends `keep_source` = `--save`), tests: new `backend/tests/test_archive_housekeeping.py`, `test_audio.py` (`OneConversionTests`, `FfmpegMissingIsATypeTests`; the two source-inspection tests now check the one builder/function).
+- Check: `python -m unittest backend.tests.test_archive_housekeeping backend.tests.test_audio.OneConversionTests backend.tests.test_audio.FfmpegMissingIsATypeTests`
+- Before (main.py, cli.py, audio.py at HEAD):
+  ```
+  ERROR: test_the_cli_asks_to_keep_it_only_with_save (...)
+  KeyError: 'keep_source'
+  ERROR: test_a_tick_removes_results_past_the_window (...)
+  AttributeError: module 'backend.main' has no attribute '_periodic_housekeeping'
+  ERROR: test_both_paths_map_the_first_audio_track (...)
+  TypeError: int() argument must be a string, a bytes-like object or a real number, not 'NoneType'
+  ERROR: test_missing_ffmpeg_raises_its_own_type (...)
+  ImportError: cannot import name 'FfmpegMissingError' from 'backend.audio' (...)
+  FAIL: test_one_dir_spelled_two_ways_is_one_dir (...)
+  AssertionError: 2 != 1 : [PosixPath('.../Archive'), PosixPath('.../ARCHIVE')]
+  FAIL: test_a_job_nobody_will_save_deletes_its_snapshot (...)
+  AssertionError: False is not true
+  FAIL: test_the_probe_stops_at_the_first_host_that_answers (...)
+  AssertionError: 3 != 1 : ['https://openrouter.ai', 'https://www.google.com/generate_204', 'https://www.cloudflare.com/cdn-cgi/trace']
+  FAIL: test_the_retention_scan_of_a_save_runs_on_a_worker_thread (...)
+  AssertionError: Lists differ: [True] != [False]
+  Ran 9 tests in 2.017s
+  FAILED (failures=4, errors=4)
+  ```
+- After: `Ran 9 tests ... OK`; full suite `Ran 939 tests ... OK (skipped=2)`. `test_sweeper_thread_not_started_when_every_policy_is_disabled` now also turns the results limit off (the timer owns it too), and `test_sweeper_thread_still_starts_for_the_results_limit_alone` pins the new case.
+- BM-25 behaviour note: `latency_ms` is now the first answering host's latency, not the best of three.
+- BM-13 remainder (`upscale_text` falls back on `"HTTP 404"`/`"not found"` in `OpenRouterError` prose; `http_retry` hints by substring) → Cross-domain: `OpenRouterError` needs a `status_code` (engine module).
