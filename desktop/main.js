@@ -5205,17 +5205,13 @@ async function pasteFromClipboard(text, target, options, trace, clipboardLease) 
       reason: "generic-electron-without-safe-front",
     });
   }
+  // A target whose process is literally named "Electron" is routed by the
+  // concrete pid of the safe foreign front app (above), or loses its name
+  // when there is none. There used to be a third step here that emptied
+  // the target "to force the global frontmost route" — but an empty
+  // target is refused as no-target just below, so every paste into such
+  // an app failed with "In Clipboard · No Focus" (DM-17).
   const targetHint = `${effectiveTarget.appName} ${effectiveTarget.windowTitle} ${String(frontBefore.name || "")}`.toLowerCase();
-  const genericElectronTarget = /^electron$/i.test(effectiveTarget.appName);
-  if (genericElectronTarget) {
-    // For Electron-based third-party apps, process-level targeting can hit the shell process
-    // instead of the real focused webview/editor. Force global frontmost route.
-    traceStep(trace, "target_route_override", {
-      from: pasteTargetSummary(effectiveTarget),
-      reason: "generic-electron-use-frontmost-global",
-    });
-    effectiveTarget = emptyCapturedPasteTarget();
-  }
   traceStep(trace, "paste_strategy", { targetHint: compactLogText(targetHint, 80) });
   logPasteTrace("start", {
     target: pasteTargetSummary(effectiveTarget),
