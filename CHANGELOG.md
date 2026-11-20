@@ -3,6 +3,26 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.12] - 2026-11-21
+
+### Added
+
+- **Screen mode draws rectangles.** The bar above the capsule has two tools — a rectangle, which every take starts with (corner where you press, opposite corner where you let go, in any direction), and the pen — then a divider, then the colours.
+- **Every stroke is numbered** in a circle beside where it began, on the screen and in the screenshot; numbering restarts with each screenshot. The digit is always black, and the circle stays put while the stroke is drawn.
+- **Marks an agent can act on.** A stroke's mark carries its number, screenshot, colour, shape and place (`[✏️3 скрин 7: жёлтый прямоугольник, вверху слева]`) where it began in speech, and `[/3]` where it was released. The transcript opens with a header that names the screenshots' folder once and says how to read the marks, and ends with a summary: one item per screenshot, each stroke with its box and close-up. Screenshot marks are short (`[📸 03:53 скрин 7]`).
+- **Cheaper pictures for an agent.** Beside each screenshot: a downscaled copy and a close-up of every stroke.
+
+### Changed
+
+- **A screenshot is the front window** — no menu bar, no Dock — unless there is no such window or a stroke lies outside it; stroke positions are measured in that area.
+- **Strokes are 1.5 times thinner.**
+
+### Fixed
+
+- **The drawings and the bar no longer stay on screen after the stop.** A press the app had given up on could still start a take; a second press then joined it while the drawing session opened under another id, and the stop could not find it. The session now opens under the take the window is actually running, and a stop ends any drawing session still open.
+- **The pasted transcript keeps its lines.** The paste collapsed every line break, so a screen take's header, marks and summary arrived as one line.
+- **The first launch after an update no longer fails with "the optional engine install is breaking the bundled runtime's imports".** The check timed out while macOS scanned the new runtime and blamed a healthy engine; a slow check now blames nothing, and its limit only guards against a hang.
+
 ## [1.6.11] - 2026-11-20
 
 ### Fixed
