@@ -8730,7 +8730,10 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
     renderRecordingsList();
   }
   const requestSeq = ++recordingOpenRequestSeq;
-  const pendingDisplayName = matchedItem?.display_name || recordingTitleFromName(name);
+  // A recording's file name is its time (`20261121-034611.txt`), not its
+  // title: until the list or the response names it, the viewer says it is
+  // loading rather than showing the file name as the title.
+  const pendingDisplayName = matchedItem?.display_name || "";
   if (!options.silent) {
     setRecordingViewerLoading(pendingDisplayName, !!matchedItem?.has_audio);
   }
@@ -8745,6 +8748,7 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
     // including the Title/Saved-at header; only the export path wants it.
     const r = await apiGet<{
       name: string;
+      display_name?: string;
       archive_dir?: string;
       modified_at: string;
       size_bytes: number;
@@ -8760,7 +8764,7 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
       "/api/recordings/" + encodeURIComponent(name) + suffix
     );
     if (requestSeq !== recordingOpenRequestSeq || selectedRecordingKey() !== requestKey) return;
-    const displayName = matchedItem?.display_name || recordingTitleFromName(name);
+    const displayName = matchedItem?.display_name || r.display_name || recordingTitleFromName(name);
     $("recordingTitleLabel").textContent = displayName;
     $("recordingMeta").textContent = `${fmtDateTime(r.modified_at)} · ${fmtBytes(r.size_bytes || 0)}`;
     $("recordingContent").setAttribute("aria-busy", "false");
@@ -8833,7 +8837,7 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
   } catch (e) {
     if (requestSeq !== recordingOpenRequestSeq || selectedRecordingKey() !== requestKey) return;
     const message = sanitizeUiErrorMessage(e, "Could not open this recording.");
-    $("recordingTitleLabel").textContent = pendingDisplayName;
+    $("recordingTitleLabel").textContent = pendingDisplayName || recordingTitleFromName(name);
     $("recordingMeta").textContent = "Load failed";
     $("recordingContent").setAttribute("aria-busy", "false");
     // The message goes in the placeholder, NOT the body. The body is
