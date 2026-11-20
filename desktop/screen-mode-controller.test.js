@@ -1150,7 +1150,7 @@ test("the helper is told each number's circle exactly where the overlay draws it
   }
 });
 
-test("a tap on a stroke's number deletes it everywhere, is never a click, and the rest renumber live", async () => {
+test("a tap on a stroke's number deletes it everywhere, is never a click, and the rest keep their numbers", async () => {
   const world = createWorld();
   try {
     await world.controller.start(ID, { recordClicks: true });
@@ -1160,17 +1160,17 @@ test("a tap on a stroke's number deletes it everywhere, is never a click, and th
     assert.deepEqual(await screenNumbers(world), ["1", "2", "3"]);
     const [, second] = sentDiscs(world);
     world.say({ t: "tap", x: second[0] + 3, y: second[1] - 3 });
-    assert.deepEqual(await screenNumbers(world), ["1", "2"], "the numbers close up on the screen");
+    assert.deepEqual(await screenNumbers(world), ["1", "3"], "the others keep their numbers on the screen");
     const overlay = world.overlays()[0];
     assert.equal(await overlay.webContents.executeJavaScript("window.__hasStrokes([2])"), false, "off the screen");
     assert.equal(sentDiscs(world).length, 2, "the helper forgets its number");
     assert.ok(world.logs.some((l) => l.includes("stroke 2 deleted by its number; 2 left on the screen")));
     const shot = await world.controller.takeShot("hotkey");
     assert.equal(paintedMoveTos(shot.files[0]).length, 2, "not in the screenshot");
-    assert.deepEqual(painted(shot.files[0]).calls.filter((c) => c[0] === "fillText").map((c) => c[1]), ["1", "2"]);
+    assert.deepEqual(painted(shot.files[0]).calls.filter((c) => c[0] === "fillText").map((c) => c[1]), ["1", "3"]);
     const manifest = (await world.controller.finish({ id: ID })).manifest;
     const strokes = manifest.events.filter((e) => e.type === "stroke");
-    assert.deepEqual(strokes.map((e) => [e.shot, e.n, e.box.x]), [[1, 1, 10], [1, 2, 50]], "not in the manifest; 1..k");
+    assert.deepEqual(strokes.map((e) => [e.shot, e.n, e.box.x]), [[1, 1, 10], [1, 3, 50]], "not in the manifest; the numbers as drawn");
     assert.equal(manifest.events.find((e) => e.type === "shot").strokes, 2);
     assert.equal(manifest.events.some((e) => e.type === "click"), false, "a tap on a number is not a click, setting on or not");
   } finally {
@@ -1194,11 +1194,11 @@ test("the pointer on a stroke's number shows a cross in that same circle; off it
     // Back on it, and tapped: the stroke goes, and so does the cross.
     world.say({ t: "hover", x: first[0], y: first[1] });
     world.say({ t: "tap", x: first[0], y: first[1] });
-    assert.deepEqual(await screenNumbers(world), ["1"]);
+    assert.deepEqual(await screenNumbers(world), ["2"], "the one left keeps its number");
     // A cross is never painted into a screenshot.
     world.say({ t: "hover", x: sentDiscs(world)[0][0], y: sentDiscs(world)[0][1] });
     const shot = await world.controller.takeShot("hotkey");
-    assert.deepEqual(painted(shot.files[0]).calls.filter((c) => c[0] === "fillText").map((c) => c[1]), ["1"]);
+    assert.deepEqual(painted(shot.files[0]).calls.filter((c) => c[0] === "fillText").map((c) => c[1]), ["2"], "the screenshot shows the number the stroke had");
   } finally {
     world.cleanup();
   }

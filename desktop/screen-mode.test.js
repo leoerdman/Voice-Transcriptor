@@ -448,7 +448,7 @@ test("only finished strokes still on the screen have numbers to hit", () => {
   assert.deepEqual(liveBadges(s, new Set([3])).map((b) => b.id), [2]);
 });
 
-test("deleting a stroke by its number takes it out of the record and closes up the numbers on the screen", () => {
+test("deleting a stroke by its number takes it out of the record; the others keep their numbers (user, 2026-11-21)", () => {
   const s = createScreenSession({ id: "x", dir: "/d" });
   drawLine(s, [0, 0], [100, 100], 10); // id 1, shot 1
   shoot(s, { at: 15, files: ["/d/shot-01.png"] });
@@ -459,10 +459,16 @@ test("deleting a stroke by its number takes it out of the record and closes up t
   assert.equal(gone.id, 3);
   assert.equal(gone.n, 2, "it goes with the number the user tapped");
   assert.equal(s.strokes.some((st) => st.id === 3), false, "out of the session record");
-  assert.deepEqual(unshotStrokes(s).map((st) => [st.id, st.n]), [[2, 1], [4, 2]], "consecutive again");
+  assert.deepEqual(unshotStrokes(s).map((st) => [st.id, st.n]), [[2, 1], [4, 3]], "nobody takes over its number");
   assert.equal(s.strokes.find((st) => st.id === 1).n, 1, "a stroke in a screenshot keeps its number");
   drawLine(s, [600, 0], [700, 100], 50);
-  assert.equal(s.strokes[s.strokes.length - 1].n, 3, "the next stroke follows the ones left");
+  assert.equal(s.strokes[s.strokes.length - 1].n, 4, "a deleted number is not given again");
+  deleteStroke(s, 5);
+  drawLine(s, [800, 0], [900, 100], 60);
+  assert.equal(s.strokes[s.strokes.length - 1].n, 5, "not even the last one");
+  shoot(s, { at: 70, files: ["/d/shot-02.png"] });
+  drawLine(s, [0, 0], [100, 100], 80);
+  assert.equal(s.strokes[s.strokes.length - 1].n, 1, "a new picture starts at 1");
 });
 
 test("a stroke in a screenshot, or still being drawn, cannot be deleted", () => {
@@ -476,7 +482,7 @@ test("a stroke in a screenshot, or still being drawn, cannot be deleted", () => 
   assert.equal(s.strokes.length, 2);
 });
 
-test("the manifest of a shot after a deletion has no trace of the deleted stroke, and its numbers are 1..k", () => {
+test("the manifest of a shot after a deletion has no trace of the deleted stroke, and the others keep their numbers", () => {
   const s = createScreenSession({ id: "x", dir: "/d" });
   drawLine(s, [0, 0], [100, 100], 10);
   drawLine(s, [200, 0], [300, 100], 20);
@@ -485,7 +491,7 @@ test("the manifest of a shot after a deletion has no trace of the deleted stroke
   const shot = shoot(s, { at: 40, files: ["/d/shot-01.png"] });
   assert.deepEqual(shot.strokeIds, [2, 3]);
   const m = screenSessionManifest(s);
-  assert.deepEqual(m.events.filter((e) => e.type === "stroke").map((e) => [e.at, e.n]), [[20, 1], [30, 2]]);
+  assert.deepEqual(m.events.filter((e) => e.type === "stroke").map((e) => [e.at, e.n]), [[20, 2], [30, 3]]);
   assert.equal(m.events.find((e) => e.type === "shot").strokes, 2);
 });
 

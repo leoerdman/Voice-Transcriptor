@@ -972,9 +972,10 @@ function createScreenModeController(deps) {
       const stroke = deleteStroke(session, id);
       if (!stroke) return;
       if (hoveredId === id) setHovered(0);
+      // The others keep their numbers (screen-mode.js, beginStroke): only
+      // the deleted one leaves the screen.
       queueOp(["x", id]);
       const left = unshotStrokes(session);
-      for (const s of left) queueOp(["n", s.id, s.n]);
       sendControls();
       log(`[screen-mode] stroke ${stroke.n} deleted by its number; ${left.length} left on the screen`);
     });

@@ -3,6 +3,12 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.19] - 2026-11-21
+
+### Changed
+
+- **Deleting a stroke no longer renumbers the others.** Each stroke keeps its number; a deleted stroke's number is simply skipped — on the screen, in the screenshot and in the text — and never given again. A new screenshot still starts from 1.
+
 ## [1.6.18] - 2026-11-21
 
 ### Added

@@ -113,6 +113,8 @@ function createScreenSession({ id, dir, startedAt = Date.now(), color = SCREEN_M
     shots: [],
     activeStrokeId: 0,
     nextStrokeId: 1,
+    // The number the next stroke on the screen gets (see beginStroke).
+    nextStrokeN: 1,
     nextClickId: 1,
   };
 }
@@ -133,11 +135,14 @@ function unshotStrokes(session) {
  * THIS MOMENT. Where a stroke was is a fact about when it was drawn: a
  * display unplugged or rearranged later must not move it.
  *
- * Its number (`n`, drawn beside it and named in its mark) follows the
- * strokes already on the screen: 1, 2, 3… since the last shot.
+ * Its number (`n`, drawn beside it and named in its mark) is the next
+ * one since the last shot — 1, 2, 3… — and it is the stroke's for good: a
+ * deleted stroke's number is neither taken over by the strokes after it
+ * nor given again, so what the user has said about "3" stays about 3
+ * (user, 2026-11-21: "чтобы id не менялись").
  */
 function beginStroke(session, { x, y, at = Date.now(), displayId = 0, displayBounds = null }) {
-  const n = unshotStrokes(session).reduce((max, s) => Math.max(max, s.n), 0) + 1;
+  const n = session.nextStrokeN++;
   const stroke = {
     id: session.nextStrokeId++,
     n,
@@ -566,9 +571,9 @@ function pendingStrokes(session) {
  * began) to the captured region it lies in — null for a click outside
  * every captured area: it is still this shot's, with no place.
  *
- * The screen is clean after a shot, so the strokes still on it (finished
- * after the capture began, or kept from a display that failed) are
- * numbered again from 1: the next image starts at 1 too. Returns the shot
+ * The screen is clean after a shot, so the next image starts at 1: the
+ * strokes still on it (finished after the capture began, or kept from a
+ * display that failed) take 1..k and the next stroke k+1. Returns the shot
  * record.
  */
 function recordShot(session, { at = Date.now(), files, strokeIds, reason, area = SHOT_AREA.DISPLAY, preview = "", regions = {}, crops = {}, clicks = {} }) {
@@ -582,7 +587,7 @@ function recordShot(session, { at = Date.now(), files, strokeIds, reason, area =
     stroke.crop = crops[stroke.id] || "";
     taken.push(stroke.id);
   }
-  renumberUnshot(session);
+  startNextPicture(session);
   for (const click of pendingClicks(session)) {
     if (!Object.prototype.hasOwnProperty.call(clicks, click.id)) continue;
     click.shot = index;
@@ -594,12 +599,13 @@ function recordShot(session, { at = Date.now(), files, strokeIds, reason, area =
 }
 
 /**
- * The strokes on the screen are numbered 1..k in drawing order, with no
- * gap: the picture, the manifest's `n` and the transcript's marks name a
- * stroke by this one number.
+ * A shot cleared the screen: the next picture is numbered from 1. The
+ * strokes it did not take are its first ones, 1..k in drawing order.
  */
-function renumberUnshot(session) {
-  unshotStrokes(session).forEach((stroke, i) => { stroke.n = i + 1; });
+function startNextPicture(session) {
+  const left = unshotStrokes(session);
+  left.forEach((stroke, i) => { stroke.n = i + 1; });
+  session.nextStrokeN = left.length + 1;
 }
 
 /**
@@ -607,14 +613,14 @@ function renumberUnshot(session) {
  * finished stroke still on the screen can go: one in a screenshot is part
  * of that picture, and one being drawn holds the button. It leaves the
  * session record — so no screenshot, manifest or transcript mark ever has
- * it — and the strokes still on the screen close up to 1..k. Returns the
- * deleted stroke, or null when there was none to delete.
+ * it. The other strokes keep their numbers and its number is not given
+ * again (beginStroke): the picture and the text simply skip it. Returns
+ * the deleted stroke, or null when there was none to delete.
  */
 function deleteStroke(session, id) {
   const stroke = pendingStrokes(session).find((s) => s.id === id);
   if (!stroke) return null;
   session.strokes.splice(session.strokes.indexOf(stroke), 1);
-  renumberUnshot(session);
   return stroke;
 }
 
