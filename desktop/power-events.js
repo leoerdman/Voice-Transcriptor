@@ -37,6 +37,12 @@ const POWER_EVENT_ACTIONS = Object.freeze({
   // not always announce a lock first.
   suspend: "release-warm-capture",
   "lock-screen": "release-warm-capture",
+  // The OS is shutting down or logging out (Linux, macOS; Windows reports
+  // it as the window's `session-end`, which main routes to the same
+  // handler). The window's close-confirmation (DM-30) must never hold up
+  // an ending session: the session ends whether or not the dialog is
+  // answered, and a held close only turns a clean exit into a killed one.
+  shutdown: "end-session",
 });
 
 /** Every event name the app subscribes to, in registration order. */
@@ -46,6 +52,7 @@ const POWER_EVENTS = Object.freeze(Object.keys(POWER_EVENT_ACTIONS));
 const POWER_ACTIONS = Object.freeze({
   RECLAIM_SHORTCUTS: "reclaim-shortcuts",
   RELEASE_WARM_CAPTURE: "release-warm-capture",
+  END_SESSION: "end-session",
 });
 
 /**
@@ -71,11 +78,12 @@ const subscribedMonitors = new WeakSet();
  * @param {object} handlers
  * @param {Function} handlers.reclaimShortcuts   run on resume
  * @param {Function} handlers.releaseWarmCapture run on suspend / lock-screen, given the event name
+ * @param {Function} [handlers.endSession]       run on shutdown (the OS is ending the session)
  * @param {Function} [handlers.log]              one line per event and per handler failure
  * @returns {{registered: string[], alreadySubscribed: boolean}}
  */
 function subscribePowerEvents(powerMonitor, handlers = {}) {
-  const { reclaimShortcuts, releaseWarmCapture, log } = handlers;
+  const { reclaimShortcuts, releaseWarmCapture, endSession, log } = handlers;
   if (!powerMonitor || typeof powerMonitor.on !== "function") {
     throw new TypeError("subscribePowerEvents: powerMonitor with .on() is required");
   }
@@ -95,6 +103,7 @@ function subscribePowerEvents(powerMonitor, handlers = {}) {
       note(`[power] ${event} — ${action}`);
       try {
         if (action === POWER_ACTIONS.RECLAIM_SHORTCUTS) reclaimShortcuts(event);
+        else if (action === POWER_ACTIONS.END_SESSION) { if (typeof endSession === "function") endSession(event); }
         else releaseWarmCapture(event);
       } catch (e) {
         // An OS event callback is not a place to throw from: the other

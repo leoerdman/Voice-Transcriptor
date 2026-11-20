@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 
-import { RECORDING_CUES, createRecordingCuePlayer } from "../src/recording-cues";
+import { CUE_ATTACK_SEC, RECORDING_CUES, createRecordingCuePlayer } from "../src/recording-cues";
 
 function fakeContext(state: AudioContextState = "running") {
   const calls: string[] = [];
@@ -47,7 +47,7 @@ describe("recording cues", () => {
     calls.length = 0;
     play("stop");
     expect(calls).toContain(`freq.set ${RECORDING_CUES.stop.baseHz}@10`);
-    expect(calls).toContain(`gain.ramp ${RECORDING_CUES.stop.gainPeak}@${10 + 0.012}`);
+    expect(calls).toContain(`gain.ramp ${RECORDING_CUES.stop.gainPeak}@${10 + CUE_ATTACK_SEC}`);
   });
 
   it("opens one AudioContext for every cue, and only when the first cue plays", () => {

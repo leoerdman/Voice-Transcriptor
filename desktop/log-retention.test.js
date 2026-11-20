@@ -3,8 +3,7 @@
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 
-const { archivesToPrune, MAIN_LOG_ARCHIVE_KEEP_COUNT, MAIN_LOG_ARCHIVE_KEEP_BYTES } = require("./log-retention");
-const { topLevelFunctionSource } = require("./main-source");
+const { archivesToPrune, pruneLogArchives, MAIN_LOG_ARCHIVE_KEEP_COUNT, MAIN_LOG_ARCHIVE_KEEP_BYTES } = require("./log-retention");
 
 const MB = 1024 * 1024;
 const DAY = 24 * 60 * 60 * 1000;
@@ -43,8 +42,40 @@ test("input order does not matter", () => {
   assert.deepEqual(archivesToPrune(archives).sort(), ["main.log.archive-10", "main.log.archive-11"]);
 });
 
-test("the boot sweep deletes exactly what archivesToPrune names (wiring)", () => {
-  const fn = topLevelFunctionSource("pruneMainLogArchives");
-  assert.ok(fn, "pruneMainLogArchives not found");
-  assert.match(fn, /archivesToPrune\(/);
+test("once an archive is pruned every older one goes too: no holes in the kept history", () => {
+  // A big newer archive pushes past the byte cap; the small older one
+  // behind it must not survive on its own.
+  const archives = [archive(0, 10 * MB), archive(1, 45 * MB), archive(2, MB)];
+  assert.deepEqual(archivesToPrune(archives), ["main.log.archive-1", "main.log.archive-2"]);
+});
+
+test("the boot sweep removes exactly the pruned archives from a real directory", () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "log-retention-"));
+  try {
+    const logPath = path.join(dir, "main.log");
+    fs.writeFileSync(logPath, "live");
+    fs.writeFileSync(path.join(dir, "other.txt"), "not ours");
+    const now = Date.now() / 1000;
+    for (let i = 0; i < 12; i += 1) {
+      const p = path.join(dir, `main.log.archive-${String(i).padStart(2, "0")}`);
+      fs.writeFileSync(p, "x");
+      fs.utimesSync(p, now - i * 60, now - i * 60);
+    }
+    const lines = [];
+    const removed = pruneLogArchives(logPath, { log: (l) => lines.push(l) });
+    assert.deepEqual(removed.sort(), ["main.log.archive-10", "main.log.archive-11"]);
+    assert.ok(fs.existsSync(logPath), "the live log is never an archive");
+    assert.ok(fs.existsSync(path.join(dir, "other.txt")), "files of other names are not touched");
+    assert.equal(fs.readdirSync(dir).filter((n) => n.startsWith("main.log.archive-")).length, 10);
+    assert.equal(lines.length, 2);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an unreadable directory is not an error", () => {
+  assert.deepEqual(pruneLogArchives("/nonexistent-dir-for-test/main.log"), []);
 });

@@ -35,7 +35,7 @@ export const RECORDING_CUES: Readonly<Record<RecordingCueKind, Readonly<Recordin
 });
 
 /** Attack of the gain envelope, seconds. */
-const CUE_ATTACK_SEC = 0.012;
+export const CUE_ATTACK_SEC = 0.012;
 /** The oscillator runs this much past the envelope's end. */
 const CUE_RELEASE_TAIL_SEC = 0.01;
 /** Exponential ramps cannot reach zero; this is "silent". */

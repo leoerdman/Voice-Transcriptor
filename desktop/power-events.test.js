@@ -33,14 +33,14 @@ function fakeMonitor() {
 test("the three power events the app depends on are all subscribed", () => {
   // BUG-81's resume re-claim and 1.6.0's warm-microphone release both
   // shipped dead because nothing subscribed them.
-  assert.deepEqual([...POWER_EVENTS].sort(), ["lock-screen", "resume", "suspend"]);
+  assert.deepEqual([...POWER_EVENTS].sort(), ["lock-screen", "resume", "shutdown", "suspend"]);
 });
 
 test("resume reclaims shortcuts; suspend and lock-screen release the warm capture", () => {
   assert.equal(powerEventAction("resume"), POWER_ACTIONS.RECLAIM_SHORTCUTS);
   assert.equal(powerEventAction("suspend"), POWER_ACTIONS.RELEASE_WARM_CAPTURE);
   assert.equal(powerEventAction("lock-screen"), POWER_ACTIONS.RELEASE_WARM_CAPTURE);
-  assert.equal(powerEventAction("shutdown"), "", "an event we do not handle has no action");
+  assert.equal(powerEventAction("on-ac"), "", "an event we do not handle has no action");
   assert.equal(powerEventAction(undefined), "");
 });
 
@@ -102,4 +102,18 @@ test("a monitor without .on(), or missing handlers, is refused loudly", () => {
     () => subscribePowerEvents(fakeMonitor(), { reclaimShortcuts: () => { } }),
     TypeError,
   );
+});
+
+
+test("shutdown ends the session through its own handler, and only that one", () => {
+  assert.equal(powerEventAction("shutdown"), POWER_ACTIONS.END_SESSION);
+  const monitor = fakeMonitor();
+  const calls = [];
+  subscribePowerEvents(monitor, {
+    reclaimShortcuts: () => calls.push("reclaim"),
+    releaseWarmCapture: () => calls.push("release"),
+    endSession: (event) => calls.push(`end:${event}`),
+  });
+  monitor.emit("shutdown");
+  assert.deepEqual(calls, ["end:shutdown"]);
 });

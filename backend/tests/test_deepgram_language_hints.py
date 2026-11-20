@@ -120,7 +120,10 @@ class ConfigTests(unittest.TestCase):
         repaired = _validate_config_shape(cfg)
         self.assertEqual(repaired["preferences"]["deepgram"]["language_hints"], ["ru", "en"])
         cfg = {"preferences": {"deepgram": {"language_hints": "ru"}}}
-        self.assertEqual(_validate_config_shape(cfg)["preferences"]["deepgram"]["language_hints"], [])
+        self.assertEqual(
+            _validate_config_shape(cfg)["preferences"]["deepgram"]["language_hints"],
+            list(DEFAULT_LANGUAGE_HINTS),
+        )
 
 
 if __name__ == "__main__":
@@ -170,6 +173,30 @@ class DeclaredLanguageMergeTests(unittest.TestCase):
 
     def test_regional_tags_compare_by_base_language(self):
         self.assertEqual(self._text(("ru", "en"), tag="en-US"), "tak, tak. Еще")
+
+    def test_a_mislabelled_word_does_not_hand_its_english_neighbour_to_ru(self):
+        # One lv word glued to a real English clause: the runs split at the
+        # declared/undeclared boundary, so only the lv word goes to ru and
+        # the English stays with the (more confident) multilingual reading.
+        from backend.deepgram_dual import merge_readings
+
+        primary = self._seg([
+            {"word": "tak", "start": 1.0, "end": 1.3, "confidence": 0.95, "language": "lv"},
+            {"word": "single", "start": 1.35, "end": 1.7, "confidence": 0.99, "language": "en"},
+            {"word": "source", "start": 1.7, "end": 2.1, "confidence": 0.99, "language": "en"},
+        ])
+        secondary = self._seg([
+            {"word": "Так", "start": 1.0, "end": 1.3, "confidence": 0.8},
+            {"word": "сингл", "start": 1.35, "end": 1.7, "confidence": 0.5},
+            {"word": "сорс", "start": 1.7, "end": 2.1, "confidence": 0.5},
+        ])
+        self.assertEqual(merge_readings(primary, secondary, expected_languages=("ru", "en")).text, "Так single source")
+
+    def test_an_empty_language_tag_is_no_tag(self):
+        from backend.deepgram_dual import merge_readings
+
+        p, s = self._readings(tag="")
+        self.assertEqual(merge_readings(p, s, expected_languages=("ru", "en")).text, merge_readings(p, s).text)
 
 
 class SplicedWordEvidenceTests(unittest.TestCase):

@@ -11922,7 +11922,6 @@ async function stopLive(
   liveStartAttemptSeq += 1;
   const stopTransitionToken = createClientSessionId();
   stopTransitionInFlight = true;
-  playRecordingCue("stop");
   stopTransitionOwnerToken = stopTransitionToken;
   // ``_wsToCloseAtEnd`` is hoisted to function scope so the outer
   // ``finally`` block can close the WS AFTER the entire transcribe
@@ -12474,6 +12473,11 @@ async function stopLive(
   tearDown("workletNode.disconnect", () => {
     detachWorkletCapture("live teardown");
   });
+  // The take has stopped taking audio (the tail hold and the drain are
+  // behind us, the worklet is detached): the stop tone now cannot end up
+  // in the recording or the live stream. A discarded double-tap gets it
+  // too — every audible start is closed by an audible stop.
+  playRecordingCue("stop");
   tearDown("scriptNode.input.disconnect", () => {
     if (src && scriptNode) src.disconnect(scriptNode);
   });

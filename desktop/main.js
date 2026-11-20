@@ -139,7 +139,7 @@ const { buildPwshPasteFallbackScript } = require("./windows-paste-fallback");
 // (DM-09, DM-27).
 const { backendHandleOf, decideBackendExit } = require("./backend-exit");
 const { createSingleFlight } = require("./single-flight");
-const { archivesToPrune } = require("./log-retention");
+const { pruneLogArchives } = require("./log-retention");
 // Recording ids are unique only per renderer page: key them with the
 // page's epoch (DM-32).
 const { recordingKey, createBoundedKeySet } = require("./renderer-epoch");
@@ -784,25 +784,7 @@ function recoverOrphanRotatingLogs() {
 // Archive retention: rotation never deletes; the boot sweep deletes what
 // ./log-retention decides (the user's 10 archives / 50 MB policy, BL-03).
 function pruneMainLogArchives() {
-  try {
-    const logPath = mainLogFilePath();
-    const dir = path.dirname(logPath);
-    const prefix = path.basename(logPath) + ".";
-    const archives = [];
-    for (const name of fs.readdirSync(dir)) {
-      if (!name.startsWith(prefix)) continue;
-      let st;
-      try { st = fs.statSync(path.join(dir, name)); } catch { continue; }
-      if (!st.isFile()) continue;
-      archives.push({ name, mtimeMs: st.mtimeMs, size: st.size });
-    }
-    for (const name of archivesToPrune(archives)) {
-      try {
-        fs.rmSync(path.join(dir, name), { force: true });
-        appendMainLog(`[log-rotation] pruned old archive ${name}`);
-      } catch { /* keep in place; retried next boot */ }
-    }
-  } catch { /* directory unreadable — non-fatal */ }
+  pruneLogArchives(mainLogFilePath(), { log: appendMainLog });
 }
 
 function rotateMainLogIfNeeded() {
@@ -1214,6 +1196,16 @@ function applyWindowLifecycleEvent(event, context = {}) {
 // DM-30: the close held while the app asks the renderer what is in flight.
 let mainWindowCloseInFlight = false;
 let mainWindowCloseApproved = false;
+
+/**
+ * The OS is ending the session (shutdown, logoff): closes pass without
+ * the DM-30 confirmation. A held close cannot stop the session ending —
+ * it only turns a clean exit into a killed one.
+ */
+function allowSessionEndClose(reason) {
+  mainWindowCloseApproved = true;
+  appendMainLog(`[main-window] session ending (${normalizeLifecycleReason(reason)}): closes no longer ask`);
+}
 
 function approveMainWindowClose(reason) {
   if (shortcutCaptureAbortHandler) {
@@ -8715,6 +8707,8 @@ async function createWindow(options = {}) {
       })
       .finally(() => { mainWindowCloseInFlight = false; });
   });
+  // Windows announces logoff/shutdown to the window, not to powerMonitor.
+  win.on("session-end", () => allowSessionEndClose("session-end"));
   win.on("minimize", () => {
     // Rule 3: the OS did it and the app keeps running. Recorded so the
     // log distinguishes "the user minimised" from "something hid it".
@@ -9882,6 +9876,7 @@ app.whenReady().then(async () => {
   subscribePowerEvents(require("electron").powerMonitor, {
     reclaimShortcuts: () => registerGlobalShortcuts(),
     releaseWarmCapture: (reason) => notifyRendererSystemSuspend(reason),
+    endSession: (reason) => allowSessionEndClose(reason),
     log: appendMainLog,
   });
 

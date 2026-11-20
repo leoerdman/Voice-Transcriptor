@@ -527,21 +527,37 @@ def _word_spans(words: Iterable[dict]) -> list[tuple[float, float]]:
     return union_spans((w["start"], w["end"]) for w in words)
 
 
-def _contested_runs(primary: list[dict], secondary_language: str) -> list[list[dict]]:
+def _contested_runs(
+    primary: list[dict], secondary_language: str, expected: "frozenset[str]" = frozenset()
+) -> list[list[dict]]:
     """Runs of primary words the primary itself attributes to a language
-    other than the secondary reading's. A word with no language tag, a
-    word in the secondary's language, a clause-level record, or a pause
-    longer than a clause break ends a run."""
+    other than the secondary reading's. A word with no (or an empty)
+    language tag, a word in the secondary's language, a clause-level
+    record, or a pause longer than a clause break ends a run.
+
+    With declared languages (``expected``) a run also ends where the tags
+    cross between declared and undeclared: each run is then one kind, so
+    the rule deciding it (``_settle_contested_stretches``) never lets a
+    mislabelled word hand a neighbouring real-English clause to the
+    monolingual reading, or the other way round."""
     runs: list[list[dict]] = []
     run: list[dict] = []
     for word in primary:
         language = word.get("language")
         contested = (
             isinstance(language, str)
+            and bool(language.strip())
             and language != secondary_language
             and not word.get(SPANLESS_WORD_FLAG)
         )
-        if contested and run and word["start"] - run[-1]["end"] > INTERIM_WORD_GAP_SPLIT_SEC:
+        if contested and run and (
+            word["start"] - run[-1]["end"] > INTERIM_WORD_GAP_SPLIT_SEC
+            or (
+                expected
+                and (_language_base(language) in expected)
+                != (_language_base(run[-1].get("language")) in expected)
+            )
+        ):
             runs.append(run)
             run = []
         if contested:
@@ -669,7 +685,7 @@ def _settle_contested_stretches(
     secondary_ground = _word_spans(
         w for w in secondary if not w.get(SPANLESS_WORD_FLAG)
     )
-    for run in _contested_runs(primary, secondary_language):
+    for run in _contested_runs(primary, secondary_language, frozenset(expected)):
         start, end = run[0]["start"], run[-1]["end"]
         # A word belongs to the stretch its midpoint falls in, half-open
         # [start, end): no overlap threshold to tune, and a word that only
@@ -686,6 +702,8 @@ def _settle_contested_stretches(
         coverage = _covered_fraction(secondary_ground, start, end)
         removed_primary.update(id(w) for w in run)
         removed_secondary.update(id(w) for w in rivals)
+        # One kind per run (``_contested_runs`` splits at the boundary), so
+        # the first word speaks for all of it.
         undeclared = bool(expected) and _language_base(run[0].get("language")) not in expected
         to_secondary_here = coverage >= SPANLESS_SHADOW_MIN_FRACTION and (
             undeclared or secondary_conf >= primary_conf

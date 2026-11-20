@@ -838,15 +838,20 @@ def _validate_config_shape(cfg: Any) -> Dict[str, Any]:
                 )
                 repaired["dual_secondary_language"] = dg_defaults["dual_secondary_language"]
             hints_raw = dg_prefs.get("language_hints")
-            if hints_raw is not None and (
-                not isinstance(hints_raw, list)
-                or list(normalize_language_hints(hints_raw)) != hints_raw
-            ):
-                # Unknown codes would be a 400 from Deepgram that kills the
-                # stream; keep what is valid instead of the whole default.
+            if hints_raw is not None and not isinstance(hints_raw, list):
+                # Not a list at all: no user choice survives in it, so it
+                # is the default — never a silent "no hints".
                 logger.warning(
-                    "config.preferences.deepgram.language_hints must be a list of "
-                    "supported codes; keeping the valid ones"
+                    "config.preferences.deepgram.language_hints must be a list; resetting"
+                )
+                repaired["language_hints"] = list(DEFAULT_LANGUAGE_HINTS)
+            elif hints_raw is not None and list(normalize_language_hints(hints_raw)) != hints_raw:
+                # Unknown codes would be a 400 from Deepgram that kills the
+                # stream; keep the user's valid choices instead of the
+                # whole default.
+                logger.warning(
+                    "config.preferences.deepgram.language_hints holds unsupported "
+                    "codes; keeping the valid ones"
                 )
                 repaired["language_hints"] = list(normalize_language_hints(hints_raw))
             if repaired:
