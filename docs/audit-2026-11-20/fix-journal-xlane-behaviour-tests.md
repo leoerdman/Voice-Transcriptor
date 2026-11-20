@@ -171,3 +171,31 @@ Cut from `main` at 8e8f0a6.
   wiring test fails. Restored → green.
 - Suites: desktop 503/503, frontend 649/649, typecheck, lint, build,
   `node --check`: green.
+
+## 5. Timing budgets (DM-20), second test
+
+- The crash-restart policy moves into `desktop/backend-exit.js`
+  (`BACKEND_RESTART_MAX_ATTEMPTS/BACKOFF_STEP_MS/BACKOFF_MAX_MS`,
+  `backendRestartPlan(attempt)` → `{ giveUp }` or `{ giveUp: false, delayMs }`);
+  main.js's backend exit handler asks it instead of computing
+  `attempt > MAX` and `Math.min(step * attempt, max)` inline. Same numbers.
+- `timing-budgets.test.js` second test: six `doesNotMatch` regexes (pass
+  when the code is deleted) replaced by
+  - behaviour: attempts 1..10 → 800, 1600, 2400, 3200, 4000, 4800, 5000,
+    5000, give up, give up; plus a check that main.js schedules
+    `restartPlan.delayMs` and gives up on `restartPlan.giveUp`;
+  - positive textual (naming is a fact of the text): each remaining
+    budget is declared once with its value and the call site waits for it
+    (`setTimeout(tick, BACKEND_HEALTH_RETRY_MS)`,
+    `timeoutMs: ENGINE_PIP_INSTALL_TIMEOUT_MS`,
+    `const deadlineMs = GUARDED_STOP_DEADLINE_MS`, `pointerLockMs: 80`
+    used by the capsule's pointer lock) — deleting or inlining a call
+    site now fails, which the old negatives did not.
+  The first test (cold-start budget = health + page load) was already
+  positive; kept.
+- Break-it evidence: cap off by one (`>=`) → the policy test fails; the
+  ceiling dropped → fails; main.js scheduling a fixed `1000` instead of
+  the plan → fails; the health-poll `setTimeout(tick, …)` line deleted →
+  the naming test fails. Restored → green.
+- Suites: desktop 504/504, frontend 649/649, typecheck, lint, build,
+  `node --check`: green.

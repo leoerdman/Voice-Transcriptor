@@ -170,7 +170,7 @@ desktop/
 ├── renderer-requests.js            # the main window's requests (shortcuts, record toggle, reveal) — what main accepts from each (pure, node --test); replaces the document.title channel
 ├── auto-stop-config.js             # the silence auto-stop setting main applies: the renderer's, or off — no copy of its defaults (pure, node --test)
 ├── data-dir.js                     # the one rule for where the desktop shell keeps its data (pure, node --test)
-├── backend-exit.js                 # what the shell does when the backend child exits: restart, report, or let it go on quit (pure, node --test)
+├── backend-exit.js                 # what the shell does when the backend child exits: restart (with the capped backoff), report, or let it go on quit (pure, node --test)
 ├── log-retention.js                # which main.log archives the boot sweep deletes: newest 10, at most 50 MB (user decision; pure, node --test)
 ├── backend-auth.js                 # the backend API token: minted per launch, passed in the backend's env, handed only to the main window over IPC (pure, node --test)
 ├── private-log.js                  # main.log appends: the file is created 0600, an older world-readable one tightened once (pure, node --test)

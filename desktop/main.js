@@ -142,7 +142,7 @@ const { STOP_ACTION, decideMainProcessStop } = require("./recording-stop");
 const { buildPwshPasteFallbackScript } = require("./windows-paste-fallback");
 // What a backend exit means: restart or not, and whose handle it clears
 // (DM-09, DM-27).
-const { backendHandleOf, decideBackendExit } = require("./backend-exit");
+const { backendHandleOf, decideBackendExit, backendRestartPlan } = require("./backend-exit");
 const { createSingleFlight } = require("./single-flight");
 // A session that grants no permission request or check (the capsule, DM-35).
 const { denyAllSessionPermissions } = require("./session-permissions");
@@ -667,15 +667,8 @@ const MAIN_WINDOW_PAGE_LOAD_TIMEOUT_MS = 15_000;
  */
 const MAIN_WINDOW_INITIAL_LOAD_TIMEOUT_MS = BACKEND_COLD_START_HEALTH_TIMEOUT_MS + MAIN_WINDOW_PAGE_LOAD_TIMEOUT_MS;
 
-/**
- * Crash-restart policy. After BACKEND_RESTART_MAX_ATTEMPTS restarts the
- * shell stops and shows the boot error: a deterministically broken backend
- * would otherwise restart forever, grow the log and hide the real failure.
- * The backoff grows by one step per attempt up to its ceiling.
- */
-const BACKEND_RESTART_MAX_ATTEMPTS = 8;
-const BACKEND_RESTART_BACKOFF_STEP_MS = 800;
-const BACKEND_RESTART_BACKOFF_MAX_MS = 5000;
+// The crash-restart policy (attempt cap, backoff) is ./backend-exit's
+// backendRestartPlan.
 /** /api/health polling: pause between tries, and one request's ceiling. */
 const BACKEND_HEALTH_RETRY_MS = 250;
 const BACKEND_HEALTH_REQUEST_TIMEOUT_MS = 2000;
@@ -8043,12 +8036,11 @@ async function startBackend() {
       }
       const attempt = backendRestartAttempts + 1;
       backendRestartAttempts = attempt;
-      // Hard cap: after 8 attempts, stop scheduling. A deterministically
-      // broken backend (corrupt config, missing dep, port conflict we
-      // can't escape) would otherwise restart every 5s forever, growing
-      // the log file unboundedly and masking the real failure. The user
-      // sees a permanent backend error in the renderer instead.
-      if (attempt > BACKEND_RESTART_MAX_ATTEMPTS) {
+      // Hard cap (./backend-exit): past it, stop scheduling. The user
+      // sees a permanent backend error in the renderer instead of a
+      // backend restarting every 5 s forever.
+      const restartPlan = backendRestartPlan(attempt);
+      if (restartPlan.giveUp) {
         failBackendBoot(
           BACKEND_BOOT_ERROR_CODES.BACKEND_EXITED,
           `Backend exited (code ${code}, signal ${signal || "none"}) after ${attempt - 1} restart attempts — giving up.`,
@@ -8058,7 +8050,7 @@ async function startBackend() {
         broadcastBackendBootError();
         return;
       }
-      const delay = Math.min(BACKEND_RESTART_BACKOFF_STEP_MS * attempt, BACKEND_RESTART_BACKOFF_MAX_MS);
+      const delay = restartPlan.delayMs;
       appendMainLog(`[backend-restart-scheduled] attempt=${attempt} delayMs=${delay}`);
       backendRestartTimer = setTimeout(() => {
         // 1.1.25 fix: previously nulled ``backendRestartTimer`` BEFORE
