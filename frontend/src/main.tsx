@@ -37,11 +37,17 @@ import {
 import {
   createSessionMetadataSaver,
   decideDrainedSilence,
+  emptyFinalKeepsLiveText,
+  EMPTY_FINAL_STATUS,
+  keepLiveTranscript,
+  resolveEmptyFinalSummary,
   resolveFailedStopSummary,
   resolveSessionTitle,
   resolveTranscriptStopSummary,
   runStopEpilogue,
+  withKeptNote,
   type FinalSaveOutcome,
+  type KeptTranscript,
   type StopEpiloguePlan,
 } from "./stop-epilogue";
 import {
@@ -197,6 +203,7 @@ import {
   type PersistedLiveDraft,
 } from "./live-draft";
 import { BoundedChunkWindow, capturedHoursLabel, pcmWavDurationSec } from "./pcm-capture";
+import { draftSpokenText, parsePromotedTake, planTakeRecovery, type PromotedTake } from "./take-recovery";
 import {
   annotateTranscript,
   parseScreenManifest,
@@ -5284,10 +5291,16 @@ async function discardLiveRecovery(sessionId: string): Promise<void> {
   if (!r.ok) throw new Error(await parseError(r));
 }
 
-async function recoverBackendAudioSessions(): Promise<void> {
+/**
+ * Promote every crashed take's audio spool into History. Returns the
+ * entries it made: the crash draft of the same take is written into its
+ * entry next (``recoverLiveDraftIfAny``, ./take-recovery).
+ */
+async function recoverBackendAudioSessions(): Promise<PromotedTake[]> {
+  const promoted: PromotedTake[] = [];
   const r = await apiGet<{ items: Array<{ session_id: string }> }>("/api/live/recoveries");
   const items = Array.isArray(r.items) ? r.items : [];
-  if (!items.length) return;
+  if (!items.length) return promoted;
   const archiveDir = currentArchiveDirSnapshot();
   // Process each recovery independently. A single failure (e.g. a
   // spool file that's under the minimum duration threshold and hits
@@ -5320,7 +5333,10 @@ async function recoverBackendAudioSessions(): Promise<void> {
       succeeded += 1;
       // A recovered screen take whose screenshots could not be attached
       // (M3): recovered, but the summary says what is missing.
-      const screensError = parseScreensError(await resp.json().catch(() => null));
+      const body: unknown = await resp.json().catch(() => null);
+      const take = parsePromotedTake(sessionId, body);
+      if (take) promoted.push(take);
+      const screensError = parseScreensError(body);
       if (screensError) {
         withoutScreens += 1;
         console.warn(`Recovery promote for ${sessionId}: screenshots not attached: ${screensError}`);
@@ -5331,7 +5347,7 @@ async function recoverBackendAudioSessions(): Promise<void> {
     }
   }
   const summary = recoverySummary(succeeded, failed, withoutScreens);
-  if (!summary) return;
+  if (!summary) return promoted;
   showRecordSessionNotice(summary.text, summary.tone, UI_TOKENS.notice.longMs);
   if (succeeded > 0) {
     void loadRecordings(true).catch((e) => {
@@ -5344,6 +5360,7 @@ async function recoverBackendAudioSessions(): Promise<void> {
       );
     });
   }
+  return promoted;
 }
 
 function resolveFastLocalLanguage(language: string): string {
@@ -6108,53 +6125,86 @@ function readStaleLiveDraftOnce(): Promise<{ draft: PersistedLiveDraft | null; l
   return staleLiveDraftRead;
 }
 
-async function recoverLiveDraftIfAny(): Promise<void> {
+/**
+ * Put back what a crash left: the previous run's draft, joined with the
+ * History entries the boot just promoted from crashed takes' audio
+ * (``promoted``) — the draft's text and the take's screen marks go into
+ * its entry, beside its audio and screenshots (./take-recovery). A draft
+ * whose take has no promoted entry is saved on its own, as before. The
+ * draft stays in its slot until every write that carries it succeeded,
+ * so a failure is retried at the next start.
+ */
+async function recoverLiveDraftIfAny(promoted: ReadonlyArray<PromotedTake> = []): Promise<void> {
   const { draft, legacy } = await readStaleLiveDraftOnce();
-  if (!draft) return;
   // A localStorage-era draft moves to the backend slot — unless a session
   // of this run has already taken the slot, which it must not lose.
-  if (legacy && !liveDraftSlotWrittenThisRun) void persistLiveDraftPayload(draft);
-  try {
-    const sourceText = String(draft.source_text || "").trim();
-    const transcriptText = String(draft.transcript_text || "").trim();
-    const sessionId = String(draft.session_id || "").trim();
-    if (!sourceText && !transcriptText) {
-      if (mayClearRecoveredDraft(sessionId, liveDraftSlotWrittenThisRun)) await clearLiveDraft(sessionId);
-      return;
+  if (draft && legacy && !liveDraftSlotWrittenThisRun) void persistLiveDraftPayload(draft);
+  const plan = planTakeRecovery(draft, promoted);
+  let draftSaved = !plan.draftAlone && !plan.draftInWrites;
+  let shown: { text: string; title: string; savedName: string } | null = null;
+  for (const write of plan.writes) {
+    try {
+      const saved = await saveRecordingText({
+        name: write.name,
+        archiveDir: write.archiveDir,
+        requireExisting: true,
+        title: write.title,
+        sourceText: write.sourceText,
+        transcriptText: write.transcriptText,
+        provider: write.provider,
+        model: write.model,
+        language: write.language,
+      });
+      if (write.fromDraft) draftSaved = true;
+      if (write === plan.shown) shown = { text: write.transcriptText, title: write.title, savedName: saved.name };
+    } catch (e) {
+      console.warn("Recovered take: writing its text and screen marks failed", e);
     }
-    const stamp = Number(draft.updated_at || Date.now());
-    const recovered = await saveRecordingText({
-      archiveDir: String(draft.archive_dir || "").trim() || currentArchiveDirSnapshot(),
-      title: String(draft.title || "Recovered recording") + " (Recovered)",
-      sourceText,
-      transcriptText,
-      provider: recoveredDraftProvider(draft),
-      model: String(draft.model || "-"),
-      language: String(draft.language || "auto"),
-      recordingCollection: recordingCollectionFromDraft(draft.recording_collection),
-    });
-    const recoveredText = transcriptText || sourceText;
+  }
+  if (draft && plan.draftAlone) {
+    try {
+      const sourceText = String(draft.source_text || "").trim();
+      const transcriptText = String(draft.transcript_text || "").trim();
+      const title = String(draft.title || "Recovered recording");
+      const recovered = await saveRecordingText({
+        archiveDir: String(draft.archive_dir || "").trim() || currentArchiveDirSnapshot(),
+        title: title + " (Recovered)",
+        sourceText,
+        transcriptText,
+        provider: recoveredDraftProvider(draft),
+        model: String(draft.model || "-"),
+        language: String(draft.language || "auto"),
+        recordingCollection: recordingCollectionFromDraft(draft.recording_collection),
+      });
+      draftSaved = true;
+      shown = { text: draftSpokenText(draft), title, savedName: recovered.name };
+    } catch (e) {
+      console.warn("Live draft recovery failed; keeping draft for next startup", e);
+    }
+  }
+  if (shown) {
     publishRecordingOutput({
       recordingId: 0,
-      pasteText: recoveredText,
-      domText: recoveredText,
+      pasteText: shown.text,
+      domText: shown.text,
       kind: "transcript",
     });
     setCurrentRecordingSummary({
-      title: String(draft.title || "Recovered recording"),
+      title: shown.title,
       status: "Recovered unsaved draft from the previous session.",
       tone: "warning",
-      savedName: recovered.name,
+      savedName: shown.savedName,
     });
     showRecordSessionNotice(
       "Recovered the last unsaved draft from a previous session.",
       "warning",
       UI_TOKENS.notice.longMs,
     );
-    setStatus("Recovered " + new Date(stamp).toLocaleTimeString());
+    setStatus("Recovered " + new Date(Number(draft?.updated_at || Date.now())).toLocaleTimeString());
+  }
+  if (draft && draftSaved) {
+    const sessionId = String(draft.session_id || "").trim();
     if (mayClearRecoveredDraft(sessionId, liveDraftSlotWrittenThisRun)) await clearLiveDraft(sessionId);
-  } catch (e) {
-    console.warn("Live draft recovery failed; keeping draft for next startup", e);
   }
 }
 
@@ -10608,6 +10658,13 @@ interface RecordingOutputSignal {
   /** The text to render in the ``$finalOutput`` DOM element. Defaults to
    *  ``pasteText`` when omitted. Pass explicit ``""`` to clear the DOM. */
   domText?: string;
+  /**
+   * What the TRANSCRIBE panel shows when it is not ``domText``: the live
+   * text with screen marks a take keeps when it has no final transcript
+   * (./stop-epilogue ``keepLiveTranscript``). ``domText`` then stays the
+   * short status the desktop shell shows in the capsule.
+   */
+  panelText?: string;
   /** Classification of this event for the recording state machine. */
   kind?: RecordingFinalSignalKind;
   /**
@@ -10669,7 +10726,8 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
     // ``resetLiveDraftState``. This used to be written as an ``if`` with
     // a comment for a body, which hides the intent rather than stating
     // it — a reader had to prove to themselves that nothing was missing.
-    $("finalOutput").textContent = domText;
+    const panelText = String(signal.panelText || "").trim();
+    $("finalOutput").textContent = panelText || domText;
   }
 }
 
@@ -12455,12 +12513,13 @@ async function stopLive(
   // summary — is ``runStopEpilogue`` (./stop-epilogue), one for all.
   const endWithoutTranscript = (
     plan: StopEpiloguePlan,
-    metadata: { transcriptText: string; provider: string } = { transcriptText: "", provider: metadataProvider },
+    metadataProviderForSave: string = metadataProvider,
   ): Promise<FinalSaveOutcome> => runStopEpilogue(plan, {
-    publish: (signal) => publishRecordingOutput({
+    publish: (signal, panelText) => publishRecordingOutput({
       recordingId,
       pasteText: "",
       domText: signal.domText,
+      panelText,
       kind: signal.kind,
       sessionToken: sessionUiToken,
     }),
@@ -12470,10 +12529,10 @@ async function stopLive(
       }
     },
     setStatus: (label) => setStatusScoped(sessionUiToken, label),
-    save: () => saveSessionMetadata({
+    save: (transcriptText) => saveSessionMetadata({
       spokenTranscript: "",
-      transcriptText: metadata.transcriptText,
-      provider: metadata.provider,
+      transcriptText,
+      provider: metadataProviderForSave,
     }),
     release: releaseStopEpilogueBookkeeping,
     patchSummary: (summary) => patchCurrentRecordingSummary({
@@ -12623,6 +12682,18 @@ async function stopLive(
     void deferredSinkDestroy.destroy();
   }
 
+  // Screen mode: the strokes and screenshots of this take, from the
+  // archived manifest (the staged one when the save could not archive
+  // it). Fixed from here on: every exit below — the transcript, or the
+  // live text a take without one keeps — carries the same marks.
+  const screenMarks: ScreenMark[] = screenManifest
+    ? screenMarksFromManifest(screenManifest, recordingClockStartAt)
+    : [];
+  /** What this take keeps when it ends without a final transcript
+   *  (./stop-epilogue). Read late: final events can still land while the
+   *  socket drains. */
+  const keptLiveTranscript = (): KeptTranscript => keepLiveTranscript(latestSourceForSave(), screenMarks, recordedMs);
+
   if (startupAbortReason && !savedAudioFile && !transcribeInputFile && captureLevel.frames === 0) {
     await endWithoutTranscript({
       signal: { domText: startupAbortReason, kind: "error" },
@@ -12657,7 +12728,9 @@ async function stopLive(
       },
       conflictStatus: drainedFailureReason?.notice ||
         "Silence was detected, but the original archive changed before the session could be finalized. The entry was not recreated elsewhere.",
-    }, { transcriptText: drainedDomText, provider: metadataProvider });
+      transcriptText: drainedDomText,
+      kept: keptLiveTranscript(),
+    });
     return;
   }
 
@@ -12676,6 +12749,7 @@ async function stopLive(
         ? { status: "Audio saved. Final transcription was skipped for this session.", tone: "success" }
         : { status: "Audio saved, but the canonical transcription input is unavailable for this session.", tone: "warning" },
       conflictStatus: "Audio is available, but the original archive changed before the session metadata could be finalized.",
+      kept: keptLiveTranscript(),
     });
     return;
   }
@@ -12693,7 +12767,8 @@ async function stopLive(
       save: true,
       summary: { status: `${msg} Audio is still saved locally.`, tone: "error" },
       conflictStatus: `${msg} The original archive changed before the session metadata could be finalized.`,
-    }, { transcriptText: "", provider });
+      kept: keptLiveTranscript(),
+    }, provider);
     return;
   }
   // (``transcribeStartedAt`` is captured at the top of ``stopLive``)
@@ -13087,13 +13162,38 @@ async function stopLive(
       `source=${transcriptSource} wsFramesNeverSent=${wsFramesNeverSent} ` +
       `${describeLiveFinalStats(finalEnvelopeStats)}`,
     );
+    // The final pass produced nothing, but the live preview held speech:
+    // the take ends on what it kept (./stop-epilogue) — shown in the
+    // TRANSCRIBE panel and saved to History, never pasted — instead of
+    // "no speech detected" over words the user watched appear.
+    if (emptyFinalKeepsLiveText(transcriptRaw, latestSourceForSave())) {
+      const kept = keptLiveTranscript();
+      console.log(`[trace stopLive] empty final; keeping the live text ${traceTextStats("kept", kept.text)}`);
+      publishRecordingOutput({
+        recordingId,
+        pasteText: "",
+        domText: `${EMPTY_FINAL_STATUS} ${kept.note}`,
+        panelText: kept.text,
+        kind: "status",
+        sessionToken: sessionUiToken,
+      });
+      if (isCurrentUiSession(sessionUiToken)) {
+        $("progressRow").hidden = true;
+      }
+      setStatusScoped(sessionUiToken, "Done");
+      const keptSave = await saveSessionMetadata({ spokenTranscript: "", transcriptText: kept.text, provider });
+      patchCurrentRecordingSummary({
+        title: resolveSessionTitle("", latestSourceForSave(), defaultTitle),
+        ...resolveEmptyFinalSummary(kept, keptSave),
+        savedName: persistedRecordingName,
+        transcribeLatencyMs: performance.now() - transcribeStartedAt,
+      }, sessionUiToken);
+      return;
+    }
     // Screen mode: the strokes and screenshots go into the transcript at
     // the moments they happened in speech (./screen-annotations). The
     // envelope's segments time the text they describe; any other source
     // is placed by its share of the recording's duration.
-    const screenMarks: ScreenMark[] = screenManifest
-      ? screenMarksFromManifest(screenManifest, recordingClockStartAt)
-      : [];
     const plainTranscriptRaw = transcriptRaw;
     const screenWordStartsMs = transcriptSource === "envelope"
       ? wordStartsFromSegments(liveFinalSlots.get(sessionUiToken)?.envelope?.segments || [])
@@ -13187,10 +13287,16 @@ async function stopLive(
   } catch (e) {
     console.error("Live transcription finalization failed", e);
     const safeMessage = sanitizeUiErrorMessage(e, "Transcription failed. Audio is still saved.");
+    // The take ends on what it kept: the live text with its screen marks
+    // is what the TRANSCRIBE panel shows and History stores
+    // (./stop-epilogue); the error stays the capsule's status and the
+    // summary's.
+    const kept = keptLiveTranscript();
     publishRecordingOutput({
       recordingId,
       pasteText: "",
       domText: safeMessage,
+      panelText: kept.text,
       kind: "error",
       sessionToken: sessionUiToken,
     });
@@ -13198,14 +13304,14 @@ async function stopLive(
       $("progressRow").hidden = true;
     }
     setStatusScoped(sessionUiToken, "Error");
-    const fallbackSave = await saveSessionMetadata({ spokenTranscript: "", transcriptText: "", provider });
+    const fallbackSave = await saveSessionMetadata({ spokenTranscript: "", transcriptText: kept.text, provider });
     patchCurrentRecordingSummary({
       title: provisionalTitle,
-      ...resolveFailedStopSummary({
+      ...withKeptNote(resolveFailedStopSummary({
         failureMessage: safeMessage,
         persistedName: persistedRecordingName,
         outcome: fallbackSave,
-      }),
+      }), kept),
       transcribeLatencyMs: performance.now() - transcribeStartedAt,
     }, sessionUiToken);
   } finally {
@@ -13345,14 +13451,15 @@ async function initRecordingsBootstrap(): Promise<void> {
     console.warn("Initial recordings load failed", e);
     failed.push("History could not be loaded");
   }
+  let promoted: PromotedTake[] = [];
   try {
-    await recoverBackendAudioSessions();
+    promoted = await recoverBackendAudioSessions();
   } catch (e) {
     console.warn("Recovery import failed", e);
     failed.push("interrupted recordings could not be recovered");
   }
   try {
-    await recoverLiveDraftIfAny();
+    await recoverLiveDraftIfAny(promoted);
   } catch (e) {
     console.warn("Draft recovery failed", e);
     failed.push("an interrupted transcript draft could not be recovered");

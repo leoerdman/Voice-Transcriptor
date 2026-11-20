@@ -1181,6 +1181,7 @@ def _adopt_screen_session_for_recording(
     stem: str,
     *,
     audio_started_at: Optional[float],
+    audio_ended_at: Optional[float] = None,
 ) -> tuple[Optional[dict[str, Any]], str]:
     """Adopt a staged screen session as recording *stem*'s screenshots —
     the one call both the save and the crash-time promotion make.
@@ -1201,6 +1202,7 @@ def _adopt_screen_session_for_recording(
                 target_dir,
                 stem,
                 audio_started_at=audio_started_at,
+                audio_ended_at=audio_ended_at,
             ),
             "",
         )
@@ -1581,21 +1583,23 @@ def _store_live_promote_cache(session_id: str, payload: dict) -> None:
         _live_promote_cache[session_id] = (now, dict(payload))
 
 
-def _recovery_audio_started_at_ms(pcm_path: Path) -> Optional[float]:
-    """Epoch ms of a spool's first sample, from the spool alone.
+def _recovery_audio_span_ms(pcm_path: Path) -> tuple[Optional[float], Optional[float]]:
+    """Epoch ms of a spool's first and last sample, from the spool alone.
 
     The spool is written in real time, each frame as it arrives, so its
-    last write (mtime) minus the audio it holds is when capture began —
-    the renderer's recording clock to within a frame's latency. That is
-    what a screen take's marks are placed against (``audioStartedAt``),
-    and it is available after a crash, when nothing else is."""
+    last write (mtime) is when capture ended and that minus the audio it
+    holds is when capture began — the renderer's recording clock to
+    within a frame's latency. That is the time frame a screen take's
+    marks are placed in (``audioStartedAt`` / ``endedAt``), and after a
+    crash nothing else knows it."""
     try:
         st = pcm_path.stat()
     except OSError:
-        return None
+        return None, None
     duration_ms = (st.st_size - st.st_size % 2) / float(LIVE_PCM_BYTES_PER_SEC) * 1000.0
-    started = st.st_mtime * 1000.0 - duration_ms
-    return started if started > 0 else None
+    ended = st.st_mtime * 1000.0
+    started = ended - duration_ms
+    return (started if started > 0 else None), (ended if ended > 0 else None)
 
 
 def _promote_live_recovery(
@@ -1711,18 +1715,22 @@ def _promote_live_recovery(
             )
             audio_out = target_dir / f"{stem}.wav"
             tmp_audio = _atomic_temp_path(audio_out)
+            # What the entry's text file says. Returned with the result:
+            # the renderer completes the entry (the take's crash draft and
+            # its screen marks) by rewriting this file, and keeps every
+            # field it has nothing better for.
+            text_fields = {
+                "title": title,
+                "source_text": "[Recovered live audio capture]",
+                "transcript_text": "",
+                "provider": "local",
+                "model": model,
+                "language": language,
+            }
             try:
                 write_wav_from_pcm16_stream(str(pcm_path), str(tmp_audio), LIVE_SAMPLE_RATE_HZ)
                 atomic_promote_file(tmp_audio, audio_out)
-                _write_recording_text_file(
-                    out=text_out,
-                    title=title,
-                    source_text="[Recovered live audio capture]",
-                    transcript_text="",
-                    provider="local",
-                    model=model,
-                    language=language,
-                )
+                _write_recording_text_file(out=text_out, **text_fields)
                 # 1.1.25 fix: register the archive AFTER writes succeed.
                 # Previously called before write_wav; if the write
                 # failed, the archive dir was already registered for
@@ -1748,11 +1756,13 @@ def _promote_live_recovery(
             # audio exactly as on the normal save (H-01/BM-04/S-01) —
             # adopted beside the recovered recording BEFORE retention
             # runs, so they are this (exempt) recording's media from now on.
+            audio_started_at, audio_ended_at = _recovery_audio_span_ms(pcm_path)
             screens_manifest, screens_error = _adopt_screen_session_for_recording(
                 str(meta.get("screen_session_id") or ""),
                 target_dir,
                 stem,
-                audio_started_at=_recovery_audio_started_at_ms(pcm_path),
+                audio_started_at=audio_started_at,
+                audio_ended_at=audio_ended_at,
             )
             # Same retention policy as ``save_recording_with_audio``. The
             # freshly promoted stem is exempt so a clock skew can never
@@ -1765,6 +1775,7 @@ def _promote_live_recovery(
                 "archive_dir": str(target_dir),
                 "screens": screens_manifest,
                 "screens_error": screens_error,
+                **text_fields,
             }
             _safe_delete_live_recovery(session_id)
             _store_live_promote_cache(session_id, result)

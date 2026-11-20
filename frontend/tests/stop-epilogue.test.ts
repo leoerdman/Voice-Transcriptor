@@ -5,11 +5,17 @@ import {
   attemptFinalSave,
   createSessionMetadataSaver,
   decideDrainedSilence,
+  EMPTY_FINAL_STATUS,
+  emptyFinalKeepsLiveText,
+  keepLiveTranscript,
+  resolveEmptyFinalSummary,
+  NOTHING_KEPT,
   resolveEpilogueSummary,
   resolveFailedStopSummary,
   resolveSessionTitle,
   resolveTranscriptStopSummary,
   runStopEpilogue,
+  withKeptNote,
   type DrainedSilenceInput,
   type FinalSaveOutcome,
   type SessionSaveRequest,
@@ -312,5 +318,123 @@ describe("resolveSessionTitle — titles come from what was SAID", () => {
     expect(resolveSessionTitle("final words", "live words", "D")).toBe("final words");
     expect(resolveSessionTitle("", "live words", "D")).toBe("live words");
     expect(resolveSessionTitle(" \n", "", "D")).toBe("D");
+  });
+});
+
+describe("keepLiveTranscript — a take without a final transcript keeps its live text and marks", () => {
+  const marks = [
+    { atMs: 1_000, text: "[✏️ 00:01 линия справа (74%, 53%) → скрин 1]" },
+    { atMs: 9_000, text: "[📸 00:09 скрин 1: /rec/take.screens/shot-01.png]" },
+  ];
+
+  it("places the marks in the live text by the one composer", () => {
+    const kept = keepLiveTranscript("вот тут кнопка съехала вправо", marks, 10_000);
+    expect(kept.text).toBe(annotateTranscript("вот тут кнопка съехала вправо", marks, { durationMs: 10_000 }));
+    expect(kept.text).toContain("shot-01.png");
+    expect(kept.text).toContain("кнопка");
+    expect(kept.note).toBe("The live text and the screen marks are kept as the transcript.");
+  });
+
+  it("a screen take drawn without speaking keeps its marks alone", () => {
+    const kept = keepLiveTranscript("  ", marks, 10_000);
+    expect(kept.text).toBe(marks.map((m) => m.text).join("\n"));
+    expect(kept.note).toBe("The screen marks are kept as the transcript.");
+  });
+
+  it("a voice take keeps its live text", () => {
+    expect(keepLiveTranscript(" hello there ", [], 5_000)).toEqual({
+      text: "hello there",
+      note: "The live text is kept as the transcript.",
+    });
+  });
+
+  it("a take with neither keeps nothing", () => {
+    expect(keepLiveTranscript("", [], 5_000)).toEqual(NOTHING_KEPT);
+  });
+});
+
+describe("runStopEpilogue — a failed stop keeps the live text with marks in the panel and History", () => {
+  function keptRecorder() {
+    const published: Array<{ domText: string; panelText: string }> = [];
+    const saved: string[] = [];
+    const summaries: Array<{ status: string; tone: string }> = [];
+    const fx: StopEpilogueEffects = {
+      publish: (signal, panelText) => published.push({ domText: signal.domText, panelText }),
+      hideProgress: () => {},
+      setStatus: () => {},
+      save: async (transcriptText) => {
+        saved.push(transcriptText);
+        return { kind: "saved" };
+      },
+      release: () => {},
+      patchSummary: (summary) => summaries.push(summary),
+    };
+    return { published, saved, summaries, fx };
+  }
+  const kept = keepLiveTranscript("live words [mark]", [], 1_000);
+
+  it("mic not delivering audio: the capsule gets the status, the panel and History the kept marks", async () => {
+    const { published, saved, summaries, fx } = keptRecorder();
+    const marksOnly = keepLiveTranscript("", [{ atMs: 0, text: "[📸 00:00 скрин 1: /x/shot-01.png]" }], 1_000);
+    await runStopEpilogue({
+      signal: { domText: "[ Mic not delivering audio ]", kind: "error" },
+      statusLabel: "Done",
+      save: true,
+      summary: { status: "The microphone delivered no audio.", tone: "error" },
+      transcriptText: "[ Mic not delivering audio ]",
+      kept: marksOnly,
+    }, fx);
+    expect(published).toEqual([{ domText: "[ Mic not delivering audio ]", panelText: marksOnly.text }]);
+    expect(saved).toEqual([marksOnly.text]);
+    expect(summaries[0].status).toBe("The microphone delivered no audio. The screen marks are kept as the transcript.");
+  });
+
+  it("auto transcribe off / no key: the live text is shown and saved, not a status line", async () => {
+    const { published, saved, summaries, fx } = keptRecorder();
+    await runStopEpilogue({ ...noProviderPlan, kept }, fx);
+    expect(published[0].panelText).toBe("live words [mark]");
+    expect(published[0].domText).toBe(noProviderPlan.signal.domText);
+    expect(saved).toEqual(["live words [mark]"]);
+    expect(summaries[0].status).toBe(`${noProviderPlan.summary?.status} ${kept.note}`);
+  });
+
+  it("silence with nothing kept still shows and saves its status line", async () => {
+    const { published, saved, summaries, fx } = keptRecorder();
+    await runStopEpilogue({
+      signal: { domText: "[ Silence ]", kind: "status" },
+      statusLabel: "Done",
+      save: true,
+      summary: { status: "Silence detected.", tone: "success" },
+      transcriptText: "[ Silence ]",
+    }, fx);
+    expect(published).toEqual([{ domText: "[ Silence ]", panelText: "[ Silence ]" }]);
+    expect(saved).toEqual(["[ Silence ]"]);
+    expect(summaries[0].status).toBe("Silence detected.");
+  });
+
+  it("empty final with live text: the take keeps the live text instead of 'no speech detected'", () => {
+    expect(emptyFinalKeepsLiveText("", "слова из превью")).toBe(true);
+    expect(emptyFinalKeepsLiveText("final words", "слова из превью")).toBe(false);
+    // Nothing live either: the old ending (marks alone, or no speech).
+    expect(emptyFinalKeepsLiveText("", "  ")).toBe(false);
+    expect(resolveEmptyFinalSummary(kept, { kind: "saved" })).toEqual({
+      status: `${EMPTY_FINAL_STATUS} ${kept.note}`,
+      tone: "warning",
+    });
+    expect(resolveEmptyFinalSummary(kept, { kind: "failed", message: "HTTP 503" }).status)
+      .toBe(`${EMPTY_FINAL_STATUS} ${kept.note} Saving the session to History failed: HTTP 503`);
+  });
+
+  it("transcription threw: the failed-stop summary says the live text is kept", () => {
+    const summary = withKeptNote(resolveFailedStopSummary({
+      failureMessage: "Transcription failed.",
+      persistedName: "take.txt",
+      outcome: { kind: "saved" },
+    }), kept);
+    expect(summary).toEqual({
+      status: "Transcription failed. Audio is still available. The live text is kept as the transcript.",
+      tone: "error",
+      savedName: "take.txt",
+    });
   });
 });

@@ -187,6 +187,7 @@ def adopt_session(
     stem: str,
     *,
     audio_started_at: Optional[float] = None,
+    audio_ended_at: Optional[float] = None,
 ) -> Optional[dict[str, Any]]:
     """Move a staged session next to recording ``stem`` and return its
     manifest with the new paths. ``None`` when there is nothing to adopt
@@ -198,6 +199,13 @@ def adopt_session(
     what turns an event's epoch time into a position in THIS recording's
     audio, so every later transcript of it — a re-transcription months
     on — places the marks from the archive alone.
+
+    ``audio_ended_at`` (epoch ms of the recording's last audio sample) is
+    stored as ``endedAt`` only when the manifest has none. The shell
+    writes ``endedAt`` when the take stops; a take whose app died never
+    stopped, and without an end its marks have no time frame to be placed
+    in (``screenSessionDurationMs`` in frontend/src/screen-annotations.ts)
+    — every one of them would land at the end of the text.
 
     All or nothing: the folder is assembled beside its destination under
     a work name (moved there — a copy when the archive is on another
@@ -233,6 +241,8 @@ def adopt_session(
         )
         if audio_started_at is not None and audio_started_at > 0:
             manifest["audioStartedAt"] = int(audio_started_at)
+        if audio_ended_at is not None and audio_ended_at > 0 and not manifest.get("endedAt"):
+            manifest["endedAt"] = int(audio_ended_at)
         atomic_write_json(work / EVENTS_FILE_NAME, manifest)
     except (OSError, ValueError, TypeError) as exc:
         _undo_adoption(work, source, moved, session_id)

@@ -518,10 +518,22 @@ describe("boot, update check and History bootstrap (FQ-13/FQ-14/FQ-15/FQ-22)", (
     const read = start.indexOf("readStaleLiveDraftOnce()");
     expect(read).toBeGreaterThan(0);
     expect(start.indexOf("persistLiveDraft(true);")).toBeGreaterThan(read);
-    const recover = mainTsxSlice("async function recoverLiveDraftIfAny(): Promise<void> {", "\n}\n");
+    const recover = mainTsxSlice("async function recoverLiveDraftIfAny(", "\n}\n");
     expect(recover).toContain("await readStaleLiveDraftOnce();");
     expect(recover).not.toContain("readBackendLiveDraft(");
-    expect(recover.match(/mayClearRecoveredDraft\(sessionId, liveDraftSlotWrittenThisRun\)/g) || []).toHaveLength(2);
+    // One clear, gated by FG-08, and only once the draft's text is saved.
+    expect(recover.match(/mayClearRecoveredDraft\(sessionId, liveDraftSlotWrittenThisRun\)/g) || []).toHaveLength(1);
+    expect(recover).toContain("if (draft && draftSaved) {");
+  });
+
+  it("a crashed take's draft is joined with the entry its audio was promoted into (./take-recovery)", () => {
+    const boot = mainTsxSlice("async function initRecordingsBootstrap(): Promise<void> {", "\n}\n");
+    const promote = boot.indexOf("promoted = await recoverBackendAudioSessions();");
+    expect(promote).toBeGreaterThan(0);
+    expect(boot.indexOf("await recoverLiveDraftIfAny(promoted);")).toBeGreaterThan(promote);
+    const recover = mainTsxSlice("async function recoverLiveDraftIfAny(", "\n}\n");
+    expect(recover).toContain("const plan = planTakeRecovery(draft, promoted);");
+    expect(recover).toContain("requireExisting: true,");
   });
 
   it("FQ-13 / FU-17 (M1): the update check stamps and renders by updateCheckOutcome, per trigger", () => {
