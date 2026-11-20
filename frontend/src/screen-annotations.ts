@@ -133,14 +133,15 @@ export function regionWords(xPct: number, yPct: number): string {
 }
 
 /**
- * One mark per event, its time relative to the recording's audio. The
+ * One mark per event (strokes that read identically count once), its
+ * time relative to the recording's audio. The
  * origin is the archived ``audioStartedAt``; ``fallbackStartAt`` (the
  * renderer's live clock) only matters for a manifest the save never
  * archived, and the session's own start is the last resort.
  */
 export function screenMarksFromManifest(manifest: ScreenManifest, fallbackStartAt = 0): ScreenMark[] {
   const origin = manifest.audioStartedAt || (fallbackStartAt > 0 ? fallbackStartAt : manifest.startedAt);
-  return manifest.events.map((e) => {
+  const marks = manifest.events.map((e) => {
     const atMs = Math.max(0, e.at - origin);
     const time = fmtOffset(atMs);
     if (e.type === "stroke") {
@@ -154,6 +155,15 @@ export function screenMarksFromManifest(manifest: ScreenManifest, fallbackStartA
       ? `: ${e.files.join(", ")}`
       : " — не сохранён (нет доступа к записи экрана)";
     return { atMs, text: `[📸 ${time} скрин ${e.shot ?? ""}${files}]` };
+  });
+  // A mark's text is its whole content (second, place, shot): strokes
+  // that read the same — a gesture that came apart into many short
+  // strokes at one spot — are one mark, the first of them.
+  const seen = new Set<string>();
+  return marks.filter((m) => {
+    if (seen.has(m.text)) return false;
+    seen.add(m.text);
+    return true;
   });
 }
 
