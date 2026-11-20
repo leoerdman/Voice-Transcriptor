@@ -472,6 +472,16 @@ test("every mac dist script builds screen mode's helper before electron-builder;
   assert.doesNotMatch(mas, /^\s*bash \S*build-native\.sh/m);
 });
 
+test("every module the desktop bundle ships is named in PROJECT_STRUCTURE.md", () => {
+  // The structure map is where a reader looks first; a shipped module
+  // missing from it (user-data-dir.js was, from the commit that added it)
+  // is a module nobody is told exists.
+  const structure = fs.readFileSync(path.join(DESKTOP_DIR, "..", "PROJECT_STRUCTURE.md"), "utf8");
+  const shipped = pkg.build.files.filter((f) => /^[\w.-]+\.js$/.test(f));
+  const missing = shipped.filter((f) => !new RegExp(`[├└]── ${f.replace(/\./g, "\\.")}\\s`).test(structure));
+  assert.deepEqual(missing, []);
+});
+
 test("the helper's place in the bundle is one fact across build-native.sh, package.json, main.js and afterPack", () => {
   const { SCREEN_INPUT_HELPER_IN_BUNDLE } = require("./scripts/macos-signing-utils");
   const [dirInBundle, name] = [path.dirname(SCREEN_INPUT_HELPER_IN_BUNDLE), path.basename(SCREEN_INPUT_HELPER_IN_BUNDLE)];

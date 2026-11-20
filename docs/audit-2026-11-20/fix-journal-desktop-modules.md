@@ -205,3 +205,34 @@ DX-25: `build-native.sh mac-x64` is now an explicit error ("macOS builds are arm
 instead of a dead branch; the mis-indented `"user-data-dir.js"` entry is fixed. main.js's
 dev path `mac-${process.arch}` stays (main.js lane; on Intel it resolves to a directory
 that is never built → `isSupported()` false, consistent with arm64-only).
+
+### C6 — H-04, H-10, DX-29 + H-03 (documentation half)
+Files: `PROJECT_STRUCTURE.md`, `desktop/window-lifecycle.js`, `desktop/packaging.test.js`.
+Check: `node --test --test-name-pattern="PROJECT_STRUCTURE" desktop/packaging.test.js`.
+Before (PROJECT_STRUCTURE.md at HEAD of C5):
+```
+exit=1
+✖ every module the desktop bundle ships is named in PROJECT_STRUCTURE.md (4.92675ms)
+  + actual - expected
+  + [
+  +   'user-data-dir.js'
+  + ]
+  - []
+```
+After:
+```
+exit=0
+✔ every module the desktop bundle ships is named in PROJECT_STRUCTURE.md (1.672917ms)
+```
+H-10: also added backend/model_catalog.py, audio_mime.py, deepgram_format.py and
+frontend live-source.ts, live-pane.ts, transcription-catalog.ts, shortcut-display.ts,
+plus the unlisted desktop/scripts (build-native.sh, notarize-dmg.sh,
+check-designated-requirement.js, generate-dmg-background.py); the guard covers the
+desktop bundle only (backend/frontend entries have no machine-readable list to check
+against). H-04: "non-activating panels" (PROJECT_STRUCTURE), "exclusion rectangles"
+(controller header C3, main.swift stdin comment C1), "prune list" (controller header C2),
+"non-focusable … panel" / "the capsule is a panel" (window-lifecycle.js) reworded to what
+the code is. DX-29/H-03: window-lifecycle.js now states that `capsuleInteraction` comes
+from a 700 ms clock in main.js (not an identity) and that a Dock click inside it is
+swallowed; the behavioural fix is main.js's (Cross-domain). Doc-only; no check beyond the
+grep that the stale words are gone.
