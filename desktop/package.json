@@ -57,6 +57,7 @@
       "clipboard-lease.js",
       "recording-stop.js",
       "windows-paste-fallback.js",
+      "renderer-toggle.js",
       "power-events.js",
       "child-io.js",
       "paste-protocol.js",

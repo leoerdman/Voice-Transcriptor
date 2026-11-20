@@ -127,6 +127,13 @@ const {
 const { STOP_ACTION, decideMainProcessStop } = require("./recording-stop");
 // The Windows PowerShell paste fallback: activate, verify, then Ctrl+V (DM-04).
 const { buildPwshPasteFallbackScript } = require("./windows-paste-fallback");
+// The record hotkey's renderer round trip, with a press that expires
+// when main stops waiting for it (DM-05).
+const {
+  RENDERER_TOGGLE_BUDGET_MS,
+  toggleNotAfter,
+  toggleDispatchScript,
+} = require("./renderer-toggle");
 // One lease per paste on the snapshot of the user's clipboard, released
 // exactly once (DM-02, DM-26).
 const { createClipboardLeases } = require("./clipboard-lease");
@@ -2673,37 +2680,12 @@ function macMicrophoneAccessGranted() {
  * capsule at a time — but there was no work worth blocking for.
  */
 async function dispatchRendererTogglePress(allowStart, startDetail = { mode: "voice" }) {
+  // The press expires with the budget main waits for it, so a renderer
+  // that unblocks after main gave up cannot run it late (DM-05).
   return execRendererJsWithTimeout(
-    `
-    (() => {
-      const uiReady = typeof window.__transcriptorLiveStatusSnapshot === 'function';
-      const isRec = !!(window.__transcriptorIsRecording);
-      const recordingId = Number(window.__transcriptorCurrentRecordingId || 0);
-      const auto = !!(document.getElementById('autoTranscribeToggle') && document.getElementById('autoTranscribeToggle').checked);
-      const liveSnapshot = uiReady ? window.__transcriptorLiveStatusSnapshot() : null;
-      const autoSendEnter = !!liveSnapshot?.autoSendEnter;
-      const timerText = String(liveSnapshot?.timerText || '00:00').trim();
-      // The renderer owns the recording clock and the floor under it.
-      // Asking it — rather than timing the press here — is what keeps
-      // the two processes from disagreeing about whether this stop
-      // produced anything.
-      const tooShort = isRec && typeof window.__transcriptorRecordingTooShort === 'function'
-        ? !!window.__transcriptorRecordingTooShort()
-        : false;
-      const state = { ok: true, uiReady, wasRecording: isRec, recording: isRec, dispatched: false, discarded: tooShort, auto, autoSendEnter, timerText, recordingId };
-      if (!uiReady) return state;
-      if (!isRec && !${allowStart ? "true" : "false"}) return state;
-      // The detail is read only when this press STARTS a recording: it says
-      // which kind (voice or screen) and, for screen mode, the session id
-      // the renderer hands back to main when the take stops.
-      window.dispatchEvent(new CustomEvent('transcriptor-hotkey-toggle', { detail: ${JSON.stringify(startDetail)} }));
-      state.dispatched = true;
-      state.recording = !isRec;
-      return state;
-    })();
-    `,
+    toggleDispatchScript({ allowStart, startDetail, notAfter: toggleNotAfter() }),
     null,
-    2000,
+    RENDERER_TOGGLE_BUDGET_MS,
   );
 }
 
@@ -2751,7 +2733,7 @@ async function toggleRecordingFromShortcut(mode = "voice") {
     if (result === null) {
       // Renderer didn't respond inside the budget — log, release the
       // inflight guard via the outer finally, and let the user retry.
-      appendMainLog("[shortcut] toggle aborted: renderer probe timed out (2s)");
+      appendMainLog(`[shortcut] toggle aborted: renderer probe timed out (${RENDERER_TOGGLE_BUDGET_MS}ms); the press expires unrun`);
       resetRecordingStatusState();
       traceEnd(trace, "failed", { reason: "renderer-probe-timeout" });
       return;
