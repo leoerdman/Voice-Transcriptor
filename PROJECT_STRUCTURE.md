@@ -159,6 +159,18 @@ desktop/
 ├── linux-wm-class.js               # WM_CLASS split from `wmctrl -lpGx` for Linux window activation (pure, node --test)
 ├── user-data-dir.js                # one spelling for the app's data directory, shared with backend/data_dir.py (pure, node --test)
 ├── window-lifecycle.js             # main-window lifecycle SSOT: activate/close/minimise/quit/second-instance/capsule decisions and where the window opens (pure, node --test)
+├── transcript-signal.js            # what a renderer hand-off signal means for the post-stop task: paste, keep waiting, or terminal (pure, node --test)
+├── clipboard-lease.js              # one owner of the user's real-clipboard snapshot during a paste; released exactly once (pure, node --test)
+├── recording-stop.js               # what a main-process stop does once the renderer has or has not answered (pure, node --test)
+├── windows-paste-fallback.js       # the Windows PowerShell paste fallback script; sends keys only after a confirmed foreground switch (pure, node --test)
+├── renderer-toggle.js              # the record hotkey's one renderer round trip and its deadline (pure, node --test)
+├── data-dir.js                     # the one rule for where the desktop shell keeps its data (pure, node --test)
+├── backend-exit.js                 # what the shell does when the backend child exits: restart, report, or let it go on quit (pure, node --test)
+├── renderer-epoch.js               # which renderer a recording id belongs to, so a reloaded renderer's ids are never confused (pure, node --test)
+├── shortcut-runtime.js             # the accelerators bound right now and how a Settings update changes them (pure, node --test)
+├── capsule-geometry.js             # the recording capsule's window size and placement (pure, node --test)
+├── screen-session-start.js         # what main does once screenMode.start() has answered for a take already recording (pure, node --test)
+├── capsule-preload.js              # the recording capsule's preload bridge to main (stop, screenshot, geometry) — replaces the document.title channel
 ├── ipc-contract.test.js            # main.js/preload.js IPC channel-name contract test (node --test)
 ├── preload.js                      # safe renderer bridge (path-for-file, engine lifecycle invoke-only, recordingFinal send-only, system-suspend receive-only)
 ├── package.json                    # electron-builder config and desktop scripts
