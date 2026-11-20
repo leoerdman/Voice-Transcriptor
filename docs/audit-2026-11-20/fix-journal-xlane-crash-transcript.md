@@ -94,3 +94,20 @@ TRANSCRIBE panel, and clears the draft only once the write carrying it succeeded
 Tests: `frontend/tests/take-recovery.test.ts` (12), contract pins in
 `renderer-main-contract.test.ts` / `recording-save.test.ts`,
 `test_a_promotion_says_what_it_wrote_so_the_renderer_can_complete_the_entry`.
+
+## Verification
+
+- Backend `unittest discover`: 1053 OK. Frontend: typecheck, lint clean, vitest 55 files / 708
+  tests, `vite build` OK. Desktop untouched (no desktop file changed).
+- Not run in the live app: no crash/kill was reproduced against a running build.
+
+## Residual (not fixed here)
+
+- Backend dies mid-take and comes back before the stop's draft clear gives up: the clear
+  succeeds, so the next launch joins the promoted spool with no draft — the entry gets its
+  marks but not the live text. The live text is then in the text-only entry the stop's
+  final save made (with staging screenshot paths, since the provisional save never archived
+  them). Fixing it means not clearing the draft when the stop's saves failed, which needs the
+  draft slot to survive the next start's first autosave (FG-08 reads it only once per run).
+- A promote that fails (409 while the backend still finalizes the spool, 400 too short) leaves
+  the draft to be saved alone, as before; the spool is promoted without text at a later boot.
