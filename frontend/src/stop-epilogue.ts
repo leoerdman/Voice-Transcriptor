@@ -18,6 +18,7 @@
  */
 
 import { smartRecordingTitle } from "./recording-title";
+import { annotateTranscript, type ScreenMark } from "./screen-annotations";
 
 export interface DrainedSilenceInput {
   /** ``captureSilenceSnapshot(...).silentCapture`` — the session's own
@@ -198,6 +199,72 @@ export function createSessionMetadataSaver(
   }, deps.classify);
 }
 
+/**
+ * ── What a take keeps when it has no final transcript (``keepLiveTranscript``) ──
+ *
+ * The live text the provider streamed during the take, with the take's
+ * screen marks placed in it by the one composer
+ * (``annotateTranscript``). Every stop that ends without a final
+ * transcript — the transcription pass threw, the final came back empty,
+ * the microphone delivered nothing, Auto transcribe is off, no provider
+ * key — used to end on a status line in the TRANSCRIBE panel and an
+ * empty transcript in History: the words the user had watched appear in
+ * the live preview, and every stroke and screenshot mark of a screen
+ * take, were gone from both. What the take kept is now what the panel
+ * shows and History stores, and the summary says it is the live text.
+ *
+ * The marks are placed by their share of the take's duration: the live
+ * text has no word timings the stop can trust.
+ */
+export interface KeptTranscript {
+  /** Live text with marks; "" when the take has neither. */
+  text: string;
+  /** One sentence for the summary saying what ``text`` is; "" with no text. */
+  note: string;
+}
+
+export const NOTHING_KEPT: KeptTranscript = Object.freeze({ text: "", note: "" });
+
+export function keepLiveTranscript(
+  liveText: string,
+  marks: ReadonlyArray<ScreenMark>,
+  durationMs: number,
+): KeptTranscript {
+  const live = String(liveText || "").trim();
+  const text = annotateTranscript(live, marks, { durationMs }).trim();
+  if (!text) return NOTHING_KEPT;
+  const note = live && marks.length
+    ? "The live text and the screen marks are kept as the transcript."
+    : live
+      ? "The live text is kept as the transcript."
+      : "The screen marks are kept as the transcript.";
+  return { text, note };
+}
+
+/** A summary that says what the take kept, when it kept anything. */
+export function withKeptNote<T extends StopSummaryCopy>(summary: T, kept: KeptTranscript): T {
+  return kept.text ? { ...summary, status: `${summary.status} ${kept.note}` } : summary;
+}
+
+/**
+ * The transcription pass ran and came back empty while the live preview
+ * held words (the envelope never came and the saved-audio decode gave
+ * nothing in its budget; an empty remote pass): the take ends on what it
+ * kept, not on "no speech detected". A take whose live text is empty too
+ * keeps the old ending — its transcript is its marks, if any.
+ */
+export function emptyFinalKeepsLiveText(finalTranscript: string, liveText: string): boolean {
+  return !String(finalTranscript || "").trim() && !!String(liveText || "").trim();
+}
+
+export const EMPTY_FINAL_STATUS = "The final pass produced no transcript.";
+
+/** The summary of a stop whose empty final was replaced by the kept text. */
+export function resolveEmptyFinalSummary(kept: KeptTranscript, outcome: FinalSaveOutcome): StopSummaryCopy {
+  const base = withKeptNote<StopSummaryCopy>({ status: EMPTY_FINAL_STATUS, tone: "warning" }, kept);
+  return resolveEpilogueSummary({ summary: base }, outcome) || base;
+}
+
 export interface StopEpiloguePlan {
   /** What the recording-final channel carries. Never paste text: no
    *  epilogue here has a transcript to deliver. */
@@ -210,14 +277,23 @@ export interface StopEpiloguePlan {
   summary: StopSummaryCopy | null;
   /** The summary when the archive changed under the save. */
   conflictStatus?: string;
+  /** What History stores as the transcript when the take kept nothing
+   *  (a status line such as "[ Silence ]"; "" by default). */
+  transcriptText?: string;
+  /** The live text with marks the take keeps (``keepLiveTranscript``). */
+  kept?: KeptTranscript;
 }
 
 export interface StopEpilogueEffects {
-  publish(signal: StopEpiloguePlan["signal"]): void;
+  /** ``panelText`` is what the TRANSCRIBE panel shows: the kept text, or
+   *  the signal's own text when the take kept nothing. The signal itself
+   *  stays a short status — it is what the capsule says. */
+  publish(signal: StopEpiloguePlan["signal"], panelText: string): void;
   hideProgress(): void;
   setStatus(label: string): void;
-  /** The metadata save, already classified (``attemptFinalSave``). */
-  save(): Promise<FinalSaveOutcome>;
+  /** The metadata save, already classified (``attemptFinalSave``), of the
+   *  transcript the epilogue resolved. */
+  save(transcriptText: string): Promise<FinalSaveOutcome>;
   /** Ends the session: live draft, mic-health session, busy flag, stop
    *  transition. Runs exactly once, whatever the save did. */
   release(): void;
@@ -253,16 +329,20 @@ export async function runStopEpilogue(
   plan: StopEpiloguePlan,
   fx: StopEpilogueEffects,
 ): Promise<FinalSaveOutcome> {
-  fx.publish(plan.signal);
+  const kept = plan.kept || NOTHING_KEPT;
+  fx.publish(plan.signal, kept.text || plan.signal.domText);
   fx.hideProgress();
   fx.setStatus(plan.statusLabel);
   let outcome: FinalSaveOutcome = { kind: "not-attempted" };
   try {
-    if (plan.save) outcome = await fx.save();
+    if (plan.save) outcome = await fx.save(kept.text || plan.transcriptText || "");
   } finally {
     fx.release();
   }
-  const summary = resolveEpilogueSummary(plan, outcome);
+  const summary = resolveEpilogueSummary(
+    { ...plan, summary: plan.summary && withKeptNote(plan.summary, kept) },
+    outcome,
+  );
   if (summary) fx.patchSummary(summary);
   return outcome;
 }

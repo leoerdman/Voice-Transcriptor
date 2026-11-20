@@ -37,11 +37,17 @@ import {
 import {
   createSessionMetadataSaver,
   decideDrainedSilence,
+  emptyFinalKeepsLiveText,
+  EMPTY_FINAL_STATUS,
+  keepLiveTranscript,
+  resolveEmptyFinalSummary,
   resolveFailedStopSummary,
   resolveSessionTitle,
   resolveTranscriptStopSummary,
   runStopEpilogue,
+  withKeptNote,
   type FinalSaveOutcome,
+  type KeptTranscript,
   type StopEpiloguePlan,
 } from "./stop-epilogue";
 import {
@@ -10605,6 +10611,13 @@ interface RecordingOutputSignal {
   /** The text to render in the ``$finalOutput`` DOM element. Defaults to
    *  ``pasteText`` when omitted. Pass explicit ``""`` to clear the DOM. */
   domText?: string;
+  /**
+   * What the TRANSCRIBE panel shows when it is not ``domText``: the live
+   * text with screen marks a take keeps when it has no final transcript
+   * (./stop-epilogue ``keepLiveTranscript``). ``domText`` then stays the
+   * short status the desktop shell shows in the capsule.
+   */
+  panelText?: string;
   /** Classification of this event for the recording state machine. */
   kind?: RecordingFinalSignalKind;
   /**
@@ -10666,7 +10679,8 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
     // ``resetLiveDraftState``. This used to be written as an ``if`` with
     // a comment for a body, which hides the intent rather than stating
     // it — a reader had to prove to themselves that nothing was missing.
-    $("finalOutput").textContent = domText;
+    const panelText = String(signal.panelText || "").trim();
+    $("finalOutput").textContent = panelText || domText;
   }
 }
 
@@ -12452,12 +12466,13 @@ async function stopLive(
   // summary — is ``runStopEpilogue`` (./stop-epilogue), one for all.
   const endWithoutTranscript = (
     plan: StopEpiloguePlan,
-    metadata: { transcriptText: string; provider: string } = { transcriptText: "", provider: metadataProvider },
+    metadataProviderForSave: string = metadataProvider,
   ): Promise<FinalSaveOutcome> => runStopEpilogue(plan, {
-    publish: (signal) => publishRecordingOutput({
+    publish: (signal, panelText) => publishRecordingOutput({
       recordingId,
       pasteText: "",
       domText: signal.domText,
+      panelText,
       kind: signal.kind,
       sessionToken: sessionUiToken,
     }),
@@ -12467,10 +12482,10 @@ async function stopLive(
       }
     },
     setStatus: (label) => setStatusScoped(sessionUiToken, label),
-    save: () => saveSessionMetadata({
+    save: (transcriptText) => saveSessionMetadata({
       spokenTranscript: "",
-      transcriptText: metadata.transcriptText,
-      provider: metadata.provider,
+      transcriptText,
+      provider: metadataProviderForSave,
     }),
     release: releaseStopEpilogueBookkeeping,
     patchSummary: (summary) => patchCurrentRecordingSummary({
@@ -12620,6 +12635,18 @@ async function stopLive(
     void deferredSinkDestroy.destroy();
   }
 
+  // Screen mode: the strokes and screenshots of this take, from the
+  // archived manifest (the staged one when the save could not archive
+  // it). Fixed from here on: every exit below — the transcript, or the
+  // live text a take without one keeps — carries the same marks.
+  const screenMarks: ScreenMark[] = screenManifest
+    ? screenMarksFromManifest(screenManifest, recordingClockStartAt)
+    : [];
+  /** What this take keeps when it ends without a final transcript
+   *  (./stop-epilogue). Read late: final events can still land while the
+   *  socket drains. */
+  const keptLiveTranscript = (): KeptTranscript => keepLiveTranscript(latestSourceForSave(), screenMarks, recordedMs);
+
   if (startupAbortReason && !savedAudioFile && !transcribeInputFile && captureLevel.frames === 0) {
     await endWithoutTranscript({
       signal: { domText: startupAbortReason, kind: "error" },
@@ -12654,7 +12681,9 @@ async function stopLive(
       },
       conflictStatus: drainedFailureReason?.notice ||
         "Silence was detected, but the original archive changed before the session could be finalized. The entry was not recreated elsewhere.",
-    }, { transcriptText: drainedDomText, provider: metadataProvider });
+      transcriptText: drainedDomText,
+      kept: keptLiveTranscript(),
+    });
     return;
   }
 
@@ -12673,6 +12702,7 @@ async function stopLive(
         ? { status: "Audio saved. Final transcription was skipped for this session.", tone: "success" }
         : { status: "Audio saved, but the canonical transcription input is unavailable for this session.", tone: "warning" },
       conflictStatus: "Audio is available, but the original archive changed before the session metadata could be finalized.",
+      kept: keptLiveTranscript(),
     });
     return;
   }
@@ -12690,7 +12720,8 @@ async function stopLive(
       save: true,
       summary: { status: `${msg} Audio is still saved locally.`, tone: "error" },
       conflictStatus: `${msg} The original archive changed before the session metadata could be finalized.`,
-    }, { transcriptText: "", provider });
+      kept: keptLiveTranscript(),
+    }, provider);
     return;
   }
   // (``transcribeStartedAt`` is captured at the top of ``stopLive``)
@@ -13084,13 +13115,38 @@ async function stopLive(
       `source=${transcriptSource} wsFramesNeverSent=${wsFramesNeverSent} ` +
       `${describeLiveFinalStats(finalEnvelopeStats)}`,
     );
+    // The final pass produced nothing, but the live preview held speech:
+    // the take ends on what it kept (./stop-epilogue) — shown in the
+    // TRANSCRIBE panel and saved to History, never pasted — instead of
+    // "no speech detected" over words the user watched appear.
+    if (emptyFinalKeepsLiveText(transcriptRaw, latestSourceForSave())) {
+      const kept = keptLiveTranscript();
+      console.log(`[trace stopLive] empty final; keeping the live text ${traceTextStats("kept", kept.text)}`);
+      publishRecordingOutput({
+        recordingId,
+        pasteText: "",
+        domText: `${EMPTY_FINAL_STATUS} ${kept.note}`,
+        panelText: kept.text,
+        kind: "status",
+        sessionToken: sessionUiToken,
+      });
+      if (isCurrentUiSession(sessionUiToken)) {
+        $("progressRow").hidden = true;
+      }
+      setStatusScoped(sessionUiToken, "Done");
+      const keptSave = await saveSessionMetadata({ spokenTranscript: "", transcriptText: kept.text, provider });
+      patchCurrentRecordingSummary({
+        title: resolveSessionTitle("", latestSourceForSave(), defaultTitle),
+        ...resolveEmptyFinalSummary(kept, keptSave),
+        savedName: persistedRecordingName,
+        transcribeLatencyMs: performance.now() - transcribeStartedAt,
+      }, sessionUiToken);
+      return;
+    }
     // Screen mode: the strokes and screenshots go into the transcript at
     // the moments they happened in speech (./screen-annotations). The
     // envelope's segments time the text they describe; any other source
     // is placed by its share of the recording's duration.
-    const screenMarks: ScreenMark[] = screenManifest
-      ? screenMarksFromManifest(screenManifest, recordingClockStartAt)
-      : [];
     const plainTranscriptRaw = transcriptRaw;
     const screenWordStartsMs = transcriptSource === "envelope"
       ? wordStartsFromSegments(liveFinalSlots.get(sessionUiToken)?.envelope?.segments || [])
@@ -13184,10 +13240,16 @@ async function stopLive(
   } catch (e) {
     console.error("Live transcription finalization failed", e);
     const safeMessage = sanitizeUiErrorMessage(e, "Transcription failed. Audio is still saved.");
+    // The take ends on what it kept: the live text with its screen marks
+    // is what the TRANSCRIBE panel shows and History stores
+    // (./stop-epilogue); the error stays the capsule's status and the
+    // summary's.
+    const kept = keptLiveTranscript();
     publishRecordingOutput({
       recordingId,
       pasteText: "",
       domText: safeMessage,
+      panelText: kept.text,
       kind: "error",
       sessionToken: sessionUiToken,
     });
@@ -13195,14 +13257,14 @@ async function stopLive(
       $("progressRow").hidden = true;
     }
     setStatusScoped(sessionUiToken, "Error");
-    const fallbackSave = await saveSessionMetadata({ spokenTranscript: "", transcriptText: "", provider });
+    const fallbackSave = await saveSessionMetadata({ spokenTranscript: "", transcriptText: kept.text, provider });
     patchCurrentRecordingSummary({
       title: provisionalTitle,
-      ...resolveFailedStopSummary({
+      ...withKeptNote(resolveFailedStopSummary({
         failureMessage: safeMessage,
         persistedName: persistedRecordingName,
         outcome: fallbackSave,
-      }),
+      }), kept),
       transcribeLatencyMs: performance.now() - transcribeStartedAt,
     }, sessionUiToken);
   } finally {
