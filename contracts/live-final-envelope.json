@@ -63,8 +63,12 @@
       "finalize_ms": 214.7,
       "dual_stream": true,
       "dual_secondary_language": "ru",
+      "dual_secondary_failed": false,
       "dual_filled_from_secondary": 3,
       "dual_filled_from_primary": 1,
+      "dual_duplicates_removed": 1,
+      "dual_contested_to_secondary": 1,
+      "dual_contested_to_primary": 0,
       "recovery": {
         "spans": [
           [

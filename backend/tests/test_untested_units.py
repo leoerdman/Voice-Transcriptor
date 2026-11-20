@@ -20,6 +20,7 @@ of them had a caller in the test suite:
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 
 class AudioContentTypeTests(unittest.TestCase):
@@ -169,6 +170,72 @@ class AbToolTests(unittest.TestCase):
 
         with self.assertRaises(SystemExit):
             build_parser().parse_args(["/tmp/a.wav"])
+
+    def test_dual_is_refused_for_a_configuration_the_app_never_runs(self):
+        """BE-25: the app opens a second reading only for a multilingual
+        recording; the tool measured ``--language ru --dual`` anyway."""
+        import contextlib
+        import io
+
+        from backend.tools import deepgram_live_ab as ab
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), mock.patch.object(ab, "_load_api_key") as key:
+            code = ab.main(["/nonexistent.wav", "--language", "ru", "--dual"])
+        self.assertEqual(code, 3)
+        self.assertIn("--dual applies only to a multilingual recording", err.getvalue())
+        key.assert_not_called()
+
+    def test_a_run_that_raises_still_shuts_its_session_down(self):
+        """BE-25: ``shutdown()`` was outside the ``finally``."""
+        import asyncio
+
+        from backend.tools import deepgram_live_ab as ab
+
+        class _Session:
+            stream_death_sec = None
+            shut = False
+
+            async def events(self):
+                return
+                yield
+
+            async def send_pcm(self, chunk):
+                raise RuntimeError("socket died")
+
+            async def shutdown(self, wait_timeout: float = 3.0):
+                _Session.shut = True
+
+        acquisition = mock.Mock(session=_Session())
+        with mock.patch.object(ab._POOL, "acquire", mock.AsyncMock(return_value=acquisition)):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(ab._run_one(
+                    api_key="k", model="nova-3", pcm=b"\0" * 6400, language="multi",
+                    keyterms=(), chunk_ms=100, speed=1000.0, file_label="a.wav",
+                    run_index=1,
+                ))
+        self.assertTrue(_Session.shut)
+
+    def test_dumped_readings_replay_offline_through_the_shipped_merge(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from backend.tools.dual_replay import replay
+
+        word = {"word": "Когда", "start": 1.0, "end": 1.4, "confidence": 0.9}
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "take.multi+ru.run1.json"
+            path.write_text(json.dumps({
+                "file": "take.wav", "primary_language": "multi", "secondary_language": "ru",
+                "primary_segments": [{"start": 1.0, "end": 1.4, "text": "Ir", "words": [
+                    {"word": "Ir", "start": 1.0, "end": 1.4, "confidence": 0.5, "language": "lt"}]}],
+                "secondary_segments": [{"start": 1.0, "end": 1.4, "text": "Когда", "words": [word]}],
+            }), encoding="utf-8")
+            out = replay(path, words=True)
+        self.assertIn("contested_to_secondary=1", out)
+        self.assertIn("\nКогда\n", out)
+        self.assertIn("src=ru", out)
 
     def test_pcm_is_read_as_mono_16k_int16(self):
         import struct

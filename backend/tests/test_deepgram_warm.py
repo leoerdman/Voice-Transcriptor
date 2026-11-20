@@ -874,7 +874,7 @@ class _WarmHandlerCase(unittest.IsolatedAsyncioTestCase):
         """A pool holding one warm ``_WarmFakeUpstream``."""
         pool = self.main.DEEPGRAM_WARM_POOL
         pool.start()
-        pool.rewarm("dg", self.main._live_config(
+        pool.rewarm("dg", self.main.live_config(
             model="nova-3", language="auto", diarize=False, keyterms=(),
         ))
         await asyncio.sleep(0)
@@ -950,6 +950,55 @@ class WarmSessionLivenessTests(_WarmHandlerCase):
         self.assertEqual(replacement.audio_offset_sec, 0.0)
         errors = [m for m in ws.sent if m.get("type") == "error"]
         self.assertEqual(errors, [], "the swap is a recovery, not a failure")
+
+    async def test_audio_dropped_during_a_swap_is_declared_to_the_replacement(self):
+        """BW-09: audio the send queue had to drop while the replacement
+        was connecting was declared to the socket about to be discarded,
+        so the surviving session's coverage never counted it."""
+        from unittest import mock as _mock
+
+        release = asyncio.Event()
+
+        class _SlowReplacement(_WarmFakeUpstream):
+            undelivered = 0
+
+            async def connect(self) -> None:
+                if len(_WarmFakeUpstream.instances) > 1:
+                    await release.wait()
+
+            def note_undelivered_audio(self, nbytes: int) -> None:
+                self.undelivered += nbytes
+                super().note_undelivered_audio(nbytes)
+
+        ws = _WarmFakeWebSocket()
+        with _mock.patch.object(self.main, "DeepgramLiveSession", _SlowReplacement), \
+                _mock.patch.object(self.main, "_WARM_PROBE_TIMEOUT_SEC", 0.1), \
+                _mock.patch.object(self.main, "_WARM_PROBE_POLL_SEC", 0.01), \
+                _mock.patch.object(self.main, "_SEND_QUEUE_MAX_BYTES", 2000):
+            pool = await self._armed_pool()
+            warm = _WarmFakeUpstream.instances[0]
+            task = self._run(ws, self._recovery())
+            await asyncio.sleep(0.02)
+            await ws.messages.put({"type": "websocket.receive", "bytes": _voiced(1600)})
+            # The probe expires and the swap starts connecting.
+            for _ in range(300):
+                if len(_WarmFakeUpstream.instances) > 1:
+                    break
+                await asyncio.sleep(0.01)
+            for i in range(5):
+                await ws.messages.put(
+                    {"type": "websocket.receive", "bytes": _voiced(1600, seed=10 + i)}
+                )
+            await asyncio.sleep(0.2)
+            release.set()
+            await asyncio.sleep(0.1)
+            await self._finish(ws, task)
+            await pool.close_all()
+
+        replacement = _WarmFakeUpstream.instances[1]
+        self.assertTrue(warm.discarded)
+        self.assertGreater(replacement.undelivered, 0, "the drop was not declared to the survivor")
+        self.assertEqual(warm.undelivered, 0, "the drop was declared to the discarded socket")
 
     async def test_a_replayed_ring_that_dropped_audio_offsets_the_replacement(self):
         # A user who opens the microphone and thinks for a while streams
@@ -1054,7 +1103,7 @@ class WarmSessionLivenessTests(_WarmHandlerCase):
             await asyncio.sleep(0)
             keys = [row["configKey"] for row in pool.status()["sockets"]]
             self.assertIn(
-                self.main._live_config(
+                self.main.live_config(
                     model="nova-3", language="auto", diarize=False, keyterms=(),
                 ).to_query_string(),
                 keys,
@@ -1158,7 +1207,7 @@ class DualStreamWarmingTests(_WarmHandlerCase):
             await self._finish(ws, task)
             for _ in range(4):
                 await asyncio.sleep(0)
-            primary = self.main._live_config(
+            primary = self.main.live_config(
                 model="nova-3", language="auto", diarize=False, keyterms=(),
             )
             keys = [row["configKey"] for row in pool.status()["sockets"]]
@@ -1191,7 +1240,7 @@ class DualStreamWarmingTests(_WarmHandlerCase):
             await self.main._prewarm_deepgram_at_boot()
             for _ in range(4):
                 await asyncio.sleep(0)
-            primary = self.main._live_config(
+            primary = self.main.live_config(
                 model="nova-3", language="auto", diarize=False, keyterms=(),
             )
             keys = [row["configKey"] for row in pool.status()["sockets"]]

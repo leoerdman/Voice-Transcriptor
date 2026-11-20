@@ -40,6 +40,8 @@ from backend.live_envelope import (  # noqa: E402
     live_final_stats,
 )
 
+from backend.deepgram_dual import DUAL_STATS_KEYS, MergedReading, dual_stats  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_PATH = REPO_ROOT / "contracts" / "live-final-envelope.json"
 
@@ -93,10 +95,20 @@ def _deepgram_stream_envelope() -> dict:
                 "keepalives_sent": 0,
                 "connect_ms": 318.4,
                 "finalize_ms": 214.7,
-                "dual_stream": True,
-                "dual_secondary_language": "ru",
-                "dual_filled_from_secondary": 3,
-                "dual_filled_from_primary": 1,
+                # Through the producer the session uses, so the contract
+                # lists every dual key it actually sends (BE-13).
+                **dual_stats(
+                    MergedReading(
+                        secondary_word_count=5,
+                        filled_from_secondary=3,
+                        filled_from_primary=1,
+                        duplicates_removed=1,
+                        contested_to_secondary=1,
+                        contested_to_primary=0,
+                    ),
+                    secondary_language="ru",
+                    secondary_failed=False,
+                ),
             },
             recovery={
                 "spans": [[2.0, 3.1]],
@@ -198,6 +210,10 @@ class LiveFinalEnvelopeShapeTests(unittest.TestCase):
     def test_envelope_from_result_reads_an_error_out_of_the_result(self):
         env = envelope_from_result({"error": "boom"}, source=DEEPGRAM_LIVE_SOURCE)
         self.assertEqual(env["error"], "boom")
+
+    def test_the_fixture_carries_every_dual_key_the_session_sends(self):
+        stats = _deepgram_stream_envelope()["stats"]
+        self.assertEqual([k for k in stats if k.startswith("dual_")], list(DUAL_STATS_KEYS))
 
     def test_stats_is_an_object_even_when_the_session_reported_none(self):
         self.assertEqual(_connect_failure_envelope()["stats"], {})

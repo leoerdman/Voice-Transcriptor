@@ -35,6 +35,35 @@ class OpenRouterError(RemoteError):
     """
 
 
+# One endpoint, named once: both calls below post to it.
+OPENROUTER_CHAT_COMPLETIONS_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+
+def _content_text(raw_content: Any, *, what: str) -> str:
+    """The text of a chat completion's ``message.content``.
+
+    A string is the text. The multimodal form — a list of parts like
+    ``{"type": "text", "text": "..."}`` — is the text of its text parts,
+    joined. Anything else is a response this client does not understand
+    and is raised as a provider error. ``str()`` of the list (what both
+    callers used to do) delivered the Python repr ``[{'type': 'text',
+    'text': '…'}]`` to the user as their transcript (BE-20).
+    """
+    if isinstance(raw_content, str):
+        return raw_content
+    if isinstance(raw_content, list):
+        parts = [
+            part.get("text")
+            for part in raw_content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        if parts and all(isinstance(p, str) for p in parts):
+            return "".join(parts)
+    raise RemoteError(
+        f"{what}: unexpected message content type {type(raw_content).__name__}"
+    )
+
+
 # Re-export under the legacy name so any downstream import that used
 # ``from backend.remote_openrouter import RemoteError`` keeps working.
 # New code should import ``OpenRouterError`` directly.
@@ -98,7 +127,7 @@ def openrouter_transcribe(
 
     fmt = _openrouter_audio_format(filename or "audio.wav")
 
-    url = "https://openrouter.ai/api/v1/chat/completions"
+    url = OPENROUTER_CHAT_COMPLETIONS_URL
     headers = {
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
@@ -177,7 +206,7 @@ def openrouter_transcribe(
                 f"OpenRouter model '{model or DEFAULT_OPENROUTER_AUDIO_MODEL}' "
                 "returned no transcript content for this audio"
             )
-        text = raw_content if isinstance(raw_content, str) else str(raw_content)
+        text = _content_text(raw_content, what="OpenRouter transcribe")
     except (KeyError, IndexError, TypeError) as shape_err:
         # OpenRouter changed the response shape (or echoed an empty
         # error envelope). Returning ``str(js)`` made the entire raw
@@ -212,7 +241,7 @@ def openrouter_upscale_text(
     if not source_text:
         raise RemoteError("empty text for upscale")
 
-    url = "https://openrouter.ai/api/v1/chat/completions"
+    url = OPENROUTER_CHAT_COMPLETIONS_URL
     headers = {
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
@@ -262,9 +291,7 @@ def openrouter_upscale_text(
     # error the caller could fall back from.
     if raw_content is None:
         raise RemoteError("openrouter upscale returned no content")
-    out_text = (
-        raw_content if isinstance(raw_content, str) else str(raw_content)
-    ).strip()
+    out_text = _content_text(raw_content, what="openrouter upscale").strip()
     if not out_text:
         raise RemoteError("openrouter upscale returned empty text")
 
