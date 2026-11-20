@@ -761,6 +761,7 @@ declare global {
     __transcriptorLastUiFinalKind?: RecordingFinalSignalKind;
     __transcriptorLiveStatusSnapshot?: () => LiveStatusSnapshot;
     __transcriptorRecordingTooShort?: () => boolean;
+    __transcriptorLiveTake?: () => { mode: LiveRecordingMode; screenSessionId: string };
     __transcriptorSetMainStatus?: (status: string, kind?: StatusKind) => boolean;
     __setBackendBootStatus?: (msg: string) => void;
     __setBackendBootError?: (failure: BootFailure) => void;
@@ -9592,6 +9593,9 @@ let startAt = 0;
 // under ``liveScreenSessionId`` and hands them back at stop).
 let liveRecordingMode: LiveRecordingMode = "voice";
 let liveScreenSessionId = "";
+// Main reads the take a hotkey press left starting from here
+// (desktop/renderer-toggle.js) and opens the screen session under its id.
+window.__transcriptorLiveTake = () => ({ mode: liveRecordingMode, screenSessionId: liveScreenSessionId });
 
 // Holds the unsubscribe ``onScreenVoiceTake`` returns, so a second run of
 // the subscription (a Vite HMR re-run of top-level code) retires the first.

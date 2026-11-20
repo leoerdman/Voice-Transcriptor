@@ -43,11 +43,13 @@ const SCREEN_MODE = Object.freeze({
   colors: Object.freeze(["#ff3b30", "#ffcc00", "#34c759", "#0a84ff", "#bf5af2", "#ffffff"]),
   // The tools, in palette order. Every take starts with the first.
   tools: Object.freeze(["rect", "pen"]),
-  strokeWidth: 4,
+  // 1.5 times thinner than the first 4 (user, 2026-11-21).
+  strokeWidth: 2.5,
   borderColor: "#ff3b30",
   borderWidth: 3,
-  // The number in a circle of the stroke's colour (DIP).
-  badge: Object.freeze({ radius: 10, gap: 3, fontSize: 12, fontWeight: 700, fontFamily: "-apple-system, system-ui, sans-serif" }),
+  // The number in a circle of the stroke's colour (DIP); the digit is
+  // always black — every palette colour is bright (user, 2026-11-21).
+  badge: Object.freeze({ digitColor: "#000000", radius: 10, gap: 3, fontSize: 12, fontWeight: 700, fontFamily: "-apple-system, system-ui, sans-serif" }),
   // The front window is the captured area only if it is at least this
   // big on its display (DIP): a sliver is not "the window the user means".
   // The helper is handed it with every request, so a tiny window on top is
@@ -237,73 +239,39 @@ function strokeShape(stroke) {
 }
 
 /**
- * Where a stroke's number goes: the centre of a circle of `radius` that
- * must not cover what the stroke marks and must stay inside `view` (the
- * display live, the captured area in the image).
- *   * rectangle — outside its top-left corner (diagonally, then above,
- *     then to the left); inside the corner only when none of those fits;
- *   * pen — just past where the stroke began, on the side away from the
- *     stroke's middle (outside a ring, beyond the start of a line).
+ * Where a stroke's number goes: beside the point where the stroke BEGAN,
+ * and nowhere else — up and to the left of it, its edge `gap` from that
+ * point; when that would leave `view` (the display live, the captured
+ * area in the image), the next corner around it that fits. It depends on
+ * the start alone, so it stays put while the stroke is drawn: placed by
+ * the stroke's middle or its box, it slid around the start as the line
+ * grew (user, 2026-11-21: "пускай она просто около начала полоски стоит").
  * Self-contained: embedded verbatim in the overlay page.
  *
- * @param {string} tool
  * @param {number[][]} points  the stroke's points, in the same space as `view`
  * @param {{x:number,y:number,width:number,height:number}} view
  * @param {number} radius
- * @param {number} gap         space between the circle and the stroke's
- *                             centre line (half the line width included)
+ * @param {number} gap         space between the circle and the start point
+ *                             (half the line width included)
  */
-function numberBadgeCenter(tool, points, view, radius, gap) {
+function numberBadgeCenter(points, view, radius, gap) {
   const fits = (c) => (
     c.x - radius >= view.x && c.y - radius >= view.y &&
     c.x + radius <= view.x + view.width && c.y + radius <= view.y + view.height
   );
-  const clamp = (c) => ({
-    x: Math.min(Math.max(c.x, view.x + radius), view.x + view.width - radius),
-    y: Math.min(Math.max(c.y, view.y + radius), view.y + view.height - radius),
-  });
-  let minX = Infinity;
-  let minY = Infinity;
-  let maxX = -Infinity;
-  let maxY = -Infinity;
-  for (const p of points) {
-    minX = Math.min(minX, p[0]);
-    minY = Math.min(minY, p[1]);
-    maxX = Math.max(maxX, p[0]);
-    maxY = Math.max(maxY, p[1]);
-  }
-  const off = radius + gap;
-  let candidates;
-  if (tool === "rect") {
-    // Diagonally off the corner, its edge `gap` from the corner point; the
-    // circle then clears both sides' lines, which start at the corner.
-    const diagonal = off * Math.SQRT1_2;
-    candidates = [
-      { x: minX - diagonal, y: minY - diagonal },
-      { x: minX + radius, y: minY - off },
-      { x: minX - off, y: minY + radius },
-      { x: minX + off, y: minY + off },
-    ];
-  } else {
-    const start = points[0];
-    let dx = start[0] - (minX + maxX) / 2;
-    let dy = start[1] - (minY + maxY) / 2;
-    const len = Math.hypot(dx, dy);
-    if (len < 1) {
-      dx = -Math.SQRT1_2;
-      dy = -Math.SQRT1_2;
-    } else {
-      dx /= len;
-      dy /= len;
-    }
-    candidates = [
-      { x: start[0] + dx * off, y: start[1] + dy * off },
-      { x: start[0] - off * Math.SQRT1_2, y: start[1] - off * Math.SQRT1_2 },
-      { x: start[0] + off * Math.SQRT1_2, y: start[1] + off * Math.SQRT1_2 },
-    ];
-  }
+  const start = points[0];
+  const d = (radius + gap) * Math.SQRT1_2;
+  const candidates = [
+    { x: start[0] - d, y: start[1] - d },
+    { x: start[0] + d, y: start[1] - d },
+    { x: start[0] - d, y: start[1] + d },
+    { x: start[0] + d, y: start[1] + d },
+  ];
   for (const c of candidates) if (fits(c)) return c;
-  return clamp(candidates[0]);
+  return {
+    x: Math.min(Math.max(candidates[0].x, view.x + radius), view.x + view.width - radius),
+    y: Math.min(Math.max(candidates[0].y, view.y + radius), view.y + view.height - radius),
+  };
 }
 
 /**

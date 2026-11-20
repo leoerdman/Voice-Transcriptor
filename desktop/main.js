@@ -3019,10 +3019,24 @@ async function toggleRecordingFromShortcut(mode = "voice") {
     });
     // A press that started a screen take starts its screen side at once:
     // the session and its surfaces come up while the microphone opens.
+    // The session is opened under the id of the take the renderer is
+    // actually starting, which it reports with the press (result.take) —
+    // not under this press's own id. A press main gave up on can still
+    // start a take late; a second press then finds that take starting and
+    // joins it. Opening the session under the second press's id left it
+    // with no take to finish it: the drawings and the palette stayed on
+    // the screen after the stop (2026-11-21).
     let screenStart = null;
+    let screenStartId = "";
     const beginScreenTake = () => {
-      if (screenStart || startDetail.mode !== "screen" || !result?.dispatched || !result.recording) return;
-      screenStart = startScreenTake(startDetail.screenSessionId, pressedAt);
+      if (screenStart || !result?.dispatched || !result.recording) return;
+      const take = result.take && typeof result.take === "object" ? result.take : null;
+      if (!take || take.mode !== "screen" || !isScreenSessionId(take.screenSessionId)) return;
+      if (take.screenSessionId !== startDetail.screenSessionId) {
+        appendMainLog(`[screen-mode] press joined the take already starting: ${take.screenSessionId} (press id ${startDetail.screenSessionId || "none"})`);
+      }
+      screenStartId = take.screenSessionId;
+      screenStart = startScreenTake(screenStartId, pressedAt);
     };
     beginScreenTake();
 
@@ -3101,8 +3115,8 @@ async function toggleRecordingFromShortcut(mode = "voice") {
           // No take, so no screen take: the capsule shows its failure in its
           // usual shape and the session is dropped once its start settles.
           releaseCapsuleScreenHold();
-          retireScreenTake(startDetail.screenSessionId);
-          void screenMode.finish({ id: startDetail.screenSessionId, discard: true }).catch((e) => {
+          retireScreenTake(screenStartId);
+          void screenMode.finish({ id: screenStartId, discard: true }).catch((e) => {
             appendMainLog(`[screen-mode] discard of an unconfirmed take failed: ${e?.message || e}`);
           });
         }
@@ -3154,10 +3168,10 @@ async function toggleRecordingFromShortcut(mode = "voice") {
         traceStep(trace, "screen_mode_started", { outcome: started?.outcome || "", error: started?.error || "" });
         const after = decideAfterScreenStart(started);
         if (after !== AFTER_SCREEN_START.KEEP) {
-          retireScreenTake(startDetail.screenSessionId);
+          retireScreenTake(screenStartId);
           releaseCapsuleScreenHold();
         }
-        if (after === AFTER_SCREEN_START.VOICE_TAKE) notifyRendererVoiceTake(startDetail.screenSessionId);
+        if (after === AFTER_SCREEN_START.VOICE_TAKE) notifyRendererVoiceTake(screenStartId);
         traceStep(trace, "screen_mode_after_start", { decision: after });
       }
       traceEnd(trace, "recording-started", { mode: startDetail.mode });
@@ -9293,7 +9307,9 @@ app.whenReady().then(async () => {
       const id = String(p.id || "");
       if (!isScreenSessionId(id)) return { ok: false, error: "bad-session-id" };
       retireScreenTake(id);
-      return await screenMode.finish({ id, discard: p.discard === true });
+      const out = await screenMode.finish({ id, discard: p.discard === true, endsTake: true });
+      if (out?.adoptedId) retireScreenTake(out.adoptedId);
+      return out;
     } catch (e) {
       appendMainLog(`[screen-mode] finish failed: ${e?.message || e}`);
       return { ok: false, error: "finish-failed" };

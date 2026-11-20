@@ -41,7 +41,7 @@ test("an answer that is not a start is never mistaken for a live session", () =>
 // is read — only for which names are called, and in which order).
 test("main starts the session before the awaits that used to delay it, and reads the answer after (S-02)", () => {
   const fn = topLevelFunctionSource("toggleRecordingFromShortcut");
-  const startAt = fn.indexOf("screenStart = startScreenTake(startDetail.screenSessionId, pressedAt)");
+  const startAt = fn.indexOf("screenStart = startScreenTake(screenStartId, pressedAt)");
   assert.ok(startAt > 0, "toggleRecordingFromShortcut starts the screen session");
   assert.ok(startAt < fn.indexOf("await waitForRendererRecordingStart()"), "start() waits behind the microphone confirmation");
   assert.ok(startAt < fn.indexOf("await frontAtHotkeyPromise"), "start() waits behind the frontmost-app lookup");

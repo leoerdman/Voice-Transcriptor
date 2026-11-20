@@ -291,36 +291,35 @@ test("a pen stroke's shape: dot, line, loop or curve", () => {
   assert.equal(shape([[100, 100], [300, 102], [100, 101]]), "line");
 });
 
-test("a rectangle's number sits outside its top-left corner, inside only when there is no room", () => {
+test("a stroke's number sits up-left of where the stroke began, for both tools", () => {
   const view = { x: 0, y: 0, width: 1000, height: 800 };
   const r = 10;
   const gap = 5;
-  const c = numberBadgeCenter("rect", [[500, 400], [300, 200]], view, r, gap);
-  assert.ok(c.x < 300 && c.y < 200, "outside the corner");
-  assert.ok(Math.abs(Math.hypot(300 - c.x, 200 - c.y) - (r + gap)) < 1e-9, "its edge `gap` from the corner");
-  // Clear of both sides: wherever the circle reaches x >= 300 - gap/2
-  // (the left side's line), it is above that side's top, and vice versa.
-  for (let a = 0; a < 2 * Math.PI; a += 0.01) {
-    const px = c.x + r * Math.cos(a);
-    const py = c.y + r * Math.sin(a);
-    assert.ok(!(px >= 300 - 2 && py >= 200 - 2), "the circle does not touch the rectangle's lines");
-  }
-  // Against the top edge: beside the corner instead, still outside the box.
-  const top = numberBadgeCenter("rect", [[100, 5], [400, 300]], view, r, gap);
-  assert.ok(top.x + r <= 100, "to the left of the box");
-  assert.ok(top.y - r >= 0);
-  // In the very corner of the view: inside the box, never off the picture.
-  const inside = numberBadgeCenter("rect", [[2, 2], [400, 300]], view, r, gap);
-  assert.ok(inside.x - r >= 0 && inside.y - r >= 0);
+  const c = numberBadgeCenter([[500, 400], [300, 200]], view, r, gap);
+  assert.ok(c.x < 500 && c.y < 400, "up and to the left of the start");
+  assert.ok(Math.abs(Math.hypot(500 - c.x, 400 - c.y) - (r + gap)) < 1e-9, "its edge `gap` from the start");
 });
 
-test("a pen stroke's number sits just past its start, away from its middle", () => {
+test("the number does not move while the stroke is drawn, whichever way it goes (user, 2026-11-21)", () => {
   const view = { x: 0, y: 0, width: 1000, height: 800 };
-  const ring = circle(500, 400, 100); // starts at its rightmost point
-  const c = numberBadgeCenter("pen", ring, view, 10, 5);
-  assert.ok(c.x > 600 + 10, "outside the ring, not over what it circles");
-  const line = numberBadgeCenter("pen", [[200, 300], [600, 300]], view, 10, 5);
-  assert.ok(line.x < 200 - 10, "beyond the start of the line");
+  const start = [400, 300];
+  const at = numberBadgeCenter([start], view, 10, 5);
+  for (const end of [[700, 300], [100, 300], [400, 700], [400, 50], [700, 700], [100, 50]]) {
+    const ring = [start, end, [end[0], start[1]], start];
+    assert.deepEqual(numberBadgeCenter([start, end], view, 10, 5), at, `line towards ${end}`);
+    assert.deepEqual(numberBadgeCenter(ring, view, 10, 5), at, `ring through ${end}`);
+  }
+});
+
+test("near the edge of the view the number takes the next corner around the start, never off the picture", () => {
+  const view = { x: 0, y: 0, width: 1000, height: 800 };
+  const r = 10;
+  const top = numberBadgeCenter([[100, 5], [400, 300]], view, r, 5);
+  assert.ok(top.y > 5 && top.x < 100, "below-left when there is no room above");
+  const corner = numberBadgeCenter([[2, 2], [400, 300]], view, r, 5);
+  assert.ok(corner.x > 2 && corner.y > 2, "below-right in the very corner");
+  const edge = numberBadgeCenter([[995, 795]], view, r, 5);
+  assert.ok(edge.x + r <= 1000 && edge.y + r <= 800, "up-left stays inside at the far corner");
 });
 
 test("the number is placed by the same function the overlay page embeds", () => {
@@ -328,7 +327,7 @@ test("the number is placed by the same function the overlay page embeds", () => 
   // eslint-disable-next-line no-new-func
   const copy = new Function(`return (${numberBadgeCenter.toString()})`)();
   const view = { x: 0, y: 0, width: 300, height: 300 };
-  assert.deepEqual(copy("rect", [[100, 100], [200, 200]], view, 10, 5), numberBadgeCenter("rect", [[100, 100], [200, 200]], view, 10, 5));
+  assert.deepEqual(copy([[100, 100], [200, 200]], view, 10, 5), numberBadgeCenter([[100, 100], [200, 200]], view, 10, 5));
   // eslint-disable-next-line no-new-func
   const fit = new Function(`return (${fitWithin.toString()})`)();
   assert.deepEqual(fit(3456, 2234, 1568, 1150000), fitWithin(3456, 2234, 1568, 1150000));

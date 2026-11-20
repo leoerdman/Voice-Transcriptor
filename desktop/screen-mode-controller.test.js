@@ -1012,7 +1012,7 @@ test("a stroke covering most of the area gets no close-up: the preview already s
   }
 });
 
-test("a white stroke's number is a dark digit; every other colour's is white", async () => {
+test("a stroke's number is a black digit whatever the colour (user, 2026-11-21)", async () => {
   const { SCREEN_MODE } = require("./screen-mode");
   const world = createWorld();
   try {
@@ -1020,11 +1020,35 @@ test("a white stroke's number is a dark digit; every other colour's is white", a
     drawStroke(world, [[100, 100], [200, 200]]); // red, the default
     await tick(30);
     const red = world.overlays()[0].page.screenCanvas.ctx.calls.filter((c) => c[0] === "fillText").pop();
-    assert.equal(red[4], "#ffffff");
+    assert.equal(red[4], "#000000");
     const overlay = world.overlays()[0];
     await overlay.webContents.executeJavaScript(`window.__apply([["b", 99, ${JSON.stringify(SCREEN_MODE.colors[5])}, 300, 300, "rect", 2], ["m", 99, 400, 400]])`);
     const white = overlay.page.screenCanvas.ctx.calls.filter((c) => c[0] === "fillText").pop();
-    assert.equal(white[4], "#111111");
+    assert.equal(white[4], "#000000");
+  } finally {
+    world.cleanup();
+  }
+});
+
+// ── 2026-11-21: a session no take owns ─────────────────────────────────
+test("the stopping take ends a live session under another id: its drawings and palette leave the screen", async () => {
+  const world = createWorld();
+  const RENDERER_TAKE = "screen-20261120-100400-000";
+  try {
+    await world.controller.start(ID);
+    drawStroke(world, [[100, 100], [200, 160]]);
+    await tick(30);
+    // Any other finish of a foreign id still refuses.
+    assert.deepEqual(await world.controller.finish({ id: RENDERER_TAKE }), { ok: false, error: "session-mismatch" });
+    assert.equal(world.controller.isActive(), true);
+    // The renderer's stop for its take: the live session goes with it.
+    const out = await world.controller.finish({ id: RENDERER_TAKE, endsTake: true });
+    assert.equal(out.ok, true);
+    assert.equal(out.adoptedId, ID);
+    assert.equal(out.manifest.id, ID);
+    assert.equal(out.manifest.events.filter((e) => e.type === "shot").length, 1, "the pending drawing is shot at the stop");
+    assert.equal(world.controller.isActive(), false);
+    assert.equal(world.overlays().length, 0, "nothing left on the screen");
   } finally {
     world.cleanup();
   }

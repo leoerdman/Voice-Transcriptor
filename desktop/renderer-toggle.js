@@ -59,6 +59,13 @@ function toggleDispatchScript({ allowStart, startDetail = { mode: "voice" }, not
       window.dispatchEvent(new CustomEvent('transcriptor-hotkey-toggle', { detail: ${JSON.stringify(startDetail)} }));
       state.dispatched = true;
       state.recording = !isRec;
+      // The take this press left starting, read after the (synchronous)
+      // dispatch: this press's own, or one an earlier press already began
+      // that this press joined. Main opens the screen session under ITS id.
+      if (!isRec) {
+        const take = typeof window.__transcriptorLiveTake === 'function' ? window.__transcriptorLiveTake() : null;
+        state.take = take ? { mode: String(take.mode || ''), screenSessionId: String(take.screenSessionId || '') } : null;
+      }
       return state;
     })();
     `;

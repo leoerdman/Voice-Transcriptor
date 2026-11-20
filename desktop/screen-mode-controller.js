@@ -186,6 +186,7 @@ function overlayHtml() {
   const ctx = cv.getContext("2d");
   const LINE = ${SCREEN_MODE.strokeWidth};
   const BADGE_R = ${badge.radius};
+  const BADGE_DIGIT = ${JSON.stringify(badge.digitColor)};
   // Clear of the stroke's line: the gap plus half the line's width.
   const BADGE_GAP = ${badge.gap + SCREEN_MODE.strokeWidth / 2};
   const BADGE_FONT = (scale) => ${JSON.stringify(`${badge.fontWeight} `)} + (${badge.fontSize} * scale) + ${JSON.stringify(`px ${badge.fontFamily}`)};
@@ -240,18 +241,11 @@ function overlayHtml() {
     }
     c.restore();
   }
-  // A light colour (the white or the yellow of the palette) takes a dark
-  // digit: a white one on it could not be read.
-  function digitColor(hex) {
-    const v = parseInt(String(hex).slice(1), 16);
-    const lum = (0.2126 * ((v >> 16) & 255) + 0.7152 * ((v >> 8) & 255) + 0.0722 * (v & 255)) / 255;
-    return lum > 0.6 ? "#111111" : "#ffffff";
-  }
   // The stroke's number in a circle of its colour, placed inside \`view\`
   // (display points) by the shared rule.
   function drawBadge(c, s, scale, view, ox, oy) {
     if (!s.points.length || !s.n) return;
-    const at = numberBadgeCenter(s.tool, s.points, view, BADGE_R, BADGE_GAP);
+    const at = numberBadgeCenter(s.points, view, BADGE_R, BADGE_GAP);
     const x = (at.x - ox) * scale;
     const y = (at.y - oy) * scale;
     c.save();
@@ -262,7 +256,7 @@ function overlayHtml() {
     c.lineWidth = scale;
     c.strokeStyle = "rgba(0,0,0,0.35)";
     c.stroke();
-    c.fillStyle = digitColor(s.color);
+    c.fillStyle = BADGE_DIGIT;
     c.font = BADGE_FONT(scale);
     c.textAlign = "center";
     c.textBaseline = "middle";
@@ -1384,7 +1378,14 @@ function createScreenModeController(deps) {
     }
   }
 
-  async function finishNow({ id = "", discard = false } = {}) {
+  /**
+   * `endsTake`: the renderer's take is stopping (its stopLive). It has one
+   * take and main one session, so a live session under another id belongs
+   * to no take at all — left alone, nobody would ever end it and its
+   * drawings and palette would stay on the screen (2026-11-21). It is
+   * ended with this take and its manifest handed back, named in the log.
+   */
+  async function finishNow({ id = "", discard = false, endsTake = false } = {}) {
     // Whatever state it finds, this id has ended: a start for it that is
     // still on its way must not open it again.
     if (id) endedIds.add(id);
@@ -1393,7 +1394,12 @@ function createScreenModeController(deps) {
         ? { ok: true, manifest: lastManifest }
         : { ok: false, error: "no-session" };
     }
-    if (id && session.id !== id) return { ok: false, error: "session-mismatch" };
+    let adoptedId = "";
+    if (id && session.id !== id) {
+      if (!endsTake) return { ok: false, error: "session-mismatch" };
+      adoptedId = session.id;
+      log(`[screen-mode] take ${id} stops while ${adoptedId} is live; no other take owns it — ending it with this one`);
+    }
     endedIds.add(session.id);
     const dir = session.dir;
     session.endedAt = Date.now();
@@ -1410,7 +1416,7 @@ function createScreenModeController(deps) {
       return { ok: true, manifest: null };
     }
     log(`[screen-mode] finished ${manifest?.id} events=${manifest?.events?.length || 0}`);
-    return { ok: true, manifest };
+    return adoptedId ? { ok: true, manifest, adoptedId } : { ok: true, manifest };
   }
 
   // Never rejects: whatever goes wrong on the way is a FAILED start the
