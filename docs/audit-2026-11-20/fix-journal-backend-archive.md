@@ -237,3 +237,36 @@ Proof method: SKILL §7.1 — the fixed file is put aside, `git show HEAD:<path>
   ```
 - After: OK; full suite `Ran 942 tests ... OK (skipped=2)` (one earlier run at load average 346 failed two timing tests in `test_deepgram_warm`, untouched here; they pass alone and on the rerun).
 - BM-26 scope: a chunked body without `Content-Length` is still bounded only by the per-route copy check.
+
+## Not done (ID → reason)
+- **BL-03** (P2) — log archive pruning: not done, user decision. AGENTS.md rule 3 forbids deleting logs without the user's explicit request, and the fix starts deleting them (it is also desktop code).
+- **BM-01** (P1) — `GET /` serves the renderer token unauthenticated. The backend cannot close it alone: refusing the token on `GET /` breaks the app until the desktop shell delivers the token to its window another way. Documented honestly in `cli_access.py` (C7); the fix is listed under Cross-domain.
+- **BM-29** (P2) — `*_duration_sec` in the stats are word-count estimates: renaming the fields (or switching semantics) is a contract change with the renderer → Cross-domain.
+- **BM-20** (P2, hypothesis) — partly: `TRANSCRIPTOR_CLI_TOKEN` added (C7); `--token` kept, removing a documented flag is an observable behaviour change.
+- **BM-21**, non-empty invalid keyfile — kept by the pinned rule `test_a_keyfile_with_content_is_never_replaced` (B-020); only the whitespace case and the false "regenerating" message were fixed (C9).
+- **BM-24**, the `retries`-means-attempts naming — the callers are engine modules; resource half fixed (C9) → Cross-domain.
+- **BM-13**, upscale model fallback on `"HTTP 404"`/`"not found"` prose and the `http_retry` hint substrings — needs `OpenRouterError.status_code` (engine) → Cross-domain; ffmpeg half fixed (C10).
+- **BL-13** (P2, hypothesis, perf) — three directory walks per dictation: unmeasured (no timings in the logs); the redesign it proposes (incremental list cache, retention from the list index) changes cache semantics and has no failing check to prove. BL-14's dedupe (C10) halves the walks on the user's machine.
+- **BL-18**, second half (`upload_queue.json` persists item transcripts, 1.58 MB): persisting metadata only would lose the queue's text after the 24 h results sweep — an observable change; left.
+- **BL-17** — no separate change: its cause (BL-01's race) is removed in C2; the WARNING now reports a genuinely abnormal state.
+- **BM-27** (tests gap) — no own change; closed by the tests added with C3, C4, C5, C8 (adoption with failures, malformed events, CLI scope, recovery of a screen take, divergent mtimes).
+- **H-11** (hypothesis, perf) — fixed in C8 without a failing check (behaviour-identical; the per-recording calls went from three to one).
+
+## Cross-domain, for the lead
+1. **Renderer (`frontend/src/main.tsx`)** — S-01/H-01/BM-04: add `screen_session_id: liveScreenSessionId` to the `/ws/transcribe` query (`wsQuery`, ~11474); `recoverBackendAudioSessions` (~5126) must stop sending `recording_collection: RECORDING_COLLECTIONS.live` to `/api/live/recoveries/{id}/promote` (send nothing: the sidecar decides); the live-draft snapshot (~5811/~6003) should use `liveRecordingCollection(mode)`.
+2. **Renderer** — BM-05: `save-with-audio` and promote now answer `screens_error` (string, "" on success); show it, and do not fall back to `stagedScreenManifest` when it is set (~12682).
+3. **Renderer** — BL-16: after a successful `save-with-audio` with `live_session_id`, the extra `POST /api/live/recoveries/{id}/discard` is redundant (the backend now defers/executes the delete itself).
+4. **Renderer** — S-17: the comment near `main.tsx:380` restates "newest five" (an env-tunable default).
+5. **Renderer** — BL-12: debounce the network-state flip after resume before `scheduleLocalWarmup()` (Whisper loaded ~50×/18 days on wake blips while the provider is Deepgram).
+6. **Renderer + backend** — BM-29: rename `avg/min/max_duration_sec` to `estimated_*` on both sides (or read real durations where audio exists).
+7. **Desktop + backend + renderer** — BM-01: stop injecting `window.__TRANSCRIPTOR_API_TOKEN` in `GET /` (`backend/main.py` `index`). The desktop shell already knows a per-launch secret (`BACKEND_BOOT_NONCE`, but `/api/health` serves that one publicly, so a new secret is needed): pass the token to the window via preload/IPC (or `loadURL` `extraHeaders` checked by `index`), then remove the injection.
+8. **Desktop** — BL-02: create `main.log` with mode 0600 in `appendMainLog`. BL-03 stays a user decision.
+9. **Engines** — BL-02: `remote_deepgram_live.py` `_handle_result` logs `text=%r`; the coverage-hole report logs up to `_HOLE_REPORT_TEXT_CHARS` of speech; `deepgram_recovery.py` logs the unplaced decoded words. Drop or gate them.
+10. **Engines** — BL-04: `deepgram_warm.py:103` `logging.getLogger("transcriptor.deepgram_warm")` → `__name__` (all warm-pool INFO is invisible today).
+11. **Engines** — BL-11: `transcribe_gigaam.py` should remember a failed checkpoint host for a while instead of re-downloading on every trigger (the warmup endpoint now reports it as unreachable instead of 500).
+12. **Engines** — BM-13: give `OpenRouterError` a `status_code`; then `upscale_text` (backend/main.py) can fall back on `status_code == 404` instead of prose.
+13. **Engines** — BM-24: rename `request_with_retry(retries=…)` to `attempts=` together with its callers in `remote_deepgram.py` / `remote_openrouter.py`.
+14. **Live-WS lane (merge note)** — this lane touched the `ws_transcribe` handler in two small places outside the 4560–6030 block: the `finally` now calls `_end_live_session_ownership(session_id, recovery_ctx)` (BL-01) and `_open_live_recovery(...)` gets `screen_session_id=qp.get("screen_session_id") or ""` (S-01). `_open_live_recovery`, `_finalize_live_recovery`, `_recovery_spool_bytes` (BW-13 overlaps) were edited here too.
+
+## Final suite
+`/tmp/vt-tests-archive/bin/python -m unittest discover -s backend/tests` → `Ran 942 tests ... OK (skipped=2)` (start of lane: 882 tests OK).
