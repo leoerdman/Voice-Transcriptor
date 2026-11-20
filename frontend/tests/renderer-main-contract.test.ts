@@ -444,6 +444,17 @@ describe("the live preview defers to a resolved envelope, verbatim (B-041)", () 
   });
 });
 
+describe("live socket close handler (FL-03)", () => {
+  const handler = /ws\.onclose = \(ev\) => \{([\s\S]*?)\n {4}\};/.exec(mainTsx)?.[1] || "";
+
+  it("records the error envelope through liveCloseOwesErrorEnvelope, without bailing out on a missing slot", () => {
+    expect(handler, "ws.onclose handler not found").toBeTruthy();
+    expect(handler).toContain("liveCloseOwesErrorEnvelope({");
+    expect(handler).toContain("resolveLiveFinal(sessionUiToken, {");
+    expect(handler).not.toMatch(/if \(!slot\) return;/);
+  });
+});
+
 /** Slice one top-level function of main.tsx, from its header to the next marker. */
 function mainTsxSlice(header: string, next: string): string {
   const start = mainTsx.indexOf(header);

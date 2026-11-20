@@ -13,6 +13,7 @@ import {
 import { decideLiveTranscriptAdoption } from "./live-coverage";
 import {
   describeLiveFinalStats,
+  liveCloseOwesErrorEnvelope,
   parseLiveFinalEnvelope,
   type LiveFinalEnvelopeFields as LiveFinalEnvelopeBody,
   type LiveFinalStats,
@@ -11535,20 +11536,23 @@ async function startLive(
       // close before finalize means the stream died; release any pending
       // waiters for THIS session with a synthetic error envelope so
       // stopLive doesn't hang on waitForLiveFinalEnvelope.
+      //
+      // stopLive arms its waiter lazily, so at the moment of an unclean
+      // close there is usually no slot and nobody waiting yet. The
+      // envelope is recorded regardless (``resolveLiveFinal`` creates the
+      // slot): bailing out on a missing slot meant the later waiter had
+      // nothing to resolve against and burned its whole budget (FL-03).
+      // The real ``final`` message always arrives before ``onclose``.
       const slot = liveFinalSlots.get(sessionUiToken);
-      if (!slot) return;
-      if (slot.envelope) return;
-      // No ``waiters.length === 0`` bail-out. stopLive now arms its
-      // waiter lazily (see below), so at the moment of an unclean close
-      // there is often nobody waiting yet — and dropping the synthetic
-      // error envelope here meant the later waiter had nothing to
-      // resolve against and burned its whole timeout. Recording the
-      // envelope in the slot is safe either way: ``resolveLiveFinal``
-      // is a no-op once ``slot.envelope`` is set, and the real ``final``
-      // message always arrives before ``onclose``.
-      console.log(`[trace ws-close] code=${ev.code} reason="${ev.reason || ""}" wasClean=${ev.wasClean} hadEnvelope=${!!slot.envelope} waiters=${slot.waiters.length}`);
-      if (ev.wasClean && (ev.code === 1000 || ev.code === 1005)) return;
+      console.log(`[trace ws-close] code=${ev.code} reason="${ev.reason || ""}" wasClean=${ev.wasClean} hadEnvelope=${!!slot?.envelope} waiters=${slot?.waiters.length ?? 0}`);
+      if (!liveCloseOwesErrorEnvelope({ hadEnvelope: !!slot?.envelope, wasClean: ev.wasClean, code: ev.code })) return;
       console.warn(`live ws unexpectedly closed (code=${ev.code}, reason=${ev.reason || "?"})`);
+      if (activeUiSessionToken === sessionUiToken && isRecording) {
+        patchCurrentRecordingSummary({
+          status: "Live stream lost. The recording continues and will be transcribed from the saved audio.",
+          tone: "warning",
+        }, sessionUiToken);
+      }
       resolveLiveFinal(sessionUiToken, {
         text: "",
         segments: [],

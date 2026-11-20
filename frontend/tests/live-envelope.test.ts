@@ -7,6 +7,7 @@ import {
   DEEPGRAM_LIVE_SOURCE,
   LOCAL_ASSIST_SOURCE,
   describeLiveFinalStats,
+  liveCloseOwesErrorEnvelope,
   parseLiveFinalEnvelope,
   parseLiveFinalStats,
 } from "../src/live-envelope";
@@ -228,5 +229,21 @@ describe("describeLiveFinalStats — every parsed field has a reader", () => {
     expect(describeLiveFinalStats(undefined)).toBe(
       "connect=n/a finalize=n/a dual=0 recovery=n/a",
     );
+  });
+});
+
+describe("liveCloseOwesErrorEnvelope — FL-03: a socket that dies mid-recording records its failure", () => {
+  it("an unclean close with no envelope yet owes one, whether or not a waiter exists", () => {
+    expect(liveCloseOwesErrorEnvelope({ hadEnvelope: false, wasClean: false, code: 1006 })).toBe(true);
+    expect(liveCloseOwesErrorEnvelope({ hadEnvelope: false, wasClean: true, code: 1011 })).toBe(true);
+  });
+
+  it("a clean normal close after finalize owes nothing", () => {
+    expect(liveCloseOwesErrorEnvelope({ hadEnvelope: false, wasClean: true, code: 1000 })).toBe(false);
+    expect(liveCloseOwesErrorEnvelope({ hadEnvelope: false, wasClean: true, code: 1005 })).toBe(false);
+  });
+
+  it("a session that already has its final envelope is never overwritten", () => {
+    expect(liveCloseOwesErrorEnvelope({ hadEnvelope: true, wasClean: false, code: 1006 })).toBe(false);
   });
 });
