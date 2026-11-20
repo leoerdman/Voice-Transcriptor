@@ -275,8 +275,9 @@ test("a shot leaves a stroke still being drawn on the screen, with what it has d
   }
 });
 
-// The user: "make them disappear first, then the screenshot is saved."
-test("a shot takes its strokes off the screen before the capture, and still paints them into the image", async () => {
+// The user, 2026-11-20 (after trying the reverse): "first the screenshot,
+// then clear the drawings off the screen".
+test("a shot is captured with its strokes still on the screen; they leave the moment it is taken", async () => {
   const world = createWorld();
   try {
     await world.controller.start(ID);
@@ -288,11 +289,12 @@ test("a shot takes its strokes off the screen before the capture, and still pain
     const shot = world.controller.takeShot("capsule");
     await tick(5);
     assert.equal(world.captures.length, 1, "the capture is under way");
-    assert.equal(await overlay.webContents.executeJavaScript("window.__hasStrokes([1])"), false, "gone from the screen while the capture runs");
+    assert.equal(await overlay.webContents.executeJavaScript("window.__hasStrokes([1])"), true, "still on the screen while the capture runs");
     release();
     const result = await shot;
-    assert.equal(paintedMoveTos(result.files[0]).length, 1, "the image still holds the stroke");
-    assert.ok(world.logs.some((l) => /strokes off screen for shot \(capsule\) in \d+ ms/.test(l)));
+    assert.equal(await overlay.webContents.executeJavaScript("window.__hasStrokes([1])"), false, "gone once it is taken");
+    assert.equal(paintedMoveTos(result.files[0]).length, 1, "the image holds the stroke");
+    assert.ok(world.logs.some((l) => /shot captured \(capsule\) displays=1 capture_ms=\d+ strokes_off=1 compose_ms=\d+/.test(l)));
   } finally {
     world.cleanup();
   }

@@ -879,48 +879,84 @@ function createScreenModeController(deps) {
     }
     const allDisplays = screen.getAllDisplays();
     const at = Date.now();
-    // The strokes leave the screen first, the moment the shot is asked
-    // for: the capture never shows them anyway (the overlays are
-    // content-protected) and the image gets them painted from their data,
-    // which the overlay keeps aside until the shot is done.
-    if (ids.length) {
-      const clearStarted = Date.now();
-      await Promise.all([...overlays.values()].map((entry) => overlayCall(entry, `window.__detach(${JSON.stringify(ids)})`)));
-      log(`[screen-mode] strokes off screen for shot (${reason}) in ${Date.now() - clearStarted} ms`);
+    // The order the user sees (2026-11-20, after trying the reverse): the
+    // shot is taken FIRST, with the strokes still on the screen, and the
+    // moment the capture is done they vanish with the flash. Taking them
+    // off before the capture left the screen empty for the ~0.7 s the
+    // shot took — "it cleared, then nothing, then it saved". The capture
+    // never shows the strokes either way (the overlays are
+    // content-protected); they are painted into the image from their
+    // data, which the overlay keeps aside after `__detach`.
+    //
+    // 1. capture every display at once;
+    const captureStarted = Date.now();
+    const targets = displayIds.map((displayId) => {
+      const display = allDisplays.find((d) => d.id === displayId);
+      if (!display) return { displayId, display: null, file: "", onDisplay: [] };
+      const ordinal = allDisplays.indexOf(display) + 1;
+      return {
+        displayId,
+        display,
+        file: path.join(session.dir, shotFileName(session.shots.length + 1, ordinal, displayIds.length)),
+        onDisplay: pending.filter((s) => s.displayId === displayId).map((s) => s.id),
+      };
+    });
+    const failures = [];
+    const raw = await Promise.all(targets.map(async (target) => {
+      if (!target.display) {
+        failures.push(`display ${target.displayId} is gone`);
+        return false;
+      }
+      try {
+        await captureRegion(target.display.bounds, target.file);
+        return true;
+      } catch (e) {
+        failures.push(`display ${target.displayId}: ${e?.message || e}`);
+        fs.rmSync(target.file, { force: true });
+        return false;
+      }
+    }));
+    const captureMs = Date.now() - captureStarted;
+    const grabbed = targets.filter((_, i) => raw[i]);
+    // 2. the captured strokes leave the screen, now;
+    const grabbedIds = grabbed.flatMap((target) => target.onDisplay);
+    if (grabbedIds.length) {
+      await Promise.all([...overlays.values()].map((entry) => overlayCall(entry, `window.__detach(${JSON.stringify(grabbedIds)})`)));
     }
+    if (grabbed.length) {
+      for (const entry of overlays.values()) overlayCall(entry, "window.__flash()");
+    }
+    // 3. and are painted into the images that hold them.
+    const composeStarted = Date.now();
     const files = [];
     const captured = new Set();
-    const failures = [];
-    for (const displayId of displayIds) {
-      const display = allDisplays.find((d) => d.id === displayId);
-      if (!display) {
-        failures.push(`display ${displayId} is gone`);
-        continue;
-      }
-      const ordinal = allDisplays.indexOf(display) + 1;
-      const file = path.join(session.dir, shotFileName(session.shots.length + 1, ordinal, displayIds.length));
-      const onDisplay = pending.filter((s) => s.displayId === displayId).map((s) => s.id);
+    for (const target of grabbed) {
       try {
-        await captureRegion(display.bounds, file);
-        if (onDisplay.length) {
+        if (target.onDisplay.length) {
           // The strokes are part of the image: without them painted in,
           // this file is not the shot the strokes are said to be in.
-          const raw = fs.readFileSync(file).toString("base64");
+          const png = fs.readFileSync(target.file).toString("base64");
           const composed = await overlayEval(
-            overlays.get(displayId),
-            `window.__composite(${JSON.stringify(`${PNG_DATA_URL_PREFIX}${raw}`)}, ${JSON.stringify(onDisplay)})`,
+            overlays.get(target.displayId),
+            `window.__composite(${JSON.stringify(`${PNG_DATA_URL_PREFIX}${png}`)}, ${JSON.stringify(target.onDisplay)})`,
           );
           if (typeof composed !== "string" || !composed.startsWith(PNG_DATA_URL_PREFIX)) {
             throw new Error("the overlay returned no image");
           }
-          fs.writeFileSync(file, Buffer.from(composed.slice(PNG_DATA_URL_PREFIX.length), "base64"));
+          fs.writeFileSync(target.file, Buffer.from(composed.slice(PNG_DATA_URL_PREFIX.length), "base64"));
         }
-        files.push(file);
-        captured.add(displayId);
+        files.push(target.file);
+        captured.add(target.displayId);
       } catch (e) {
-        failures.push(`display ${displayId}: ${e?.message || e}`);
-        fs.rmSync(file, { force: true });
+        failures.push(`display ${target.displayId}: ${e?.message || e}`);
+        fs.rmSync(target.file, { force: true });
       }
+    }
+    if (grabbed.length) {
+      log(
+        `[screen-mode] shot captured (${reason}) displays=${grabbed.length} capture_ms=${captureMs} ` +
+        `strokes_off=${grabbedIds.length} compose_ms=${Date.now() - composeStarted}`,
+      );
     }
     if (failures.length) {
       // No screenshot is claimed for a display that was not captured: its
@@ -940,7 +976,6 @@ function createScreenModeController(deps) {
     }
     if (!files.length) return null;
     const shot = recordShot(session, { at, files, strokeIds: taken, reason });
-    for (const entry of overlays.values()) overlayCall(entry, "window.__flash()");
     writeEvents();
     log(`[screen-mode] shot ${shot.index} reason=${reason} files=${files.length} strokes=${shot.strokeIds.length}`);
     return { index: shot.index, files };
