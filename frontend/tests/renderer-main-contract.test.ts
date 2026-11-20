@@ -505,6 +505,35 @@ describe("live half: one rule per fact, no dead state (FL-05/06/09/14/15/16/17/1
   });
 });
 
+describe("boot, update check and History bootstrap (FQ-13/FQ-14/FQ-15/FQ-22)", () => {
+  it("FQ-13: a failed update check is not stamped as 'checked today'", () => {
+    const fn = mainTsxSlice("async function runUpdateCheck(): Promise<void> {", "\n}\n");
+    const guard = fn.indexOf('if (result.status !== "unknown") {');
+    const stamp = fn.indexOf("localStorage.setItem(UPDATE_CHECK_CACHE_KEY");
+    expect(guard).toBeGreaterThan(0);
+    expect(stamp).toBeGreaterThan(guard);
+    expect(mainTsx).not.toMatch(/\}, 4000\);/);
+  });
+
+  it("FQ-14: the classifier lives in ./boot-error and every raw error gets its disclosure", () => {
+    expect(mainTsx).toContain('import { classifyBootError } from "./boot-error";');
+    expect(mainTsx).not.toMatch(/function classifyBootError\(/);
+    expect(mainTsx).not.toContain("raw !== detail");
+  });
+
+  it("FQ-15: bootstrap failures reach the status line, and the boot race clears only its own promise", () => {
+    const init = mainTsxSlice("async function initRecordingsBootstrap(): Promise<void> {", "\n}\n");
+    expect(init).toContain('setStatus(`${said.charAt(0).toUpperCase()}${said.slice(1)}. Restart the app to try again.`, "warning");');
+    expect(mainTsx).toMatch(/if \(recordingsBootstrapPromise === bootRecordingsBootstrap\) \{\s*recordingsBootstrapPromise = null;/);
+  });
+
+  it("FQ-22: no overlay state written right before the page reloads", () => {
+    const retry = mainTsxSlice('_bootRetry.addEventListener("click", () => {', "window.location.reload();");
+    expect(retry).toBeTruthy();
+    expect(retry).not.toContain("_bootOverlayHidden");
+  });
+});
+
 describe("live socket close handler (FL-03)", () => {
   const handler = /ws\.onclose = \(ev\) => \{([\s\S]*?)\n {4}\};/.exec(mainTsx)?.[1] || "";
 

@@ -44,6 +44,7 @@ import {
   uploadSourceValidationError,
 } from "./upload-item";
 import { UPLOAD_QUEUE_SAVE_FAILED_STATUS, nextQueueSaveRetry } from "./upload-queue-persist";
+import { classifyBootError } from "./boot-error";
 import {
   captureElapsedMs,
   decidePreRoll,
@@ -13591,22 +13592,32 @@ window.addEventListener("transcriptor-hotkey-stop", (ev) => {
 
 async function initRecordingsBootstrap(): Promise<void> {
   recordingsBootstrapReady = false;
+  // Each failure was console-only: the History pane just stayed empty
+  // and an unrecovered interrupted recording said nothing (FQ-15).
+  const failed: string[] = [];
   try {
     await loadRecordings(false);
   } catch (e) {
     console.warn("Initial recordings load failed", e);
+    failed.push("History could not be loaded");
   }
   try {
     await recoverBackendAudioSessions();
   } catch (e) {
     console.warn("Recovery import failed", e);
+    failed.push("interrupted recordings could not be recovered");
   }
   try {
     await recoverLiveDraftIfAny();
   } catch (e) {
     console.warn("Draft recovery failed", e);
+    failed.push("an interrupted transcript draft could not be recovered");
   }
   recordingsBootstrapReady = !!currentArchiveDirSnapshot();
+  if (failed.length) {
+    const said = failed.join("; ");
+    setStatus(`${said.charAt(0).toUpperCase()}${said.slice(1)}. Restart the app to try again.`, "warning");
+  }
 }
 
 // Graph interactions are disabled with the Graph view. Restore together with
@@ -13655,10 +13666,15 @@ async function runUpdateCheck(): Promise<void> {
   updateBtnEl.disabled = true;
   renderUpdateStatus("Checking…", "neutral");
   const result = await checkForUpdate(__APP_UPDATE_META__, fetch);
-  try {
-    localStorage.setItem(UPDATE_CHECK_CACHE_KEY, String(Date.now()));
-  } catch {
-    /* quota/private-mode: the throttle just resets each launch */
+  // Only a check that got an answer counts as "checked today". Stamping
+  // the failed one too meant an offline launch silenced the daily check
+  // for 24 h (FQ-13).
+  if (result.status !== "unknown") {
+    try {
+      localStorage.setItem(UPDATE_CHECK_CACHE_KEY, String(Date.now()));
+    } catch {
+      /* quota/private-mode: the throttle just resets each launch */
+    }
   }
   switch (result.status) {
     case "update-available": {
@@ -13693,8 +13709,10 @@ if (updateBtnEl) {
     void runUpdateCheck();
   });
 }
-// Passive boot check at most once per day — silent on failure so an
-// offline start never nags.
+// Passive boot check at most once per day, a few seconds after launch
+// so it never competes with the backend boot. A failure is shown in
+// Settings and not stamped, so the next launch tries again.
+const UPDATE_CHECK_BOOT_DELAY_MS = 4_000;
 (() => {
   let lastChecked = 0;
   try {
@@ -13705,7 +13723,7 @@ if (updateBtnEl) {
   if (!shouldAutoCheck(Date.now(), lastChecked)) return;
   window.setTimeout(() => {
     void runUpdateCheck();
-  }, 4000);
+  }, UPDATE_CHECK_BOOT_DELAY_MS);
 })();
 
 applyBackendBootstrap();
@@ -13786,7 +13804,7 @@ window.addEventListener("pagehide", stopGatedPolls, { once: true });
 // to resume. On timeout the recordings list stays empty; the user can still
 // record and the list reloads on the next manual refresh.
 let recordingsBootstrapTimeoutHandle = 0;
-recordingsBootstrapPromise = Promise.race([
+const bootRecordingsBootstrap: Promise<void> = Promise.race([
   initRecordingsBootstrap(),
   new Promise<void>((_, rej) => {
     recordingsBootstrapTimeoutHandle = window.setTimeout(
@@ -13795,15 +13813,24 @@ recordingsBootstrapPromise = Promise.race([
     );
   }),
 ])
-  .catch((e) => { console.warn("[bootstrap]", e?.message ?? e); })
+  .catch((e) => {
+    console.warn("[bootstrap]", e?.message ?? e);
+    setStatus("History is taking unusually long to load. Recording still works; the list reloads on the next refresh.", "warning");
+  })
   .finally(() => {
     // The loser of a race is not cancelled by winning it. Without this
     // the timer stayed armed for the full 15 s after a bootstrap that
     // finished in 40 ms, holding its closure and keeping the process
     // from going idle.
     window.clearTimeout(recordingsBootstrapTimeoutHandle);
-    recordingsBootstrapPromise = null;
+    // Clear only our own promise: a settings archive-folder change made
+    // during the boot race installs its own, and nulling it here made
+    // ``ensureRecordingsArchiveReady`` stop waiting for it (FQ-15).
+    if (recordingsBootstrapPromise === bootRecordingsBootstrap) {
+      recordingsBootstrapPromise = null;
+    }
   });
+recordingsBootstrapPromise = bootRecordingsBootstrap;
 // Platform marker on <body> so the stylesheet can gate macOS-specific
 // chrome offsets (traffic-light padding under hiddenInset). Without
 // this, Windows/Linux users see a 42px dead zone at the top of the
@@ -13844,68 +13871,7 @@ window.__setBackendBootStatus = (msg: string) => {
   setStatus(msg);
 };
 
-/**
- * Map a raw backend-startup error string to a user-actionable message.
- *
- * The backend sends us ``uvicorn`` stderr tails verbatim via
- * ``__setBackendBootError`` — those can include absolute filesystem
- * paths, Python tracebacks, or obscure OS error codes (``EADDRINUSE``,
- * ``WinError 10013``). Rendering them raw is (a) scary to non-technical
- * users, (b) info-leaky to anyone who photographs the window. We
- * classify the known families into actionable copy and keep the raw
- * text behind a "Show details" disclosure for anyone debugging.
- */
-function classifyBootError(raw: string): { headline: string; detail: string } {
-  const low = (raw || "").toLowerCase();
-  if (!low) {
-    return {
-      headline: "Backend failed to start.",
-      detail: "Unknown startup failure — check the main.log in the data directory.",
-    };
-  }
-  if (low.includes("address already in use") ||
-      low.includes("eaddrinuse") ||
-      low.includes("winerror 10048") ||
-      low.includes("only one usage of each socket address")) {
-    // Do NOT name a port here. The backend scans upward from
-    // TRANSCRIPTOR_PORT (default 8321) through 24 candidates before
-    // falling back to an OS-assigned port, so the number that actually
-    // collided is rarely 8321. Telling the user to free 8321 when the
-    // conflict was on 8327 sends them chasing the wrong process; the
-    // real port is in the technical-details disclosure below.
-    return {
-      headline: "The backend port is already in use.",
-      detail: "Another copy of Transcriptor is still running. Close it via the tray icon (or reboot if that doesn't work) and try again. The exact port is in the technical details below.",
-    };
-  }
-  if (low.includes("permission denied") ||
-      low.includes("eacces") ||
-      low.includes("winerror 5")) {
-    return {
-      headline: "Transcriptor couldn't access its data directory.",
-      detail: "Check that Transcriptor's data directory is writable by your user account. On Windows, verify no antivirus is blocking %APPDATA%\\Transcriptor.",
-    };
-  }
-  if (low.includes("no module named") || low.includes("modulenotfounderror")) {
-    return {
-      headline: "A Python dependency is missing.",
-      detail: "The bundled runtime is incomplete. Reinstall Transcriptor from the same installer (.exe / .dmg / .AppImage) to restore it.",
-    };
-  }
-  if (low.includes("python 3 interpreter was not found") ||
-      low.includes("python: not found") ||
-      low.includes("python was not found")) {
-    return {
-      headline: "Python 3 is required.",
-      detail: "Install Python 3.10+ from python.org, then reopen Transcriptor. Linux users: `sudo apt install python3 python3-venv python3-pip`.",
-    };
-  }
-  // Unknown family — generic copy + let the user open the log.
-  return {
-    headline: "Backend failed to start.",
-    detail: "Open the log file from the support section below and share the tail with support, or reinstall from the latest installer.",
-  };
-}
+// The raw-stderr → actionable-copy mapping lives in ./boot-error.
 
 window.__setBackendBootError = (msg: string) => {
   const raw = String(msg || "").trim();
@@ -13927,7 +13893,7 @@ window.__setBackendBootError = (msg: string) => {
     const friendly = document.createElement("div");
     friendly.textContent = detail;
     detailEl.appendChild(friendly);
-    if (raw && raw !== detail) {
+    if (raw) {
       const details = document.createElement("details");
       details.style.marginTop = "8px";
       details.style.fontSize = "12px";
@@ -13965,10 +13931,7 @@ if (_bootRetry) {
     const statusEl = document.getElementById("bootOverlayStatus");
     if (statusEl) statusEl.textContent = "Reloading…";
     const overlay = document.getElementById("bootOverlay");
-    if (overlay) {
-      _bootOverlayHidden = false;
-      overlay.dataset.state = "loading";
-    }
+    if (overlay) overlay.dataset.state = "loading";
     window.location.reload();
   });
 }
