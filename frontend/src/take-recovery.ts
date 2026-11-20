@@ -29,7 +29,7 @@ import { smartRecordingTitle } from "./recording-title";
 import {
   annotateTranscript,
   parseScreenManifest,
-  screenMarksFromManifest,
+  screenAnnotationFromManifest,
   screenSessionDurationMs,
   type ScreenManifest,
 } from "./screen-annotations";
@@ -79,7 +79,7 @@ export function parsePromotedTake(sessionId: string, body: unknown): PromotedTak
 export function recoveredTakeTranscript(spoken: string, screens: ScreenManifest | null): string {
   const words = String(spoken || "").trim();
   if (!screens) return words;
-  return annotateTranscript(words, screenMarksFromManifest(screens), {
+  return annotateTranscript(words, screenAnnotationFromManifest(screens), {
     durationMs: screenSessionDurationMs(screens),
   }).trim();
 }

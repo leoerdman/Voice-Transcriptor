@@ -205,12 +205,14 @@ import {
 import { BoundedChunkWindow, capturedHoursLabel, pcmWavDurationSec } from "./pcm-capture";
 import { draftSpokenText, parsePromotedTake, planTakeRecovery, type PromotedTake } from "./take-recovery";
 import {
+  EMPTY_SCREEN_ANNOTATION,
   annotateTranscript,
+  hasScreenAnnotation,
   parseScreenManifest,
-  screenMarksFromManifest,
+  screenAnnotationFromManifest,
   screenSessionDurationMs,
   wordStartsFromSegments,
-  type ScreenMark,
+  type ScreenAnnotation,
 } from "./screen-annotations";
 import {
   UPLOAD_QUEUE_RESTORE_FAILED_STATUS,
@@ -9153,9 +9155,9 @@ $("retranscribeBtn").addEventListener("click", async () => {
       // segment timings). The upscale below still rewrites only the
       // spoken text.
       const spokenText = text;
-      const screen = await screenMarksForSavedRecording(audioState.savedName, audioState.archiveDir || "");
-      if (screen.marks.length) {
-        text = annotateTranscript(spokenText, screen.marks, { durationMs: screen.durationMs });
+      const screen = await screenAnnotationForSavedRecording(audioState.savedName, audioState.archiveDir || "");
+      if (hasScreenAnnotation(screen.annotation)) {
+        text = annotateTranscript(spokenText, screen.annotation, { durationMs: screen.durationMs });
       }
       // Session-gated writes: if the user started a new live recording
       // while we were transcribing, the new session owns `finalOutput`
@@ -9639,11 +9641,11 @@ subscribeToScreenVoiceTake();
  * (Re-transcribe today), so a transcript of a screen recording never
  * loses its marks.
  */
-async function screenMarksForSavedRecording(
+async function screenAnnotationForSavedRecording(
   name: string,
   archiveDir: string,
-): Promise<{ marks: ScreenMark[]; durationMs: number }> {
-  const none = { marks: [], durationMs: 0 };
+): Promise<{ annotation: ScreenAnnotation; durationMs: number }> {
+  const none = { annotation: EMPTY_SCREEN_ANNOTATION, durationMs: 0 };
   if (!name) return none;
   try {
     const params = new URLSearchParams();
@@ -9652,7 +9654,7 @@ async function screenMarksForSavedRecording(
     const r = await apiGet<{ screens_manifest?: unknown }>("/api/recordings/" + encodeURIComponent(name) + suffix);
     const manifest = parseScreenManifest(r.screens_manifest);
     if (!manifest) return none;
-    return { marks: screenMarksFromManifest(manifest), durationMs: screenSessionDurationMs(manifest) };
+    return { annotation: screenAnnotationFromManifest(manifest), durationMs: screenSessionDurationMs(manifest) };
   } catch (e) {
     console.warn("[trace screen] archived marks unavailable", e);
     return none;
@@ -12689,13 +12691,14 @@ async function stopLive(
   // archived manifest (the staged one when the save could not archive
   // it). Fixed from here on: every exit below — the transcript, or the
   // live text a take without one keeps — carries the same marks.
-  const screenMarks: ScreenMark[] = screenManifest
-    ? screenMarksFromManifest(screenManifest, recordingClockStartAt)
-    : [];
+  const screenAnnotation: ScreenAnnotation = screenManifest
+    ? screenAnnotationFromManifest(screenManifest, recordingClockStartAt)
+    : EMPTY_SCREEN_ANNOTATION;
+  const screenAnnotated = hasScreenAnnotation(screenAnnotation);
   /** What this take keeps when it ends without a final transcript
    *  (./stop-epilogue). Read late: final events can still land while the
    *  socket drains. */
-  const keptLiveTranscript = (): KeptTranscript => keepLiveTranscript(latestSourceForSave(), screenMarks, recordedMs);
+  const keptLiveTranscript = (): KeptTranscript => keepLiveTranscript(latestSourceForSave(), screenAnnotation, recordedMs);
   /** The final transcript (with its marks) once it has been shown: a stop
    *  that fails after this point keeps the final, not the live draft. */
   let finalTranscriptShown = "";
@@ -13205,17 +13208,17 @@ async function stopLive(
       ? wordStartsFromSegments(liveFinalSlots.get(sessionUiToken)?.envelope?.segments || [])
       : [];
     const withScreenMarks = (text: string, timed: boolean): string => (
-      screenMarks.length
-        ? annotateTranscript(text, screenMarks, {
+      screenAnnotated
+        ? annotateTranscript(text, screenAnnotation, {
           wordStartsMs: timed ? screenWordStartsMs : undefined,
           durationMs: recordedMs,
         })
         : text
     );
-    if (screenMarks.length) {
+    if (screenAnnotated) {
       transcriptRaw = withScreenMarks(plainTranscriptRaw, true);
       console.log(
-        `[trace screen] marks=${screenMarks.length} session=${screenManifest?.id || ""} ` +
+        `[trace screen] marks=${screenAnnotation.marks.length} session=${screenManifest?.id || ""} ` +
         `timed=${screenWordStartsMs.length > 0}`,
       );
     }
@@ -13301,7 +13304,7 @@ async function stopLive(
     // A throw after the final transcript was shown (a later save or paste
     // step) keeps that final; before it, the live text with its marks.
     const kept: KeptTranscript = finalTranscriptShown
-      ? { text: finalTranscriptShown, note: "The final transcript is kept.", spoken: true }
+      ? { text: finalTranscriptShown, note: "The final transcript is kept.", spoken: true, screen: screenAnnotation }
       : keptLiveTranscript();
     publishRecordingOutput({
       recordingId,
