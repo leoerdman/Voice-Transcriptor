@@ -182,6 +182,11 @@ struct PressClassifier {
         lastOutcome = .handedOver
         return .pass
       case .idle:
+        // A release that ends no press (another app posting mouse-ups, a
+        // release whose press went past the tap) has no outcome. Leaving
+        // the previous press's outcome here made the helper report it once
+        // per stray release — 13 identical "press" lines in a millisecond.
+        lastOutcome = nil
         return .pass
       }
     }

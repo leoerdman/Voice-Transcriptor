@@ -43,6 +43,7 @@ const CASES = [
   "a drag that ends on a control is still a stroke",
   "a drag with no press seen still draws, and its release passes on",
   "a release with no press seen passes",
+  "a stray release after a click reports no second outcome",
   "a tap switched off mid-stroke ends the stroke and the next drag draws",
   "a held press whose release went past the tap is handed over",
   "a held press still down passes through to its release",

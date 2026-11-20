@@ -106,3 +106,24 @@ After: `14 passed` in the two files; full frontend `48 files, 616 tests passed`;
 build OK; desktop `437/437` (untouched).
 
 Not verified live: a real adoption failure (needs a failing disk write during a screen take's save).
+
+## Step 3 · coordinator side note: the helper's "press outcome=click clicks=0 drags=0" flood
+
+Real. `main.swift` logs `classifier.lastOutcome` on every left-mouse-up the tap sees. A release
+that ends no press (phase `.idle`: another app posting mouse-ups — `clicks=0` is the click state
+synthetic events carry — or a release whose press went past the tap) returned `.pass` but left
+`lastOutcome` at the PREVIOUS press's value, so each stray release re-reported it: the 13 lines at
+12:28:11.792. Fix (root cause, in the rule): `PressClassifier.classify(.up)` in `.idle` sets
+`lastOutcome = nil`, so no line is emitted for a release that finished nothing. The decision
+(`.pass`) is unchanged — the release still reaches the app.
+
+Files: `desktop/native/screen-input/PressClassifier.swift`, `desktop/native/tests/press-classifier/main.swift`
+(new case), `desktop/screen-input.test.js` (case list).
+Check: `node --test desktop/screen-input.test.js` (compiles and runs the Swift suite; macOS + CLT).
+Before (line reverted): `pass 1 fail 1` —
+`FAIL a stray release after a click reports no second outcome: expected no outcome, got Optional(main.PressClassifier.Outcome.click)`.
+After: `pass 2 fail 0`.
+
+Not verified live: which process posts the stray mouse-ups on the user's machine is not known;
+after the next build the log should show no repeated `press` lines (the shipped helper binary
+must be rebuilt by `desktop/scripts/build-native.sh`).
