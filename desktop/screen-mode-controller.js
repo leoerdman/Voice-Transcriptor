@@ -194,7 +194,7 @@ function paletteSize(colorCount) {
  * @param {() => string} deps.helperPath       absolute path of the native helper
  * @param {() => string} deps.stagingRoot      directory the sessions are staged in
  * @param {(line: string) => void} deps.log
- * @param {() => (import("electron").Rectangle|null)} deps.capsuleBounds
+ * @param {() => (import("electron").BrowserWindow|null)} deps.capsuleWindow  the capsule, when it is on screen
  * @param {(active: boolean) => void} deps.onActiveChange   capsule restyle / raise
  * @param {(warning: string) => void} deps.onWarning
  * @param {() => string} [deps.screenCaptureAccess]  macOS media access status for "screen"
@@ -208,7 +208,7 @@ function createScreenModeController(deps) {
   let palette = null;
   let helper = null;
   let helperBuffer = "";
-  let lastExclusionKey = "";
+  let lastControlsKey = "";
   let displayListeners = null;
   let flushScheduled = false;
   let chain = Promise.resolve();
@@ -260,7 +260,6 @@ function createScreenModeController(deps) {
       show: false,
       enableLargerThanScreen: true,
       alwaysOnTop: true,
-      type: "panel",
       title: "Transcriptor Screen Mode",
       backgroundColor: "#00000000",
       webPreferences: {
@@ -351,9 +350,25 @@ function createScreenModeController(deps) {
   }
 
   // ── palette ───────────────────────────────────────────────────────────
+  function visibleWindow(w) {
+    return w && !w.isDestroyed() && w.isVisible() ? w : null;
+  }
+
+  // Our own controls, as the helper must know them: presses on these are
+  // taps delivered in-process (`deliverTap`), never clicks through the
+  // window server.
+  function controlWindows() {
+    return [visibleWindow(deps.capsuleWindow()), visibleWindow(palette)].filter(Boolean);
+  }
+
+  function capsuleBounds() {
+    const w = visibleWindow(deps.capsuleWindow());
+    return w ? w.getBounds() : null;
+  }
+
   function paletteBounds() {
     const size = paletteSize(SCREEN_MODE.colors.length);
-    const capsule = deps.capsuleBounds();
+    const capsule = capsuleBounds();
     if (capsule) {
       return {
         x: Math.round(capsule.x + (capsule.width - size.width) / 2),
@@ -385,9 +400,6 @@ function createScreenModeController(deps) {
       hasShadow: false,
       show: false,
       alwaysOnTop: true,
-      // Non-activating panel, like the capsule: picking a colour must not
-      // activate the app and raise its main window over the user's work.
-      type: "panel",
       title: "Transcriptor Screen Colors",
       backgroundColor: "#00000000",
       webPreferences: {
@@ -425,24 +437,48 @@ function createScreenModeController(deps) {
 
   // Called by main whenever it moves or resizes the capsule, and here
   // when the palette or the helper appears: the helper must always know
-  // where our own controls are, so presses on them pass straight through.
+  // where our own controls are.
   function refreshLayout() {
     if (!session) return;
     if (palette && !palette.isDestroyed()) {
       try { palette.setBounds(paletteBounds(), false); } catch { }
     }
     if (!helper) return;
-    const rects = [];
-    const capsule = deps.capsuleBounds();
-    if (capsule) rects.push([capsule.x, capsule.y, capsule.width, capsule.height]);
-    if (palette && !palette.isDestroyed()) {
-      const b = palette.getBounds();
-      rects.push([b.x, b.y, b.width, b.height]);
-    }
+    const rects = controlWindows().map((w) => {
+      const b = w.getBounds();
+      return [b.x, b.y, b.width, b.height];
+    });
     const key = JSON.stringify(rects);
-    if (key === lastExclusionKey) return;
-    lastExclusionKey = key;
-    sendHelper({ cmd: "exclude", rects });
+    if (key === lastControlsKey) return;
+    lastControlsKey = key;
+    sendHelper({ cmd: "controls", rects });
+  }
+
+  /**
+   * A tap the helper took on one of our controls: click whatever is at
+   * that point inside the control's own page. The window server never
+   * sees it, so the app is never activated and its main window never
+   * comes forward. The page's own click handlers do the rest — the same
+   * handlers a real click runs.
+   */
+  function deliverTap(x, y) {
+    const target = controlWindows().find((w) => {
+      const b = w.getBounds();
+      return x >= b.x && x < b.x + b.width && y >= b.y && y < b.y + b.height;
+    });
+    if (!target) return;
+    const b = target.getBounds();
+    const localX = x - b.x;
+    const localY = y - b.y;
+    target.webContents.executeJavaScript(
+      `(() => {
+        const el = document.elementFromPoint(${localX}, ${localY});
+        if (!el) return false;
+        el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, clientX: ${localX}, clientY: ${localY} }));
+        return true;
+      })()`,
+      true,
+    ).catch((e) => log(`[screen-mode] tap delivery failed: ${e?.message || e}`));
   }
 
   // ── native helper ─────────────────────────────────────────────────────
@@ -456,7 +492,7 @@ function createScreenModeController(deps) {
     const child = childProcess.spawn(bin, [], { stdio: ["pipe", "pipe", "pipe"] });
     helper = child;
     helperBuffer = "";
-    lastExclusionKey = "";
+    lastControlsKey = "";
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
       helperBuffer += chunk;
@@ -504,10 +540,19 @@ function createScreenModeController(deps) {
       log(`[screen-mode] helper error ${msg.code}`);
       return;
     }
+    if (t === "press") {
+      // One line per finished press: what the hardware sent and what the
+      // rule made of it — the record any "this gesture did not draw"
+      // report is diagnosed from.
+      log(`[screen-mode] press outcome=${msg.outcome} clicks=${msg.clicks} drags=${msg.drags}`);
+      return;
+    }
     const x = Number(msg.x);
     const y = Number(msg.y);
     if (!Number.isFinite(x) || !Number.isFinite(y)) return;
-    if (t === "start") {
+    if (t === "tap") {
+      deliverTap(x, y);
+    } else if (t === "start") {
       const display = screen.getDisplayNearestPoint({ x: Math.round(x), y: Math.round(y) });
       const stroke = beginStroke(session, { x, y, displayId: display.id });
       queueOp(["b", stroke.id, stroke.color, x, y]);

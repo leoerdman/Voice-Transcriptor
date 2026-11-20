@@ -19,7 +19,7 @@ const swiftc = process.platform === "darwin"
   : { status: 1 };
 const skip = swiftc.status !== 0 ? "swiftc is not available (macOS + Command Line Tools only)" : false;
 
-test("PressClassifier: clicks pass, drags draw, double-tap-drag draws", { skip }, () => {
+test("PressClassifier: clicks pass, drags draw, double-tap-drag draws, controls tap in-process", { skip }, () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "screen-input-test-"));
   const bin = path.join(dir, "press-classifier-tests");
   const native = path.join(__dirname, "native");
@@ -40,5 +40,7 @@ test("PressClassifier: clicks pass, drags draw, double-tap-drag draws", { skip }
   fs.rmSync(dir, { recursive: true, force: true });
   assert.equal(run.status, 0, run.stderr);
   assert.match(run.stdout, /ok double-tap and drag draws/);
-  assert.equal(run.stdout.trim().split("\n").length, 8);
+  assert.match(run.stdout, /ok a press on our own control is a tap delivered in-process/);
+  assert.match(run.stdout, /ok a drag with no press seen still draws/);
+  assert.equal(run.stdout.trim().split("\n").length, 11);
 });

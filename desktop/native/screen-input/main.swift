@@ -8,27 +8,25 @@
 // scroll and hover underneath) or ignores it (and can never see a drag).
 //
 // This helper sits in front of the window server with a CGEventTap and
-// decides per press:
-//
-//   * left button down  -> held back (swallowed) until we know what it is;
-//   * moved < threshold  -> still undecided, keep holding;
-//   * button up first    -> it was a CLICK: the held "down" and this "up"
-//                           are re-posted, so the app underneath receives
-//                           an ordinary click (click count preserved);
-//   * moved >= threshold -> it is a STROKE: every drag event is swallowed
-//                           and reported on stdout for the overlay to draw.
-//
-// Presses that start inside an excluded rectangle (the capsule and the
-// colour palette — our own controls) are passed through untouched.
-// The decision itself is PressClassifier (PressClassifier.swift);
-// this file is the event tap and the protocol around it.
+// decides, per press, between a click (replayed to the app underneath), a
+// stroke (drawn), and a tap on one of our own controls (delivered to the
+// app in-process, never through the window server). The rule is
+// PressClassifier (PressClassifier.swift); this file is the event tap and
+// the protocol around it.
 //
 // Protocol — one JSON object per line.
-//   stdin : {"cmd":"exclude","rects":[[x,y,w,h],...]}   global points
+//   stdin : {"cmd":"controls","rects":[[x,y,w,h],...]}  our controls, global points
 //           {"cmd":"quit"}
 //   stdout: {"t":"ready"}
 //           {"t":"start","x":..,"y":..} {"t":"move","x":..,"y":..} {"t":"end","x":..,"y":..}
+//           {"t":"tap","x":..,"y":..}                  a press-and-release on a control
+//           {"t":"press","outcome":"click|stroke|tap|controlDrag|orphanStroke",
+//            "clicks":n,"drags":n}                     one line per finished press
 //           {"t":"error","code":"tap-unavailable"}            then exit 2
+//
+// Output is written from a serial queue, never from the tap callback
+// itself: a callback that waits on a pipe gets the tap disabled by macOS
+// for being slow, and events then flow past undrawn.
 //
 // Coordinates are CGEvent global points: top-left origin of the main
 // display, the same space Electron's `screen` module uses on macOS.
@@ -50,15 +48,14 @@ final class State {
 }
 
 let state = State()
-let stdoutLock = NSLock()
+let outputQueue = DispatchQueue(label: "screen-input.output")
 
 func emit(_ object: [String: Any]) {
   guard let data = try? JSONSerialization.data(withJSONObject: object),
         var line = String(data: data, encoding: .utf8) else { return }
   line += "\n"
-  stdoutLock.lock()
-  FileHandle.standardOutput.write(line.data(using: .utf8)!)
-  stdoutLock.unlock()
+  let bytes = Data(line.utf8)
+  outputQueue.async { FileHandle.standardOutput.write(bytes) }
 }
 
 func emitPoint(_ kind: String, _ p: CGPoint) {
@@ -86,14 +83,21 @@ let callback: CGEventTapCallBack = { _, type, event, _ in
   default: return Unmanaged.passUnretained(event)
   }
   let p = event.location
+  let clicks = event.getIntegerValueField(.mouseEventClickState)
   state.lock.lock()
   let decision = state.classifier.classify(kind, at: p)
+  let outcome = kind == .up ? state.classifier.lastOutcome : nil
+  let drags = state.classifier.drags
   state.lock.unlock()
+  if let outcome = outcome {
+    emit(["t": "press", "outcome": outcome.rawValue, "clicks": clicks, "drags": drags])
+  }
   switch decision {
   case .pass:
     return Unmanaged.passUnretained(event)
   case .hold:
     if kind == .down { state.heldDown = event.copy() }
+    if kind == .up { state.heldDown = nil }  // a drag that wandered off a control
     return nil
   case .replayClick:
     // A click: hand the app underneath the press it never saw, then the
@@ -112,6 +116,13 @@ let callback: CGEventTapCallBack = { _, type, event, _ in
     return nil
   case .strokeEnd:
     emitPoint("end", p)
+    return nil
+  case .strokeEndPassingUp:
+    emitPoint("end", p)
+    return Unmanaged.passUnretained(event)
+  case .tap(let at):
+    state.heldDown = nil
+    emitPoint("tap", at)
     return nil
   }
 }
@@ -143,12 +154,12 @@ Thread.detachNewThread {
           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           let cmd = obj["cmd"] as? String else { continue }
     if cmd == "quit" { break }
-    if cmd == "exclude", let rects = obj["rects"] as? [[Double]] {
+    if cmd == "controls", let rects = obj["rects"] as? [[Double]] {
       let parsed = rects.compactMap { r -> CGRect? in
         r.count == 4 ? CGRect(x: r[0], y: r[1], width: r[2], height: r[3]) : nil
       }
       state.lock.lock()
-      state.classifier.excluded = parsed
+      state.classifier.controls = parsed
       state.lock.unlock()
     }
   }

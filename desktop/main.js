@@ -2058,12 +2058,6 @@ async function ensureRecordingStatusCapsuleWindow() {
     show: false,
     focusable: false,
     hasShadow: false,
-    // A click on the capsule (stop, the screen-mode screenshot button)
-    // must not activate the app: activation raises every window of it,
-    // the main window included. NSPanel's non-activating mask is the
-    // platform's own answer — the panel takes the click, the app stays
-    // in the background, the user's app keeps focus.
-    ...(process.platform === "darwin" ? { type: "panel" } : {}),
     title: "Transcriptor Recording",
     backgroundColor: "#00000000",
     webPreferences: {
@@ -2285,12 +2279,7 @@ const screenMode = createScreenModeController({
   helperPath: screenModeHelperPath,
   stagingRoot: screenModeStagingRoot,
   log: (line) => appendMainLog(line),
-  capsuleBounds: () => {
-    if (!recordingStatusWindow || recordingStatusWindow.isDestroyed() || !recordingStatusWindow.isVisible()) {
-      return null;
-    }
-    return recordingStatusWindow.getBounds();
-  },
+  capsuleWindow: () => recordingStatusWindow,
   onActiveChange: (active) => {
     if (active) bindScreenShotHotkey();
     else unbindScreenShotHotkey();

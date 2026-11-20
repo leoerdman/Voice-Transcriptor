@@ -7,9 +7,9 @@ import Foundation
 
 typealias D = PressClassifier.Decision
 
-func run(_ name: String, excluded: [CGRect] = [], _ steps: [(PressClassifier.Kind, Double, Double, D)]) {
+func run(_ name: String, controls: [CGRect] = [], _ steps: [(PressClassifier.Kind, Double, Double, D)]) {
   var c = PressClassifier(dragThreshold: 5)
-  c.excluded = excluded
+  c.controls = controls
   for (i, step) in steps.enumerated() {
     let got = c.classify(step.0, at: CGPoint(x: step.1, y: step.2))
     if got != step.3 {
@@ -59,22 +59,43 @@ run("a double-click without moving stays two clicks", [
 ])
 
 let capsule = CGRect(x: 600, y: 900, width: 134, height: 30)
-run("presses on our own controls pass through, drags included", excluded: [capsule], [
-  (.down, 610, 910, .pass),
-  (.dragged, 700, 910, .pass),
-  (.up, 700, 910, .pass),
+
+// The capsule's screen button, tapped: never delivered through the window
+// server (which would activate the app and raise its main window).
+run("a press on our own control is a tap delivered in-process", controls: [capsule], [
+  (.down, 720, 915, .hold),
+  (.up, 720, 915, .tap(at: CGPoint(x: 720, y: 915))),
   (.down, 100, 100, .hold),
   (.up, 100, 100, .replayClick),
 ])
 
-run("a drag that ends on a control is still a stroke", excluded: [capsule], [
+run("a jitter on a control is still a tap", controls: [capsule], [
+  (.down, 720, 915, .hold),
+  (.dragged, 722, 916, .hold),
+  (.up, 722, 916, .tap(at: CGPoint(x: 720, y: 915))),
+])
+
+run("a press that wanders off a control taps nothing", controls: [capsule], [
+  (.down, 720, 915, .hold),
+  (.dragged, 720, 700, .hold),
+  (.up, 720, 700, .hold),
+])
+
+run("a drag that ends on a control is still a stroke", controls: [capsule], [
   (.down, 100, 100, .hold),
   (.dragged, 300, 500, .strokeStart(from: CGPoint(x: 100, y: 100))),
   (.dragged, 610, 910, .strokeMove),
   (.up, 610, 910, .strokeEnd),
 ])
 
+// A trackpad drag whose press this tap never saw as its own (drag lock,
+// three-finger drag, a double-tap-drag that starts with the movement).
+run("a drag with no press seen still draws, and its release passes on", [
+  (.dragged, 300, 300, .strokeStart(from: CGPoint(x: 300, y: 300))),
+  (.dragged, 340, 320, .strokeMove),
+  (.up, 340, 320, .strokeEndPassingUp),
+])
+
 run("a release with no press seen passes", [
   (.up, 1, 1, .pass),
-  (.dragged, 1, 1, .pass),
 ])
