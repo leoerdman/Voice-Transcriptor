@@ -1189,7 +1189,14 @@ const UI_TOKENS = {
      * pipeline failsafe. A kill switch, not a second behaviour.
      */
     preArmScriptProcessorFallback: true,
-    vuAmplify: 4,
+    /**
+     * How much the capsule's waveform magnifies the input level — display
+     * only: the level it scales (`__transcriptorVuLevel`) feeds nothing but
+     * the capsule; the recorded audio, speech detection and auto-stop read
+     * the raw RMS. 10 = 2.5 times the first 4: at 4 ordinary speech barely
+     * moved the bars (user, 2026-11-21: "усиливать в 2 или в 3 раза").
+     */
+    vuAmplify: 10,
     /**
      * How long the capture graph — MediaStream, AudioContext, capture
      * worklet — stays alive after Stop, waiting for the next press.

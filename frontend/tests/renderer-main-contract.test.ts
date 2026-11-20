@@ -784,3 +784,13 @@ describe("upscale presets carry their output language", () => {
     expect(mainTsxSlice("function renderUpscaleOutputLanguageSelect(", "\n}\n")).toContain('const choices = ["", ...upscaleOutputLanguageOptions];');
   });
 });
+
+describe("the capsule waveform's display gain", () => {
+  it("magnifies the input level 2.5 times the first 4, for the capsule only (user, 2026-11-21)", () => {
+    expect(mainTsx).toContain("vuAmplify: 10,");
+    // The only reader of the magnified level is main's capsule probe; the raw
+    // RMS (speech detection, auto-stop) is published separately, unscaled.
+    expect(mainTsx).toContain("window.__transcriptorRmsLevel = Math.max(0, Number.isFinite(rms) ? rms : 0);");
+    expect(mainTsx.match(/__transcriptorVuLevel = [^;]*vuAmplify/g)?.length).toBe(2);
+  });
+});

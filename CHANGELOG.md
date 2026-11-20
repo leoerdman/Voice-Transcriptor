@@ -3,6 +3,12 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.16] - 2026-11-21
+
+### Changed
+
+- **The capsule's waveform is 2.5 times taller for the same voice**, so ordinary speech shows. Display only: the recorded audio, speech detection and auto-stop are unchanged.
+
 ## [1.6.15] - 2026-11-21
 
 ### Changed
