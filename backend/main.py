@@ -9,6 +9,8 @@ import binascii
 import hashlib
 import importlib
 import socket
+import ssl
+import urllib.error
 import uuid
 import re
 import secrets
@@ -24,7 +26,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from urllib.request import urlopen
 
 from fastapi import (
@@ -78,8 +80,8 @@ from backend.audio_mime import AUDIO_EXT_TO_MIME, audio_content_type
 from backend.audio import (
     AudioError,
     compact_audio_chunks_for_remote,
+    FfmpegMissingError,
     ensure_wav_16k,
-    ensure_wav_16k_preserve_channels,
     split_channels,
     write_wav_from_pcm16_stream,
 )
@@ -87,6 +89,7 @@ from backend.cli_access import (
     CliAccess,
     base_url_from_scope,
     cli_defaults,
+    cli_save_request_refusal,
     cli_token_may_call,
 )
 from backend.config import APP_ROOT, DATA_DIR, load_config, redact_config, save_config
@@ -233,10 +236,55 @@ _ACCESS_LOG_POLLED_PATHS: frozenset[str] = frozenset({
     "/api/ui/live-draft", # live-draft autosave, ~1 per 1.2 s while recording
     "/api/models/local",  # Settings → Local models list
 })
+# Polled by id: a job's progress is read every ~1 s while it runs (BL-15:
+# 28 % of all access lines in November, ~15 per job). The job's start and
+# end are logged by the job store itself.
+_ACCESS_LOG_POLLED_PATH_RE = re.compile(r"^/api/jobs/[^/]+$")
+
+
+# ── Dictated text stays out of the log (BL-02) ──────────────────────────────
+#
+# A recording's file name is ``<timestamp>__<title>``, and the title is the
+# first words of what was dictated. main.log is the artefact users attach
+# for support, so a name is logged as its timestamp plus a short digest:
+# still unique and greppable against the archive, no longer the words.
+def _log_safe_recording_name(name: str) -> str:
+    leaf = Path(str(name or "")).name
+    # Only a suffix this app gives a recording's files is kept: a title
+    # with a dot in it ("v2.1 notes") must not leak through as one.
+    known_suffixes = {screen_sessions.SCREENS_DIR_SUFFIX, ".txt", *ALLOWED_AUDIO_EXTS}
+    raw_suffix = Path(leaf).suffix
+    suffix = raw_suffix if raw_suffix.lower() in known_suffixes else ""
+    stem = leaf[: len(leaf) - len(suffix)] if suffix else leaf
+    stamp = stem.split("__", 1)[0] if "__" in stem else "recording"
+    digest = hashlib.sha1(leaf.encode("utf-8", errors="replace")).hexdigest()[:8]
+    return f"{stamp}#{digest}{suffix}"
+
+
+# Recording routes whose second path segment is a recording's name; every
+# other ``/api/recordings/<x>`` route is a fixed word.
+_ACCESS_LOG_FIXED_RECORDING_ROUTES: frozenset[str] = frozenset({
+    "save", "save-with-audio", "save-from-path", "pick-folder", "open-folder", "stats",
+})
+
+
+def _log_safe_access_path(raw_path: str) -> str:
+    """The request path as the access log may show it: a recording's name
+    reduced to ``_log_safe_recording_name``, and no query string on
+    recording routes (``archive_dir`` names the user's folders)."""
+    path, _, _query = raw_path.partition("?")
+    parts = path.split("/")
+    # ["", "api", "recordings", "<name>", ...]
+    if len(parts) >= 4 and parts[1] == "api" and parts[2] == "recordings":
+        if parts[3] and parts[3] not in _ACCESS_LOG_FIXED_RECORDING_ROUTES:
+            parts[3] = _log_safe_recording_name(unquote(parts[3]))
+        return "/".join(parts)
+    return raw_path
 
 
 class _MutedPollingAccessFilter(logging.Filter):
-    """Drop access-log records for successful polls of the paths above.
+    """Drop access-log records for successful polls of the paths above, and
+    keep a recording's name (its dictated title) out of every other line.
 
     uvicorn emits access records with
     ``args = (client_addr, method, full_path, http_version, status)``.
@@ -251,13 +299,19 @@ class _MutedPollingAccessFilter(logging.Filter):
         raw_path, status = args[2], args[4]
         if not isinstance(raw_path, str):
             return True
+        safe_path = _log_safe_access_path(raw_path)
+        if safe_path != raw_path:
+            record.args = (*args[:2], safe_path, *args[3:])
         try:
             code = int(status)
         except (TypeError, ValueError):
             return True
         if not (200 <= code < 300):
             return True  # a failing poll is signal, not noise
-        return raw_path.split("?", 1)[0] not in _ACCESS_LOG_POLLED_PATHS
+        bare = raw_path.split("?", 1)[0]
+        if bare in _ACCESS_LOG_POLLED_PATHS:
+            return False
+        return not (args[1] == "GET" and _ACCESS_LOG_POLLED_PATH_RE.match(bare))
 
 
 _uvicorn_access_logger = logging.getLogger("uvicorn.access")
@@ -447,6 +501,8 @@ async def _app_lifespan(_app: "FastAPI") -> AsyncIterator[None]:
 app = FastAPI(title="Call Transcriptor", lifespan=_app_lifespan)
 JOB_MAX_WORKERS = 2
 UPLOAD_QUEUE_MAX_PERSISTED_ITEMS = 200
+# A finished item's transcript, as the renderer persists it with the queue.
+UPLOAD_QUEUE_MAX_TEXT_CHARS = 200_000
 jobs = JobStore(max_workers=JOB_MAX_WORKERS)
 
 
@@ -518,6 +574,10 @@ def _safe_error_text(exc: object, *, max_len: int = 200) -> str:
 # and the remote path re-compresses into REMOTE_TRANSCRIBE_CHUNK_SEC
 # Opus/WebM chunks before any provider call.
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+# The largest request body the HTTP middleware lets through: one upload at
+# MAX_UPLOAD_BYTES plus the form fields beside it (see
+# guard_host_and_set_cache_control).
+MAX_REQUEST_BODY_BYTES = MAX_UPLOAD_BYTES + 16 * 1024 * 1024
 # Hard ceiling on the live-recovery SPOOL. Derived from MAX_UPLOAD_BYTES
 # so any file the app accepts as an upload can also exist as a recovery
 # spool; at the current upload ceiling that is 4 GB, and 16 kHz mono
@@ -911,6 +971,17 @@ def _sweep_orphan_tmp_files() -> None:
             if not root.exists() or not root.is_dir():
                 continue
             for p in root.iterdir():
+                # A screenshots folder being assembled or retired by
+                # ``screen_sessions.adopt_session`` when the process died.
+                if screen_sessions.is_screens_work_dir(p):
+                    try:
+                        if p.stat().st_mtime > cutoff:
+                            continue
+                        shutil.rmtree(p)
+                        removed += 1
+                    except OSError:
+                        continue
+                    continue
                 if not p.is_file():
                     continue
                 if not _TMP_ORPHAN_RE.search(p.name):
@@ -1062,8 +1133,63 @@ def _cleanup_live_recovery_files() -> None:
         except OSError as e:
             logger.debug("live recovery cleanup skipped for %s: %s", p, e)
     # Screen-mode screenshots staged for a take whose save never happened
-    # are that take's recovery material too, and age out with it.
-    screen_sessions.sweep_orphan_sessions(DATA_DIR, LIVE_RECOVERY_RETENTION_SEC)
+    # are that take's recovery material too, and age out with it — but
+    # never while that take's audio spool is still here to be promoted
+    # (its staging folder may be older than the spool's last write).
+    screen_sessions.sweep_orphan_sessions(
+        DATA_DIR,
+        LIVE_RECOVERY_RETENTION_SEC,
+        keep_ids=_screen_sessions_referenced_by_recoveries(),
+    )
+
+
+def _screen_sessions_referenced_by_recoveries() -> set[str]:
+    """Screen session ids named by a recovery sidecar whose spool still
+    exists — staged screenshots a promotion will adopt."""
+    ids: set[str] = set()
+    for pcm_path in LIVE_RECOVERY_DIR.glob("*.pcm16"):
+        try:
+            meta = json.loads(pcm_path.with_suffix(".json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        sid = str(meta.get("screen_session_id") or "") if isinstance(meta, dict) else ""
+        if screen_sessions.is_session_id(sid):
+            ids.add(sid)
+    return ids
+
+
+def _adopt_screen_session_for_recording(
+    screen_session_id: str,
+    target_dir: Path,
+    stem: str,
+    *,
+    audio_started_at: Optional[float],
+) -> tuple[Optional[dict[str, Any]], str]:
+    """Adopt a staged screen session as recording *stem*'s screenshots —
+    the one call both the save and the crash-time promotion make.
+
+    Returns ``(manifest, error)``. ``manifest`` is None when there was
+    nothing to adopt or adoption failed; ``error`` is non-empty only for a
+    failure, which ``adopt_session`` guarantees left the staged folder and
+    any previous screenshots intact. The audio and transcript are already
+    durable, so the save answers 200 and says ``screens_error`` instead of
+    pretending the recording simply has no screenshots."""
+    if not screen_session_id:
+        return None, ""
+    try:
+        return (
+            screen_sessions.adopt_session(
+                DATA_DIR,
+                screen_session_id,
+                target_dir,
+                stem,
+                audio_started_at=audio_started_at,
+            ),
+            "",
+        )
+    except screen_sessions.ScreenAdoptionError as e:
+        logger.warning("%s", e)
+        return None, "screenshots could not be attached to this recording"
 
 
 def _normalize_live_session_id(value: str) -> str:
@@ -1073,11 +1199,21 @@ def _normalize_live_session_id(value: str) -> str:
     return str(uuid.uuid4())
 
 
+def _recovery_stem_glob(session_id: str) -> str:
+    """The glob for ONE session's spool stem, exactly as
+    ``_open_live_recovery`` names it: ``YYYYmmdd_HHMMSS_<session id>``.
+    A bare ``*_<id>`` also matched ``<ts>_a_b`` for id ``b`` (ids may hold
+    underscores — BUG-52), so discarding or promoting ``b`` could act on
+    session ``a_b`` (BM-28). The caller validates the id first
+    (``LIVE_SESSION_ID_RE``: no glob metacharacters)."""
+    return f"{'[0-9]' * 8}_{'[0-9]' * 6}_{session_id}"
+
+
 def _live_recovery_paths(session_id: str) -> tuple[Optional[Path], Optional[Path]]:
     safe_session_id = (session_id or "").strip()
     if not safe_session_id or not LIVE_SESSION_ID_RE.fullmatch(safe_session_id):
         return None, None
-    matches = sorted(LIVE_RECOVERY_DIR.glob(f"*_{safe_session_id}.pcm16"))
+    matches = sorted(LIVE_RECOVERY_DIR.glob(f"{_recovery_stem_glob(safe_session_id)}.pcm16"))
     if not matches:
         return None, None
     pcm_path = matches[-1]
@@ -1100,7 +1236,7 @@ def _delete_live_recovery(session_id: str) -> bool:
     Deleting a session's remains must not depend on which half of it
     still happens to exist.
     """
-    stem_glob = f"*_{session_id}" if LIVE_SESSION_ID_RE.fullmatch(session_id or "") else ""
+    stem_glob = _recovery_stem_glob(session_id) if LIVE_SESSION_ID_RE.fullmatch(session_id or "") else ""
     if not stem_glob:
         return False
     removed = False
@@ -1124,11 +1260,74 @@ def _delete_live_recovery(session_id: str) -> bool:
 
 
 def _safe_delete_live_recovery(session_id: str) -> bool:
+    """Delete a session's recovery files — or, while its WebSocket handler
+    still owns them, ask the handler to.
+
+    ONE owner of the spool's deletion (BL-01): from the moment the handler
+    registers the session until it has sent the ``final`` envelope and
+    finalized the sidecar, the spool is the handler's. The finalize-time
+    recovery reads it back (``_recovery_spool_bytes``) to repair holes in
+    the envelope. The renderer's save / discard used to unlink it from
+    under that read whenever it landed first — 400 of 1 591 sessions in
+    November logged "spool not readable at finalize" and shipped holes
+    unrepaired — and the finalize then rewrote a "recoverable" sidecar
+    that no spool backed (the orphan sidecars ``_delete_live_recovery``
+    documents).
+
+    A request that arrives while the handler owns the files is recorded
+    and marked on disk (``status: "discarded"``, so a crash before the
+    handler finishes never offers the take for promotion again); the
+    handler executes it as its last step (``_unregister_live_session``).
+    Returns True when the files are gone or their deletion is scheduled.
+    """
+    with _live_sessions_lock:
+        deferred = session_id in _live_sessions_in_flight
+        if deferred:
+            _live_recovery_discard_pending.add(session_id)
+    if deferred:
+        _mark_live_recovery_discarded(session_id)
+        return True
     try:
         return _delete_live_recovery(session_id)
     except OSError as exc:
         logger.warning("live recovery delete failed for %s: %s", session_id, exc)
         return False
+
+
+LIVE_RECOVERY_STATUS_DISCARDED = "discarded"
+
+
+def _mark_live_recovery_discarded(session_id: str) -> None:
+    """Persist a deferred discard in the sidecar (see
+    ``_safe_delete_live_recovery``). Best effort: the in-memory request is
+    what the handler acts on; the mark only covers a crash in between."""
+    _pcm_path, meta_path = _live_recovery_paths(session_id)
+    if meta_path is None:
+        return
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if not isinstance(meta, dict):
+            return
+        meta["status"] = LIVE_RECOVERY_STATUS_DISCARDED
+        atomic_write_json(meta_path, meta)
+    except (OSError, ValueError) as exc:
+        logger.warning("live recovery %s: could not mark discarded: %s", session_id, exc)
+
+
+def _end_live_session_ownership(session_id: str, recovery: Optional[dict]) -> None:
+    """The WebSocket handler's last step. Finalize the spool while still
+    its owner, THEN release ownership and carry out a save/discard that
+    arrived meanwhile — never the other way round, or that request would
+    unlink the spool under the finalize-time recovery read (BL-01)."""
+    if recovery is not None:
+        _finalize_live_recovery(recovery)
+    if _unregister_live_session(session_id):
+        _safe_delete_live_recovery(session_id)
+
+
+def _live_recovery_discard_is_pending(session_id: str) -> bool:
+    with _live_sessions_lock:
+        return session_id in _live_recovery_discard_pending
 
 
 def _session_id_from_recovery_stem(stem: str) -> str:
@@ -1174,6 +1373,9 @@ def _session_id_from_recovery_stem(stem: str) -> str:
 # Both endpoints consult this, so the list can no longer offer something
 # the promote will reject.
 _live_sessions_in_flight: set[str] = set()
+# Sessions whose recovery files were asked to be deleted while their
+# handler still owned them (``_safe_delete_live_recovery``). Same lock.
+_live_recovery_discard_pending: set[str] = set()
 _live_sessions_lock = threading.Lock()
 
 
@@ -1184,11 +1386,18 @@ def _register_live_session(session_id: str) -> None:
         _live_sessions_in_flight.add(session_id)
 
 
-def _unregister_live_session(session_id: str) -> None:
+def _unregister_live_session(session_id: str) -> bool:
+    """End the handler's ownership. Returns True when a discard of the
+    session's recovery files was requested meanwhile — the caller then
+    deletes them (``_safe_delete_live_recovery`` now acts directly)."""
     if not session_id:
-        return
+        return False
     with _live_sessions_lock:
         _live_sessions_in_flight.discard(session_id)
+        if session_id in _live_recovery_discard_pending:
+            _live_recovery_discard_pending.discard(session_id)
+            return True
+        return False
 
 
 def _live_session_is_streaming(session_id: str) -> bool:
@@ -1207,6 +1416,11 @@ def _list_live_recoveries() -> list[dict[str, Any]]:
                 or _session_id_from_recovery_stem(pcm_path.stem)
             )
             if not LIVE_SESSION_ID_RE.fullmatch(session_id):
+                continue
+            # A take whose save already landed (its discard was deferred
+            # and the process died before the handler executed it) is not
+            # a recovery: promoting it would duplicate the saved recording.
+            if str(raw.get("status") or "") == LIVE_RECOVERY_STATUS_DISCARDED:
                 continue
             # Never offer a session that is streaming right now: promoting
             # it would truncate the WAV and unlink the spool from under the
@@ -1350,10 +1564,27 @@ def _store_live_promote_cache(session_id: str, payload: dict) -> None:
         _live_promote_cache[session_id] = (now, dict(payload))
 
 
+def _recovery_audio_started_at_ms(pcm_path: Path) -> Optional[float]:
+    """Epoch ms of a spool's first sample, from the spool alone.
+
+    The spool is written in real time, each frame as it arrives, so its
+    last write (mtime) minus the audio it holds is when capture began —
+    the renderer's recording clock to within a frame's latency. That is
+    what a screen take's marks are placed against (``audioStartedAt``),
+    and it is available after a crash, when nothing else is."""
+    try:
+        st = pcm_path.stat()
+    except OSError:
+        return None
+    duration_ms = (st.st_size - st.st_size % 2) / float(LIVE_PCM_BYTES_PER_SEC) * 1000.0
+    started = st.st_mtime * 1000.0 - duration_ms
+    return started if started > 0 else None
+
+
 def _promote_live_recovery(
     session_id: str,
     archive_dir: str = "",
-    recording_collection: str = "live",
+    recording_collection: str = "",
 ) -> dict[str, Any]:
     # Fast path: a freshly cached success means we served this promotion
     # recently. Return the stored result so UI retries are idempotent
@@ -1395,6 +1626,10 @@ def _promote_live_recovery(
                     status_code=409,
                     detail="session is still recording; stop it before promoting",
                 )
+            # Same rule as the list: a discarded take is not offered and
+            # cannot be promoted.
+            if str(meta.get("status") or "") == LIVE_RECOVERY_STATUS_DISCARDED:
+                raise HTTPException(status_code=404, detail="live recovery not found")
             # Refuse an oversized spool BEFORE touching it. The
             # conversion below streams (``write_wav_from_pcm16_stream``,
             # ~2 MB per chunk), so this is a bound on how much of the
@@ -1492,6 +1727,16 @@ def _promote_live_recovery(
                 raise
             finally:
                 _best_effort_unlink(tmp_audio, context="live recovery tmp cleanup")
+            # A screen-mode take: its staged screenshots belong to this
+            # audio exactly as on the normal save (H-01/BM-04/S-01) —
+            # adopted beside the recovered recording BEFORE retention
+            # runs, so they are this (exempt) recording's media from now on.
+            screens_manifest, screens_error = _adopt_screen_session_for_recording(
+                str(meta.get("screen_session_id") or ""),
+                target_dir,
+                stem,
+                audio_started_at=_recovery_audio_started_at_ms(pcm_path),
+            )
             # Same retention policy as ``save_recording_with_audio``. The
             # freshly promoted stem is exempt so a clock skew can never
             # collect the audio we just recovered.
@@ -1501,6 +1746,8 @@ def _promote_live_recovery(
                 "name": text_out.name,
                 "audio_name": audio_out.name,
                 "archive_dir": str(target_dir),
+                "screens": screens_manifest,
+                "screens_error": screens_error,
             }
             _safe_delete_live_recovery(session_id)
             _store_live_promote_cache(session_id, result)
@@ -1509,6 +1756,11 @@ def _promote_live_recovery(
         # grow unbounded when callers hit 404/400 and never retry.
         _release_session_promote_lock(session_id)
     return result
+
+
+#: Who ``_require_api_auth`` let in, on ``request.state.api_caller``.
+API_CALLER_RENDERER = "renderer"
+API_CALLER_CLI = "cli"
 
 
 async def _require_api_auth(request: Request) -> None:
@@ -1540,6 +1792,11 @@ async def _require_api_auth(request: Request) -> None:
                 status_code=403,
                 detail="the command-line token may not call this endpoint",
             )
+        # A route both callers share narrows itself for this one
+        # (``save-from-path`` — ``cli_save_request_refusal``).
+        request.state.api_caller = API_CALLER_CLI
+    else:
+        request.state.api_caller = API_CALLER_RENDERER
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         origin = request.headers.get("origin")
         if origin and not _origin_allowed(origin, request):
@@ -1589,6 +1846,19 @@ async def guard_host_and_set_cache_control(request: Request, call_next):
     # request can never rewrite the recorded address.
     if CLI_ACCESS.is_enabled():
         CLI_ACCESS.sync_connection(base_url_from_scope(request.scope))
+    # The upload ceiling, enforced BEFORE the body is read (BM-26): the
+    # per-route check runs while copying from an UploadFile, i.e. after
+    # Starlette's multipart parser has already spooled the whole body to
+    # a temp file — a body past the limit filled the temp volume first.
+    # A declared length is refused here; the allowance covers the form
+    # fields that travel beside the file (a transcript of up to
+    # LIVE_DRAFT_MAX_TEXT_CHARS characters, multipart framing).
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_REQUEST_BODY_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={"detail": f"request body too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB of media)"},
+        )
     response = await call_next(request)
     path = request.url.path or ""
     if path.startswith("/assets/"):
@@ -1739,6 +2009,13 @@ def _hub_offline_error_types() -> tuple[type[BaseException], ...]:
                 types.append(candidate)
     # DNS failure below every client library.
     types.append(socket.gaierror)
+    # The stdlib transport (GigaAM fetches its checkpoint with urllib) and
+    # TLS failures below every client: a host whose certificate expired is
+    # as unreachable as one with no route (BL-11 — the GigaAM CDN's
+    # expired certificate answered this endpoint with HTTP 500 and a stack
+    # trace). ``HTTPError`` is a URLError too, but it is the host
+    # answering, not the host being out of reach — see _is_hub_offline_error.
+    types.extend((urllib.error.URLError, ssl.SSLError))
     return tuple(types)
 
 
@@ -1757,7 +2034,7 @@ def _is_hub_offline_error(exc: BaseException) -> bool:
     current: Optional[BaseException] = exc
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if isinstance(current, _HUB_OFFLINE_ERRORS):
+        if isinstance(current, _HUB_OFFLINE_ERRORS) and not isinstance(current, urllib.error.HTTPError):
             return True
         current = current.__cause__ or current.__context__
     return False
@@ -1833,22 +2110,22 @@ async def network_status(_auth: None = Depends(_require_api_auth)):
     )
 
     def _probe_sync() -> dict:
-        best_latency_ms: Optional[int] = None
-        online = False
+        # The answer is a boolean plus one latency: the first host that
+        # answers settles it (BM-25). Probing all three on every poll
+        # (~every 10 s) tripled the work and sent two third-party hosts a
+        # request each time for nothing; the later hosts are fallbacks
+        # for when an earlier one is down or blocked.
         for url in probes:
             started = time.perf_counter()
             try:
                 with urlopen(url, timeout=2.5) as resp:
                     code = getattr(resp, "status", 200) or 200
                     ok = int(code) < 500
-                elapsed_ms = int((time.perf_counter() - started) * 1000)
-                if ok:
-                    online = True
-                    if best_latency_ms is None or elapsed_ms < best_latency_ms:
-                        best_latency_ms = elapsed_ms
             except Exception:
                 continue
-        return {"online": online, "latency_ms": best_latency_ms if online else None}
+            if ok:
+                return {"online": True, "latency_ms": int((time.perf_counter() - started) * 1000)}
+        return {"online": False, "latency_ms": None}
 
     return await asyncio.to_thread(_probe_sync)
 
@@ -2147,6 +2424,16 @@ def _copy_source_media_file(source_path: Path, target: Path) -> int:
         raise
 
 
+def _job_snapshot_is_kept(payload: Optional[dict]) -> bool:
+    """Whether a from-path job keeps its snapshot of the source after it
+    ends (``keep_source``, default true). The renderer and ``--save`` file
+    the snapshot as the recording's audio afterwards (save-from-path), so
+    they keep it; a plain CLI transcription never uses it again, and
+    without this the full copy of every file (up to 2 GB each) sat in
+    uploads/ until the 24 h sweep (BM-19)."""
+    return _payload_bool(payload, "keep_source", True)
+
+
 def _snapshot_source_media_for_job(source_path: Path, job_id: str) -> Path:
     orig_name = _normalize_filename(source_path.name)
     target = _upload_snapshot_path(job_id, orig_name)
@@ -2377,7 +2664,7 @@ def _run_local_transcribe_once(
         if split_stereo:
             wav_path = str(RESULTS_DIR / f"{run_id}.16k.wav")
             temp_paths.append(wav_path)
-            ensure_wav_16k_preserve_channels(str(upload_path), wav_path)
+            ensure_wav_16k(str(upload_path), wav_path, channels=None)
             set_progress(0.15)
             # Register the channel files BEFORE split_channels writes
             # them (BUG-64): the paths are deterministic, and if the ch2
@@ -2516,11 +2803,14 @@ def _default_upload_queue_state() -> dict[str, Any]:
     }
 
 
-def _upload_queue_str(value: object, max_len: int = 200_000) -> str:
+# The two persisted UI states (upload queue, live draft) clamp untrusted
+# renderer input with the SAME two rules; they were written out twice with
+# different default caps (BM-15). Every caller names its cap.
+def _bounded_text(value: object, max_len: int) -> str:
     return str(value or "").strip()[:max_len]
 
 
-def _upload_queue_number(value: object) -> Optional[float]:
+def _nonneg_finite(value: object) -> Optional[float]:
     if value is None:
         return None
     try:
@@ -2533,10 +2823,10 @@ def _upload_queue_number(value: object) -> Optional[float]:
 def _normalize_upload_queue_item(raw: object) -> Optional[dict[str, Any]]:
     if not isinstance(raw, dict):
         return None
-    display_name = _upload_queue_str(raw.get("displayName"), 512)
+    display_name = _bounded_text(raw.get("displayName"), 512)
     if not display_name:
         return None
-    status = _upload_queue_str(raw.get("status"), 32)
+    status = _bounded_text(raw.get("status"), 32)
     if status not in UPLOAD_QUEUE_STATUSES:
         # "I do not recognise this" is not "this failed". A client that
         # adds a status — a newer renderer against an older backend —
@@ -2545,26 +2835,26 @@ def _normalize_upload_queue_item(raw: object) -> Optional[dict[str, Any]]:
         # item is still there and nothing is claimed about it.
         status = "queued"
     item: dict[str, Any] = {
-        "id": _upload_queue_str(raw.get("id"), 128) or uuid.uuid4().hex,
+        "id": _bounded_text(raw.get("id"), 128) or uuid.uuid4().hex,
         "displayName": display_name,
-        "sizeBytes": int(_upload_queue_number(raw.get("sizeBytes")) or 0),
-        "sourcePath": _upload_queue_str(raw.get("sourcePath"), 4096),
+        "sizeBytes": int(_nonneg_finite(raw.get("sizeBytes")) or 0),
+        "sourcePath": _bounded_text(raw.get("sourcePath"), 4096),
         "status": status,
-        "text": _upload_queue_str(raw.get("text")),
-        "error": _upload_queue_str(raw.get("error"), 4096),
-        "provider": _upload_queue_str(raw.get("provider"), 32),
-        "model": _upload_queue_str(raw.get("model"), 256),
-        "language": _upload_queue_str(raw.get("language"), 32),
-        "audioDurationSec": _upload_queue_number(raw.get("audioDurationSec")) or 0,
-        "requestedProvider": _upload_queue_str(raw.get("requestedProvider"), 32),
-        "requestedLanguage": _upload_queue_str(raw.get("requestedLanguage"), 32),
-        "requestedModel": _upload_queue_str(raw.get("requestedModel"), 256),
+        "text": _bounded_text(raw.get("text"), UPLOAD_QUEUE_MAX_TEXT_CHARS),
+        "error": _bounded_text(raw.get("error"), 4096),
+        "provider": _bounded_text(raw.get("provider"), 32),
+        "model": _bounded_text(raw.get("model"), 256),
+        "language": _bounded_text(raw.get("language"), 32),
+        "audioDurationSec": _nonneg_finite(raw.get("audioDurationSec")) or 0,
+        "requestedProvider": _bounded_text(raw.get("requestedProvider"), 32),
+        "requestedLanguage": _bounded_text(raw.get("requestedLanguage"), 32),
+        "requestedModel": _bounded_text(raw.get("requestedModel"), 256),
         "requestedDiarize": bool(raw.get("requestedDiarize") is True),
-        "savedName": _upload_queue_str(raw.get("savedName"), 512),
-        "savedArchiveDir": _upload_queue_str(raw.get("savedArchiveDir"), 4096),
+        "savedName": _bounded_text(raw.get("savedName"), 512),
+        "savedArchiveDir": _bounded_text(raw.get("savedArchiveDir"), 4096),
     }
     for field in ("startedAt", "endedAt", "completedAt"):
-        value = _upload_queue_number(raw.get(field))
+        value = _nonneg_finite(raw.get(field))
         if value is not None:
             item[field] = value
     return item
@@ -2610,18 +2900,6 @@ def _default_live_draft_state() -> dict[str, Any]:
     }
 
 
-def _live_draft_str(value: object, max_len: int = 4096) -> str:
-    return str(value or "").strip()[:max_len]
-
-
-def _live_draft_number(value: object) -> Optional[float]:
-    if value is None:
-        return None
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if 0 <= parsed < float("inf") else None
 
 
 def _normalize_live_draft(payload: object) -> Optional[dict[str, Any]]:
@@ -2648,19 +2926,19 @@ def _normalize_live_draft(payload: object) -> Optional[dict[str, Any]]:
     if not isinstance(draft_src, dict):
         raise HTTPException(status_code=400, detail="live draft must be an object")
     return {
-        "session_id": _live_draft_str(draft_src.get("session_id"), 128),
-        "started_at": _live_draft_number(draft_src.get("started_at")) or 0,
-        "updated_at": _live_draft_number(draft_src.get("updated_at")) or int(time.time() * 1000),
+        "session_id": _bounded_text(draft_src.get("session_id"), 128),
+        "started_at": _nonneg_finite(draft_src.get("started_at")) or 0,
+        "updated_at": _nonneg_finite(draft_src.get("updated_at")) or int(time.time() * 1000),
         "recording": bool(draft_src.get("recording") is True),
-        "timer": _live_draft_str(draft_src.get("timer"), 32),
-        "title": _live_draft_str(draft_src.get("title"), 512),
-        "source_text": _live_draft_str(draft_src.get("source_text"), LIVE_DRAFT_MAX_TEXT_CHARS),
-        "transcript_text": _live_draft_str(draft_src.get("transcript_text"), LIVE_DRAFT_MAX_TEXT_CHARS),
-        "provider": _live_draft_str(draft_src.get("provider"), 32),
-        "model": _live_draft_str(draft_src.get("model"), 256),
-        "language": _live_draft_str(draft_src.get("language"), 32),
-        "archive_dir": _live_draft_str(draft_src.get("archive_dir"), 4096),
-        "recording_collection": _live_draft_str(draft_src.get("recording_collection"), 64),
+        "timer": _bounded_text(draft_src.get("timer"), 32),
+        "title": _bounded_text(draft_src.get("title"), 512),
+        "source_text": _bounded_text(draft_src.get("source_text"), LIVE_DRAFT_MAX_TEXT_CHARS),
+        "transcript_text": _bounded_text(draft_src.get("transcript_text"), LIVE_DRAFT_MAX_TEXT_CHARS),
+        "provider": _bounded_text(draft_src.get("provider"), 32),
+        "model": _bounded_text(draft_src.get("model"), 256),
+        "language": _bounded_text(draft_src.get("language"), 32),
+        "archive_dir": _bounded_text(draft_src.get("archive_dir"), 4096),
+        "recording_collection": _bounded_text(draft_src.get("recording_collection"), 64),
     }
 
 
@@ -2699,8 +2977,8 @@ def _clear_live_draft_state(session_id: str = "") -> dict[str, Any]:
     """
     current = _read_live_draft_state()
     draft = current.get("draft") if isinstance(current.get("draft"), dict) else None
-    expected_owner = _live_draft_str(session_id, 128)
-    actual_owner = _live_draft_str(draft.get("session_id"), 128) if draft else ""
+    expected_owner = _bounded_text(session_id, 128)
+    actual_owner = _bounded_text(draft.get("session_id"), 128) if draft else ""
     if expected_owner and actual_owner and actual_owner != expected_owner:
         logger.info(
             "live draft not cleared: owned by session %s, not %s",
@@ -3070,8 +3348,9 @@ def _resolve_recordings_target_dir(archive_dir: str = "", *, create: bool = True
 RECORDING_COLLECTION_LIVE = "live"
 RECORDING_COLLECTION_UPLOADS = "uploads"
 # Screen-mode recordings: dictated with drawings and screenshots over the
-# screen. Their screenshots live in the desktop shell's screen-session
-# store (desktop/screen-mode.js), which keeps the same newest-N count.
+# screen. Their screenshots are archived beside the recording as
+# ``<stem>.screens`` and owned by this backend (backend/screen_sessions.py);
+# their retention is the collection's entry in AUDIO_RETENTION_POLICIES.
 RECORDING_COLLECTION_SCREEN = "screen"
 RECORDING_COLLECTION_DIR_NAMES: dict[str, str] = {
     RECORDING_COLLECTION_LIVE: "Live Capsule",
@@ -3099,9 +3378,10 @@ _RECORDING_COLLECTION_DIR_NAME_TO_KEY: dict[str, str] = {
 #                    brought in. Worth keeping around while they are
 #                    still working with that material, but not forever,
 #                    so this is an *age* rule.
-#   Screen Sessions — screen-mode takes. The audio is kept for the
-#                    newest five, the same count the desktop shell keeps
-#                    for their screenshot batches.
+#   Screen Sessions — screen-mode takes. A count rule over the recording's
+#                    media as one thing: its audio AND its screenshots
+#                    folder are kept or collected together (default count
+#                    below, ``TRANSCRIPTOR_SCREEN_AUDIO_KEEP_COUNT``).
 #
 # What this replaced: a single global "keep audio only for the newest
 # recording in the archive" rule, written twice (once for the per-save
@@ -3263,20 +3543,33 @@ def _recordings_scan_dirs(root: Path) -> list[Path]:
         child = root / folder_name
         if child.exists() and child.is_dir():
             candidates.append(child)
-    seen: set[str] = set()
+    seen: set[object] = set()
     dirs: list[Path] = []
     for candidate in candidates:
         try:
             resolved = candidate.resolve()
-            key = str(resolved)
         except OSError:
             resolved = candidate
-            key = str(candidate)
+        key = _dir_identity(resolved)
         if key in seen:
             continue
         seen.add(key)
         dirs.append(resolved)
     return dirs
+
+
+def _dir_identity(path: Path) -> object:
+    """What makes two spellings of a directory the same directory: the
+    file system's (device, inode). ``resolve()`` keeps the spelling it was
+    given, so on a case-insensitive volume ".../Transcriptor/recordings"
+    and ".../transcriptor/recordings" were two archive dirs — swept,
+    scanned and counted twice (BL-14, both are in the registry on the
+    user's machine)."""
+    try:
+        st = path.stat()
+        return (st.st_dev, st.st_ino)
+    except OSError:
+        return str(path)
 
 
 def _iter_recording_files_by_suffix(directory: Path, suffixes: set[str]) -> list[Path]:
@@ -3327,14 +3620,11 @@ def _recordings_scan_cache_key(root: Path) -> tuple:
 
 
 def _recordings_storage_dirs_for_roots(roots: Iterable[Path]) -> list[Path]:
-    seen: set[str] = set()
+    seen: set[object] = set()
     dirs: list[Path] = []
     for root in roots:
         for d in _recordings_scan_dirs(root):
-            try:
-                key = str(d.resolve())
-            except OSError:
-                key = str(d)
+            key = _dir_identity(d)
             if key in seen:
                 continue
             seen.add(key)
@@ -3426,7 +3716,10 @@ def _prune_recording_audio(
       record and are not subject to retention at any age or count.
     * An audio file with no sibling transcript is left alone: it is
       either an orphan or a save still in flight in another process,
-      and neither is ours to collect.
+      and neither is ours to collect. Neither is one whose sibling
+      transcript this app did not write (``_is_app_recording_text``):
+      the archive folder is user-chosen, and a same-stem pair there may
+      be the user's own files.
     * ``keep_stems`` is an unconditional exemption, used by the save
       path for the recording it has just written. Exempt files still
       occupy a slot in the ``max_items`` ranking — the take the user
@@ -3458,55 +3751,112 @@ def _prune_recording_audio(
     # On an archive with a few thousand entries this turned every save
     # (and every startup retention sweep) into seconds of blocking I/O,
     # which the user experiences as the app stalling right after Stop.
-    text_stems = {p.stem for p in _iter_recording_text_files(target_dir)}
-    candidates: list[tuple[float, str, Path]] = []
+    text_by_stem = {p.stem: p for p in _iter_recording_text_files(target_dir)}
+    # Ownership is checked only for stems that have media beside them (a
+    # header read per media file, not per transcript), once per stem.
+    owned_cache: dict[str, bool] = {}
+
+    def _owned(stem: str) -> bool:
+        if stem not in owned_cache:
+            text = text_by_stem.get(stem)
+            owned_cache[stem] = text is not None and _is_app_recording_text(text)
+        return owned_cache[stem]
+
+    # One entry per RECORDING (stem), holding all of its media: the audio
+    # file(s) and the screen-mode screenshots folder. The policy ranks
+    # recordings, and a recording's media is kept or collected together
+    # (BM-07/S-05). Ranking audio files and ``.screens`` folders as two
+    # lists on two different timestamps (a folder's mtime moves whenever
+    # Finder writes a .DS_Store into it) let one recording keep its audio
+    # and lose its screenshots, or the reverse.
+    audio_by_stem: dict[str, list[Path]] = {}
+    screens_by_stem: dict[str, Path] = {}
+    orphan_screens: list[Path] = []
     for entry in entries:
         try:
+            if screen_sessions.is_screens_dir(entry):
+                stem = screen_sessions.screens_stem(entry)
+                if _owned(stem):
+                    screens_by_stem[stem] = entry
+                elif stem not in text_by_stem:
+                    orphan_screens.append(entry)
+                continue
             if not entry.is_file():
                 continue
             if entry.suffix.lower() not in _RECORDING_AUDIO_EXTS:
                 continue
-            if entry.stem not in text_stems:
+            if not _owned(entry.stem):
                 continue
-            candidates.append((entry.stat().st_mtime, entry.name, entry))
+            audio_by_stem.setdefault(entry.stem, []).append(entry)
         except OSError as e:
-            logger.debug("audio retention: skip %s: %s", entry, e)
+            logger.debug("audio retention: skip %s: %s", _log_safe_recording_name(entry.name), e.strerror or type(e).__name__)
+    candidates: list[tuple[float, str]] = []
+    for stem in set(audio_by_stem) | set(screens_by_stem):
+        mtime = _recording_media_mtime(audio_by_stem.get(stem, []), text_by_stem[stem])
+        if mtime is not None:
+            candidates.append((mtime, stem))
     exempt = {stem for stem in keep_stems if stem}
     stamp = time.time() if now is None else now
 
     deleted = 0
-    for entry, reason in _beyond_retention_policy(candidates, effective, exempt=exempt, now=stamp):
-        try:
-            entry.unlink()
-            deleted += 1
-            logger.info("audio retention: removed %s (%s)", entry.name, reason)
-        except OSError as e:
-            logger.warning("audio retention: failed to remove %s: %s", entry, e)
-    deleted += _prune_recording_screens(entries, text_stems, effective, exempt=exempt, now=stamp)
+    for stem, reason in _beyond_retention_policy(candidates, effective, exempt=exempt, now=stamp):
+        for audio in audio_by_stem.get(stem, []):
+            try:
+                audio.unlink()
+                deleted += 1
+                logger.info("audio retention: removed %s (%s)", _log_safe_recording_name(audio.name), reason)
+            except OSError as e:
+                logger.warning("audio retention: failed to remove %s: %s", _log_safe_recording_name(audio.name), e.strerror or type(e).__name__)
+        screens = screens_by_stem.get(stem)
+        if screens is not None:
+            try:
+                shutil.rmtree(screens)
+                deleted += 1
+                logger.info("screens retention: removed %s (%s)", _log_safe_recording_name(screens.name), reason)
+            except OSError as e:
+                logger.warning("screens retention: failed to remove %s: %s", _log_safe_recording_name(screens.name), e.strerror or type(e).__name__)
+    deleted += _prune_orphan_screens(orphan_screens, now=stamp)
     return deleted
 
 
+def _recording_media_mtime(audio: list[Path], text: Path) -> Optional[float]:
+    """The time one recording is ranked by: its audio's (newest, when a
+    re-save left two), else — screenshots whose audio is already gone —
+    its transcript's. Never the ``.screens`` folder's own mtime, which any
+    file written into it moves."""
+    times: list[float] = []
+    for p in audio:
+        try:
+            times.append(p.stat().st_mtime)
+        except OSError:
+            continue
+    if times:
+        return max(times)
+    try:
+        return text.stat().st_mtime
+    except OSError:
+        return None
+
+
 def _beyond_retention_policy(
-    candidates: list[tuple[float, str, Path]],
+    candidates: list[tuple[float, str]],
     policy: AudioRetentionPolicy,
     *,
     exempt: set[str],
     now: float,
-) -> list[tuple[Path, str]]:
-    """The one ranking rule for a recording's media, whatever the kind.
+) -> list[tuple[str, str]]:
+    """The one ranking rule for recordings' media.
 
-    ``candidates`` are ``(mtime, name, path)`` and are ranked newest
-    first (name descending breaks mtime ties). Returns the entries the
+    ``candidates`` are ``(mtime, stem)``, one per recording, ranked newest
+    first (stem descending breaks mtime ties, so the outcome is
+    deterministic rather than filesystem order). Returns the stems the
     policy collects with the reason, skipping exempt stems while still
     counting them toward ``max_items``.
     """
-    ranked = sorted(candidates, key=lambda item: (item[0], item[1]), reverse=True)
+    ranked = sorted(candidates, reverse=True)
     age_cutoff = now - policy.max_age_sec if policy.max_age_sec > 0 else None
-    out: list[tuple[Path, str]] = []
-    for index, (mtime, _name, entry) in enumerate(ranked):
-        stem = screen_sessions.screens_stem(entry) if entry.name.endswith(
-            screen_sessions.SCREENS_DIR_SUFFIX
-        ) else entry.stem
+    out: list[tuple[str, str]] = []
+    for index, (mtime, stem) in enumerate(ranked):
         if stem in exempt:
             continue
         over_count = policy.max_items > 0 and index >= policy.max_items
@@ -3514,43 +3864,33 @@ def _beyond_retention_policy(
         if not (over_count or over_age):
             continue
         out.append((
-            entry,
+            stem,
             "beyond newest %d" % policy.max_items if over_count else "older than %d s" % policy.max_age_sec,
         ))
     return out
 
 
-def _prune_recording_screens(
-    entries: list[Path],
-    text_stems: set[str],
-    policy: AudioRetentionPolicy,
-    *,
-    exempt: set[str],
-    now: float,
-) -> int:
-    """Screen-mode screenshot folders (``<stem>.screens``) follow their
-    recording's audio rule exactly: same policy, same ranking, same
-    exemption — a recording's media is kept or collected as one kind of
-    thing, never by a second count. Transcripts stay forever."""
-    candidates: list[tuple[float, str, Path]] = []
-    for entry in entries:
+def _prune_orphan_screens(orphans: list[Path], *, now: float) -> int:
+    """A ``<stem>.screens`` folder whose transcript is gone (deleted in
+    Finder — the archive is a visible folder) belongs to no recording any
+    more and would otherwise stay forever (BM-08). Collected only when it
+    is provably the app's (``screen_sessions.is_app_screens_dir``) and has
+    sat untouched for the recovery window, the same grace an unadopted
+    staging folder gets."""
+    if LIVE_RECOVERY_RETENTION_SEC <= 0:
+        return 0
+    cutoff = now - LIVE_RECOVERY_RETENTION_SEC
+    removed = 0
+    for entry in orphans:
         try:
-            if not screen_sessions.is_screens_dir(entry):
+            if not screen_sessions.is_app_screens_dir(entry) or entry.stat().st_mtime > cutoff:
                 continue
-            if screen_sessions.screens_stem(entry) not in text_stems:
-                continue
-            candidates.append((entry.stat().st_mtime, entry.name, entry))
-        except OSError as e:
-            logger.debug("screens retention: skip %s: %s", entry, e)
-    deleted = 0
-    for entry, reason in _beyond_retention_policy(candidates, policy, exempt=exempt, now=now):
-        try:
             shutil.rmtree(entry)
-            deleted += 1
-            logger.info("screens retention: removed %s (%s)", entry.name, reason)
+            removed += 1
+            logger.info("screens retention: removed %s (its transcript is gone)", _log_safe_recording_name(entry.name))
         except OSError as e:
-            logger.warning("screens retention: failed to remove %s: %s", entry, e)
-    return deleted
+            logger.warning("screens retention: failed to remove %s: %s", _log_safe_recording_name(entry.name), e.strerror or type(e).__name__)
+    return removed
 
 
 def _register_archive_dir(path: Path) -> None:
@@ -3646,14 +3986,11 @@ def _get_known_archive_dirs() -> list[Path]:
                 candidates.append(p)
         except Exception:
             continue
-    # Deduplicate by resolved absolute path.
-    seen: set[str] = set()
+    # Deduplicate by identity on disk, not by spelling (BL-14).
+    seen: set[object] = set()
     result: list[Path] = []
     for d in candidates:
-        try:
-            key = str(d.resolve())
-        except Exception:
-            key = str(d)
+        key = _dir_identity(d)
         if key not in seen:
             seen.add(key)
             result.append(d)
@@ -3701,6 +4038,22 @@ def _any_audio_retention_enabled() -> bool:
     return any(policy.enabled for policy in AUDIO_RETENTION_POLICIES.values())
 
 
+def _periodic_housekeeping() -> None:
+    """One tick of the timer: recorded-audio retention AND the job results /
+    upload snapshots age limit. The latter used to run only when a new job
+    was created (BL-18: results and a CLI snapshot sat on disk 42 h past a
+    24 h limit because no job followed them)."""
+    if _any_audio_retention_enabled():
+        try:
+            _sweep_recording_audio_retention()
+        except Exception:
+            logger.exception("periodic audio retention sweep failed")
+    try:
+        _cleanup_expired_files()
+    except Exception:
+        logger.exception("periodic results/uploads cleanup failed")
+
+
 def start_audio_retention_sweeper() -> None:
     """Run the audio-retention sweep on a timer, once per process.
 
@@ -3711,7 +4064,7 @@ def start_audio_retention_sweeper() -> None:
     threads.
     """
     global _audio_retention_sweeper_thread
-    if not _any_audio_retention_enabled():
+    if not _any_audio_retention_enabled() and RESULT_RETENTION_SEC <= 0:
         return
     with _audio_retention_sweeper_lock:
         if (
@@ -3723,10 +4076,7 @@ def start_audio_retention_sweeper() -> None:
         def _loop() -> None:
             while True:
                 time.sleep(AUDIO_RETENTION_SWEEP_INTERVAL_SEC)
-                try:
-                    _sweep_recording_audio_retention()
-                except Exception:
-                    logger.exception("periodic audio retention sweep failed")
+                _periodic_housekeeping()
 
         _audio_retention_sweeper_thread = threading.Thread(
             target=_loop, daemon=True, name="audio-retention-sweep"
@@ -3754,6 +4104,30 @@ def _recording_audio_payload(name: str, target_dir: Optional[Path] = None) -> di
         "audio_size_bytes": size_bytes,
         "audio_mime": mime,
     }
+
+
+# Ownership of a transcript: every ``.txt`` this app writes starts with the
+# header ``_render_recording_content`` renders — "Title: …" on the first line
+# and "Saved at: …" on the second (unchanged since the first release). The
+# archive folder is a user-chosen, user-visible folder (it may be ~/Movies,
+# ~/Documents), so a same-stem ``.txt`` beside a media file proves nothing:
+# ``talk.txt`` next to ``talk.mp4`` is the user's own pair. Retention and
+# "delete all" act ONLY on recordings whose transcript carries this header,
+# so they can never delete a file the app did not create.
+_APP_RECORDING_HEADER_RE = re.compile(r"\ATitle: [^\r\n]*\r?\nSaved at: ")
+# The title line is the only variable-length part before "Saved at:".
+_APP_RECORDING_HEADER_READ_BYTES = 8192
+
+
+def _is_app_recording_text(path: Path) -> bool:
+    """True when *path* is a transcript this app wrote (see the header rule
+    above). Unreadable files are not ours to touch."""
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(_APP_RECORDING_HEADER_READ_BYTES)
+    except OSError:
+        return False
+    return bool(_APP_RECORDING_HEADER_RE.match(head.decode("utf-8", errors="replace")))
 
 
 def _render_recording_content(
@@ -4133,6 +4507,7 @@ async def ws_transcribe(websocket: WebSocket):
                 language=lang_opt or "auto",
                 archive_dir=archive_dir,
                 recording_collection=recording_collection,
+                screen_session_id=qp.get("screen_session_id") or "",
             )
         except Exception as e:
             recovery_ctx = None
@@ -4206,9 +4581,7 @@ async def ws_transcribe(websocket: WebSocket):
         else:
             logger.warning("ws/transcribe transient broken pipe: %s", e)
     finally:
-        _unregister_live_session(session_id)
-        if recovery_ctx is not None:
-            _finalize_live_recovery(recovery_ctx)
+        _end_live_session_ownership(session_id, recovery_ctx)
 
 
 def _normalize_live_provider(raw: Optional[str]) -> str:
@@ -4233,8 +4606,15 @@ def _open_live_recovery(
     language: str,
     archive_dir: str,
     recording_collection: str,
+    screen_session_id: str = "",
 ) -> dict:
     """Create a recovery PCM file + metadata for a live session.
+
+    The sidecar carries everything a crash-time promotion needs to file
+    the take where the normal save would have: the archive dir, the
+    collection and — for a screen-mode take — the staged screen session
+    whose screenshots belong to this audio (``screen_session_id``; an
+    invalid id is dropped, never stored).
 
     Ordering is critical for leak-freedom:
       1. Build ``meta_payload`` in memory (infallible).
@@ -4262,6 +4642,9 @@ def _open_live_recovery(
         "language": language,
         "archive_dir": archive_dir,
         "recording_collection": recording_collection,
+        "screen_session_id": (
+            str(screen_session_id) if screen_sessions.is_session_id(screen_session_id) else ""
+        ),
         "status": "recording",
         "provider": provider,
     }
@@ -4422,7 +4805,11 @@ def _finalize_live_recovery(recovery: dict) -> None:
                 "finished_at": datetime.now().isoformat(),
                 "bytes": recovery["bytes"],
                 "chunks": recovery["chunks"],
-                "status": "error" if recovery["had_error"] else "recoverable",
+                "status": (
+                    LIVE_RECOVERY_STATUS_DISCARDED
+                    if _live_recovery_discard_is_pending(str(recovery.get("session_id") or ""))
+                    else "error" if recovery["had_error"] else "recoverable"
+                ),
                 "write_error": str(recovery.get("write_error") or ""),
             }
         )
@@ -4459,9 +4846,10 @@ def _recovery_spool_bytes(recovery: Optional[dict]) -> bytes:
     * the file is opened UNBUFFERED (``_open_live_recovery``), so
       everything ``_record_recovery_chunk`` accepted is already visible
       to this read even though the writer still holds the handle;
-    * it is deleted only by ``_finalize_live_recovery``, which the
-      WebSocket handler runs in its ``finally`` — strictly after the
-      envelope has been sent.
+    * nothing deletes it while the WebSocket handler owns it: a save or
+      discard that arrives meanwhile is deferred until the handler's
+      ``finally`` has finalized it (``_safe_delete_live_recovery``) —
+      strictly after the envelope has been sent.
 
     Returns ``b""`` — never raises — when there is no spool, when it is
     unreadable, or when it is larger than this process will read at
@@ -6118,7 +6506,11 @@ async def promote_live_recovery(
     # numpy conversion and a 500 MB cap; both are gone, and the real
     # ceiling is ``MAX_RECOVERY_PROMOTE_BYTES``.)
     archive_dir = str((payload or {}).get("archive_dir") or "").strip()
-    recording_collection = str((payload or {}).get("recording_collection") or "live").strip()
+    # Empty means "where the take was recorded": the recovery sidecar holds
+    # the collection the live session was opened with (S-01). A literal
+    # "live" default here made that field dead and filed every crashed
+    # screen take under Live Capsule.
+    recording_collection = str((payload or {}).get("recording_collection") or "").strip()
     result = await asyncio.to_thread(
         _promote_live_recovery,
         session_id,
@@ -6183,6 +6575,7 @@ async def create_job_from_path(
     split_stereo = _payload_bool(payload, "split_stereo", True)
     word_timestamps = _payload_bool(payload, "word_timestamps", False)
 
+    keep_source = _job_snapshot_is_kept(payload)
     job_id = str(uuid.uuid4())
     upload_path = await asyncio.to_thread(_snapshot_source_media_for_job, source_path, job_id)
     jobs.create(job_id)
@@ -6193,9 +6586,9 @@ async def create_job_from_path(
         language=lang_opt,
         split_stereo=split_stereo,
         word_timestamps=word_timestamps,
-        cleanup_upload_path=False,
+        cleanup_upload_path=not keep_source,
     )
-    return {"job_id": job_id, "audio_source_path": str(upload_path)}
+    return {"job_id": job_id, "audio_source_path": str(upload_path) if keep_source else ""}
 
 
 @app.post("/api/transcribe-sync")
@@ -6390,9 +6783,8 @@ def _run_remote_transcribe_once(
             _raise_if_cancelled()
             _set_progress(0.30)
         except AudioError as e:
-            err_text = str(e).lower()
             native_exts = {"wav", "mp3", "m4a", "mp4", "aac"}
-            if "ffmpeg is not installed" not in err_text:
+            if not isinstance(e, FfmpegMissingError):
                 raise RemoteError(f"audio compression failed: {e}") from e
             if orig_ext not in native_exts or source_size > REMOTE_RAW_FALLBACK_MAX_BYTES:
                 raise RemoteError(
@@ -6639,6 +7031,7 @@ async def create_remote_job_from_path(
     orig_name = _normalize_filename(source_path.name)
     lang_opt = _normalize_language(str((payload or {}).get("language") or "auto"))
 
+    keep_source = _job_snapshot_is_kept(payload)
     job_id = str(uuid.uuid4())
     upload_path = await asyncio.to_thread(_snapshot_source_media_for_job, source_path, job_id)
     jobs.create(job_id)
@@ -6651,9 +7044,9 @@ async def create_remote_job_from_path(
         diarize=_payload_bool(payload, "diarize", False),
         num_speakers=str((payload or {}).get("num_speakers") or ""),
         remote_model=_remote_model_from_payload(payload),
-        cleanup_upload_path=False,
+        cleanup_upload_path=not keep_source,
     )
-    return {"job_id": job_id, "audio_source_path": str(upload_path)}
+    return {"job_id": job_id, "audio_source_path": str(upload_path) if keep_source else ""}
 
 
 @app.post("/api/remote/transcribe-sync")
@@ -7095,7 +7488,19 @@ def enable_cli_access(request: Request, _auth: None = Depends(_require_api_auth)
 
 @app.post("/api/cli/disable")
 def disable_cli_access(request: Request, _auth: None = Depends(_require_api_auth)):
-    CLI_ACCESS.disable()
+    try:
+        CLI_ACCESS.disable()
+    except OSError as e:
+        # Revoked for this run, but the token file — the switch — is still
+        # on disk and the next start would turn access back on. Say so.
+        logger.error("cli access: token revoked in memory but its file survived: %s", e)
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "command-line access is revoked until the app restarts, but its token "
+                f"file could not be removed: {_safe_error_text(e)}"
+            ),
+        )
     logger.info("cli access disabled; token revoked")
     return _cli_status_payload(request)
 
@@ -7525,7 +7930,7 @@ def _build_recordings_list_payload(d: "Path") -> dict:
                 # Finder is missing from History. ``debug``-level so a
                 # routine truncated-during-save won't spam ops, but the
                 # name and exception class are still in the support log.
-                logger.debug("recordings list: skipped %s (%s: %s)", p.name, type(e).__name__, e)
+                logger.debug("recordings list: skipped %s (%s)", _log_safe_recording_name(p.name), type(e).__name__)
                 continue
     _prune_recordings_entry_cache(live_keys)
     items.sort(key=lambda x: x["modified_at"], reverse=True)
@@ -7606,31 +8011,75 @@ def _delete_all_recordings_sync() -> dict:
     failed = 0
     for d in _recordings_storage_dirs_for_roots(_get_known_archive_dirs()):
         for p in _iter_recording_text_files(d):
+            # Only recordings this app wrote: the archive folder is
+            # user-chosen, and a ``.txt`` the user keeps there (with its
+            # same-stem media) is not ours to delete.
+            if not _is_app_recording_text(p):
+                continue
             audio_path = _recording_audio_path(p.name, target_dir=d)
-            audio_backup: Optional[Path] = None
+            screens_path = screen_sessions.recording_screens_dir(d, p.stem)
+            # Every medium is moved aside under a ``.tmp-<hex>`` name
+            # BEFORE the transcript goes, so a failure anywhere up to the
+            # transcript's unlink puts all of it back (S-06/BM-11). The
+            # screenshots used to be removed after the transcript with
+            # ``ignore_errors=True``: a locked file left them on disk with
+            # no transcript — never collectable again — while the
+            # recording was counted deleted.
+            moved_aside: list[tuple[Path, Path]] = []
             try:
-                if audio_path is not None:
-                    audio_backup = audio_path.with_name(f"{audio_path.name}.tmp-{uuid.uuid4().hex}")
-                    os.replace(audio_path, audio_backup)
+                for original in (audio_path, screens_path):
+                    if original is None:
+                        continue
+                    aside = original.with_name(f"{original.name}.tmp-{uuid.uuid4().hex}")
+                    os.replace(original, aside)
+                    moved_aside.append((original, aside))
                 p.unlink()
-                if audio_backup is not None:
-                    _best_effort_unlink(audio_backup, context="delete-all audio cleanup")
-                # A screen-mode recording's screenshots go with it.
-                screens = screen_sessions.screens_dir(d, p.stem)
-                if screen_sessions.is_screens_dir(screens):
-                    shutil.rmtree(screens, ignore_errors=True)
-                deleted += 1
             except Exception as exc:
-                if audio_backup is not None and audio_backup.exists():
+                for original, aside in reversed(moved_aside):
                     try:
-                        os.replace(audio_backup, audio_path)
+                        os.replace(aside, original)
                     except OSError as restore_err:
                         logger.warning(
-                            "delete-all audio rollback failed for %s: %s",
-                            audio_path,
-                            restore_err,
+                            "delete-all rollback failed for %s: %s",
+                            _log_safe_recording_name(original.name),
+                            restore_err.strerror or type(restore_err).__name__,
                         )
-                logger.warning("delete-all recording failed for %s: %s", p, exc)
+                logger.warning("delete-all recording failed for %s: %s", _log_safe_recording_name(p.name), type(exc).__name__)
+                failed += 1
+                continue
+            deleted += 1
+            for _original, aside in moved_aside:
+                try:
+                    if aside.is_dir():
+                        shutil.rmtree(aside)
+                    else:
+                        aside.unlink()
+                except OSError as exc:
+                    # The recording is gone; what is left carries the
+                    # ``.tmp-<hex>`` name the boot sweep collects.
+                    logger.warning(
+                        "delete-all: %s left for the boot sweep: %s",
+                        _log_safe_recording_name(_original.name),
+                        exc.strerror or type(exc).__name__,
+                    )
+        # Screenshots whose transcript was already gone (deleted in
+        # Finder): no recording names them, and "delete all" means them
+        # too (BM-08). Only folders provably the app's.
+        try:
+            leftovers = [e for e in d.iterdir() if screen_sessions.is_app_screens_dir(e)]
+        except OSError:
+            leftovers = []
+        for folder in leftovers:
+            if any((d / f"{screen_sessions.screens_stem(folder)}{ext}").exists() for ext in (".txt", ".TXT")):
+                continue
+            try:
+                shutil.rmtree(folder)
+            except OSError as exc:
+                logger.warning(
+                    "delete-all: orphan screenshots %s not removed: %s",
+                    _log_safe_recording_name(folder.name),
+                    exc.strerror or type(exc).__name__,
+                )
                 failed += 1
     return {"deleted": deleted, "failed": failed}
 
@@ -7661,6 +8110,9 @@ def _read_recording_payload(p: "Path", target_dir: Optional["Path"] = None) -> d
     display = _extract_transcript_text(raw)
     source_file = _recording_source_file(raw)
     archive_dir = target_dir or p.parent
+    # Asked once per recording (H-11): the folder check, the listing and
+    # the manifest read each ran against the same path up to three times.
+    screens_folder = screen_sessions.recording_screens_dir(archive_dir, p.stem)
     return {
         "name": p.name,
         "source_file": source_file,
@@ -7679,19 +8131,11 @@ def _read_recording_payload(p: "Path", target_dir: Optional["Path"] = None) -> d
         # Screen mode: the screenshot file names, in shot order, served by
         # GET /api/recordings/{name}/screens/{file}. Empty for any other
         # recording.
-        "screens": screen_sessions.list_screenshots(archive_dir, p.stem),
+        "screens": screen_sessions.screenshots_in(screens_folder) if screens_folder else [],
         # The archived manifest: what every transcript of this recording
         # places its screen marks from (``frontend/src/screen-annotations.ts``).
-        "screens_manifest": (
-            screen_sessions.read_manifest(screen_sessions.screens_dir(archive_dir, p.stem))
-            if screen_sessions.is_screens_dir(screen_sessions.screens_dir(archive_dir, p.stem))
-            else None
-        ),
-        "screens_dir": (
-            str(screen_sessions.screens_dir(archive_dir, p.stem))
-            if screen_sessions.is_screens_dir(screen_sessions.screens_dir(archive_dir, p.stem))
-            else ""
-        ),
+        "screens_manifest": screen_sessions.read_manifest(screens_folder) if screens_folder else None,
+        "screens_dir": str(screens_folder) if screens_folder else "",
     }
 
 
@@ -7848,6 +8292,40 @@ async def get_recordings_stats(_auth: None = Depends(_require_api_auth)):
         return result
 
 
+@dataclass(frozen=True)
+class _SaveFields:
+    title: str
+    source_text: str
+    transcript_text: str
+    provider: str
+    model: str
+    language: str
+
+
+def _normalize_save_fields(
+    *,
+    title: object,
+    source_text: object,
+    transcript_text: object,
+    provider: object,
+    model: object,
+    language: object,
+) -> _SaveFields:
+    """The text fields of a recording save, normalised ONCE for both save
+    routes (BM-16): the title made a safe file-name part, the rest
+    stripped, and the placeholder source rule (B-031/B-032) applied."""
+    safe_transcript = str(transcript_text or "").strip()
+    safe_provider = str(provider or "").strip()
+    return _SaveFields(
+        title=_sanitize_name(str(title or "recording")),
+        source_text=_placeholder_source_text(str(source_text or "").strip(), safe_transcript, safe_provider),
+        transcript_text=safe_transcript,
+        provider=safe_provider,
+        model=str(model or "").strip(),
+        language=str(language or "").strip(),
+    )
+
+
 @app.post("/api/recordings/save")
 def save_recording(
     payload: dict = Body(...),
@@ -7858,13 +8336,16 @@ def save_recording(
     archive_dir = str(payload.get("archive_dir") or "").strip()
     recording_collection = _normalize_recording_collection(payload.get("recording_collection") or "")
     require_existing = _payload_bool(payload, "require_existing", False)
-    title = _sanitize_name(str(payload.get("title") or "recording"))
-    source_text = str(payload.get("source_text") or "").strip()
-    transcript_text = str(payload.get("transcript_text") or "").strip()
-    provider = str(payload.get("provider") or "").strip()
-    model = str(payload.get("model") or "").strip()
-    language = str(payload.get("language") or "").strip()
-    source_text = _placeholder_source_text(source_text, transcript_text, provider)
+    fields = _normalize_save_fields(
+        title=payload.get("title"),
+        source_text=payload.get("source_text"),
+        transcript_text=payload.get("transcript_text"),
+        provider=payload.get("provider"),
+        model=payload.get("model"),
+        language=payload.get("language"),
+    )
+    title, source_text, transcript_text = fields.title, fields.source_text, fields.transcript_text
+    provider, model, language = fields.provider, fields.model, fields.language
 
     target_dir = _resolve_recordings_collection_target_dir(
         archive_dir,
@@ -7923,15 +8404,16 @@ async def _save_recording_audio_source(
 ) -> dict[str, Any]:
     raw_existing_name = str(name or "").strip()
     existing_name = _recording_text_name_leaf(raw_existing_name) if raw_existing_name else ""
-    safe_title = _sanitize_name(str(title or "recording"))
-    safe_source_text = str(source_text or "").strip()
-    safe_transcript_text = str(transcript_text or "").strip()
-    safe_provider = str(provider or "").strip()
-    safe_model = str(model or "").strip()
-    safe_language = str(language or "").strip()
-    safe_source_text = _placeholder_source_text(
-        safe_source_text, safe_transcript_text, safe_provider
+    fields = _normalize_save_fields(
+        title=title,
+        source_text=source_text,
+        transcript_text=transcript_text,
+        provider=provider,
+        model=model,
+        language=language,
     )
+    safe_title, safe_source_text, safe_transcript_text = fields.title, fields.source_text, fields.transcript_text
+    safe_provider, safe_model, safe_language = fields.provider, fields.model, fields.language
 
     safe_orig_name = _normalize_filename(orig_name or "recording.wav")
     _validate_audio_filename(safe_orig_name)
@@ -7992,8 +8474,12 @@ async def _save_recording_audio_source(
             ) from backup_err
     new_audio_placed = False
     save_completed = False
-    try:
-        await write_tmp_audio(tmp_audio)
+
+    def _place_audio_and_text() -> None:
+        # Blocking file work (an fsync of up to 2 GB, the transcript's
+        # fsync) runs on a worker thread, never on the event loop that
+        # carries live WebSocket frames (BM-12).
+        nonlocal new_audio_placed
         atomic_promote_file(tmp_audio, out_audio)
         new_audio_placed = True
         _write_recording_text_file(
@@ -8006,6 +8492,10 @@ async def _save_recording_audio_source(
             model=safe_model,
             language=safe_language,
         )
+
+    try:
+        await write_tmp_audio(tmp_audio)
+        await asyncio.to_thread(_place_audio_and_text)
         save_completed = True
     except BaseException:
         # Any failure after the prior audio backup was moved aside must
@@ -8041,31 +8531,31 @@ async def _save_recording_audio_source(
         # backup only survives here on the happy path (no rollback).
         if save_completed and audio_backup is not None and audio_backup.exists():
             _best_effort_unlink(audio_backup, context="recording audio backup cleanup")
-    if existing_audio is not None and existing_audio.resolve() != out_audio.resolve():
-        _best_effort_unlink(existing_audio, context="recording superseded audio cleanup")
-    # Screen mode: the take's screenshots become part of this recording —
-    # moved beside it as ``<stem>.screens`` before retention runs, so the
-    # rule below already sees them as this (exempt) recording's media.
-    screens_manifest: Optional[dict[str, Any]] = None
-    if screen_session_id:
-        try:
-            screens_manifest = screen_sessions.adopt_session(
-                DATA_DIR,
-                screen_session_id,
-                target_dir,
-                stem,
-                audio_started_at=screen_audio_started_at,
-            )
-        except OSError as e:
-            logger.warning("screen session %s adoption failed: %s", screen_session_id, e)
-    # Persist this dir only after transcript + audio are durable so startup
-    # retroactive retention does not learn failed/empty archive targets.
-    _register_archive_dir(target_dir)
-    # Audio retention, per the collection's own policy (voice notes keep
-    # the newest N, uploaded media ages out); transcripts stay forever.
-    # The stem we just wrote is exempt — a save must never be able to
-    # delete its own audio — but it still counts toward a count limit.
-    pruned = _prune_recording_audio(target_dir, keep_stems=(stem,))
+    def _file_the_saved_recording() -> tuple[Optional[dict[str, Any]], str, int]:
+        # Same thread rule as above (BM-12): moving screenshots (a copy
+        # across volumes), the retention scan of the whole folder and the
+        # registry write are file work, not event-loop work.
+        if existing_audio is not None and existing_audio.resolve() != out_audio.resolve():
+            _best_effort_unlink(existing_audio, context="recording superseded audio cleanup")
+        # Screen mode: the take's screenshots become part of this recording —
+        # moved beside it as ``<stem>.screens`` before retention runs, so the
+        # rule below already sees them as this (exempt) recording's media.
+        manifest, adopt_error = _adopt_screen_session_for_recording(
+            screen_session_id,
+            target_dir,
+            stem,
+            audio_started_at=screen_audio_started_at,
+        )
+        # Persist this dir only after transcript + audio are durable so startup
+        # retroactive retention does not learn failed/empty archive targets.
+        _register_archive_dir(target_dir)
+        # Audio retention, per the collection's own policy (voice notes keep
+        # the newest N, uploaded media ages out); transcripts stay forever.
+        # The stem we just wrote is exempt — a save must never be able to
+        # delete its own audio — but it still counts toward a count limit.
+        return manifest, adopt_error, _prune_recording_audio(target_dir, keep_stems=(stem,))
+
+    screens_manifest, screens_error, pruned = await asyncio.to_thread(_file_the_saved_recording)
     _invalidate_recordings_cache()
     # Atomically discard the live recovery spool now that the audio is
     # safely on disk. This closes the race window between a successful
@@ -8089,6 +8579,7 @@ async def _save_recording_audio_source(
         "archive_dir": str(target_dir),
         "pruned_audio_count": pruned,
         "screens": screens_manifest,
+        "screens_error": screens_error,
     }
 
 
@@ -8133,8 +8624,17 @@ async def save_recording_with_audio(
 @app.post("/api/recordings/save-from-path")
 async def save_recording_from_path(
     payload: dict = Body(...),
+    *,
+    request: Request,
     _auth: None = Depends(_require_api_auth),
 ):
+    # The CLI token may file a new recording and nothing more (BM-02/S-07):
+    # not overwrite an existing one, not register a folder, not pick a
+    # collection. Refused before the source is even resolved.
+    if getattr(request.state, "api_caller", "") == API_CALLER_CLI:
+        refusal = cli_save_request_refusal(payload or {})
+        if refusal:
+            raise HTTPException(status_code=403, detail=refusal)
     source_path = await asyncio.to_thread(
         _resolve_source_media_path,
         (payload or {}).get("source_path") or (payload or {}).get("path"),

@@ -81,7 +81,7 @@ class AwaitCancelledTests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("socket would not close")
 
         task = asyncio.get_running_loop().create_task(boom())
-        with self.assertLogs("transcriptor.async_tasks", level="WARNING") as logs:
+        with self.assertLogs("backend.async_tasks", level="WARNING") as logs:
             await await_cancelled(task, what="deepgram sender")
         self.assertIn("deepgram sender ended with an error", logs.output[0])
         self.assertIn("socket would not close", logs.output[0])

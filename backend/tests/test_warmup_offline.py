@@ -83,6 +83,26 @@ class WarmupOfflineTests(IsolatedBackendMainImportMixin, unittest.IsolatedAsynci
         self.assertEqual(result["model"], self._model())
         self.assertNotIn("detail", result)
 
+    async def test_an_expired_certificate_on_the_model_cdn_is_unreachable_not_500(self):
+        # BL-11, verbatim from main.log 2026-11-19: GigaAM's checkpoint is
+        # fetched with urllib, and its CDN's certificate had expired.
+        import ssl
+        import urllib.error
+
+        cert = ssl.SSLCertVerificationError(1, "certificate verify failed: certificate has expired")
+        boom = urllib.error.URLError(cert)
+        with mock.patch.object(self.main, "warm_model", side_effect=boom):
+            result = await self._warmup()
+        self.assertEqual(result["state"], "offline")
+
+    async def test_a_host_answering_with_an_http_error_still_fails(self):
+        import urllib.error
+
+        boom = urllib.error.HTTPError("https://cdn.example/model.ckpt", 404, "Not Found", {}, None)
+        with mock.patch.object(self.main, "warm_model", side_effect=boom):
+            with self.assertRaises(urllib.error.HTTPError):
+                await self._warmup()
+
 
 if __name__ == "__main__":
     unittest.main()

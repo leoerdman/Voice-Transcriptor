@@ -159,5 +159,96 @@ class LiveRecoveryLivenessTests(unittest.TestCase):
         self.assertAlmostEqual(record["duration_sec"], 43.0, delta=0.5)
 
 
+class SessionIdMatchingTests(unittest.TestCase):
+    """BM-28: ids may contain underscores, so ``*_b`` matched ``<ts>_a_b``."""
+
+    setUp = LiveRecoveryLivenessTests.setUp
+    tearDown = LiveRecoveryLivenessTests.tearDown
+
+    def _spool(self, stem: str) -> Path:
+        pcm = self.main.LIVE_RECOVERY_DIR / f"{stem}.pcm16"
+        pcm.write_bytes(b"\x00\x01" * 32000)
+        pcm.with_suffix(".json").write_text("{}", encoding="utf-8")
+        return pcm
+
+    def test_discarding_b_never_touches_a_b(self) -> None:
+        other = self._spool("20261120_101010_a_b")
+        mine = self._spool("20261120_101011_b")
+        self.main._delete_live_recovery("b")
+        self.assertFalse(mine.exists())
+        self.assertTrue(other.exists(), "session a_b was deleted by a discard of b")
+        self.assertTrue(other.with_suffix(".json").exists())
+
+    def test_the_paths_of_b_are_bs(self) -> None:
+        self._spool("20261120_101011_b")
+        self._spool("20261120_101012_a_b")
+        pcm, _meta = self.main._live_recovery_paths("b")
+        self.assertEqual(pcm.name, "20261120_101011_b.pcm16")
+
+
+class SpoolHasOneOwnerTests(unittest.TestCase):
+    """BL-01: while the WebSocket handler owns a session, a save/discard
+    must not unlink the spool the finalize-time recovery still reads."""
+
+    setUp = LiveRecoveryLivenessTests.setUp
+    tearDown = LiveRecoveryLivenessTests.tearDown
+
+    def _open(self) -> dict:
+        recovery = self.main._open_live_recovery(
+            session_id=SESSION,
+            started_at=datetime.now(),
+            provider="deepgram",
+            model="nova-3",
+            language="auto",
+            archive_dir="",
+            recording_collection="live",
+        )
+        self.main._record_recovery_chunk(
+            recovery, b"\x00\x01" * (2 * self.main.LIVE_SAMPLE_RATE_HZ)
+        )
+        return recovery
+
+    def _files(self) -> list[str]:
+        return sorted(p.suffix for p in self.main.LIVE_RECOVERY_DIR.iterdir())
+
+    def test_a_save_during_the_session_leaves_the_spool_readable(self) -> None:
+        self.main._register_live_session(SESSION)
+        recovery = self._open()
+        try:
+            self.assertTrue(self.main._safe_delete_live_recovery(SESSION))
+            self.assertGreater(len(self.main._recovery_spool_bytes(recovery)), 0)
+        finally:
+            self.main._end_live_session_ownership(SESSION, recovery)
+
+    def test_the_deferred_discard_runs_after_finalize_and_leaves_nothing(self) -> None:
+        self.main._register_live_session(SESSION)
+        recovery = self._open()
+        self.main._safe_delete_live_recovery(SESSION)
+        self.main._end_live_session_ownership(SESSION, recovery)
+        # No spool AND no orphan "recoverable" sidecar rewritten by finalize.
+        self.assertEqual(self._files(), [])
+
+    def test_a_crash_after_the_save_does_not_offer_the_take_again(self) -> None:
+        self.main._register_live_session(SESSION)
+        recovery = self._open()
+        self.main._safe_delete_live_recovery(SESSION)
+        recovery["pcm_file"].close()
+        # The process dies here: the handler never runs its last step.
+        self.main._live_sessions_in_flight.clear()
+        listed = [r["session_id"] for r in self.main._list_live_recoveries()]
+        self.assertNotIn(SESSION, listed)
+        with self.assertRaises(self.main.HTTPException) as ctx:
+            self.main._promote_live_recovery(SESSION)
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_without_a_request_finalize_keeps_the_recovery(self) -> None:
+        self.main._register_live_session(SESSION)
+        recovery = self._open()
+        self.main._end_live_session_ownership(SESSION, recovery)
+        self.assertEqual(self._files(), [".json", ".pcm16"])
+        listed = [r["session_id"] for r in self.main._list_live_recoveries()]
+        self.assertIn(SESSION, listed)
+
+
 if __name__ == "__main__":
     unittest.main()

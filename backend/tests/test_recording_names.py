@@ -15,6 +15,9 @@ from unittest import mock
 
 TEST_WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 
+# What ``_require_api_auth`` leaves on a request the renderer's token let in.
+_RENDERER_REQUEST = SimpleNamespace(state=SimpleNamespace(api_caller="renderer"))
+
 
 def _fresh_main_module(data_dir: str):
     os.environ["TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG"] = "1"
@@ -571,7 +574,7 @@ class RecordingNameTests(unittest.TestCase):
         root.mkdir(parents=True)
         recording = root / "Existing.TXT"
         audio = root / "Existing.webm"
-        recording.write_text("Title: Existing\nTranscription:\none\n", encoding="utf-8")
+        recording.write_text("Title: Existing\nSaved at: 2026-11-20 10:00:00\nTranscription:\none\n", encoding="utf-8")
         audio.write_bytes(b"audio")
 
         result = self.main._delete_all_recordings_sync()
@@ -585,7 +588,7 @@ class RecordingNameTests(unittest.TestCase):
         root.mkdir(parents=True)
         recording = root / "Locked.TXT"
         audio = root / "Locked.webm"
-        recording.write_text("Title: Locked\nTranscription:\none\n", encoding="utf-8")
+        recording.write_text("Title: Locked\nSaved at: 2026-11-20 10:00:00\nTranscription:\none\n", encoding="utf-8")
         audio.write_bytes(b"audio")
         original_unlink = Path.unlink
 
@@ -612,10 +615,10 @@ class RecordingNameTests(unittest.TestCase):
         # and be kept forever.
         root = (Path(self._tmp.name) / "recordings").resolve()
         root.mkdir(parents=True)
-        (root / "Keep.TXT").write_text("keep", encoding="utf-8")
+        (root / "Keep.TXT").write_text("Title: Keep\nSaved at: 2026-11-20 10:00:00\n", encoding="utf-8")
         keep_audio = root / "Keep.webm"
         keep_audio.write_bytes(b"keep")
-        (root / "Old.TXT").write_text("old", encoding="utf-8")
+        (root / "Old.TXT").write_text("Title: Old\nSaved at: 2026-11-20 10:00:00\n", encoding="utf-8")
         old_audio = root / "Old.webm"
         old_audio.write_bytes(b"old")
 
@@ -991,7 +994,7 @@ class RecordingNameTests(unittest.TestCase):
         root = (Path(self._tmp.name) / "recordings").resolve()
         root.mkdir(parents=True)
         recording = root / "Existing.TXT"
-        recording.write_text("old", encoding="utf-8")
+        recording.write_text("Title: Existing\nSaved at: 2026-11-20 10:00:00\n", encoding="utf-8")
         audio = root / "Existing.wav"
         audio.write_bytes(b"old audio")
 
@@ -1007,7 +1010,7 @@ class RecordingNameTests(unittest.TestCase):
         payload = b"tiny mp3 payload"
         source.write_bytes(payload)
 
-        result = asyncio.run(self.main.save_recording_from_path({
+        result = asyncio.run(self.main.save_recording_from_path(request=_RENDERER_REQUEST, payload={
             "source_path": str(source),
             "title": "Lecture",
             "source_text": "source",
@@ -1034,7 +1037,7 @@ class RecordingNameTests(unittest.TestCase):
         payload = b"tiny mp3 payload"
         source.write_bytes(payload)
 
-        result = asyncio.run(self.main.save_recording_from_path({
+        result = asyncio.run(self.main.save_recording_from_path(request=_RENDERER_REQUEST, payload={
             "source_path": str(source),
             "title": "Lecture",
             "source_text": "source",
@@ -1056,7 +1059,7 @@ class RecordingNameTests(unittest.TestCase):
         payload = b"tiny mp3 payload"
         source.write_bytes(payload)
 
-        result = asyncio.run(self.main.save_recording_from_path({
+        result = asyncio.run(self.main.save_recording_from_path(request=_RENDERER_REQUEST, payload={
             "source_path": str(source),
             "title": "Lecture",
             "source_text": "source",
@@ -1326,8 +1329,8 @@ class RecordingNameTests(unittest.TestCase):
         session_id = "promote-claim"
         recovery_dir = self.main.LIVE_RECOVERY_DIR
         recovery_dir.mkdir(parents=True, exist_ok=True)
-        # ``_live_recovery_paths`` globs ``*_<session>.pcm16``.
-        pcm = recovery_dir / f"2026-09-04_19-37-12_{session_id}.pcm16"
+        # The spool name ``_open_live_recovery`` writes: ``YYYYmmdd_HHMMSS_<session>``.
+        pcm = recovery_dir / f"20260904_193712_{session_id}.pcm16"
         pcm.write_bytes(b"\x00\x00" * 16000)
         pcm.with_suffix(".json").write_text(
             json.dumps({

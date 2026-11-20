@@ -17,29 +17,48 @@ desktop shell draws and captures). Their life has two stages:
    their new home. From then on the screenshots are part of the recording:
    listed with it, served with it, deleted with it, and kept or collected
    by the SAME retention rule as its audio (``AUDIO_RETENTION_POLICIES``
-   in main.py — newest five for the Screen Sessions collection).
+   in main.py, the Screen Sessions entry).
 
-A staging folder that was never adopted (the app died before the save,
-the save failed twice) is an orphan; ``sweep_orphan_sessions`` collects it
-on the live-recovery schedule, the same window the audio spool of such a
-take is kept for.
+A take whose app died before the save is recovered from its audio spool:
+the spool's sidecar names the screen session, and the crash-time promotion
+adopts the staged folder exactly as the save does (``_promote_live_recovery``
+in main.py). A staging folder nothing adopted and no pending recovery names
+(the take was discarded, the save failed twice) is an orphan;
+``sweep_orphan_sessions`` collects it on the live-recovery schedule.
 
-This module is dependency-free (stdlib only) so it can be tested without
-the FastAPI app.
+This module depends only on the stdlib and ``backend.storage`` (the SSOT
+atomic writer, itself stdlib-only), so it can be tested without the
+FastAPI app.
 """
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
-import os
 import re
 import shutil
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
+from backend.storage import atomic_write_json
+
 logger = logging.getLogger(__name__)
+
+
+class ScreenAdoptionError(Exception):
+    """Adoption of a staged session failed. The staged folder is left (or
+    put back) where it was and any previous ``<stem>.screens`` is intact,
+    so a retry finds exactly what the first attempt found."""
+
+
+def _reason(exc: BaseException) -> str:
+    """An error's reason without its paths: an archive path ends in the
+    recording's name, which is the first words dictated, and the log is
+    the artefact users attach for support."""
+    return getattr(exc, "strerror", None) or type(exc).__name__
 
 STAGING_DIR_NAME = "screen-sessions"
 SCREENS_DIR_SUFFIX = ".screens"
@@ -72,15 +91,28 @@ def screens_stem(path: Path) -> str:
     return path.name[: -len(SCREENS_DIR_SUFFIX)]
 
 
-def list_screenshots(target_dir: Path, stem: str) -> list[str]:
-    """Screenshot file names of one recording, in shot order."""
+def recording_screens_dir(target_dir: Path, stem: str) -> Optional[Path]:
+    """Recording *stem*'s screenshots folder, or None — the ONE answer to
+    "does this recording have screenshots, and where" (BM-10). Listing,
+    serving and the recording payload all ask here, so a symlinked
+    ``<stem>.screens`` cannot be listed as empty by one and served by
+    another."""
     d = screens_dir(target_dir, stem)
-    if not d.is_dir() or d.is_symlink():
-        return []
+    return d if is_screens_dir(d) else None
+
+
+def screenshots_in(folder: Path) -> list[str]:
+    """Screenshot file names in a screens folder, in shot order."""
     try:
-        return sorted(p.name for p in d.iterdir() if p.is_file() and SCREENSHOT_NAME_RE.fullmatch(p.name))
+        return sorted(p.name for p in folder.iterdir() if p.is_file() and SCREENSHOT_NAME_RE.fullmatch(p.name))
     except OSError:
         return []
+
+
+def list_screenshots(target_dir: Path, stem: str) -> list[str]:
+    """Screenshot file names of one recording, in shot order."""
+    d = recording_screens_dir(target_dir, stem)
+    return screenshots_in(d) if d is not None else []
 
 
 def screenshot_path(target_dir: Path, stem: str, file_name: str) -> Optional[Path]:
@@ -89,7 +121,10 @@ def screenshot_path(target_dir: Path, stem: str, file_name: str) -> Optional[Pat
     leaf = str(file_name or "")
     if not SCREENSHOT_NAME_RE.fullmatch(leaf):
         return None
-    p = screens_dir(target_dir, stem) / leaf
+    d = recording_screens_dir(target_dir, stem)
+    if d is None:
+        return None
+    p = d / leaf
     return p if p.is_file() and not p.is_symlink() else None
 
 
@@ -101,19 +136,39 @@ def read_manifest(folder: Path) -> Optional[dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
-def _write_manifest(folder: Path, manifest: dict[str, Any]) -> None:
-    out = Path(folder) / EVENTS_FILE_NAME
-    tmp = out.with_name(f"{out.name}.tmp-{os.getpid()}")
-    tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, out)
+def is_app_screens_dir(path: Path) -> bool:
+    """A screens folder this app made: its manifest names a screen session
+    (the shell writes ``id`` into every ``events.json``). What lets a
+    folder whose transcript is gone be recognised as ours."""
+    if not is_screens_dir(path):
+        return False
+    manifest = read_manifest(path)
+    return bool(manifest) and is_session_id(manifest.get("id"))
+
+
+# A ``<stem>.screens`` folder being assembled or retired: ``.tmp-<hex>``
+# like every other atomic writer's leftovers, so the boot sweep in main.py
+# (``_sweep_orphan_tmp_files``) recognises a crash's debris.
+SCREENS_WORK_DIR_RE = re.compile(re.escape(SCREENS_DIR_SUFFIX) + r"\.tmp-[0-9a-f]{6,}$")
+
+
+def _work_dir_for(dest: Path) -> Path:
+    return dest.with_name(f"{dest.name}.tmp-{uuid.uuid4().hex}")
+
+
+def is_screens_work_dir(path: Path) -> bool:
+    return bool(SCREENS_WORK_DIR_RE.search(path.name)) and path.is_dir() and not path.is_symlink()
 
 
 def _rehome_manifest(manifest: dict[str, Any], folder: Path) -> dict[str, Any]:
-    """Point every screenshot path in the manifest at ``folder``."""
+    """Point every screenshot path in the manifest at ``folder``. Fields of
+    the wrong shape (the shell wrote ``events`` as something other than a
+    list) are dropped, never trusted."""
     out = dict(manifest)
     out["dir"] = str(folder)
     events = []
-    for event in manifest.get("events") or []:
+    raw_events = manifest.get("events")
+    for event in raw_events if isinstance(raw_events, list) else []:
         if not isinstance(event, dict):
             continue
         e = dict(event)
@@ -143,6 +198,16 @@ def adopt_session(
     what turns an event's epoch time into a position in THIS recording's
     audio, so every later transcript of it — a re-transcription months
     on — places the marks from the archive alone.
+
+    All or nothing: the folder is assembled beside its destination under
+    a work name (moved there — a copy when the archive is on another
+    volume — and its manifest rewritten with the SSOT atomic writer), and
+    only a complete folder is renamed over the old one. Any failure puts
+    the staged folder back, removes the work copy, leaves the previous
+    ``<stem>.screens`` untouched and raises ``ScreenAdoptionError``. The
+    previous form deleted the old screenshots first, could leave a
+    half-copied folder that was listed as the recording's, and answered
+    a failed manifest rewrite with a manifest that existed only in memory.
     """
     if not is_session_id(session_id):
         return None
@@ -150,25 +215,92 @@ def adopt_session(
     if not source.is_dir() or source.is_symlink():
         return None
     dest = screens_dir(target_dir, stem)
-    if dest.exists():
-        shutil.rmtree(dest, ignore_errors=True)
-    # os.replace when both are on one volume; a custom archive on another
-    # disk needs a copy, which shutil.move does and then removes the source.
-    shutil.move(str(source), str(dest))
-    manifest = _rehome_manifest(read_manifest(dest) or {"version": 1, "id": session_id, "events": []}, dest)
-    if audio_started_at is not None and audio_started_at > 0:
-        manifest["audioStartedAt"] = int(audio_started_at)
+    work = _work_dir_for(dest)
+    moved = False
     try:
-        _write_manifest(dest, manifest)
-    except OSError as e:
-        logger.warning("screen session %s: events.json rewrite failed: %s", session_id, e)
-    logger.info("screen session %s adopted as %s", session_id, dest)
+        # A rename when both are on one volume. A custom archive on another
+        # disk needs a copy; the staged source is then removed only once
+        # the archived folder is complete and in place.
+        try:
+            source.replace(work)
+            moved = True
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            shutil.copytree(source, work, symlinks=True)
+        manifest = _rehome_manifest(
+            read_manifest(work) or {"version": 1, "id": session_id, "events": []}, dest
+        )
+        if audio_started_at is not None and audio_started_at > 0:
+            manifest["audioStartedAt"] = int(audio_started_at)
+        atomic_write_json(work / EVENTS_FILE_NAME, manifest)
+    except (OSError, ValueError, TypeError) as exc:
+        _undo_adoption(work, source, moved, session_id)
+        raise ScreenAdoptionError(f"screen session {session_id}: adoption failed: {_reason(exc)}") from exc
+    retired: Optional[Path] = None
+    try:
+        if dest.exists():
+            retired = _work_dir_for(dest)
+            dest.replace(retired)
+        work.replace(dest)
+    except OSError as exc:
+        if retired is not None and not dest.exists():
+            try:
+                retired.replace(dest)
+                retired = None
+            except OSError as restore_exc:
+                logger.error(
+                    "screen session %s: previous screenshots left at %s: %s",
+                    session_id, retired, restore_exc,
+                )
+        _undo_adoption(work, source, moved, session_id)
+        raise ScreenAdoptionError(f"screen session {session_id}: adoption failed: {_reason(exc)}") from exc
+    if not moved:
+        try:
+            shutil.rmtree(source)
+        except OSError as exc:
+            # Archived copy is complete; the staged one ages out with the
+            # orphan sweep.
+            logger.warning("screen session %s: staged copy not removed: %s", session_id, _reason(exc))
+    if retired is not None:
+        try:
+            shutil.rmtree(retired)
+        except OSError as exc:
+            # The new folder is in place; the old one is debris the boot
+            # sweep recognises by its work name.
+            logger.warning("screen session %s: old screenshots not removed: %s", session_id, _reason(exc))
+    logger.info("screen session %s adopted", session_id)
     return manifest
 
 
-def sweep_orphan_sessions(data_dir: Path, max_age_sec: int, *, now: Optional[float] = None) -> int:
+def _undo_adoption(work: Path, source: Path, moved: bool, session_id: str) -> None:
+    """Put a failed adoption back: the staged folder where it was, no work
+    copy left in the archive."""
+    if not work.exists():
+        return
+    try:
+        if moved:
+            work.replace(source)
+        else:
+            # A cross-volume copy: the source was never touched; the
+            # (possibly partial) copy is just debris.
+            shutil.rmtree(work)
+    except OSError as exc:
+        logger.error("screen session %s: could not undo a failed adoption (%s): %s", session_id, work, exc)
+
+
+def sweep_orphan_sessions(
+    data_dir: Path,
+    max_age_sec: int,
+    *,
+    now: Optional[float] = None,
+    keep_ids: Optional[set[str]] = None,
+) -> int:
     """Remove staged sessions no save ever adopted, once older than
-    ``max_age_sec``. ``0`` disables the sweep. Returns folders removed."""
+    ``max_age_sec``. ``0`` disables the sweep. ``keep_ids`` are sessions a
+    pending crash recovery still names (its promotion adopts them).
+    Returns folders removed."""
+    keep = keep_ids or set()
     if max_age_sec <= 0:
         return 0
     root = staging_root(data_dir)
@@ -181,6 +313,8 @@ def sweep_orphan_sessions(data_dir: Path, max_age_sec: int, *, now: Optional[flo
     for entry in entries:
         try:
             if not is_session_id(entry.name) or not entry.is_dir() or entry.is_symlink():
+                continue
+            if entry.name in keep:
                 continue
             if entry.stat().st_mtime > cutoff:
                 continue

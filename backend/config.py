@@ -168,15 +168,20 @@ def _load_or_create_fernet_key() -> bytes:
                 Fernet(raw)
                 return raw
             except Exception as e:
-                logger.warning(
-                    "encryption keyfile at %s is corrupted (%s) — regenerating "
-                    "(previously-encrypted values will become unreadable)",
+                # NOT replaced (a keyfile with content never is — see
+                # ``_clear_empty_keyfile``), so do not say "regenerating":
+                # encryption stays off until the file is fixed (BM-21).
+                logger.error(
+                    "encryption keyfile at %s is not a valid key (%s) — keeping it "
+                    "and running without encryption; move it aside to let the app "
+                    "create a fresh key",
                     _KEYFILE, e,
                 )
         return b""
 
     def _clear_empty_keyfile() -> bool:
-        """Remove a 0-byte keyfile so a real one can be written.
+        """Remove a keyfile with no key in it — 0 bytes, or only whitespace
+        (a newline left by an editor) — so a real one can be written.
 
         The "never overwrite an existing keyfile" rule below is right for
         a file WITH CONTENT: something may still be decryptable with it.
@@ -189,8 +194,12 @@ def _load_or_create_fernet_key() -> bytes:
         file for exactly this reason; this was the one secret that did
         not.
         """
+        # Decided on the STRIPPED content, the same reading
+        # ``_read_existing_keyfile`` uses (BM-21): a whitespace-only file
+        # read as "no key" there but as "has content" here, so it was
+        # neither used nor replaced and encryption stayed off for good.
         try:
-            if _KEYFILE.stat().st_size != 0:
+            if _KEYFILE.read_bytes().strip():
                 return False
         except OSError:
             return False
@@ -200,8 +209,8 @@ def _load_or_create_fernet_key() -> bytes:
             logger.error("could not clear the empty keyfile at %s: %s", _KEYFILE, e)
             return False
         logger.warning(
-            "encryption keyfile at %s was empty (0 bytes); replacing it with "
-            "a fresh key", _KEYFILE,
+            "encryption keyfile at %s held no key (empty or whitespace); "
+            "replacing it with a fresh key", _KEYFILE,
         )
         return True
 
@@ -573,13 +582,11 @@ def _adopt_legacy_encryption_key() -> None:
         )
         return
     try:
-        _KEYFILE.unlink(missing_ok=True)
-        fd = os.open(str(_KEYFILE), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            os.write(fd, raw)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        # Replaced in one rename, owner-only from the first byte (BM-22):
+        # the previous unlink-then-create left NO keyfile on disk when the
+        # create failed, while this process kept encrypting with the key
+        # generated at import — a key that then existed nowhere.
+        atomic_write_bytes(_KEYFILE, raw, mode=0o600)
     except OSError as e:
         logger.error(
             "could not adopt the legacy encryption keyfile at %s: %s — the "

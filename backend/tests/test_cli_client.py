@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -208,6 +209,19 @@ class ConnectionTests(unittest.TestCase):
         conn = cli.load_connection(str(self.dir / "nothing.json"), "http://host:1", "tok")
         self.assertEqual(conn.base_url, "http://host:1")
         self.assertEqual(conn.token, "tok")
+
+    def test_the_token_can_come_from_the_environment_not_argv(self):
+        # BM-20: a --token argument is visible to every user in `ps`.
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"TRANSCRIPTOR_CLI_TOKEN": "env-tok"}):
+            conn = cli.load_connection(str(self.dir / "nothing.json"), "http://host:1", "")
+            self.assertEqual(conn.token, "env-tok")
+            path = self.dir / "connection.json"
+            path.write_text(json.dumps({"base_url": "http://127.0.0.1:8321", "token": "file-tok"}))
+            self.assertEqual(cli.load_connection(str(path)).token, "env-tok")
+            # An explicit --token still wins.
+            self.assertEqual(cli.load_connection(str(path), "", "flag-tok").token, "flag-tok")
 
 
 # ── options ─────────────────────────────────────────────────────────

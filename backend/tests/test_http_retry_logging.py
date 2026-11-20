@@ -154,5 +154,36 @@ class GivingUpTests(unittest.TestCase):
         self.assertIn("ConnectionError", joined)
 
 
+class SupersededResponseIsReleasedTests(unittest.TestCase):
+    """BM-24: a transient response the call will not return holds a pool
+    slot (``stream=True`` leaves its body unread) until it is closed."""
+
+    def setUp(self) -> None:
+        mock.patch("backend.http_retry.time.sleep").start()
+        self.addCleanup(mock.patch.stopall)
+
+    def _closable(self, status: int) -> FakeResponse:
+        resp = FakeResponse(status)
+        resp.close = mock.Mock()
+        return resp
+
+    def test_closed_when_a_later_attempt_succeeds(self) -> None:
+        transient, ok = self._closable(503), self._closable(200)
+        with mock.patch("backend.http_retry._SESSION.request", side_effect=[transient, ok]):
+            self.assertIs(request_with_retry("GET", "https://x.test/a", retries=3), ok)
+        transient.close.assert_called_once()
+        ok.close.assert_not_called()
+
+    def test_closed_when_the_call_gives_up_on_a_transport_error(self) -> None:
+        transient = self._closable(503)
+        with mock.patch(
+            "backend.http_retry._SESSION.request",
+            side_effect=[transient, requests.ConnectionError("down"), requests.ConnectionError("down")],
+        ):
+            with self.assertRaises(RemoteError):
+                request_with_retry("GET", "https://x.test/a", retries=3)
+        transient.close.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

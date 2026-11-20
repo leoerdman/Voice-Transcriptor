@@ -105,6 +105,7 @@ class WebSocketAuthTokenTests(IsolatedBackendMainImportMixin, unittest.TestCase)
             request.query_params = {}
             request.method = "GET"
             request.client = type("FakeClient", (), {"host": "127.0.0.1"})()
+            request.state = type("FakeState", (), {})()
             return request
 
         self.assertIsNone(

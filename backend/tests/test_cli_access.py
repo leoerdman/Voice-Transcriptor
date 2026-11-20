@@ -54,6 +54,7 @@ class _FakeRequest:
         self.headers = {"x-api-token": token}
         self.client = _FakeClient()
         self.scope = {"server": ("127.0.0.1", 8321)}
+        self.state = type("State", (), {})()
 
 
 class CliRouteRuleTests(unittest.TestCase):
@@ -314,6 +315,29 @@ class CliAccessFileTests(unittest.TestCase):
         self.assertEqual(status["command_path"], str(self.access.wrapper_path))
         self.assertTrue(status["cards"])
 
+    def test_a_stale_wrapper_is_rewritten_for_the_running_app_at_boot(self):
+        # S-08: the wrapper embeds the interpreter and script of the app
+        # that wrote it; after a move or reinstall they point nowhere.
+        self.access.enable("http://127.0.0.1:8321")
+        moved = self.CliAccess(self.data_dir, python_executable="/Applications/New.app/python3",
+                               cli_script=Path("/Applications/New.app/backend/cli.py"), platform="darwin")
+        moved.load()
+        wrapper = moved.wrapper_path.read_text(encoding="utf-8")
+        self.assertIn("/Applications/New.app/python3", wrapper)
+        self.assertNotIn("/usr/bin/python3", wrapper)
+        self.assertTrue(os.access(moved.wrapper_path, os.X_OK))
+
+    def test_the_windows_path_card_writes_only_the_user_path(self):
+        # BM-17: `setx PATH "%PATH%;…"` copies system entries into the user
+        # PATH and truncates it at 1024 characters.
+        from backend.cli_access import command_cards
+
+        card = next(c for c in command_cards("C:\\Users\\a\\cli\\transcriptor.cmd", "win32") if c["id"] == "path")
+        self.assertNotIn("setx", card["text"])
+        self.assertNotIn("%PATH%", card["text"])
+        self.assertIn("GetEnvironmentVariable('Path', 'User')", card["text"])
+        self.assertIn("C:\\Users\\a\\cli", card["text"])
+
     def test_cards_quote_a_path_with_spaces(self):
         from backend.cli_access import command_cards
 
@@ -378,6 +402,58 @@ class CliAuthBoundaryTests(unittest.TestCase):
         self.assertEqual(self._status("GET", "/api/cli", "not-a-token"), 401)
 
 
+class CliSaveScopeTests(unittest.TestCase):
+    """BM-02 / S-07: through the real app, the CLI token may file a NEW
+    recording via save-from-path and nothing more — not overwrite an
+    existing one, not register a folder, not choose a collection."""
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old_data_dir = os.environ.get("TRANSCRIPTOR_DATA_DIR")
+        self.main = _reload_backend_main(self._tmp.name)
+        self.main.CLI_ACCESS.enable("http://127.0.0.1:8321")
+        self.cli_token = self.main.CLI_ACCESS.token_path.read_text(encoding="utf-8").strip()
+        self.client = TestClient(self.main.app, base_url="http://127.0.0.1:8321")
+
+    tearDown = CliAuthBoundaryTests.tearDown
+
+    def _post(self, token: str, body: dict):
+        return self.client.post(
+            "/api/recordings/save-from-path", json=body, headers={"x-api-token": token}
+        )
+
+    def test_the_cli_token_may_not_overwrite_or_redirect_a_save(self):
+        for extra in (
+            {"name": "Existing.txt", "require_existing": True},
+            {"archive_dir": "/Users/someone/Music"},
+            {"recording_collection": "live"},
+        ):
+            with self.subTest(extra=extra):
+                r = self._post(self.cli_token, {"source_path": "/no/such.wav", **extra})
+                self.assertEqual(r.status_code, 403, r.text)
+                self.assertIn("may not set", r.json()["detail"])
+
+    def test_what_the_cli_client_sends_is_not_refused(self):
+        body = {
+            "source_path": "/no/such.wav",
+            "title": "t",
+            "transcript_text": "x",
+            "provider": "local",
+            "model": "small",
+            "language": "auto",
+            "consume_source_path": True,
+            "name": "",
+        }
+        r = self._post(self.cli_token, body)
+        self.assertNotEqual(r.status_code, 403, r.text)
+
+    def test_the_renderer_keeps_the_full_body(self):
+        r = self._post(self.main.API_TOKEN, {"source_path": "/no/such.wav", "name": "Existing.txt"})
+        self.assertNotEqual(r.status_code, 403, r.text)
+
+
 class CliRouteTests(unittest.TestCase):
     """The three routes, called the way FastAPI calls them."""
 
@@ -416,6 +492,29 @@ class CliRouteTests(unittest.TestCase):
         payload = self.main.enable_cli_access(self.request, _auth=None)
         token = self.main.CLI_ACCESS.token_path.read_text(encoding="utf-8").strip()
         self.assertNotIn(token, json.dumps(payload))
+
+    def test_disable_reports_a_token_file_it_could_not_remove(self):
+        # H-02 / BM-18: the switch is the token file. If it survives, the
+        # next boot turns access back on, so "disabled" must not be said.
+        from fastapi import HTTPException
+
+        self.main.enable_cli_access(self.request, _auth=None)
+        token_path = self.main.CLI_ACCESS.token_path
+        token = token_path.read_text(encoding="utf-8").strip()
+        real_unlink = Path.unlink
+
+        def locked(path_self, *args, **kwargs):
+            if path_self == token_path:
+                raise PermissionError("locked")
+            return real_unlink(path_self, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", locked):
+            with self.assertRaises(HTTPException) as caught:
+                self.main.disable_cli_access(self.request, _auth=None)
+        self.assertEqual(caught.exception.status_code, 500)
+        self.assertIn("token", caught.exception.detail)
+        # Revoked in this process regardless.
+        self.assertFalse(self.main.CLI_ACCESS.token_matches(token))
 
     def test_enable_reports_a_write_failure_rather_than_a_false_on(self):
         from fastapi import HTTPException

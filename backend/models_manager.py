@@ -261,12 +261,13 @@ def _repo_file_sizes(repo: str, files: list[str]) -> dict[str, int]:
 
 
 def _download_worker(model_id: str) -> None:
-    import time
-
-    from huggingface_hub import hf_hub_download, list_repo_files
-
     repo = WHISPER_REPOS[model_id]
     try:
+        # Inside the try (BM-23): an ImportError outside it killed the
+        # thread with the state still "downloading" — the model then
+        # neither downloadable nor deletable until a restart.
+        from huggingface_hub import hf_hub_download, list_repo_files
+
         files = [
             f for f in list_repo_files(repo)
             if not f.startswith(".")
@@ -290,9 +291,6 @@ def _download_worker(model_id: str) -> None:
     except Exception as e:
         logger.warning("models: download failed for %s: %s", model_id, e)
         _set_state(model_id, status="error", error=f"{type(e).__name__}: {e}")
-    finally:
-        # Give pollers a moment to observe the terminal state.
-        time.sleep(0.5)
 
 
 def start_download(model_id: str) -> Dict[str, Any]:
