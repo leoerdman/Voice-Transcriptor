@@ -133,7 +133,7 @@ const { backendHandleOf, decideBackendExit } = require("./backend-exit");
 const { recordingKey, createBoundedKeySet } = require("./renderer-epoch");
 // The runtime accelerator set and how a Settings update changes it
 // (S-11, DM-23).
-const { normalizeShortcutSet, applyShortcutUpdate } = require("./shortcut-runtime");
+const { normalizeShortcutSet, applyShortcutUpdate, screenShotSlotStatus } = require("./shortcut-runtime");
 // The record hotkey's renderer round trip, with a press that expires
 // when main stops waiting for it (DM-05).
 const {
@@ -2233,21 +2233,52 @@ async function updateRecordingStatusCapsule(patch = {}) {
 // registerGlobalShortcuts.
 let desiredScreenShotHotkey = "";
 let registeredScreenShotHotkey = "";
+// Why the screenshot key could not be taken ("" = it can be / it is):
+// what the probe at registration time or the bind at take start said.
+// Settings shows it like any other slot's conflict (DM-24, S-09).
+let screenShotHotkeyError = "";
+
+/** Register ``accelerator``; returns "" on success or the refusal. */
+function registerScreenShotAccelerator(accelerator, handler) {
+  try {
+    return globalShortcut.register(accelerator, handler) ? "" : "already in use";
+  } catch (e) {
+    return String(e?.message || e) || "registration failed";
+  }
+}
+
+/**
+ * Outside a take the key is not held, but whether it CAN be held is a
+ * fact Settings needs: another app owning it means the key will be dead
+ * mid-dictation. Claim it for an instant and let it go.
+ */
+function probeScreenShotHotkey() {
+  if (!desiredScreenShotHotkey || registeredScreenShotHotkey) return;
+  const canonical = canonicalAcceleratorForPlatform(desiredScreenShotHotkey, process.platform);
+  screenShotHotkeyError = registerScreenShotAccelerator(canonical, () => { });
+  if (!screenShotHotkeyError) {
+    try { globalShortcut.unregister(canonical); } catch { }
+  }
+}
 
 function bindScreenShotHotkey() {
   unbindScreenShotHotkey();
   if (!desiredScreenShotHotkey) return;
   const canonical = canonicalAcceleratorForPlatform(desiredScreenShotHotkey, process.platform);
-  try {
-    const ok = globalShortcut.register(canonical, () => {
-      void screenMode.takeShot("hotkey").catch((e) => {
-        appendMainLog(`[screen-mode] hotkey shot failed: ${e?.message || e}`);
-      });
+  screenShotHotkeyError = registerScreenShotAccelerator(canonical, () => {
+    void screenMode.takeShot("hotkey").catch((e) => {
+      appendMainLog(`[screen-mode] hotkey shot failed: ${e?.message || e}`);
     });
-    if (ok) registeredScreenShotHotkey = canonical;
-    appendMainLog(`[shortcuts] screenshot hotkey ${ok ? "bound" : "FAILED"}: ${canonical}`);
-  } catch (e) {
-    appendMainLog(`[shortcuts] screenshot hotkey failed: ${canonical} (${e?.message || e})`);
+  });
+  if (!screenShotHotkeyError) registeredScreenShotHotkey = canonical;
+  appendMainLog(
+    `[shortcuts] screenshot hotkey ${screenShotHotkeyError ? `FAILED (${screenShotHotkeyError})` : "bound"}: ${canonical}`,
+  );
+  publishScreenShotHotkeyStatus();
+  if (screenShotHotkeyError) {
+    // The user is in a take and this is the key they will press: say so
+    // now, not by a press that does nothing.
+    notifyScreenModeWarning("screenshot-hotkey");
   }
 }
 
@@ -2255,6 +2286,33 @@ function unbindScreenShotHotkey() {
   if (!registeredScreenShotHotkey) return;
   try { globalShortcut.unregister(registeredScreenShotHotkey); } catch { }
   registeredScreenShotHotkey = "";
+  publishScreenShotHotkeyStatus();
+}
+
+/** Refresh the screenshot slot inside the published shortcut status. */
+function publishScreenShotHotkeyStatus() {
+  if (!lastShortcutStatus) return;
+  lastShortcutStatus = {
+    ...lastShortcutStatus,
+    screenShot: screenShotSlotStatus({
+      desired: desiredScreenShotHotkey,
+      supported: !!lastShortcutStatus.screenModeSupported,
+      error: screenShotHotkeyError,
+      bound: registeredScreenShotHotkey,
+    }),
+  };
+  publishShortcutStatusToRenderer();
+}
+
+/** Hand the current shortcut status to the main window (Settings badges). */
+function publishShortcutStatusToRenderer() {
+  if (!lastShortcutStatus || !win || win.isDestroyed() || !win.webContents) return;
+  win.webContents
+    .executeJavaScript(
+      `window.__transcriptorShortcutStatus = ${JSON.stringify(lastShortcutStatus)};`,
+      true,
+    )
+    .catch(() => { });
 }
 
 // The capsule stays the user's control surface in screen mode, so it is
@@ -2282,6 +2340,10 @@ function screenModeStagingRoot() {
 }
 
 const SCREEN_MODE_WARNINGS = Object.freeze({
+  "screenshot-hotkey": {
+    title: "Screenshot key is taken",
+    body: "Another app holds the screenshot key, so it does nothing in this take. Use the camera button on the capsule, or pick another key in Settings.",
+  },
   accessibility: {
     title: "Screen mode can't draw",
     body: "Allow Transcriptor in System Settings → Privacy & Security → Accessibility, then start screen mode again.",
@@ -2311,15 +2373,7 @@ const screenMode = createScreenModeController({
       void updateRecordingStatusCapsule({}).catch(() => { });
     }
   },
-  onWarning: (kind) => {
-    const copy = SCREEN_MODE_WARNINGS[kind];
-    appendMainLog(`[screen-mode] warning ${kind}`);
-    if (!copy) return;
-    try {
-      const { Notification } = require("electron");
-      if (Notification.isSupported()) new Notification({ title: copy.title, body: copy.body }).show();
-    } catch { }
-  },
+  onWarning: (kind) => notifyScreenModeWarning(kind),
   screenCaptureAccess: () => {
     try {
       return String(systemPreferences.getMediaAccessStatus("screen") || "");
@@ -2328,6 +2382,16 @@ const screenMode = createScreenModeController({
     }
   },
 });
+
+function notifyScreenModeWarning(kind) {
+  const copy = SCREEN_MODE_WARNINGS[kind];
+  appendMainLog(`[screen-mode] warning ${kind}`);
+  if (!copy) return;
+  try {
+    const { Notification } = require("electron");
+    if (Notification.isSupported()) new Notification({ title: copy.title, body: copy.body }).show();
+  } catch { }
+}
 
 /**
  * The renderer that owns the take is gone (crashed, killed, reloaded):
@@ -8497,16 +8561,7 @@ async function createWindow(options = {}) {
     // before createWindow), the renderer would otherwise render with
     // its "hotkey" Settings panel showing the configured accelerator
     // as healthy when in fact registration silently failed.
-    if (lastShortcutStatus && win && !win.isDestroyed() && win.webContents) {
-      try {
-        await win.webContents.executeJavaScript(
-          `window.__transcriptorShortcutStatus = ${JSON.stringify(lastShortcutStatus)};`,
-          true,
-        );
-      } catch (e) {
-        appendMainLog(`[did-finish-load] shortcut replay failed: ${e?.message || e}`);
-      }
-    }
+    publishShortcutStatusToRenderer();
     // Replay backendBootError if set — a window that was closed-
     // and-reopened after a failed boot attempt would otherwise
     // render its boot overlay in a "no error" state, hiding the
@@ -9495,7 +9550,8 @@ app.whenReady().then(async () => {
       screenResult.error = "unsupported";
     }
     desiredScreenShotHotkey = screenSupported ? shortcuts.screenShot || "" : "";
-    if (screenMode.isActive()) bindScreenShotHotkey();
+    screenShotHotkeyError = "";
+    probeScreenShotHotkey();
 
     // Surface registration status to the renderer so the Settings
     // panel can show a red indicator next to any shortcut that the
@@ -9549,13 +9605,15 @@ app.whenReady().then(async () => {
         active: screenResult.ok ? screenResult.accelerator : "",
         error: screenResult.ok ? "" : screenResult.error,
       },
-      // Bound only during screen mode, so "active" is not meaningful at
-      // rest; Settings shows the configured key.
-      screenShot: {
+      // Bound only during a screen take; outside one, ``error`` is what
+      // a registration probe answered, so a key another app owns is
+      // reported before the take where it would be dead (DM-24, S-09).
+      screenShot: screenShotSlotStatus({
         desired: shortcuts.screenShot || "",
-        active: "",
-        error: screenSupported ? "" : "unsupported",
-      },
+        supported: screenSupported,
+        error: screenShotHotkeyError,
+        bound: registeredScreenShotHotkey,
+      }),
       screenModeSupported: screenSupported,
       // Renderer uses this to decide whether to show the "macOS is
       // intercepting F9/F10" hint. Only relevant on darwin and only
@@ -9564,14 +9622,9 @@ app.whenReady().then(async () => {
       platform: process.platform,
     };
     lastShortcutStatus = status;
-    if (win && !win.isDestroyed() && win.webContents) {
-      win.webContents
-        .executeJavaScript(
-          `window.__transcriptorShortcutStatus = ${JSON.stringify(status)};`,
-          true,
-        )
-        .catch(() => { });
-    }
+    publishShortcutStatusToRenderer();
+    // During a take the key is (re)bound now; the bind updates the slot.
+    if (screenMode.isActive()) bindScreenShotHotkey();
 
     appendMainLog(
       `[shortcuts] registered: record=${registeredRecordHotkey || "FAILED"} ` +

@@ -55,4 +55,28 @@ function applyShortcutUpdate(current, message) {
   return { ok: true, shortcuts: next };
 }
 
-module.exports = { REQUIRED_SLOTS, OPTIONAL_SLOTS, normalizeShortcutSet, applyShortcutUpdate };
+/**
+ * The Settings status of the screenshot slot (DM-24, S-09).
+ *
+ * The key is bound only while a screen take runs, so its status used to
+ * be hard-coded ``{active: "", error: ""}`` — a key another app owns was
+ * never reported, and the one key the user presses mid-take could be dead
+ * with no sign anywhere. The status now carries the fact: outside a take,
+ * what a registration probe answered; during a take, what binding it did.
+ *
+ * @param {{desired: string, supported: boolean, error?: string, bound?: string}} input
+ *   ``error`` — the probe's or the bind's refusal ("" = the key is ours to
+ *   take); ``bound`` — the accelerator held right now (only during a take).
+ */
+function screenShotSlotStatus({ desired = "", supported = true, error = "", bound = "" } = {}) {
+  if (!supported) return { desired: String(desired || ""), active: "", error: "unsupported" };
+  return { desired: String(desired || ""), active: String(bound || ""), error: desired ? String(error || "") : "" };
+}
+
+module.exports = {
+  REQUIRED_SLOTS,
+  OPTIONAL_SLOTS,
+  normalizeShortcutSet,
+  applyShortcutUpdate,
+  screenShotSlotStatus,
+};
