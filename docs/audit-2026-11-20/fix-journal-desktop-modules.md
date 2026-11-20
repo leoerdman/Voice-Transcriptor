@@ -10,6 +10,19 @@ the check is run again. Outputs below are verbatim excerpts of the saved runs.
 
 ## Commits
 
+| Label | Hash | IDs |
+|---|---|---|
+| C1 | fed6041 | DX-07, DX-10 (main.swift type-check), DX-28 (case names) |
+| C2 | 843dea7 | DX-01, DX-04, DX-09, DX-14 |
+| C3 | 907a9f1 | S-02 = DX-03 = DM-31 (controller side), DX-02, DX-08 = H-08 = S-04 (controller side), DX-18, DX-06, S-03 (capture side), DX-10 (golden lines) |
+| C4 | 22cfe18 | DX-13 |
+| C5 | afdb862 | DX-11, H-09, DX-25, DX-20 |
+| C6 | 0c8ecde | H-04, H-10, DX-29 + H-03 (documentation half) |
+| C7 | 40851dc | DX-22, DX-21 (altool half), DX-23, H-6, H-7 (old IDs), H-12 |
+| C8 | 204be72 | DX-26 |
+| C9 | ff74adb | DX-30, DX-24 (H-8) |
+| C10 | (this journal's last commit) | journal: Not done + Cross-domain |
+
 ### C1 — DX-07, DX-10 (part: main.swift type-checked), DX-28 (part: case names, not a count)
 Files: `desktop/native/screen-input/PressClassifier.swift`, `desktop/native/screen-input/main.swift`,
 `desktop/native/tests/press-classifier/main.swift`, `desktop/screen-input.test.js`.
@@ -334,3 +347,98 @@ exit=0
 H-8: the python-build-standalone URL now names its current home (astral-sh); checked
 `curl -sIL` → `200` for the pinned 20260414 / 3.12.13 aarch64 tarball. The download is still
 verified by the pinned SHA256 in `fetch`, so the bytes cannot differ.
+
+## Final verification (on the last commit)
+`npm --prefix desktop test` → tests 343, pass 343, fail 0;
+`node --check desktop/main.js && node --check desktop/preload.js` → ok;
+`bash desktop/scripts/build-native.sh mac-arm64` → built.
+
+## Not done (ID → reason)
+- **DX-05** (P2) → refuted on reading, not changed. The overlay stores points relative to
+  the display's origin AT THE TIME they were drawn. A display that moves in the arrangement
+  keeps its pixels where they are physically, so a stroke at local (100,100) must stay at
+  local (100,100) — which is exactly what the current code does. Re-basing (the audit's
+  fix) would move every existing stroke off the place it was drawn. The only real residue
+  is a ≤16 ms window where ops queued before `__setOrigin` are applied after it; too small
+  to justify converting ops in the controller.
+- **DX-12** (P2) → needs main.js: the `54` fallback is capsule `bottomMargin 16` + height
+  30 + palette margin 8, and the overlay < palette < capsule levels are `"screen-saver"`
+  0/1 here and 2 in main.js. One constants object must be owned by one side and injected
+  into the other (see Cross-domain).
+- **DX-15** (P2, hypothesis/perf) → not measured; the suggested "composite from the file
+  URL" is not available (overlay page is a sandboxed `data:` page with CSP `img-src data:`).
+  Left until a measurement shows the cost.
+- **DX-16** (P2, UX) → product decision (pen toggle / pass-through modifier); not a defect
+  of the stated product rule.
+- **DX-17** (P2) → product decision per the lead's brief (global Option+Right / Option+Down
+  defaults); `shortcut-defaults.json` untouched.
+- **DX-19** (P2, hypothesis) → adding `ScreenCapture` to paste-capability's repair table
+  changes behaviour (it would reset a TCC grant) on an unverified macOS assumption.
+- **S-03 rest** (P1, hypothesis) → the wallpaper-only probe (compare against a one-pixel
+  probe window) and the TCC repair need macOS behaviour verified on a machine; only the
+  capture-side parts were fixed (C3: warn on every non-"granted" state, no regex, no
+  screenshot claimed for a failed capture).
+- **DX-21 notarytool half** (P2) → `notarytool --password` has no env/keychain-reference
+  form; removing the Apple-ID password path means changing `.env.example` (another lane's
+  SSOT). See Cross-domain.
+- **DX-23 manifest half** (P2) → `app_id=` in the manifest beside the installer is written
+  by BUILD.command into the same kit as the DMG; replacing it requires the same access as
+  replacing the DMG, so it is not a trust boundary. The identity guard (C7) is what protects
+  the user's grants.
+- **DX-24** (P2, known items) → D-023 (default internal identity name), D-063 (mutable
+  osxexperts ffmpeg URL: hosting decision), D-061, D-034, DMG artwork text, костыль 1
+  (main.js title channels), костыль 8 (afterPack read-only / unlockDist cycle), PowerShell
+  helper, BUGS_AUDIT_2026-09-03 §8 #30 `Alt+Left` — decisions or other lanes, unchanged.
+  H-8 was fixed (C9).
+- **DX-27** (P2, hypothesis) → re-enabling a disabled verification target changes observable
+  paste behaviour (clipboard restore) on an unverified premise.
+- **DX-28 bullets 1–2** (P2) → `ipc-contract.test.js` tests only main.js; main.js lane.
+- **DX-29 / H-03 behaviour** (P1/P2) → the 700 ms activate suppression lives in main.js;
+  only the documentation half was done here (C6).
+
+## Cross-domain, for the lead
+1. **main.js — screen-mode warnings copy** (C3): `SCREEN_MODE_WARNINGS` must gain copy for
+   the new kinds the controller now raises: `start-failed` ("Screen mode could not start"),
+   `helper` ("Screen mode stopped drawing" — the mouse helper died mid-take),
+   `capture-failed` ("A screenshot could not be taken" — the strokes stay on screen for the
+   next one). Until then they are only logged as `[screen-mode] warning <kind>`.
+2. **main.js + renderer — S-04 / DX-08 renderer side**: `screenMode.start()` now answers
+   `{ok:false, error}` on failure (`"ended"`, `"unsupported"`, helper/overlay errors).
+   main.js L2891 only traces it; it must tell the renderer to demote the take to a voice
+   take (`liveRecordingMode = "voice"`, Live collection, not Screen Sessions), so retention
+   is not downgraded for a take with no screen session.
+3. **main.js — S-02 / DM-31 main side**: the controller refuses a start whose id already
+   ended. main should also stop awaiting `frontAtHotkeyPromise` / `beginRecordingStatusSession`
+   before `screenMode.start` (or start it before the renderer is told to record), and
+   `endScreenModeForLostRenderer` should pass the take's id
+   (`screenMode.finish({ id, discard:false })`) so a renderer lost before main's start ran
+   retires that id too.
+4. **main.js — DX-12**: export the capsule geometry (`bottomMargin`, `pillHeight`) and the
+   window levels (overlay 0 < palette 1 < capsule 2 on `"screen-saver"`) from one place and
+   inject them into the controller (`deps.capsuleLayout`, `deps.levels`); the controller then
+   computes its palette fallback instead of the literal `54`.
+5. **main.js — DX-26 markers**: the VBS/PowerShell scripts main.js builds still type
+   `"OK:vbs-paste"` (L5417, L5453) and `"OK:pwsh-paste"` (L5499, L5507); build them from
+   `PASTE_OK_PREFIX` + `VBS_PASTE_METHOD` / `PWSH_PASTE_METHOD` (paste-protocol.js).
+6. **main.js — DX-29 / H-03**: decide `capsuleInteraction` from the capsule being the clicked
+   target (or route voice-mode capsule clicks through the same in-process tap path) instead of
+   `RECORDING_STATUS_CAPSULE_ACTIVATE_SUPPRESS_MS`; then drop the limit paragraph from
+   window-lifecycle.js's header.
+7. **main.js — DX-25 tail**: the dev helper path `native/build/mac-${process.arch}` can name
+   `mac-arm64` (the only target build-native.sh builds).
+8. **desktop/ipc-contract.test.js (main.js tests) — DX-28 bullets 1–2**: assert the power
+   events registration through power-events.js with a fake `powerMonitor` and its whenReady
+   depth, not a text match; drop the indentation-exact match at L195.
+9. **.env.example — DX-21 notarytool half**: remove `NOTARYTOOL_APPLE_ID` /
+   `NOTARYTOOL_TEAM_ID` / `NOTARYTOOL_PASSWORD` (keychain profile or API key only); then
+   `desktop/scripts/notarize-dmg.sh` drops the `--password` branch (my lane can do that part
+   once `.env.example` changes).
+10. **CHANGELOG.md** — user-visible changes in this lane worth an entry: screen mode no longer
+    reports a failed start as started; a stroke finished during a screenshot goes to the next
+    one; a failed capture keeps its strokes; the helper logs `tap disabled …` lines; the
+    other-Mac installer refuses ad-hoc builds and certificate changes over a granted copy.
+11. **Not verified on a machine**: DX-07's main.swift half (replaying a held press when macOS
+    switches the tap off) — type-checked and its rule unit-tested, but a live disabled tap
+    was not reproduced. The new `[screen-mode] tap disabled reason=… abandoned=…` line in
+    main.log is what will show whether the user's trackpad double-tap-drag failure is a
+    disabled tap.
