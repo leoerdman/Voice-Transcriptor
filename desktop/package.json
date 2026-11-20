@@ -76,6 +76,7 @@
       "window-lifecycle.js",
     "user-data-dir.js",
       "preload.js",
+      "capsule-preload.js",
       "shortcut-defaults.json",
       "package.json",
       "icon.png",

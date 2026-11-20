@@ -1,4 +1,4 @@
-const { app, BrowserWindow, globalShortcut, Tray, Menu, nativeImage, systemPreferences, dialog, clipboard, shell, screen } = require("electron");
+const { app, BrowserWindow, globalShortcut, Tray, Menu, nativeImage, systemPreferences, dialog, clipboard, shell, screen, ipcMain } = require("electron");
 const { spawn, spawnSync } = require("child_process");
 const http = require("http");
 const net = require("net");
@@ -1911,12 +1911,12 @@ function recordingStatusCapsuleHtml() {
       if (pointerEmitLocked) return;
       pointerEmitLocked = true;
       setTimeout(() => { pointerEmitLocked = false; }, ${t.pointerLockMs});
-      document.title = "__recording_capsule_pointer__" + Date.now();
+      window.__capsule.pointer();
     }, true);
     document.getElementById("shotBtn").addEventListener("click", (event) => {
       // Inside #core, whose click stops the recording: this one must not.
       event.stopPropagation();
-      if (screenMode) document.title = "__recording_capsule_shot__" + Date.now();
+      if (screenMode) window.__capsule.shot();
     });
     document.getElementById("core").addEventListener("click", (event) => {
       // "autostop" too: the capsule is amber and counting down, but the
@@ -1926,7 +1926,7 @@ function recordingStatusCapsuleHtml() {
       // nothing.
       if (waveMode === "recording" || waveMode === "autostop") {
         event.stopPropagation();
-        document.title = "__recording_capsule_stop__";
+        window.__capsule.stop();
       }
     });
     function animationLoop(frameNow) {
@@ -1986,6 +1986,40 @@ function watchDisplaysForRecordingStatusCapsule() {
   }
 }
 
+// The capsule's three verbs arrive over its preload (./capsule-preload),
+// not over document.title (DM-10, capsule half): a title channel fires
+// nothing when the same title is set twice, so a second stop click after
+// a stale stop was lost. Registered once; each verb is accepted only from
+// the capsule window that exists right now.
+let recordingStatusCapsuleIpcInstalled = false;
+function installRecordingStatusCapsuleIpc() {
+  if (recordingStatusCapsuleIpcInstalled) return;
+  recordingStatusCapsuleIpcInstalled = true;
+  const fromCapsule = (event) =>
+    !!recordingStatusWindow && !recordingStatusWindow.isDestroyed()
+    && event?.sender === recordingStatusWindow.webContents;
+  ipcMain.on("capsule:pointer", (event) => {
+    if (!fromCapsule(event)) return;
+    noteRecordingStatusCapsuleInteraction();
+  });
+  ipcMain.on("capsule:shot", (event) => {
+    if (!fromCapsule(event)) return;
+    noteRecordingStatusCapsuleInteraction();
+    void screenMode.takeShot("capsule").catch((e) => {
+      appendMainLog(`[screen-mode] capsule shot failed: ${e?.message || e}`);
+    });
+  });
+  ipcMain.on("capsule:stop", (event) => {
+    if (!fromCapsule(event)) return;
+    noteRecordingStatusCapsuleInteraction();
+    recordingStopInFlight = true;
+    // The capsule stops the recording. It does NOT touch the main
+    // window — it used to hide it here, which is how pressing stop
+    // could make the app vanish.
+    guardedStopFromRecordingStatus("capsule-click");
+  });
+}
+
 async function ensureRecordingStatusCapsuleWindow() {
   if (!app.isReady()) return null;
   // A pending teardown means the capsule is idle but still alive.
@@ -2034,6 +2068,8 @@ async function ensureRecordingStatusCapsuleWindow() {
     backgroundColor: "#00000000",
     webPreferences: {
       partition: RECORDING_STATUS_CAPSULE_SESSION_PARTITION,
+      // Three send-only verbs (stop, shot, pointer) — ./capsule-preload.
+      preload: path.join(__dirname, "capsule-preload.js"),
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: true,
@@ -2062,29 +2098,7 @@ async function ensureRecordingStatusCapsuleWindow() {
     recordingStatusWindowLoadPromise = null;
     cancelRecordingStatusCapsuleTeardown();
   });
-  recordingStatusWindow.webContents.on("page-title-updated", (event, title) => {
-    const raw = String(title || "");
-    if (!raw.startsWith("__recording_capsule_")) return;
-    event.preventDefault();
-    noteRecordingStatusCapsuleInteraction();
-    if (raw.startsWith("__recording_capsule_pointer__")) {
-      return;
-    }
-    if (raw.startsWith("__recording_capsule_shot__")) {
-      void screenMode.takeShot("capsule").catch((e) => {
-        appendMainLog(`[screen-mode] capsule shot failed: ${e?.message || e}`);
-      });
-      return;
-    }
-    if (raw === "__recording_capsule_stop__") {
-      recordingStopInFlight = true;
-      // The capsule stops the recording. It does NOT touch the main
-      // window — it used to hide it here, which is how pressing stop
-      // could make the app vanish.
-      guardedStopFromRecordingStatus("capsule-click");
-      return;
-    }
-  });
+  installRecordingStatusCapsuleIpc();
 
   const html = recordingStatusCapsuleHtml();
   recordingStatusWindowLoadPromise = recordingStatusWindow
@@ -9087,7 +9101,6 @@ app.whenReady().then(async () => {
   // registered once, before any window exists, so the very first render
   // can already query status. invoke-only: the renderer never receives
   // raw ipcRenderer and cannot initiate arbitrary channels.
-  const { ipcMain } = require("electron");
   // Every channel the preload exposes answers only the main window's own
   // webContents (DM-28). Only that window has the preload today, so
   // nothing else can reach these channels — but the rule was enforced by
