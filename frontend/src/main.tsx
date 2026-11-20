@@ -649,11 +649,16 @@ type ShortcutPair = { record: string; paste: string };
 // (macOS only) and are empty where the platform has no default.
 type ShortcutId = "record" | "paste" | "screen" | "screenShot";
 type ShortcutSet = Record<ShortcutId, string>;
-const SHORTCUT_SLOTS: ReadonlyArray<{ id: ShortcutId; buttonId: string; label: string }> = [
+/**
+ * `screenModeOnly`: bound only while a screen-mode take runs (desktop
+ * main.js bindScreenShotHotkey), so a bare typing key — its default ` —
+ * is a valid choice for it and for no other slot.
+ */
+const SHORTCUT_SLOTS: ReadonlyArray<{ id: ShortcutId; buttonId: string; label: string; screenModeOnly?: boolean }> = [
   { id: "record", buttonId: "shortcutRecord", label: "Record" },
   { id: "paste", buttonId: "shortcutPaste", label: "Paste" },
   { id: "screen", buttonId: "shortcutScreen", label: "Screen mode" },
-  { id: "screenShot", buttonId: "shortcutScreenShot", label: "Screenshot" },
+  { id: "screenShot", buttonId: "shortcutScreenShot", label: "Screenshot", screenModeOnly: true },
 ];
 type ShortcutDefaultsManifest = {
   platformDefaults: {
@@ -6458,12 +6463,11 @@ function handleShortcutKeydown(e: KeyboardEvent): void {
     return;
   }
 
-  const accelerator = keyEventToAccelerator(e);
-  if (!accelerator) return; // Still pressing only modifiers
-
   if (!activeShortcutBtn) return;
   const slot = shortcutSlot(activeShortcutBtn.dataset.shortcutId);
   if (!slot) return;
+  const accelerator = keyEventToAccelerator(e, { typingKeysAllowed: !!slot.screenModeOnly });
+  if (!accelerator) return; // Still pressing only modifiers
   // Reject duplicates: if the user rebinds one action to the SAME
   // accelerator as another, only one globalShortcut.register call
   // succeeds (the second overwrites/fails), leaving the first action

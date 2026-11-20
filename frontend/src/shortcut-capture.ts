@@ -109,13 +109,22 @@ function mainKeyName(key: string, code: string): string | null {
   return PUNCTUATION_CODES[code] ?? null;
 }
 
-export function keyEventToAccelerator(e: ShortcutKeyEvent): string | null {
+/**
+ * @param options.typingKeysAllowed  the slot is bound only while screen
+ *   mode runs (the screenshot key), so a bare key that types — the
+ *   default ` under Escape — cannot steal typing outside that mode and is
+ *   accepted. Every always-bound slot still needs a modifier for those.
+ */
+export function keyEventToAccelerator(
+  e: ShortcutKeyEvent,
+  options: { typingKeysAllowed?: boolean } = {},
+): string | null {
   const key = e.key === " " ? " " : String(e.key || "").trim();
   const code = String(e.code || "").trim();
   // A modifier on its own is still being held: not a binding yet.
   if (MODIFIER_KEYS.has(key)) return null;
   const hasModifier = e.altKey || e.ctrlKey || e.metaKey || e.shiftKey;
-  if (!hasModifier && !standaloneName(key, code)) return null;
+  if (!hasModifier && !options.typingKeysAllowed && !standaloneName(key, code)) return null;
 
   const parts: string[] = [];
   // Control and Command stay separate unless both are held: collapsing

@@ -51,4 +51,11 @@ describe("keyEventToAccelerator (FU-22, FU-26)", () => {
   it("returns null for a key it cannot name", () => {
     expect(keyEventToAccelerator(press("Unidentified", "", { altKey: true }))).toBeNull();
   });
+
+  it("the screen-mode-only screenshot slot takes a bare typing key: ` under Escape", () => {
+    const backquote = press("`", "Backquote");
+    expect(keyEventToAccelerator(backquote)).toBeNull();
+    expect(keyEventToAccelerator(backquote, { typingKeysAllowed: true })).toBe("`");
+    expect(keyEventToAccelerator(press("Shift", "ShiftLeft", { shiftKey: true }), { typingKeysAllowed: true })).toBeNull();
+  });
 });
