@@ -1,8 +1,13 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
 import { describe, expect, it } from "vitest";
 import {
   parseRecordingSaveResponse,
+  parseScreensError,
   planRecordingSave,
   recordingSaveFormEntries,
+  transcriptScreenManifest,
   type RecordingSaveInput,
 } from "../src/recording-save";
 
@@ -65,8 +70,51 @@ describe("planRecordingSave (FU-21)", () => {
 describe("parseRecordingSaveResponse (FU-21)", () => {
   it("parses every route's answer the same way", () => {
     expect(parseRecordingSaveResponse({ name: "a.txt", archive_dir: "/x", pruned_audio_count: 2.7, screens: { n: 1 } }, { name: "", archiveDir: "" }))
-      .toEqual({ name: "a.txt", archiveDir: "/x", prunedAudioCount: 2, screensManifest: { n: 1 } });
+      .toEqual({ name: "a.txt", archiveDir: "/x", prunedAudioCount: 2, screensManifest: { n: 1 }, screensError: "" });
     expect(parseRecordingSaveResponse({ ok: true }, { name: "old", archiveDir: "/d" }))
-      .toEqual({ name: "old", archiveDir: "/d", prunedAudioCount: 0 });
+      .toEqual({ name: "old", archiveDir: "/d", prunedAudioCount: 0, screensError: "" });
+  });
+
+  it("reads screens_error: the save succeeded but the screenshots were not attached (M3)", () => {
+    const saved = parseRecordingSaveResponse(
+      { name: "a.txt", archive_dir: "/x", screens: null, screens_error: " screenshots could not be attached to this recording " },
+      { name: "", archiveDir: "" },
+    );
+    expect(saved.screensError).toBe("screenshots could not be attached to this recording");
+    expect(saved.screensManifest).toBeUndefined();
+    expect(parseScreensError({ screens_error: 7 })).toBe("");
+    expect(parseScreensError(null)).toBe("");
+  });
+});
+
+describe("transcriptScreenManifest (M3)", () => {
+  const staged = { id: "s", files: ["/data/screen-sessions/s/shot-01.png"] };
+  const adopted = { id: "s", files: ["/rec/take.screens/shot-01.png"] };
+
+  it("annotates from the adopted manifest: archived paths", () => {
+    expect(transcriptScreenManifest(adopted, staged, "")).toBe(adopted);
+  });
+
+  it("never falls back to staging paths when the adoption failed", () => {
+    expect(transcriptScreenManifest(null, staged, "screenshots could not be attached")).toBeNull();
+  });
+
+  it("keeps the staged manifest when nothing was adopted and nothing failed", () => {
+    expect(transcriptScreenManifest(null, staged, "")).toBe(staged);
+  });
+});
+
+// Wiring (main.tsx is not importable here): the stop path and the recovery
+// path read screens_error through the helpers tested above.
+describe("main.tsx surfaces screens_error (M3)", () => {
+  const mainTsx = readFileSync(resolve(process.cwd(), "src/main.tsx"), "utf8");
+  it("the stop path annotates through transcriptScreenManifest, never staged-on-error", () => {
+    expect(mainTsx).toMatch(/screenManifest = transcriptScreenManifest\(\s*parseScreenManifest\(persisted\.screensManifest\),\s*stagedScreenManifest,\s*persisted\.screensError \|\| "",\s*\);/);
+    expect(mainTsx).not.toContain("parseScreenManifest(persisted.screensManifest) || stagedScreenManifest");
+    expect(mainTsx).toContain("if (persisted.screensError) {");
+  });
+  it("the spool promotion counts recoveries without their screenshots", () => {
+    expect(mainTsx).toContain("parseScreensError(await resp.json().catch(() => null))");
+    expect(mainTsx).toContain("recoverySummary(succeeded, failed, withoutScreens)");
   });
 });

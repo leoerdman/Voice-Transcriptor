@@ -42,7 +42,10 @@
  * Starting is all or nothing: `start` answers ok only once the helper
  * reports its tap is live and at least one overlay is on screen; anything
  * less is torn down and reported (`onWarning`) instead of a red frame
- * that draws nothing. Every session id that ended — finished, or asked to
+ * that draws nothing. What the user SEES is one moment: the overlays, the
+ * palette and the capsule in its screen shape are prepared hidden and
+ * shown together (./screen-surfaces.js) — without waiting for the helper,
+ * which comes up alongside; drawing begins when it is ready. Every session id that ended — finished, or asked to
  * finish before it ever started — is remembered, so a `start` that loses
  * the race to its own stop is refused instead of opening a take nobody
  * will finish.
@@ -59,13 +62,55 @@ const {
   screenSessionManifest,
   shotFileName,
 } = require("./screen-mode");
+const { PRESENTER_STATE, SCREEN_SURFACE, createSurfacePresenter } = require("./screen-surfaces");
 
 const OVERLAY_PARTITION = "screen-mode-overlay";
 const PALETTE = Object.freeze({ dot: 18, gap: 8, padX: 10, height: 30, marginAboveCapsule: 8 });
 // The helper prints `ready` right after macOS hands it the event tap; a
 // helper that has said nothing by then is not going to draw anything.
 const HELPER_READY_TIMEOUT_MS = 5000;
+// How long the picture may wait for its slowest surface (a window whose
+// page never loads). A frame not ready by then fails the start; a capsule
+// or palette not ready by then is left out of the picture.
+const SURFACES_READY_TIMEOUT_MS = 3000;
 const PNG_DATA_URL_PREFIX = "data:image/png;base64,";
+
+/**
+ * Every warning the controller raises through `deps.onWarning`. Main shows
+ * each one to the user from ONE copy table keyed by these values
+ * (./screen-mode-warnings.js), whose test requires copy for every kind
+ * here — a kind raised with no copy was a warning nobody saw (D1).
+ */
+const SCREEN_MODE_WARNING = Object.freeze({
+  /** A start failed for a reason other than the two below. */
+  START_FAILED: "start-failed",
+  /** The helper exited 2: no Accessibility grant, so nothing can draw. */
+  ACCESSIBILITY: "accessibility",
+  /** Screen Recording is not granted: captures would show the wallpaper. */
+  SCREEN_RECORDING: "screen-recording",
+  /** The mouse helper died mid-take: nothing draws from then on. */
+  HELPER: "helper",
+  /** A screenshot could not be taken; its strokes stay for the next one. */
+  CAPTURE_FAILED: "capture-failed",
+});
+
+/**
+ * What `start(id)` answers, as `{ ok, outcome, id?, error? }`. `ok` is
+ * true exactly for STARTED.
+ *
+ *   STARTED  the session is live (overlays up, helper tapping).
+ *   ENDED    the take already ended — its stop reached the controller
+ *            first. A normal outcome of a quick stop, not a failure: no
+ *            warning, nothing to tell the renderer (D3).
+ *   FAILED   the start failed; the controller has already warned the
+ *            user (it is the one owner of that notification — D2) and the
+ *            take goes on as a voice take.
+ */
+const SCREEN_START_OUTCOME = Object.freeze({
+  STARTED: "started",
+  ENDED: "ended",
+  FAILED: "failed",
+});
 
 function overlayHtml() {
   const border = SCREEN_MODE.borderWidth;
@@ -218,6 +263,10 @@ function paletteSize(colorCount) {
  * @param {() => (import("electron").BrowserWindow|null)} deps.capsuleWindow  the capsule, when it is on screen
  * @param {(active: boolean) => void} deps.onActiveChange   capsule restyle / raise
  * @param {(warning: string) => void} deps.onWarning
+ * @param {() => Promise<boolean>} [deps.prepareCapsule]  resolves true once the capsule is
+ *   painted in its screen shape and kept hidden for the shared showing (false: main shows it
+ *   its own way)
+ * @param {() => void} [deps.showCapsule]  show that prepared capsule, now
  * @param {() => string} [deps.screenCaptureAccess]  macOS media access status for "screen"
  * @param {(bounds: object, outFile: string) => Promise<void>} [deps.captureRegion]  replaces screencapture (tests)
  * @param {string} [deps.platform]  replaces process.platform (tests)
@@ -243,6 +292,10 @@ function createScreenModeController(deps) {
   // Every session id that ended or was asked to end. A `start` of one of
   // these lost the race to its own stop and must not open a take.
   const endedIds = new Set();
+  // The session's surfaces have been shown (one moment, ./screen-surfaces).
+  // Until then every window is created hidden; afterwards a window created
+  // for the session (a display plugged in) shows as soon as it is ready.
+  let presented = false;
 
   function serialize(fn) {
     const next = chain.then(fn, fn);
@@ -317,7 +370,7 @@ function createScreenModeController(deps) {
       throw e;
     }
     entry.ready = true;
-    w.showInactive();
+    if (presented) w.showInactive();
   }
 
   function required(what, fn) {
@@ -419,9 +472,11 @@ function createScreenModeController(deps) {
     return [visibleWindow(deps.capsuleWindow()), visibleWindow(palette)].filter(Boolean);
   }
 
+  // The capsule's place, visible or prepared hidden for the shared showing:
+  // the palette is placed above it before either is shown.
   function capsuleBounds() {
-    const w = visibleWindow(deps.capsuleWindow());
-    return w ? w.getBounds() : null;
+    const w = deps.capsuleWindow();
+    return w && !w.isDestroyed() ? w.getBounds() : null;
   }
 
   function paletteBounds() {
@@ -480,8 +535,39 @@ function createScreenModeController(deps) {
     optional("palette setVisibleOnAllWorkspaces", () => w.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }));
     const html = paletteHtml(SCREEN_MODE.colors, session ? session.color : SCREEN_MODE.colors[0]);
     await w.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
-    if (!w.isDestroyed()) w.showInactive();
+    if (w.isDestroyed()) throw new Error("palette window was destroyed while loading");
+    if (presented) w.showInactive();
     refreshLayout();
+  }
+
+  /**
+   * The one moment the take becomes visible: main is told the session is
+   * on (capsule layer, screen button, screenshot hotkey), then the capsule,
+   * every ready overlay and the palette are shown back to back, with no
+   * await between them.
+   */
+  function presentSurfaces(ready, pressedAt) {
+    presented = true;
+    announced = true;
+    deps.onActiveChange(true);
+    const showCapsule = ready.includes(SCREEN_SURFACE.CAPSULE) && typeof deps.showCapsule === "function";
+    if (showCapsule) deps.showCapsule();
+    let shownOverlays = 0;
+    for (const entry of overlays.values()) {
+      if (!entry.ready || entry.win.isDestroyed()) continue;
+      entry.win.showInactive();
+      shownOverlays += 1;
+    }
+    const showPalette = ready.includes(SCREEN_SURFACE.PALETTE) && palette && !palette.isDestroyed();
+    if (showPalette) {
+      try { palette.setBounds(paletteBounds(), false); } catch { }
+      palette.showInactive();
+    }
+    refreshLayout();
+    log(
+      `[screen-mode] surfaces visible press_to_visible_ms=${Math.max(0, Date.now() - pressedAt)} ` +
+      `capsule=${showCapsule ? 1 : 0} overlays=${shownOverlays} palette=${showPalette ? 1 : 0}`,
+    );
   }
 
   function setColor(color) {
@@ -609,21 +695,21 @@ function createScreenModeController(deps) {
       }
       if (helper === child) {
         helper = null;
-        deps.onWarning("helper");
+        deps.onWarning(SCREEN_MODE_WARNING.HELPER);
       }
     });
     child.on("exit", (code, signal) => {
       log(`[screen-mode] helper exited code=${code} signal=${signal || ""}`);
       if (helperStart && helperStart.child === child) {
         const error = new Error(`helper exited before it was ready (code=${code} signal=${signal || ""})`);
-        if (code === 2) error.warning = "accessibility";
+        if (code === 2) error.warning = SCREEN_MODE_WARNING.ACCESSIBILITY;
         helperStart.settle(error);
         return;
       }
       // stopHelper() lets go of the child before it exits: that exit is ours.
       if (helper !== child) return;
       helper = null;
-      deps.onWarning("helper");
+      deps.onWarning(SCREEN_MODE_WARNING.HELPER);
     });
     return started;
   }
@@ -757,7 +843,7 @@ function createScreenModeController(deps) {
       // No screenshot is claimed for a display that was not captured: its
       // strokes stay pending and on the screen for the next shot.
       log(`[screen-mode] capture failed (${reason}): ${failures.join("; ")}`);
-      deps.onWarning("capture-failed");
+      deps.onWarning(SCREEN_MODE_WARNING.CAPTURE_FAILED);
     }
     if (!files.length) return null;
     const taken = pending.filter((s) => captured.has(s.displayId)).map((s) => s.id);
@@ -784,15 +870,22 @@ function createScreenModeController(deps) {
   }
 
   // ── lifecycle ─────────────────────────────────────────────────────────
-  async function startNow(id) {
+  function startFailed(id, error, warning = SCREEN_MODE_WARNING.START_FAILED) {
+    log(`[screen-mode] start ${id} failed: ${error}`);
+    deps.onWarning(warning);
+    return { ok: false, outcome: SCREEN_START_OUTCOME.FAILED, error };
+  }
+
+  async function startNow(id, pressedAt) {
     if (endedIds.has(id)) {
       // Its stop got here first (the renderer finished the take while main
       // was still on its way to start it): nobody will ever finish it.
+      // This is the one place "this take already ended" is decided.
       log(`[screen-mode] start ${id} refused: that take already ended`);
-      return { ok: false, error: "ended" };
+      return { ok: false, outcome: SCREEN_START_OUTCOME.ENDED };
     }
     if (session) {
-      if (session.id === id) return { ok: true, id };
+      if (session.id === id) return { ok: true, outcome: SCREEN_START_OUTCOME.STARTED, id };
       // A new take while an old session is still up: the old take's
       // recording is over (main starts a session only for a confirmed new
       // recording), so its session is closed — screenshots kept staged —
@@ -800,34 +893,67 @@ function createScreenModeController(deps) {
       log(`[screen-mode] start ${id} while ${session.id} is live; finishing ${session.id}`);
       await finishNow({ id: session.id });
     }
-    if (!isSupported()) return { ok: false, error: "unsupported" };
+    if (!isSupported()) return startFailed(id, "unsupported");
     const dir = path.join(deps.stagingRoot(), id);
-    fs.mkdirSync(dir, { recursive: true });
-    session = createScreenSession({ id, dir });
-    lastManifest = null;
+    let expiry = null;
     try {
+      fs.mkdirSync(dir, { recursive: true });
+      session = createScreenSession({ id, dir });
+      lastManifest = null;
       watchDisplays();
-      await startHelper();
-      const results = await Promise.allSettled(screen.getAllDisplays().map((d) => createOverlay(d)));
-      for (const r of results) {
-        if (r.status === "rejected") log(`[screen-mode] overlay failed: ${r.reason?.message || r.reason}`);
-      }
-      if (![...overlays.values()].some((entry) => entry.ready)) {
-        throw new Error("no overlay could be shown");
-      }
+      // The surfaces and the helper come up side by side. The surfaces are
+      // shown together the moment the last of them is ready; the helper's
+      // `ready` is awaited only for the answer (drawing starts with it).
+      const presenter = createSurfacePresenter({
+        required: [SCREEN_SURFACE.OVERLAYS],
+        optional: [SCREEN_SURFACE.CAPSULE, SCREEN_SURFACE.PALETTE],
+        present: (ready) => {
+          try {
+            presentSurfaces(ready, pressedAt);
+          } catch (e) {
+            log(`[screen-mode] showing the surfaces failed: ${e?.message || e}`);
+          }
+        },
+      });
+      expiry = setTimeout(() => presenter.expire(), SURFACES_READY_TIMEOUT_MS);
+      expiry.unref?.();
+      let helperError = null;
+      const helperDone = startHelper().catch((e) => {
+        helperError = e;
+        // A helper that cannot tap means a take that cannot draw: nothing
+        // is shown rather than a frame that is taken down again.
+        presenter.abort();
+      });
+      const prepareCapsule = typeof deps.prepareCapsule === "function" ? deps.prepareCapsule() : Promise.resolve(false);
+      Promise.resolve(prepareCapsule).then(
+        (ok) => presenter.settle(SCREEN_SURFACE.CAPSULE, ok === true),
+        () => presenter.settle(SCREEN_SURFACE.CAPSULE, false),
+      );
+      Promise.allSettled(screen.getAllDisplays().map((d) => createOverlay(d))).then((results) => {
+        for (const r of results) {
+          if (r.status === "rejected") log(`[screen-mode] overlay failed: ${r.reason?.message || r.reason}`);
+        }
+        presenter.settle(SCREEN_SURFACE.OVERLAYS, [...overlays.values()].some((entry) => entry.ready));
+      });
+      // Without a palette the take still draws, in the default colour.
+      createPalette().then(
+        () => presenter.settle(SCREEN_SURFACE.PALETTE, true),
+        (e) => {
+          log(`[screen-mode] palette failed: ${e?.message || e}`);
+          presenter.settle(SCREEN_SURFACE.PALETTE, false);
+        },
+      );
+      const shown = await presenter.done;
+      clearTimeout(expiry);
+      if (shown === PRESENTER_STATE.FAILED) throw new Error("no overlay could be shown");
+      await helperDone;
+      if (helperError) throw helperError;
     } catch (e) {
-      log(`[screen-mode] start ${id} failed: ${e?.message || e}`);
+      clearTimeout(expiry);
       teardown();
-      fs.rmSync(dir, { recursive: true, force: true });
-      deps.onWarning(e?.warning || "start-failed");
-      return { ok: false, error: e?.message || String(e) };
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { }
+      return startFailed(id, e?.message || String(e), e?.warning || SCREEN_MODE_WARNING.START_FAILED);
     }
-    // Without a palette the take still draws, in the default colour.
-    await createPalette().catch((e) => log(`[screen-mode] palette failed: ${e?.message || e}`));
-    // Once the overlays exist: main lifts the capsule above them, shows its
-    // screen button and binds the screenshot hotkey.
-    announced = true;
-    deps.onActiveChange(true);
     // Without Screen Recording, macOS does not fail a capture: it returns
     // the wallpaper with no windows on it. Say so up front — for every
     // state but "granted" ("not-determined" included) — instead of saving
@@ -835,12 +961,12 @@ function createScreenModeController(deps) {
     const captureAccess = typeof deps.screenCaptureAccess === "function" ? deps.screenCaptureAccess() : "granted";
     if (captureAccess !== "granted") {
       log(`[screen-mode] screen recording access=${captureAccess || "unknown"}`);
-      deps.onWarning("screen-recording");
+      deps.onWarning(SCREEN_MODE_WARNING.SCREEN_RECORDING);
     }
     refreshLayout();
     writeEvents();
     log(`[screen-mode] started ${id} displays=${overlays.size}`);
-    return { ok: true, id };
+    return { ok: true, outcome: SCREEN_START_OUTCOME.STARTED, id };
   }
 
   function teardown() {
@@ -855,6 +981,7 @@ function createScreenModeController(deps) {
     }
     palette = null;
     session = null;
+    presented = false;
     if (announced) {
       announced = false;
       deps.onActiveChange(false);
@@ -890,11 +1017,33 @@ function createScreenModeController(deps) {
     return { ok: true, manifest };
   }
 
-  const start = (id) => serialize(() => startNow(id));
+  // Never rejects: whatever goes wrong on the way is a FAILED start the
+  // user has been warned about, so main has one answer to read.
+  /**
+   * @param {string} id  the take's screen session id
+   * @param {{pressedAt?: number}} [opts]  when the user pressed the key: the
+   *   "surfaces visible" log line measures press → everything on screen
+   */
+  const start = (id, opts = {}) => serialize(async () => {
+    const pressedAt = Number(opts?.pressedAt) > 0 ? Number(opts.pressedAt) : Date.now();
+    try {
+      return await startNow(id, pressedAt);
+    } catch (e) {
+      teardown();
+      return startFailed(id, e?.message || String(e));
+    }
+  });
   const takeShot = (reason) => serialize(() => takeShotNow(reason));
   const finish = (opts) => serialize(() => finishNow(opts));
 
   return { isSupported, isActive, start, takeShot, finish, teardown, refreshLayout };
 }
 
-module.exports = { createScreenModeController, overlayHtml, paletteHtml, paletteSize };
+module.exports = {
+  SCREEN_MODE_WARNING,
+  SCREEN_START_OUTCOME,
+  createScreenModeController,
+  overlayHtml,
+  paletteHtml,
+  paletteSize,
+};

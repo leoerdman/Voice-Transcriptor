@@ -23,4 +23,15 @@ describe("recoverySummary (FU-07)", () => {
     expect(s.text).toContain("Could not recover 3 interrupted recordings");
     expect(s.text).toContain("next start");
   });
+
+  it("does not call a recovery whole when its screenshots could not be attached (M3)", () => {
+    const one = recoverySummary(1, 0, 1)!;
+    expect(one.tone).toBe("warning");
+    expect(one.text).toBe("Recovered 1 interrupted recording into History. Its screenshots could not be attached.");
+    const some = recoverySummary(3, 0, 1)!;
+    expect(some.tone).toBe("warning");
+    expect(some.text).toContain("The screenshots of 1 of them could not be attached.");
+    expect(recoverySummary(2, 1, 1)!.text).toContain("The screenshots of 1 of them could not be attached.");
+    expect(recoverySummary(1, 0, 0)!.tone).toBe("success");
+  });
 });

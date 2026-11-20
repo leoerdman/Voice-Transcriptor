@@ -207,3 +207,18 @@ test("the backend API token is asked for on backend-auth's channel and answered 
   assert.match(mainSource, /ipcMain\.on\(API_TOKEN_CHANNEL,/);
   assert.match(mainSource, /TRANSCRIPTOR_API_TOKEN: BACKEND_API_TOKEN,/);
 });
+
+test("screen-mode:voice-take is sent by main and subscribed to by the renderer bridge (S-04)", () => {
+  // A screen take whose session could not start is a voice take: main
+  // tells the renderer so, or the take is filed under Screen Sessions
+  // with no screenshots. Main → main window only: there is no renderer →
+  // main traffic on this channel, so no sender for main to check.
+  assert.match(mainSource, /win\.webContents\.send\("screen-mode:voice-take"/);
+  assert.match(preloadSource, /ipcRenderer\.on\("screen-mode:voice-take"/);
+  assert.match(preloadSource, /onScreenVoiceTake:/, "the bridge is what the renderer actually calls");
+  assert.match(
+    preloadSource,
+    /ipcRenderer\.removeListener\("screen-mode:voice-take"/,
+    "the bridge must hand back a way to unsubscribe",
+  );
+});

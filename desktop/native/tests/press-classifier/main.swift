@@ -127,6 +127,20 @@ run("a release with no press seen passes", [
   (.up, 1, 1, .pass),
 ])
 
+// The helper reports `lastOutcome` on every release it sees. A stray
+// release after a finished press ends no press, so it has no outcome —
+// it used to repeat the previous press's ("press outcome=click" x13 in
+// one millisecond in the user's log).
+do {
+  let name = "a stray release after a click reports no second outcome"
+  var c = PressClassifier(dragThreshold: 5)
+  play(name, &c, [(.down, 100, 100, .hold), (.up, 100, 100, .replayClick)])
+  if c.lastOutcome != .click { fail("\(name): the click itself has no outcome") }
+  play(name, &c, [(.up, 100, 100, .pass), (.up, 100, 100, .pass)])
+  if c.lastOutcome != nil { fail("\(name): expected no outcome, got \(String(describing: c.lastOutcome))") }
+  print("ok \(name)")
+}
+
 // macOS switched the tap off in the middle of a stroke (a late callback,
 // Secure Input). The stroke ends at its last point, and the next press —
 // a trackpad double-tap-and-drag — draws from a clean state instead of
