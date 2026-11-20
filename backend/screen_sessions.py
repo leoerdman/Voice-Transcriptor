@@ -53,6 +53,13 @@ class ScreenAdoptionError(Exception):
     put back) where it was and any previous ``<stem>.screens`` is intact,
     so a retry finds exactly what the first attempt found."""
 
+
+def _reason(exc: BaseException) -> str:
+    """An error's reason without its paths: an archive path ends in the
+    recording's name, which is the first words dictated, and the log is
+    the artefact users attach for support."""
+    return getattr(exc, "strerror", None) or type(exc).__name__
+
 STAGING_DIR_NAME = "screen-sessions"
 SCREENS_DIR_SUFFIX = ".screens"
 EVENTS_FILE_NAME = "events.json"
@@ -203,7 +210,7 @@ def adopt_session(
         atomic_write_json(work / EVENTS_FILE_NAME, manifest)
     except (OSError, ValueError, TypeError) as exc:
         _undo_adoption(work, source, moved, session_id)
-        raise ScreenAdoptionError(f"screen session {session_id}: adoption failed: {exc}") from exc
+        raise ScreenAdoptionError(f"screen session {session_id}: adoption failed: {_reason(exc)}") from exc
     retired: Optional[Path] = None
     try:
         if dest.exists():
@@ -221,22 +228,22 @@ def adopt_session(
                     session_id, retired, restore_exc,
                 )
         _undo_adoption(work, source, moved, session_id)
-        raise ScreenAdoptionError(f"screen session {session_id}: adoption failed: {exc}") from exc
+        raise ScreenAdoptionError(f"screen session {session_id}: adoption failed: {_reason(exc)}") from exc
     if not moved:
         try:
             shutil.rmtree(source)
         except OSError as exc:
             # Archived copy is complete; the staged one ages out with the
             # orphan sweep.
-            logger.warning("screen session %s: staged copy not removed: %s", session_id, exc)
+            logger.warning("screen session %s: staged copy not removed: %s", session_id, _reason(exc))
     if retired is not None:
         try:
             shutil.rmtree(retired)
         except OSError as exc:
             # The new folder is in place; the old one is debris the boot
             # sweep recognises by its work name.
-            logger.warning("screen session %s: old screenshots not removed (%s): %s", session_id, retired, exc)
-    logger.info("screen session %s adopted as %s", session_id, dest)
+            logger.warning("screen session %s: old screenshots not removed: %s", session_id, _reason(exc))
+    logger.info("screen session %s adopted", session_id)
     return manifest
 
 

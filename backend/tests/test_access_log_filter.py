@@ -93,6 +93,45 @@ class AccessLogFilterTests(unittest.TestCase):
         record.args = ("127.0.0.1:1", "GET", None, "1.1", 200)
         self.assertTrue(self.filter.filter(record))
 
+    # ── BL-15: job progress is polled by id ────────────────────────
+    def test_a_successful_job_poll_is_dropped(self) -> None:
+        self.assertFalse(self.filter.filter(_record("/api/jobs/6a2396b2-aaaa", 200)))
+
+    def test_job_lines_that_are_signal_are_kept(self) -> None:
+        self.assertTrue(self.filter.filter(_record("/api/jobs/6a2396b2-aaaa", 404)))
+        self.assertTrue(self.filter.filter(_record("/api/jobs/6a2396b2-aaaa/cancel", 200, "POST")))
+        self.assertTrue(self.filter.filter(_record("/api/jobs/6a2396b2-aaaa/download/txt", 200)))
+        self.assertTrue(self.filter.filter(_record("/api/jobs/from-path", 200, "POST")))
+
+    # ── BL-02: a recording's name is its dictated title ────────────
+    def _logged_path(self, path: str, status: int = 200) -> str:
+        record = _record(path, status)
+        self.filter.filter(record)
+        return record.args[2]
+
+    def test_a_recordings_title_never_reaches_the_access_log(self) -> None:
+        title = "Позвонить%20маме%20про%20анализы"
+        path = f"/api/recordings/2026-11-08_12-20-30-572172__{title}.txt/audio?archive_dir=%2FUsers%2Fme%2FSecret"
+        logged = self._logged_path(path)
+        self.assertNotIn("маме", logged)
+        self.assertNotIn(title, logged)
+        self.assertNotIn("archive_dir", logged)
+        self.assertTrue(logged.startswith("/api/recordings/2026-11-08_12-20-30-572172#"))
+        self.assertTrue(logged.endswith(".txt/audio"))
+
+    def test_fixed_recording_routes_are_logged_as_they_are(self) -> None:
+        for path in ("/api/recordings", "/api/recordings/save-with-audio", "/api/recordings/stats/summary"):
+            with self.subTest(path=path):
+                self.assertEqual(self._logged_path(path), path)
+
+    def test_a_dotted_title_does_not_leak_as_a_suffix(self) -> None:
+        from backend.main import _log_safe_recording_name
+
+        safe = _log_safe_recording_name("Release v2.1 notes")
+        self.assertNotIn("notes", safe)
+        self.assertTrue(_log_safe_recording_name("2026-11-08_12-20__secret plan.wav").endswith(".wav"))
+        self.assertNotIn("secret", _log_safe_recording_name("2026-11-08_12-20__secret plan.wav"))
+
     def test_the_filter_is_installed_exactly_once(self) -> None:
         installed = [
             f for f in logging.getLogger("uvicorn.access").filters

@@ -24,7 +24,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from urllib.request import urlopen
 
 from fastapi import (
@@ -234,10 +234,55 @@ _ACCESS_LOG_POLLED_PATHS: frozenset[str] = frozenset({
     "/api/ui/live-draft", # live-draft autosave, ~1 per 1.2 s while recording
     "/api/models/local",  # Settings → Local models list
 })
+# Polled by id: a job's progress is read every ~1 s while it runs (BL-15:
+# 28 % of all access lines in November, ~15 per job). The job's start and
+# end are logged by the job store itself.
+_ACCESS_LOG_POLLED_PATH_RE = re.compile(r"^/api/jobs/[^/]+$")
+
+
+# ── Dictated text stays out of the log (BL-02) ──────────────────────────────
+#
+# A recording's file name is ``<timestamp>__<title>``, and the title is the
+# first words of what was dictated. main.log is the artefact users attach
+# for support, so a name is logged as its timestamp plus a short digest:
+# still unique and greppable against the archive, no longer the words.
+def _log_safe_recording_name(name: str) -> str:
+    leaf = Path(str(name or "")).name
+    # Only a suffix this app gives a recording's files is kept: a title
+    # with a dot in it ("v2.1 notes") must not leak through as one.
+    known_suffixes = {screen_sessions.SCREENS_DIR_SUFFIX, ".txt", *ALLOWED_AUDIO_EXTS}
+    raw_suffix = Path(leaf).suffix
+    suffix = raw_suffix if raw_suffix.lower() in known_suffixes else ""
+    stem = leaf[: len(leaf) - len(suffix)] if suffix else leaf
+    stamp = stem.split("__", 1)[0] if "__" in stem else "recording"
+    digest = hashlib.sha1(leaf.encode("utf-8", errors="replace")).hexdigest()[:8]
+    return f"{stamp}#{digest}{suffix}"
+
+
+# Recording routes whose second path segment is a recording's name; every
+# other ``/api/recordings/<x>`` route is a fixed word.
+_ACCESS_LOG_FIXED_RECORDING_ROUTES: frozenset[str] = frozenset({
+    "save", "save-with-audio", "save-from-path", "pick-folder", "open-folder", "stats",
+})
+
+
+def _log_safe_access_path(raw_path: str) -> str:
+    """The request path as the access log may show it: a recording's name
+    reduced to ``_log_safe_recording_name``, and no query string on
+    recording routes (``archive_dir`` names the user's folders)."""
+    path, _, _query = raw_path.partition("?")
+    parts = path.split("/")
+    # ["", "api", "recordings", "<name>", ...]
+    if len(parts) >= 4 and parts[1] == "api" and parts[2] == "recordings":
+        if parts[3] and parts[3] not in _ACCESS_LOG_FIXED_RECORDING_ROUTES:
+            parts[3] = _log_safe_recording_name(unquote(parts[3]))
+        return "/".join(parts)
+    return raw_path
 
 
 class _MutedPollingAccessFilter(logging.Filter):
-    """Drop access-log records for successful polls of the paths above.
+    """Drop access-log records for successful polls of the paths above, and
+    keep a recording's name (its dictated title) out of every other line.
 
     uvicorn emits access records with
     ``args = (client_addr, method, full_path, http_version, status)``.
@@ -252,13 +297,19 @@ class _MutedPollingAccessFilter(logging.Filter):
         raw_path, status = args[2], args[4]
         if not isinstance(raw_path, str):
             return True
+        safe_path = _log_safe_access_path(raw_path)
+        if safe_path != raw_path:
+            record.args = (*args[:2], safe_path, *args[3:])
         try:
             code = int(status)
         except (TypeError, ValueError):
             return True
         if not (200 <= code < 300):
             return True  # a failing poll is signal, not noise
-        return raw_path.split("?", 1)[0] not in _ACCESS_LOG_POLLED_PATHS
+        bare = raw_path.split("?", 1)[0]
+        if bare in _ACCESS_LOG_POLLED_PATHS:
+            return False
+        return not (args[1] == "GET" and _ACCESS_LOG_POLLED_PATH_RE.match(bare))
 
 
 _uvicorn_access_logger = logging.getLogger("uvicorn.access")
@@ -3671,7 +3722,7 @@ def _prune_recording_audio(
                 continue
             candidates.append((entry.stat().st_mtime, entry.name, entry))
         except OSError as e:
-            logger.debug("audio retention: skip %s: %s", entry, e)
+            logger.debug("audio retention: skip %s: %s", _log_safe_recording_name(entry.name), e.strerror or type(e).__name__)
     exempt = {stem for stem in keep_stems if stem}
     stamp = time.time() if now is None else now
 
@@ -3680,9 +3731,9 @@ def _prune_recording_audio(
         try:
             entry.unlink()
             deleted += 1
-            logger.info("audio retention: removed %s (%s)", entry.name, reason)
+            logger.info("audio retention: removed %s (%s)", _log_safe_recording_name(entry.name), reason)
         except OSError as e:
-            logger.warning("audio retention: failed to remove %s: %s", entry, e)
+            logger.warning("audio retention: failed to remove %s: %s", _log_safe_recording_name(entry.name), e.strerror or type(e).__name__)
     deleted += _prune_recording_screens(entries, _owned, effective, exempt=exempt, now=stamp)
     return deleted
 
@@ -3742,15 +3793,15 @@ def _prune_recording_screens(
                 continue
             candidates.append((entry.stat().st_mtime, entry.name, entry))
         except OSError as e:
-            logger.debug("screens retention: skip %s: %s", entry, e)
+            logger.debug("screens retention: skip %s: %s", _log_safe_recording_name(entry.name), e.strerror or type(e).__name__)
     deleted = 0
     for entry, reason in _beyond_retention_policy(candidates, policy, exempt=exempt, now=now):
         try:
             shutil.rmtree(entry)
             deleted += 1
-            logger.info("screens retention: removed %s (%s)", entry.name, reason)
+            logger.info("screens retention: removed %s (%s)", _log_safe_recording_name(entry.name), reason)
         except OSError as e:
-            logger.warning("screens retention: failed to remove %s: %s", entry, e)
+            logger.warning("screens retention: failed to remove %s: %s", _log_safe_recording_name(entry.name), e.strerror or type(e).__name__)
     return deleted
 
 
@@ -7780,7 +7831,7 @@ def _build_recordings_list_payload(d: "Path") -> dict:
                 # Finder is missing from History. ``debug``-level so a
                 # routine truncated-during-save won't spam ops, but the
                 # name and exception class are still in the support log.
-                logger.debug("recordings list: skipped %s (%s: %s)", p.name, type(e).__name__, e)
+                logger.debug("recordings list: skipped %s (%s)", _log_safe_recording_name(p.name), type(e).__name__)
                 continue
     _prune_recordings_entry_cache(live_keys)
     items.sort(key=lambda x: x["modified_at"], reverse=True)
@@ -7890,7 +7941,7 @@ def _delete_all_recordings_sync() -> dict:
                             audio_path,
                             restore_err,
                         )
-                logger.warning("delete-all recording failed for %s: %s", p, exc)
+                logger.warning("delete-all recording failed for %s: %s", _log_safe_recording_name(p.name), type(exc).__name__)
                 failed += 1
     return {"deleted": deleted, "failed": failed}
 

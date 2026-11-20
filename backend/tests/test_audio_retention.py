@@ -467,6 +467,21 @@ class SweepFanOutTests(AudioRetentionTestBase):
         self.assertIsNone(self.main._audio_retention_sweeper_thread)
 
 
+class RetentionLogTests(AudioRetentionTestBase):
+    """BL-02: the retention line names a recording by timestamp + digest —
+    its file name carries the first words dictated, and main.log is what
+    users attach for support."""
+
+    def test_the_removed_line_does_not_carry_the_title(self) -> None:
+        self._recording("2026-11-08_10-00-00-000000__call mum about the tests", age_sec=5 * MINUTE)
+        self._recording("2026-11-08_11-00-00-000000__newer", age_sec=1 * MINUTE)
+        with self.assertLogs("backend.main", level="INFO") as logs:
+            self.main._prune_recording_audio(self.root, now=NOW, policy=self._keep(1))
+        joined = "\n".join(logs.output)
+        self.assertIn("audio retention: removed 2026-11-08_10-00-00-000000#", joined)
+        self.assertNotIn("call mum", joined)
+
+
 class UserFilesAreNeverOursTests(AudioRetentionTestBase):
     """BM-03: the archive folder is user-chosen (it may be ~/Movies). A
     media file beside a same-stem ``.txt`` the app did not write is the

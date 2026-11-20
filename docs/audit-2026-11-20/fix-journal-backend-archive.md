@@ -105,3 +105,22 @@ Proof method: SKILL §7.1 — the fixed file is put aside, `git show HEAD:<path>
   FAILED (failures=4)
   ```
 - After: `Ran 35 tests ... OK`; full suite `Ran 905 tests ... OK (skipped=2)`.
+
+### C6 · BL-02 (P1, backend-archive part), BL-15 (P2) · no dictated title in the access log or the archive's log lines; job polls muted
+- Files: `backend/main.py` (`_log_safe_recording_name` = `<timestamp>#<sha1[:8]><known suffix>`, `_log_safe_access_path` + `_ACCESS_LOG_FIXED_RECORDING_ROUTES`: the access filter rewrites a recording route's name segment and drops its query (`archive_dir`); `_ACCESS_LOG_POLLED_PATH_RE` mutes 2xx `GET /api/jobs/<id>`; retention / screens-retention / list-skip / delete-all lines use the safe name and `strerror` instead of the path-bearing exception text), `backend/screen_sessions.py` (`_reason(exc)`; adoption lines name the session id, not the destination path), tests: `test_access_log_filter.py` (5 new), `test_audio_retention.py` (`RetentionLogTests`).
+- Check: `python -m unittest backend.tests.test_access_log_filter backend.tests.test_audio_retention.RetentionLogTests`
+- Before (main.py at HEAD):
+  ```
+  ERROR: test_a_dotted_title_does_not_leak_as_a_suffix (...)
+  ImportError: cannot import name '_log_safe_recording_name' from 'backend.main' (...)
+  FAIL: test_a_recordings_title_never_reaches_the_access_log (...)
+  AssertionError: 'маме' unexpectedly found in '/api/recordings/2026-11-08_12-20-30-572172__Позвонить%20маме%20про%20анализы.txt/audio?archive_dir=%2FUsers%2Fme%2FSecret'
+  FAIL: test_a_successful_job_poll_is_dropped (...)
+  AssertionError: True is not false
+  FAIL: test_the_removed_line_does_not_carry_the_title (...)
+  AssertionError: 'audio retention: removed 2026-11-08_10-00-00-000000#' not found in 'INFO:backend.main:audio retention: removed 2026-11-08_10-00-00-000000__call mum about the tests.webm (beyond newest 1)'
+  Ran 16 tests in 0.049s
+  FAILED (failures=3, errors=1)
+  ```
+- After: `Ran 16 tests ... OK`; full suite `Ran 911 tests ... OK (skipped=2)`.
+- Cross-domain (BL-02 remainder): engine lines `remote_deepgram_live.py` `_handle_result` (`text=%r`), coverage-hole snippets (`_HOLE_REPORT_TEXT_CHARS`), `deepgram_recovery.py` "decoded word(s) had no room … %s"; desktop `appendMainLog` should create main.log with mode 0600.
