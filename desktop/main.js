@@ -122,6 +122,9 @@ const {
   isPasteableTranscript,
   classifyRecordingSignal,
 } = require("./transcript-signal");
+// What a main-process stop does with the renderer's answer — or its
+// silence (DM-03, DM-22).
+const { STOP_ACTION, decideMainProcessStop } = require("./recording-stop");
 // One lease per paste on the snapshot of the user's clipboard, released
 // exactly once (DM-02, DM-26).
 const { createClipboardLeases } = require("./clipboard-lease");
@@ -2957,8 +2960,10 @@ async function stopRecordingFromMainProcess() {
   // (activateCapturedPasteTarget), so the hide bought nothing and cost
   // the user their window.
 
+  let decision = null;
   try {
-    const snapshot = await queryRendererRecordingState().catch(() => ({ recording: false, recordingId: 0 }));
+    // ``null`` = the renderer did not answer — NOT "idle" (DM-03).
+    const snapshot = await queryRendererRecordingState();
     const expectedRecordingId = Number(snapshot?.recordingId || 0);
     const result = snapshot?.recording
       ? await execRendererJsWithTimeout(
@@ -2985,22 +2990,18 @@ async function stopRecordingFromMainProcess() {
         null,
         2000,
       )
-      : {
-        ok: false,
-        recording: false,
-        timerText: "",
-        recordingId: expectedRecordingId,
-        auto: false,
-        autoSendEnter: false,
-      };
+      : null;
+    decision = decideMainProcessStop({ snapshot, result });
 
-    if (!result) {
+    if (decision.action === STOP_ACTION.UNCONFIRMED) {
       appendMainLog("[recording-stop] renderer stop request timed out");
       await setRecordingStatus("App Loading", RECORDING_STATUS_KIND.WARN);
       resetRecordingStatusState();
-    } else if (result?.stale) {
+    } else if (decision.action === STOP_ACTION.KEEP_RECORDING) {
       appendMainLog(
-        `[recording-stop] stale stop ignored current=${Number(result.recordingId || 0)} expected=${Number(result.expectedRecordingId || 0)}`
+        decision.reason === "stale"
+          ? `[recording-stop] stale stop ignored current=${Number(result.recordingId || 0)} expected=${Number(result.expectedRecordingId || 0)}`
+          : "[recording-stop] renderer did not answer the recording-state probe; the recording continues",
       );
       // The recording continues, so the monitor must too. Both callers
       // that can reach a stale stop — the silence auto-stop and the
@@ -3014,26 +3015,23 @@ async function stopRecordingFromMainProcess() {
       // the monitor was half the recovery.
       startRecordingStateMonitor();
       await setRecordingStatus("Recording", RECORDING_STATUS_KIND.RECORDING);
-    } else if (result?.ok) {
-      if (result.auto) {
-        enqueuePostStopTask({
-          autoTranscribe: true,
-          autoSendEnter: !!result.autoSendEnter,
-          stopRequestedAt: Date.now(),
-          recordingId: Number(result.recordingId || 0),
-          target: pasteTarget,
-        });
-        stopRecordingStateMonitor();
-      } else {
-        await setRecordingStatus("Saved To App", RECORDING_STATUS_KIND.OK);
-        resetRecordingStatusState();
-      }
+    } else if (decision.action === STOP_ACTION.ENQUEUE) {
+      enqueuePostStopTask({
+        autoTranscribe: true,
+        autoSendEnter: !!result.autoSendEnter,
+        stopRequestedAt: Date.now(),
+        recordingId: Number(result.recordingId || 0),
+        target: pasteTarget,
+      });
+      stopRecordingStateMonitor();
     } else {
       await setRecordingStatus("Saved To App", RECORDING_STATUS_KIND.OK);
       resetRecordingStatusState();
     }
   } finally {
-    clearCapturedPasteTarget();
+    // The paste target is the app the user started in; a recording that
+    // goes on still needs it at its real stop (DM-22).
+    if (!decision?.keepsPasteTarget) clearCapturedPasteTarget();
   }
 }
 
@@ -3123,15 +3121,18 @@ async function queryRendererState() {
   }
 }
 
+/**
+ * The renderer's recording state, or ``null`` when it did not answer
+ * within the budget. "No answer" is never reported as "not recording"
+ * (DM-03): a busy renderer is still recording.
+ */
 async function queryRendererRecordingState() {
   const state = await execRendererJsWithTimeout(
     `(() => ({ recording: !!window.__transcriptorIsRecording, recordingId: Number(window.__transcriptorCurrentRecordingId || 0) }))();`,
-    { recording: false, recordingId: 0 },
+    null,
     1000,
   );
-  return state && typeof state === "object"
-    ? state
-    : { recording: false, recordingId: 0 };
+  return state && typeof state === "object" ? state : null;
 }
 
 async function waitForRendererRecordingStart(
@@ -3140,7 +3141,8 @@ async function waitForRendererRecordingStart(
   const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
   let lastState = { recording: false, recordingId: 0 };
   while (Date.now() < deadline) {
-    lastState = await queryRendererRecordingState().catch(() => ({ recording: false, recordingId: 0 }));
+    // A probe without an answer says nothing; keep the last one.
+    lastState = (await queryRendererRecordingState()) || lastState;
     if (lastState?.recording && Number(lastState.recordingId || 0) > 0) {
       return {
         confirmed: true,

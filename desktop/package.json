@@ -55,6 +55,7 @@
       "recording-final-slot.js",
       "transcript-signal.js",
       "clipboard-lease.js",
+      "recording-stop.js",
       "power-events.js",
       "child-io.js",
       "paste-protocol.js",
