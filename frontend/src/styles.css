@@ -3887,19 +3887,6 @@ canvas {
   animation: upload-progress-shift 1.4s linear infinite;
 }
 
-/*
- * Determinate variant — applied when we have a real upload-byte
- * progress fraction (XHR.upload.onprogress). The animation is
- * disabled, the width is set inline by JS, and the background is
- * a solid colour so the bar reads as a normal progress indicator
- * rather than the indeterminate shimmer.
- */
-.upload-queue-item-progress-bar.is-determinate {
-  animation: none;
-  background: var(--text-2);
-  transition: width 120ms ease-out;
-}
-
 @keyframes upload-progress-shift {
   0%   { transform: translateX(-120%); }
   100% { transform: translateX(450%); }

@@ -111,6 +111,7 @@ import {
   richerTranscript,
 } from "./transcript-merge";
 import { mergeInterim } from "./live-source";
+import { createOfflineWarmupGate } from "./offline-warmup";
 import { checkForUpdate, shouldAutoCheck, updateCheckOutcome, type UpdateCheckTrigger } from "./update-check";
 import { catalogChoiceForSave, mayAutosaveUiPreferences } from "./settings-autosave";
 import {
@@ -1025,6 +1026,13 @@ const UI_TOKENS = {
   },
   network: {
     refreshIntervalMs: 10_000,
+    /**
+     * How long "offline" must last before it warms the local engine
+     * (BL-12, ./offline-warmup). A wake from sleep reports a few seconds
+     * of offline before Wi-Fi is back; a real outage outlasts a poll and
+     * a half.
+     */
+    offlineWarmupSettleMs: 15_000,
   },
   settings: {
     saveDebounceMs: 260,
@@ -1280,6 +1288,34 @@ const UI_TOKENS = {
     containerProbeTimeoutMs: 2_500,
     shortEmptyRecoveryMs: 8_000,
     defaultEmptyRecoveryMs: 20_000,
+    /**
+     * A recording at most this long (with Deepgram) is "short" for the
+     * empty-transcript recovery budget above (FL-07: an inline ``30``).
+     */
+    shortRecordingMaxSec: 30,
+    /**
+     * The Deepgram stop's announced-budget wait for the final envelope
+     * (PROTOCOL CONTRACT C3; the decision is ``computeEnvelopeDeadlineMs``
+     * in ./envelope-deadline). FL-07: these were module constants beside
+     * the stop's other budgets instead of with them.
+     *
+     *   confirmMs  — the window when the backend expects its wait to add
+     *                nothing, and the deadline before any announcement
+     *                has arrived. Sized from the round trips that DO
+     *                arrive (p50 550 ms on 2026-08-25): waiting longer for
+     *                a message the producer says is not coming is the
+     *                "stop takes 5-7 seconds" latency.
+     *   marginMs   — delivery slack on top of an announced budget: one WS
+     *                hop plus the backend's own close.
+     *   maxWaitMs  — hard ceiling whatever was announced. A stop must end;
+     *                above the worst finalize measured (9.4 s) by enough
+     *                to cover it while still terminating.
+     */
+    announcedEnvelope: {
+      confirmMs: 1_500,
+      marginMs: 800,
+      maxWaitMs: 11_000,
+    },
   },
   drain: {
     maxWaitMs: 450,
@@ -5255,7 +5291,6 @@ function getVisibleLivePreviewText(): string {
 
 function scheduleLocalWarmup(): void {
   const selectedProvider = readProviderSelection();
-  if (!selectedProvider) return;
   // Warm ONLY when the session will actually run a local engine.
   //
   // Root cause this guard fixes: the previous version warmed the
@@ -5283,17 +5318,20 @@ function scheduleLocalWarmup(): void {
   });
 }
 
+// Connectivity flip changes which engine the next session reaches:
+// going offline collapses a remote provider to the local fallback. Warm
+// on a transition only (this runs on every network poll), and on an
+// offline one only once it has lasted (BL-12: wake-from-sleep blips
+// loaded the ~700 MB model for a Deepgram user ~50 times in 18 days).
+const offlineWarmupGate = createOfflineWarmupGate({
+  settleMs: UI_TOKENS.network.offlineWarmupSettleMs,
+  warm: () => scheduleLocalWarmup(),
+});
+
 function setNetworkState(online: boolean, latencyMs: number | null = null): void {
   const wasOnline = isNetworkOnline;
   isNetworkOnline = !!online;
-  // Connectivity flip changes which engine the next session reaches:
-  // going offline collapses a remote provider to the local fallback.
-  // Warm on the transition only — this runs on every network poll, and
-  // re-warming on each tick would defeat the point of not loading the
-  // model until it is needed. ``scheduleLocalWarmup`` is a no-op while
-  // the effective provider is still remote, so the online→offline and
-  // offline→online cases both route through the same single gate.
-  if (wasOnline !== isNetworkOnline) scheduleLocalWarmup();
+  if (wasOnline !== isNetworkOnline) offlineWarmupGate.networkChanged(isNetworkOnline);
   const dot = $("netDot");
   const text = $("netText");
   dot.className = "net-dot" + (online ? " online" : " offline");
@@ -8637,10 +8675,10 @@ async function saveRecordingText(opts: {
   audioFile?: File | null;
   audioSourcePath?: string;
   consumeAudioSourcePath?: boolean;
-  /** When set, the backend atomically discards the live-recovery spool
-   *  for this session ID immediately after the audio is persisted —
-   *  closing the race window between a successful save and the
-   *  separate discardLiveRecovery() call in the frontend. */
+  /** When set, the backend discards the live-recovery spool for this
+   *  session ID as part of the save (deferred while the WebSocket
+   *  handler still owns it) — the save IS the discard; nothing else is
+   *  sent after it (BL-16). */
   liveSessionId?: string;
   /** Screen mode: the staged session the backend adopts beside this recording. */
   screenSessionId?: string;
@@ -10798,29 +10836,6 @@ function announceFinalizeBudget(token: string, value: FinalizeBudgetAnnouncement
 }
 
 /**
- * Confirmation window when the backend expects its wait to add nothing.
- *
- * Sized from the round trips that DO arrive: p50 550 ms on 2026-08-25.
- * Waiting longer than this for a message the producer says is not coming
- * is pure latency, which is what the "stop takes 5-7 seconds" complaint
- * was made of. Also the deadline in effect before any announcement has
- * arrived — see ``computeEnvelopeDeadlineMs``.
- */
-const LIVE_ENVELOPE_CONFIRM_MS = 1_500;
-
-/** Delivery slack on top of the announced budget: one WS hop plus the backend's own close. */
-const LIVE_ENVELOPE_DELIVERY_MARGIN_MS = 800;
-
-/**
- * Hard ceiling regardless of what was announced.
- *
- * A stop must end. This bounds a backend that announces something
- * unreasonable, and it is above the worst finalize measured (9.4 s) by
- * enough to cover it while still terminating.
- */
-const LIVE_ENVELOPE_MAX_WAIT_MS = 11_000;
-
-/**
  * PROTOCOL CONTRACT C3: race the final envelope against the backend's
  * ``finalizing`` announcement (which may arrive after this wait has
  * already started) and a confirm timer, instead of freezing a deadline
@@ -10834,11 +10849,7 @@ const LIVE_ENVELOPE_MAX_WAIT_MS = 11_000;
  */
 function waitForLiveEnvelopeWithAnnouncedBudget(token: string): Promise<LiveFinalEnvelope | null> {
   const tEnv = performance.now();
-  const deadlineConfig = {
-    confirmMs: LIVE_ENVELOPE_CONFIRM_MS,
-    marginMs: LIVE_ENVELOPE_DELIVERY_MARGIN_MS,
-    maxWaitMs: LIVE_ENVELOPE_MAX_WAIT_MS,
-  };
+  const deadlineConfig = UI_TOKENS.finalize.announcedEnvelope;
   return new Promise((resolve) => {
     let settled = false;
     let timerId: number | null = null;
@@ -10877,7 +10888,7 @@ function waitForLiveEnvelopeWithAnnouncedBudget(token: string): Promise<LiveFina
       applyAnnouncement(budgetSlot.value);
     } else {
       budgetSlot.waiters.push(applyAnnouncement);
-      armTimer(LIVE_ENVELOPE_CONFIRM_MS);
+      armTimer(deadlineConfig.confirmMs);
     }
   });
 }
@@ -12518,19 +12529,12 @@ async function stopLive(
         persistedRecordingArchiveDir = persisted.archiveDir;
         screenManifest = parseScreenManifest(persisted.screensManifest) || stagedScreenManifest;
         setCurrentRecordingAudio(savedAudioFile, persistedRecordingName, persistedRecordingArchiveDir, sessionUiToken);
-        // 1.1.25: best-effort recovery discard. The save above ALREADY
-        // succeeded; a 5xx from /api/live-recovery/discard does not
-        // invalidate the persisted recording. Previous code let that
-        // exception escape into the outer ``catch (e)`` at the bottom
-        // of the for-loop, which then reported the recording as a save
-        // failure and left the live-recovery snapshot for the next
-        // boot to "recover" — producing a duplicate of a recording
-        // that was already saved correctly.
-        try {
-          await discardLiveRecovery(liveSessionId);
-        } catch (e) {
-          console.warn("discardLiveRecovery failed (non-fatal); recovery will be re-promoted on next start", e);
-        }
+        // No separate recovery discard (BL-16): the save carried
+        // ``liveSessionId``, and the backend discards that session's
+        // recovery spool as part of the save — deferring it while the
+        // WebSocket handler still owns the spool (BL-01,
+        // ``_safe_delete_live_recovery``). The extra POST answered
+        // ``deleted:false`` on 1 583 of 1 591 sessions.
         const fallbackNote = tryArchiveDir !== sessionArchiveDir && sessionArchiveDir
           ? " (saved to default folder — configured archive was unavailable)"
           : "";
@@ -12763,7 +12767,7 @@ async function stopLive(
     // degraded/offline, waiting 20+ s is network stall, not useful
     // transcription work.
     const RECOVERY_HARD_TIMEOUT_MS =
-      provider === "deepgram" && recordedSec > 0 && recordedSec <= 30
+      provider === "deepgram" && recordedSec > 0 && recordedSec <= UI_TOKENS.finalize.shortRecordingMaxSec
         ? LIVE_SHORT_EMPTY_RECOVERY_TIMEOUT_MS
         : LIVE_DEFAULT_EMPTY_RECOVERY_TIMEOUT_MS;
     const recoverFromEmptyTranscriptInner = async (reason: string, signal?: AbortSignal): Promise<string> => {
@@ -12981,9 +12985,9 @@ async function stopLive(
 
       // Step 1 — wait for the envelope, on the deadline the backend
       // announced (C3). ``waitForLiveEnvelopeWithAnnouncedBudget``
-      // starts at ``LIVE_ENVELOPE_CONFIRM_MS`` and re-arms when the
+      // starts at ``announcedEnvelope.confirmMs`` and re-arms when the
       // ``finalizing`` message lands mid-wait, up to
-      // ``LIVE_ENVELOPE_MAX_WAIT_MS``; it returns immediately when the
+      // ``announcedEnvelope.maxWaitMs``; it returns immediately when the
       // envelope is already on the slot, which is the common case. No
       // socket at all means no envelope can ever arrive, so there is
       // nothing to wait for.

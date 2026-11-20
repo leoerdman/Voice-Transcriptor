@@ -171,3 +171,76 @@ intermediate state would have needed its own full verification run on a shared, 
   wiring. The button-feedback suite passes on HEAD too (refactor onto the surviving entry point).
 - After: frontend `Test Files 47 passed · Tests 607 passed`; desktop `ℹ tests 441 · pass 441 · fail 0`; typecheck,
   lint, build clean; `node --check` OK.
+
+## Commit 4 · FL-07 (numbers), BL-16, BL-12, dead CSS `.is-determinate`; FQ-12 checked
+
+- **FL-07** — `LIVE_ENVELOPE_CONFIRM_MS` / `_DELIVERY_MARGIN_MS` / `_MAX_WAIT_MS` move into
+  `UI_TOKENS.finalize.announcedEnvelope {confirmMs, marginMs, maxWaitMs}` (their reasoning moves with them) and the
+  inline "short recording ≤ 30 s" becomes `UI_TOKENS.finalize.shortRecordingMaxSec`. Same values, no behaviour
+  change. Routing the local-assist path through the announced-budget waiter is NOT done (see Not done).
+- **BL-16** — stopLive no longer POSTs `/api/live/recoveries/{id}/discard` after a successful save-with-audio: the
+  save carries `liveSessionId`, and `backend/main.py` `_save_recording_payload` calls `_safe_delete_live_recovery`
+  for it (deferred while the WS handler owns the spool — BL-01). Verified by reading the backend. The discard for a
+  DISCARDED take (no save) stays.
+- **BL-12** — new `frontend/src/offline-warmup.ts` `createOfflineWarmupGate`: an online→offline flip warms the
+  local engine only after offline has lasted `UI_TOKENS.network.offlineWarmupSettleMs` (15 s); coming back online
+  first cancels it; an offline→online flip passes through at once (the warm-up gate is a no-op for a remote
+  provider). `setNetworkState` reports flips to it. Also dropped `scheduleLocalWarmup`'s `if (!selectedProvider)`
+  guard, dead since FU-15.
+- **Dead CSS** — `.upload-queue-item-progress-bar.is-determinate` (no producer since FQ-06 (a)) deleted.
+- **FQ-12** — nothing to change: `applyRuntimeLimits` already goes through `frontend/src/runtime-limits.ts`
+  `parseRuntimeLimits`, which accepts any positive integer the backend reports and logs what it rejects (ac324e4).
+  (b) — pausing uploads while recording — is a product decision (hypothesis); not done.
+- Files: `frontend/src/{main.tsx,offline-warmup.ts,styles.css}`, `frontend/tests/offline-warmup.test.ts`.
+- Before: `offline-warmup.test.ts` cannot load on HEAD 8ae23bc (module did not exist) — exit 1; FL-07 / BL-16 / CSS
+  are a move, a deleted redundant call and a deleted rule with no behaviour to pin (FL-07 values unchanged; BL-16's
+  effect is one fewer request, verified against the backend code).
+- After: frontend `Test Files 48 passed · Tests 610 passed`; desktop `ℹ tests 441 · pass 441 · fail 0`; typecheck,
+  lint, build clean; `node --check` OK.
+
+## Not done (ID → reason)
+- **DM-14, recording-state push half** (renderer publishes `{isRec, vu, rms, lastFrameAt, recordingId}`; main drops
+  its poll) → not clean in this lane. Main reads those globals at DECISION points, synchronously with the renderer
+  (`queryRendererRecordingState` before a toggle, the stop query that also dispatches the stop, the monitor's
+  dead-pipeline check). A pushed cache answers those from a value up to one push old, so a toggle could act on a
+  recording that just ended — a new race, not a simplification. It also rewires the toggle/stop path the
+  screen-mode lane is changing (screenMode.start ordering). The monitor's level poll alone could move to a push;
+  doing half leaves both mechanisms. Left for a lane that owns the toggle path.
+- **FQ-06 (b, c)** (`onJobCreated`, delete `_stageCrossoverDelay` / `_stageTimer`) → the hook belongs in the job
+  transport (`localJob*`/`remoteJob*`/`waitForQueued*Job`, ~4669–4930), which the FQ-04 lane is rewriting in
+  parallel (job polling / cancel-in-finally). Doing it here guarantees a conflict in the same functions; it should
+  ride on that lane's result.
+- **FL-08** (one `decodeSavedRecording` for Re-transcribe and stopLive's recovery) → the two chains differ in
+  timeout, abort and the diarize snapshot; unifying them changes Re-transcribe's behaviour (gains the stop path's
+  timeout/abort — the finding asks for exactly that), a reviewable change on its own in ~250 lines of async code.
+  Not attempted in this pass for lack of time to verify it properly; no partial extraction was left behind.
+- **FL-07, second half** (local-assist envelope through `waitForLiveEnvelopeWithAnnouncedBudget`) → changes the local
+  stop budget from 4 s to 1.5 s (backend announces `finalizing` only for Deepgram) — a product decision, as the
+  live lane recorded.
+- **S-15** (History player streams `<audio src>`) → an `<audio>` element cannot send the `Authorization` header;
+  streaming needs a backend route that accepts a short-lived, route-scoped token (query or cookie). That is backend
+  work and touches token delivery, which the BM-01 lane owns. Renderer-only would mean putting the full API token in
+  a URL (the access log would record it — the reason the delete-all comment exists).
+- **FQ-14 (e)** (classes instead of inline `style.*` on the boot-error disclosure) → not in this lane's item list;
+  styles.css only lost the dead rule.
+- **FQ-12 (b)** → product decision (hypothesis).
+- **H-03 behaviour** → native-helper change, explicitly out of scope.
+
+## Cross-domain, for the lead
+1. **Screen-mode lane** — `screen-mode-controller.js` now REQUIRES `deps.capsuleLayout` (`{bottomMargin, height}`)
+   and exports `SCREEN_MODE_LAYERS`; a lane that constructs the controller (tests or main.js) must pass it.
+   main.js's `screen-mode:finish` handler now starts with `if (!isFromMainWindow(event)) return refusedSender(…)`.
+2. **FQ-04 lane** — FQ-06 (b, c) belongs on top of your transport rewrite (`onJobCreated`, then delete
+   `_stageCrossoverDelay`/`_stageTimer`).
+3. **BM-01 lane** — S-15 needs a route-scoped short-lived audio token from the backend; the renderer then sets
+   `<audio src>` and keeps the Blob fetch for re-transcribe only.
+4. **Merge note** — `frontend/src/main.tsx`: the WS-open block in startLive is dedented by two spaces (the
+   `sessionWsMode === "none"` branch went with FU-15); a lane that edits the WS query (`screen_session_id`, S-01)
+   will conflict textually there — the content is unchanged.
+5. **`window.__transcriptorMicHealth`** — written by the renderer, read by nothing in desktop/ (grep). Not in the
+   DM-15 list, so left; worth a decision (devtools aid vs dead global).
+6. **CHANGELOG** — this lane's user-visible changes: Live toolbar has no "None" (a stored None becomes the default
+   provider); Settings shortcut badges update the moment registration changes (no 2 s lag) and an empty optional
+   slot is not badged; the passive update check no longer writes "Couldn't check…" into Settings; the boot overlay
+   no longer flashes "Ready" before a boot error; the WebM-window notice says "2 hours". Only the H-03 correction
+   was written into [Unreleased] here.
