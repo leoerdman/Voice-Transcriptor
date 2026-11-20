@@ -73,7 +73,7 @@
 
 | Полоса | Где | Состояние | Что сохранено |
 |---|---|---|---|
-| **screen-gestures** (Opus, единственная живая) | ворктри `.claude/worktrees/agent-a34db39e26926102c`, ветка `worktree-agent-a34db39e26926102c` от `13f25e2` | В работе; на момент записи **0 коммитов**, незакоммичено 4 файла (+117/−5). Ей отправлено указание: немедленно WIP-коммит + журнал `docs/audit-2026-11-20/fix-journal-xlane-screen-gestures.md`, затем доделать. Не мержить, не пушить. | Снимок незакоммиченного диффа (253 строки) — **`docs/audit-2026-11-20/screen-gestures-wip-snapshot.patch`** в main (применяется `git apply` от `13f25e2`). |
+| **screen-gestures** (Opus, единственная живая) | ворктри `.claude/worktrees/agent-a34db39e26926102c`, ветка `worktree-agent-a34db39e26926102c` от `13f25e2` | В работе. **Баг 1 закоммичен**: `e815519` (эхо переотправленного клика пропускается; строка нажатия с `echoes=`/`by=`; серии одинаковых строк схлопываются в одну со счётчиком; desktop 511/511) и `b724c4c` (журнал `docs/audit-2026-11-20/fix-journal-xlane-screen-gestures.md`). Ветка **запушена на origin** (не влита). Ещё делает: схлопывание одинаковых пометок в `screen-annotations.ts` и баг 2 (быстрое стирание). | Снимок незакоммиченного диффа (253 строки) — **`docs/audit-2026-11-20/screen-gestures-wip-snapshot.patch`** в main (применяется `git apply` от `13f25e2`). |
 | p1-backend, screen-seams, ui-desktop-p2, residue, behaviour-tests, source-dup | — | Завершены, влиты в main, ворктри и ветки удалены | Журналы `docs/audit-2026-11-20/fix-journal-xlane-*.md` |
 | Читатели (сверка сентябрьской ветки, ревью коммитов ведущего, Deepgram-доки) | — | Завершены | Выводы — в §2, B.4 |
 
