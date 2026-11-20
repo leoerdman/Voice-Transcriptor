@@ -11,6 +11,7 @@ import {
   summarizeCaptureLevel,
 } from "./audio-levels";
 import { decideLiveTranscriptAdoption } from "./live-coverage";
+import { playRecordingCue } from "./recording-cues";
 import {
   describeLiveFinalStats,
   liveCloseOwesErrorEnvelope,
@@ -10975,6 +10976,8 @@ function pushCapturedFrame(input: Float32Array, preRollMs = 0): void {
     // cost the user experiences as the capsule not doing anything yet.
     markStartPhase("first-frame");
     startFirstFrameSeen = true;
+    // The microphone is really recording now: tell the user to speak.
+    playRecordingCue("start");
     const totalMs = performance.now() - startT0;
     const labels = startTimings
       .map(([label, t], i) => {
@@ -11780,6 +11783,7 @@ async function stopLive(
   liveStartAttemptSeq += 1;
   const stopTransitionToken = createClientSessionId();
   stopTransitionInFlight = true;
+  playRecordingCue("stop");
   stopTransitionOwnerToken = stopTransitionToken;
   // ``_wsToCloseAtEnd`` is hoisted to function scope so the outer
   // ``finally`` block can close the WS AFTER the entire transcribe
