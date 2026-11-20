@@ -118,7 +118,6 @@ const {
   NO_SPEECH_STATUS,
   SIGNAL_OUTCOME,
   normalizeTranscriptText,
-  isNoSpeechPlaceholder,
   isPasteableTranscript,
   classifyRecordingSignal,
 } = require("./transcript-signal");
@@ -541,10 +540,6 @@ const RECORDING_AUTOSTOP_WARMUP_MS = 1500;
  *  running with no way out but quitting. */
 const RECORDING_DEAD_PIPELINE_MS = 8000;
 
-/** How many finished recordings the renderer snapshot carries back. It is
- *  a hand-off buffer, not a history: the post-stop task looks for ONE id
- *  in it, and the renderer owns the real list. */
-const RENDERER_FINISHED_RECORDS_LIMIT = 30;
 let recordingSilenceStartedAt = 0;
 let recordingAutoStopConfig = DEFAULT_RECORDING_AUTO_STOP_CONFIG;
 let recordingAutoStopConfigRefreshAt = 0;
@@ -565,7 +560,7 @@ let pendingTranscriptionCount = 0;
 // because the renderer can publish the paste-ready text BEFORE the
 // post-stop task starts waiting for it (fast recording, queued task) —
 // an event fired into no listener would be lost, and the recording
-// would fall back to the 32 s poll for a transcript that already exists.
+// would wait out its deadline for a transcript that already exists.
 const recordingFinalSlot = createRecordingFinalSlot();
 let backendRestartTimer = null;
 // Render-process-gone recovery timer. Schedules a loadURL to recreate
@@ -3045,6 +3040,10 @@ const RENDERER_RECORDING_START_CONFIRM_POLL_MS = 80;
 
 async function queryRendererState() {
   if (!win || win.isDestroyed() || !win.webContents) return null;
+  // The paste-last lookup's view of the renderer: its newest paste-ready
+  // text and its newest ui-final publish (kind + text). Nothing else —
+  // the post-stop task reads the IPC hand-off, not the renderer's globals.
+  //
   // Attach a no-op ``.catch`` to the executeJavaScript promise up-front so
   // a late rejection (renderer crashes AFTER our Promise.race timeout
   // already gave up waiting) doesn't surface as an unhandledRejection in
@@ -3052,52 +3051,11 @@ async function queryRendererState() {
   // the queryPromise's eventual settlement is intentionally discarded.
   const queryPromise = win.webContents.executeJavaScript(
     `
-    (() => {
-      const finishedAt = Number(window.__transcriptorLastFinishedAt || 0);
-      const finishedRecordingId = Number(window.__transcriptorLastFinishedRecordingId || 0);
-      const finishedText = String(window.__transcriptorLastFinishedText || '').trim();
-      const uiFinalAt = Number(window.__transcriptorLastUiFinalAt || 0);
-      const uiFinalRecordingId = Number(window.__transcriptorLastUiFinalRecordingId || 0);
-      const uiFinalText = String(window.__transcriptorLastUiFinalText || '').trim();
-      const uiFinalKind = String(window.__transcriptorLastUiFinalKind || '').trim();
-      const finishedRecords = Array.isArray(window.__transcriptorFinishedRecords)
-        ? window.__transcriptorFinishedRecords
-          .map((x) => ({
-            recordingId: Number((x && x.recordingId) || 0),
-            finishedAt: Number((x && x.finishedAt) || 0),
-            text: String((x && x.text) || '').trim(),
-          }))
-          .filter((x) => x.recordingId > 0 && x.finishedAt > 0 && x.text.length > 0)
-          .slice(-${RENDERER_FINISHED_RECORDS_LIMIT})
-        : [];
-      const isRec = !!(window.__transcriptorIsRecording);
-      const liveSnapshot = typeof window.__transcriptorLiveStatusSnapshot === 'function'
-        ? window.__transcriptorLiveStatusSnapshot()
-        : null;
-      const status = String(liveSnapshot?.status || '').trim();
-      const statusKind = String(liveSnapshot?.statusKind || '').trim();
-      const finalText = (document.getElementById('finalOutput')?.textContent || '').trim();
-      const liveText = (document.getElementById('liveOutput')?.textContent || '').trim();
-      const busy = !!liveSnapshot?.busy;
-      const progressVisible = document.getElementById('progressRow') ? !document.getElementById('progressRow').hidden : false;
-      return {
-        finishedAt,
-        finishedRecordingId,
-        finishedText,
-        uiFinalAt,
-        uiFinalRecordingId,
-        uiFinalText,
-        uiFinalKind,
-        finishedRecords,
-        isRec,
-        status,
-        statusKind,
-        finalText,
-        liveText,
-        busy,
-        progressVisible,
-      };
-    })();
+    (() => ({
+      finishedText: String(window.__transcriptorLastFinishedText || '').trim(),
+      uiFinalText: String(window.__transcriptorLastUiFinalText || '').trim(),
+      uiFinalKind: String(window.__transcriptorLastUiFinalKind || '').trim(),
+    }))();
     `,
     true
   ).catch(() => null);
@@ -5929,25 +5887,34 @@ function enqueuePostStopTask(options = {}) {
     target: normalizeCapturedPasteTarget(options.target),
   };
   if (!task.autoTranscribe) return false;
-  // Dedup by recordingId. recordingId === 0 is the legacy fallback
-  // (renderer didn't supply one, very old build); skip dedup for
-  // those so the legacy path still works at least once. Modern
-  // renderers always send a positive monotonic id.
-  if (task.recordingId > 0) {
-    if (_enqueuedRecordingIds.has(task.recordingId)) {
-      appendMainLog(
-        `[post-stop-queue] dedup-skipped rec=${task.recordingId} ` +
-        `(already enqueued; preventing double-paste)`
-      );
-      return false;
+  // A task is matched to its transcript by recordingId alone — the IPC
+  // hand-off carries nothing else (DM-15). The renderer always reports
+  // its positive monotonic id for the recording being stopped; a task
+  // without one could only wait out the deadline for a signal that can
+  // never match it, so it is refused, and the session is closed here
+  // rather than leaving the capsule on "Transcribing".
+  if (!(task.recordingId > 0)) {
+    appendMainLog(`[post-stop-queue] refused: no recording id (rec=${task.recordingId})`);
+    if (!hasActivePostStopWork()) {
+      void setRecordingStatus("Saved To App", RECORDING_STATUS_KIND.OK)
+        .catch(() => { })
+        .finally(() => resetRecordingStatusState());
     }
-    _enqueuedRecordingIds.add(task.recordingId);
-    // Roll the oldest entry out when the cap is reached.
-    if (_enqueuedRecordingIds.size > _ENQUEUED_RECORDING_IDS_CAP) {
-      const iter = _enqueuedRecordingIds.values();
-      const oldest = iter.next().value;
-      if (oldest !== undefined) _enqueuedRecordingIds.delete(oldest);
-    }
+    return false;
+  }
+  if (_enqueuedRecordingIds.has(task.recordingId)) {
+    appendMainLog(
+      `[post-stop-queue] dedup-skipped rec=${task.recordingId} ` +
+      `(already enqueued; preventing double-paste)`
+    );
+    return false;
+  }
+  _enqueuedRecordingIds.add(task.recordingId);
+  // Roll the oldest entry out when the cap is reached.
+  if (_enqueuedRecordingIds.size > _ENQUEUED_RECORDING_IDS_CAP) {
+    const iter = _enqueuedRecordingIds.values();
+    const oldest = iter.next().value;
+    if (oldest !== undefined) _enqueuedRecordingIds.delete(oldest);
   }
   postStopQueue.push(task);
   pendingTranscriptionCount += 1;
@@ -6016,10 +5983,8 @@ async function runPostStopQueue() {
 // this gate should never fire; that is the point of putting it in front of
 // the one action a future third entry point could not undo.
 //
-// It does NOT cover the legacy `recordingId === 0` path, and an earlier
-// version of this comment claimed it did: an id of 0 is exempt from BOTH
-// gates by the same rule, because a renderer old enough not to send an id
-// cannot be deduplicated at all.
+// Both gates key on a positive recordingId; enqueuePostStopTask admits no
+// other (the hand-off protocol has nothing to match a task to without one).
 const _pastedRecordingIds = new Set();
 const _PASTED_RECORDING_IDS_CAP = 4096;
 function _markRecordingPasted(recordingId) {
@@ -6059,25 +6024,9 @@ async function processPostStopTask(task) {
   // add latency to healthy recordings; it only prevents legitimate
   // slow recovery from degrading into "Saved To App" with no paste.
   const POST_STOP_TRANSCRIPT_TIMEOUT_MS = PASTE_POST_STOP_DEADLINE_MS;
-  // BUGS_AUDIT §6.7. The renderer's IPC hand-off is the primary path;
-  // the executeJavaScript poll is what happens when it never speaks.
-  // A renderer that has the bridge sends its first signal within
-  // milliseconds of publishing any output, so this window is generous
-  // for the case it covers and short enough that an OLDER renderer —
-  // one built before the bridge existed, which will never call it —
-  // loses at most this much before the poll takes over.
-  const POST_STOP_IPC_GRACE_MS = 2000;
-  // Poll cadence once the fallback is in charge. 30 ms cost up to ~1000
-  // synchronous evaluations in the renderer at exactly the moment it
-  // finalizes Deepgram, runs the paste upscale and serializes audio
-  // (§6.7). At 250 ms the fallback costs ~120 over the whole deadline,
-  // and it only runs at all when nothing better is available.
-  const POST_STOP_POLL_INTERVAL_MS = 250;
   const deadline = Date.now() + POST_STOP_TRANSCRIPT_TIMEOUT_MS;
   let transcript = "";
-  let pollCount = 0;
   const stopRequestedAt = Number(task.stopRequestedAt || Date.now());
-  let recordingStatusPhase = "transcribing";
   let terminalWithoutPasteStatus = "";
   // BUGS_AUDIT §6.9: the best text seen for THIS recording that was not
   // paste-ready — a pre-upscale provisional, or a status-only signal
@@ -6087,14 +6036,12 @@ async function processPostStopTask(task) {
   // Sequence of the last hand-off signal already accounted for, so the
   // same signal cannot be handled twice by the loop below.
   let handledSignalSeq = 0;
-  let heardIpcSignal = false;
 
   // One reading of a hand-off signal, used wherever a signal is picked
   // up, so the primary path cannot drift from the late-arrival case.
   // Returns "final" | "terminal" | "provisional".
   const consumeIpcSignal = (signal) => {
     handledSignalSeq = signal.seq;
-    heardIpcSignal = true;
     // §6.8: finality is stated, never inferred — and so is everything
     // else. The renderer's ``final`` flag and its "<kind>:<phase>" source
     // label decide; the text is never read for clues (DM-01: a dictation
@@ -6123,32 +6070,22 @@ async function processPostStopTask(task) {
     return verdict.outcome;
   };
 
-  // How the transcript arrives, in one loop with two sources and a
-  // strict order of preference (BUGS_AUDIT §6.7):
+  // How the transcript arrives: the renderer's IPC hand-off, and only
+  // that (DM-15, S-13). An executeJavaScript poll of ~14 renderer
+  // globals and 6 DOM ids used to take over after 2 s of IPC silence,
+  // for "an older renderer built before the bridge existed" — which
+  // cannot occur, because main and renderer ship in one bundle. It was a
+  // second owner of the same decision with its own vocabulary (status
+  // literals "Done"/"Idle"/"upscaling") and it started exactly when the
+  // renderer is legitimately still finalising (envelope wait, recovery).
+  // Every renderer publish for a recording sends a signal; the slot
+  // keeps them, so one published before this task started is not lost.
+  // If the renderer never publishes, the deadline hands bestKnownText to
+  // the §6.9 recovery, as before.
   //
-  //   1. The renderer's IPC hand-off. Primary. Once ANYTHING has come
-  //      over the bridge we know the renderer speaks the protocol, so we
-  //      stay on it until the deadline: it WILL publish the paste-ready
-  //      text, and if it dies before doing so, the provisional already
-  //      in hand is the best-known text §6.9 recovers with. Zero
-  //      evaluations are injected into the renderer on this path.
-  //   2. The executeJavaScript poll. Fallback, entered only after the
-  //      bridge has stayed silent for the whole grace window — an older
-  //      renderer, built before the bridge existed, which will never
-  //      call it. recordingId <= 0 is the same case one step further
-  //      back (a renderer too old even to supply an id): there is no id
-  //      to match a signal against, so it starts polling immediately.
-  //
-  // A late first signal still wins: the loop re-reads the slot on every
-  // pass, so a renderer that speaks up after the poll started takes the
-  // poll back out of charge.
-  const ipcGraceUntil = Date.now() + POST_STOP_IPC_GRACE_MS;
-  let pollFallbackStarted = false;
   // Sleep that ends the moment the renderer publishes something newer
-  // than what has already been handled. Used for every wait below, so a
-  // signal is never sitting in the slot while this task sleeps on a
-  // timer. With a legacy recordingId there is nothing to match, and the
-  // slot degrades to exactly that plain timer.
+  // than what has already been handled, so a signal is never sitting in
+  // the slot while this task sleeps on a timer.
   const restUntilSignalOr = (ms) =>
     recordingFinalSlot.waitForSignal(task.recordingId, {
       sinceSeq: handledSignalSeq,
@@ -6156,207 +6093,13 @@ async function processPostStopTask(task) {
     });
 
   while (Date.now() < deadline) {
-    // 1. The primary path: anything the renderer has handed over.
     const known = recordingFinalSlot.peek(task.recordingId);
     if (known?.last && known.last.seq > handledSignalSeq) {
       // "provisional" is not an answer — keep waiting for the final.
       if (consumeIpcSignal(known.last) !== SIGNAL_OUTCOME.PROVISIONAL) break;
       continue;
     }
-
-    // 2. The fallback poll takes over only when the bridge has stayed
-    //    silent for the whole grace window. Once the renderer HAS used
-    //    it, the poll never starts: the renderer will publish the
-    //    paste-ready text, and until it does there is nothing the poll
-    //    could learn that §6.8 would let us paste anyway.
-    const pollInCharge =
-      !heardIpcSignal && (task.recordingId <= 0 || Date.now() >= ipcGraceUntil);
-    if (!pollInCharge) {
-      const waitUntil = heardIpcSignal ? deadline : Math.min(ipcGraceUntil, deadline);
-      await restUntilSignalOr(waitUntil - Date.now());
-      continue;
-    }
-    if (!pollFallbackStarted) {
-      pollFallbackStarted = true;
-      traceStep(trace, "poll_fallback", {
-        elapsedMs: Date.now() - stopRequestedAt,
-        recordingId: task.recordingId || 0,
-        reason: task.recordingId > 0 ? "no-ipc-signal-within-grace" : "legacy-recording-id",
-      });
-    }
-
-    // Everything below is the pre-§6.7 poll, minus the two wall-clock
-    // guesses §6.8 removed: status-only text is best-known text, never
-    // a final.
-    pollCount += 1;
-    if (!win || win.isDestroyed() || !win.webContents) {
-      traceStep(trace, "poll_window_lost", { pollCount });
-      await restUntilSignalOr(70);
-      continue;
-    }
-    const state = await queryRendererState();
-    if (!state) {
-      traceStep(trace, "poll_js_error", { pollCount });
-      await restUntilSignalOr(70);
-      continue;
-    }
-    const statusLower = String(state.status || "").trim().toLowerCase();
-    if (!state.isRec) {
-      if (statusLower === "upscaling" && recordingStatusPhase !== "upscaling") {
-        await setRecordingStatus("Upscaling", RECORDING_STATUS_KIND.UPSCALING);
-        recordingStatusPhase = "upscaling";
-      } else if ((statusLower === "processing" || statusLower === "transcribing") && recordingStatusPhase !== "transcribing") {
-        await setRecordingStatus("Transcribing", RECORDING_STATUS_KIND.TRANSCRIBING);
-        recordingStatusPhase = "transcribing";
-      }
-    }
-    const finishedRecords = Array.isArray(state.finishedRecords) ? state.finishedRecords : [];
-    const byRecording = task.recordingId > 0
-      ? finishedRecords.find((x) => Number(x?.recordingId || 0) === task.recordingId)
-      : null;
-    const byTime = task.recordingId <= 0
-      ? [...finishedRecords]
-        .filter((x) => Number(x?.finishedAt || 0) > stopRequestedAt)
-        .sort((a, b) => Number(b?.finishedAt || 0) - Number(a?.finishedAt || 0))[0]
-      : null;
-    const uiFinalKind = String(state.uiFinalKind || "").trim().toLowerCase();
-    const uiFinalText = normalizeTranscriptText(state.uiFinalText || "");
-    const uiFinalBelongsToTask =
-      task.recordingId > 0
-        ? Number(state.uiFinalRecordingId || 0) === task.recordingId
-        : Number(state.uiFinalAt || 0) > stopRequestedAt;
-    const uiFinalStatusHasTranscript =
-      uiFinalKind === "status" &&
-      uiFinalBelongsToTask &&
-      isPasteableTranscript(uiFinalText);
-    const uiFinalTerminalWithoutPaste =
-      uiFinalBelongsToTask &&
-      (uiFinalKind === "status" || uiFinalKind === "error") &&
-      !!uiFinalText &&
-      !uiFinalStatusHasTranscript;
-    const uiFinalReadyByRecording =
-      uiFinalKind === "transcript" &&
-      isPasteableTranscript(uiFinalText) &&
-      task.recordingId > 0 &&
-      Number(state.uiFinalRecordingId || 0) === task.recordingId;
-    const uiFinalReadyByTime =
-      uiFinalKind === "transcript" &&
-      isPasteableTranscript(uiFinalText) &&
-      task.recordingId <= 0 &&
-      Number(state.uiFinalAt || 0) > stopRequestedAt;
-    const readyByRecording = !!byRecording || (task.recordingId > 0 && Number(state.finishedRecordingId || 0) === task.recordingId);
-    const readyByTime = !!byTime || (task.recordingId <= 0 && state.finishedAt > stopRequestedAt);
-    if (readyByRecording || readyByTime || uiFinalReadyByRecording || uiFinalReadyByTime) {
-      transcript = normalizeTranscriptText(
-        byRecording?.text || byTime?.text || state.finishedText || uiFinalText || ""
-      );
-      if (!isPasteableTranscript(transcript)) {
-        const terminalReason = isNoSpeechPlaceholder(transcript)
-          ? "no-speech-ready-signal"
-          : !transcript && (byRecording || byTime || Number(state.finishedRecordingId || 0) === task.recordingId)
-            ? "empty-finished-record"
-            : uiFinalTerminalWithoutPaste
-              ? "ui-final-status"
-              : "";
-        if (terminalReason) {
-          terminalWithoutPasteStatus = isNoSpeechPlaceholder(transcript) || terminalReason === "empty-finished-record"
-            ? NO_SPEECH_STATUS
-            : uiFinalText;
-          traceStep(trace, "signal_ready_terminal_without_paste", {
-            pollCount,
-            expectedRecordingId: task.recordingId || 0,
-            finishedRecordingId: Number(byRecording?.recordingId || state.finishedRecordingId || state.uiFinalRecordingId || 0),
-            reason: terminalReason,
-            textLen: transcript.length,
-          });
-          break;
-        }
-        traceStep(trace, "signal_ready_ignored_non_transcript", {
-          pollCount,
-          textLen: transcript.length,
-        });
-        transcript = "";
-        await restUntilSignalOr(POST_STOP_POLL_INTERVAL_MS);
-        continue;
-      }
-      traceStep(trace, "signal_ready", {
-        pollCount,
-        finishedAt: Number(byRecording?.finishedAt || byTime?.finishedAt || state.finishedAt || 0),
-        finishedRecordingId: Number(byRecording?.recordingId || state.finishedRecordingId || state.uiFinalRecordingId || 0),
-        expectedRecordingId: task.recordingId || 0,
-        delay: Number(byRecording?.finishedAt || byTime?.finishedAt || state.finishedAt || state.uiFinalAt || 0) - stopRequestedAt,
-        source: byRecording ? "finished_record" : byTime ? "finished_record_by_time" : state.finishedText ? "finished_text" : "ui_final",
-        textLen: transcript.length,
-      });
-      break;
-    }
-    if (uiFinalStatusHasTranscript) {
-      // BUGS_AUDIT §6.8. This is the status-only publish: the renderer
-      // has text, but the paste-ready version (post-upscale) does not
-      // exist yet. It used to become the pasted transcript after 3500 ms
-      // of waiting, which made one recording produce two possible
-      // results depending on how long the upscale took. A wall clock
-      // cannot know whether text is final — only the renderer can, and
-      // it says so on the signal it publishes next. Until then this is
-      // best-known text: never pasted, but what §6.9 recovers with if
-      // the deadline expires.
-      bestKnownText = uiFinalText;
-    }
-    if (uiFinalTerminalWithoutPaste) {
-      terminalWithoutPasteStatus = isNoSpeechPlaceholder(uiFinalText)
-        ? NO_SPEECH_STATUS
-        : uiFinalText;
-      traceStep(trace, "terminal_without_paste", {
-        pollCount,
-        expectedRecordingId: task.recordingId || 0,
-        uiFinalRecordingId: Number(state.uiFinalRecordingId || 0),
-        uiFinalKind,
-        status: compactLogText(state.status || "", 80),
-        statusKind: compactLogText(state.statusKind || "", 40),
-        reason: isNoSpeechPlaceholder(uiFinalText) ? "no-speech" : "ui-final-status",
-      });
-      break;
-    }
-    const doneLike = !state.busy && !state.progressVisible && !state.isRec &&
-      (
-        state.status === "Done" ||
-        state.status === "Error" ||
-        state.status === "Idle" ||
-        state.statusKind === "done" ||
-        state.statusKind === "error" ||
-        state.statusKind === "idle"
-      );
-    if (doneLike && state.status === "Done" && uiFinalStatusHasTranscript) {
-      // Status "Done" with transcript text but no paste-ready signal
-      // yet. §6.8's second wall-clock guess lived here — 600 ms and the
-      // pre-upscale text was pasted. Keep waiting instead: the renderer
-      // publishes the paste-ready text within its own upscale SLA, and
-      // if it never does, the deadline hands bestKnownText to §6.9.
-      traceStep(trace, "done_waiting_for_paste_ready", {
-        pollCount,
-        expectedRecordingId: task.recordingId || 0,
-        uiFinalRecordingId: Number(state.uiFinalRecordingId || 0),
-        textLen: uiFinalText.length,
-      });
-      await restUntilSignalOr(POST_STOP_POLL_INTERVAL_MS);
-      continue;
-    }
-    if (doneLike) {
-      terminalWithoutPasteStatus = isNoSpeechPlaceholder(uiFinalText)
-        ? NO_SPEECH_STATUS
-        : "";
-      traceStep(trace, "terminal_done_without_transcript", {
-        pollCount,
-        expectedRecordingId: task.recordingId || 0,
-        uiFinalRecordingId: Number(state.uiFinalRecordingId || 0),
-        uiFinalKind,
-        status: compactLogText(state.status || "", 80),
-        statusKind: compactLogText(state.statusKind || "", 40),
-        reason: terminalWithoutPasteStatus ? "no-speech" : "done-no-transcript",
-      });
-      break;
-    }
-    await restUntilSignalOr(POST_STOP_POLL_INTERVAL_MS);
+    await restUntilSignalOr(deadline - Date.now());
   }
 
   let recordingStatusText = "Saved To App";
@@ -6422,11 +6165,10 @@ async function processPostStopTask(task) {
       // that bypass the enqueue dedup) is rejected by the second-line
       // guard at the top of processPostStopTask.
       //
-      // There is exactly ONE paste site in this function, reached by
-      // both hand-off paths — the IPC final and the poll fallback only
-      // differ in how ``transcript`` was filled. So paste-last and the
-      // double-paste guard cannot end up covering one path and not the
-      // other: adding a path can only mean filling in ``transcript``.
+      // There is exactly ONE paste site in this function, and the IPC
+      // hand-off is the only thing that fills ``transcript``. So
+      // paste-last and the double-paste guard cannot end up covering one
+      // path and not another.
       _markRecordingPasted(task.recordingId);
       // Show success immediately once the paste actually happened.
       await setRecordingStatus("Pasted", RECORDING_STATUS_KIND.OK);
@@ -6476,7 +6218,7 @@ async function processPostStopTask(task) {
       recordingStatusText = terminalWithoutPasteStatus;
       recordingStatusKind = RECORDING_STATUS_KIND.OK;
     } else {
-      // BUGS_AUDIT §6.9: the poll deadline expired with no ready signal
+      // BUGS_AUDIT §6.9: the deadline expired with no ready signal
       // at all — previously this branch did nothing (no clipboard write,
       // no last_transcript.json, no status naming a way out), so a slow
       // recovery that finished moments later was invisible: the user's
@@ -6485,7 +6227,7 @@ async function processPostStopTask(task) {
       // would help. Recover whatever text the renderer or disk already
       // has through the same lookup the paste-last hotkey itself uses
       // (getLatestTranscriptText), so a transcript that exists is never
-      // silently dropped just because this poll gave up on it.
+      // silently dropped just because this task gave up on it.
       //
       // bestKnownText is the stronger half of that recovery: the
       // pre-upscale text this recording actually produced, which §6.8
@@ -6504,7 +6246,7 @@ async function processPostStopTask(task) {
   if (!isRecNow) {
     await setRecordingStatus(recordingStatusText, recordingStatusKind);
   }
-  traceEnd(trace, "done", { transcriptFound: !!transcript, pollCount });
+  traceEnd(trace, "done", { transcriptFound: !!transcript });
   return {
     dwellMs: isRecNow ? 0 : RECORDING_STATUS_TERMINAL_DWELL_MS,
   };
@@ -6516,8 +6258,8 @@ async function processPostStopTask(task) {
  * ui-final transcript, nothing terminal to report.
  *
  * ``bestKnownText`` is what THIS recording produced but never declared
- * paste-ready: a ``final:false`` IPC provisional, or the status-only
- * text the poll saw. §6.8 forbids pasting it — the renderer never said
+ * paste-ready: a ``final:false`` IPC provisional (the pre-upscale text).
+ * §6.8 forbids pasting it — the renderer never said
  * it was final — but it is the most specific thing that exists for this
  * recording, so it is preferred over the general lookup below, which
  * can only offer whatever transcript happens to be newest (and on a
@@ -8668,10 +8410,9 @@ async function createWindow(options = {}) {
       appendMainLog(`[render-process-gone] dropping pendingTranscriptionCount=${pendingTranscriptionCount}`);
       pendingTranscriptionCount = 0;
     }
-    // Drain any queued post-stop tasks — their renderer state is
-    // dead, polling them would just spin processPostStopTask for
-    // 15 s per task hitting executeJavaScript failures, then time
-    // out. Faster + cleaner to drop them now.
+    // Drain any queued post-stop tasks — the renderer that would have
+    // handed their transcripts over is gone, so each would only wait out
+    // its deadline. Faster + cleaner to drop them now.
     if (postStopQueue.length > 0) {
       const dropped = postStopQueue.length;
       postStopQueue = [];
@@ -9433,8 +9174,8 @@ app.whenReady().then(async () => {
   //
   // Send-only and one-way: the renderer says "recording N's text is X,
   // and here is whether it is the paste-ready one". Everything about
-  // what that means — whether it may be pasted, when the fallback poll
-  // starts, what happens on deadline expiry — stays in the main process.
+  // what that means — whether it may be pasted, what happens on
+  // deadline expiry — stays in the main process (./transcript-signal).
   //
   // Two gates, both of them about not trusting renderer-controlled
   // input: the sender must be the main window's own webContents (the
