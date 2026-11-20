@@ -18,20 +18,34 @@
  *     discarded take's: on save the backend moves the folder beside the
  *     recording and owns it from then on (backend/screen_sessions.py).
  *
- * Event-driven, no polling: the exclusion rectangles and the palette are
- * re-laid-out when main moves the capsule (`refreshLayout`), overlays
+ * Event-driven, no polling: our controls' rectangles (sent to the helper)
+ * and the palette are re-laid-out when main moves the capsule
+ * (`refreshLayout`), overlays
  * follow displays being added, removed or rearranged, and a renderer that
  * dies or reloads mid-take ends the session through main's webContents
  * hooks (`finish`), not through a timer asking whether it is still alive.
  *
- * The rules — session record, region words, prune list, manifest — are
+ * The rules — session record, stroke positions, manifest — are
  * ./screen-mode.js. This module is the I/O around them.
  *
  * Screenshots: `screencapture -x -R` of each display that has strokes (or
  * the display under the cursor when none does). The overlays, the palette
  * and the capsule are content-protected while screen mode runs, so the
  * capture is the screen itself; the strokes are then painted onto it at
- * the image's own pixel scale by the overlay that drew them.
+ * the image's own pixel scale by the overlay that drew them. Which strokes
+ * a shot holds is decided once, when the capture begins: a stroke that
+ * finishes while the images are being made is not in them, stays on the
+ * screen and belongs to the next shot. A display that could not be
+ * captured keeps its strokes pending too — a shot never claims a stroke
+ * its images do not show.
+ *
+ * Starting is all or nothing: `start` answers ok only once the helper
+ * reports its tap is live and at least one overlay is on screen; anything
+ * less is torn down and reported (`onWarning`) instead of a red frame
+ * that draws nothing. Every session id that ended — finished, or asked to
+ * finish before it ever started — is remembered, so a `start` that loses
+ * the race to its own stop is refused instead of opening a take nobody
+ * will finish.
  */
 
 const {
@@ -48,6 +62,10 @@ const {
 
 const OVERLAY_PARTITION = "screen-mode-overlay";
 const PALETTE = Object.freeze({ dot: 18, gap: 8, padX: 10, height: 30, marginAboveCapsule: 8 });
+// The helper prints `ready` right after macOS hands it the event tap; a
+// helper that has said nothing by then is not going to draw anything.
+const HELPER_READY_TIMEOUT_MS = 5000;
+const PNG_DATA_URL_PREFIX = "data:image/png;base64,";
 
 function overlayHtml() {
   const border = SCREEN_MODE.borderWidth;
@@ -67,7 +85,7 @@ function overlayHtml() {
   const ctx = cv.getContext("2d");
   const LINE = ${SCREEN_MODE.strokeWidth};
   let origin = { x: 0, y: 0 };
-  let strokes = new Map();
+  const strokes = new Map();
   function resize() {
     const dpr = window.devicePixelRatio || 1;
     cv.width = Math.round(innerWidth * dpr);
@@ -105,7 +123,8 @@ function overlayHtml() {
     for (const s of strokes.values()) drawStroke(ctx, s, 1);
   }
   window.__setOrigin = (x, y) => { origin = { x, y }; return true; };
-  // ops: ["b", id, color, gx, gy] begin, ["m", id, gx, gy] move.
+  // ops: ["b", id, color, gx, gy] begin, ["m", id, gx, gy] move. Points
+  // are kept relative to the display they were drawn on, as it was then.
   window.__apply = (ops) => {
     for (const op of ops) {
       if (op[0] === "b") strokes.set(op[1], { color: op[2], points: [[op[3] - origin.x, op[4] - origin.y]] });
@@ -117,17 +136,19 @@ function overlayHtml() {
     redraw();
     return true;
   };
-  window.__hasStrokes = () => strokes.size > 0;
-  window.__clear = () => { strokes = new Map(); redraw(); return true; };
+  // A shot names the strokes it holds; nothing else is touched, so a
+  // stroke still being drawn keeps what it has drawn and keeps drawing.
+  window.__hasStrokes = (ids) => ids.some((id) => strokes.has(id));
+  window.__clear = (ids) => { for (const id of ids) strokes.delete(id); redraw(); return true; };
   window.__flash = () => {
     const f = document.getElementById("flash");
     f.style.transition = "none"; f.style.opacity = ".35";
     requestAnimationFrame(() => { f.style.transition = "opacity .25s ease-out"; f.style.opacity = "0"; });
     return true;
   };
-  // Paint this overlay's strokes onto a capture of its display, at the
+  // Paint the strokes \`ids\` onto a capture of this display, at the
   // capture's own pixel scale, and hand back a PNG data URL.
-  window.__composite = (dataUrl) => new Promise((resolve, reject) => {
+  window.__composite = (dataUrl, ids) => new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
       const scale = img.naturalWidth / Math.max(1, innerWidth);
@@ -136,7 +157,10 @@ function overlayHtml() {
       out.height = img.naturalHeight;
       const c = out.getContext("2d");
       c.drawImage(img, 0, 0);
-      for (const s of strokes.values()) drawStroke(c, s, scale);
+      for (const id of ids) {
+        const s = strokes.get(id);
+        if (s) drawStroke(c, s, scale);
+      }
       resolve(out.toDataURL("image/png"));
     };
     img.onerror = () => reject(new Error("capture image failed to load"));
@@ -199,6 +223,7 @@ function paletteSize(colorCount) {
  * @param {(warning: string) => void} deps.onWarning
  * @param {() => string} [deps.screenCaptureAccess]  macOS media access status for "screen"
  * @param {(bounds: object, outFile: string) => Promise<void>} [deps.captureRegion]  replaces screencapture (tests)
+ * @param {string} [deps.platform]  replaces process.platform (tests)
  */
 function createScreenModeController(deps) {
   const { BrowserWindow, screen, childProcess, fs, path, log } = deps;
@@ -220,7 +245,7 @@ function createScreenModeController(deps) {
   }
 
   function isSupported() {
-    if (process.platform !== "darwin") return false;
+    if ((deps.platform || process.platform) !== "darwin") return false;
     try {
       return fs.existsSync(deps.helperPath());
     } catch {
@@ -230,12 +255,6 @@ function createScreenModeController(deps) {
 
   function isActive() {
     return !!session;
-  }
-
-  function displayBoundsById() {
-    const out = {};
-    for (const d of screen.getAllDisplays()) out[d.id] = d.bounds;
-    return out;
   }
 
   // ── overlays ──────────────────────────────────────────────────────────
@@ -554,7 +573,7 @@ function createScreenModeController(deps) {
       deliverTap(x, y);
     } else if (t === "start") {
       const display = screen.getDisplayNearestPoint({ x: Math.round(x), y: Math.round(y) });
-      const stroke = beginStroke(session, { x, y, displayId: display.id });
+      const stroke = beginStroke(session, { x, y, displayId: display.id, displayBounds: display.bounds });
       queueOp(["b", stroke.id, stroke.color, x, y]);
     } else if (t === "move") {
       const stroke = extendStroke(session, { x, y });
@@ -586,7 +605,11 @@ function createScreenModeController(deps) {
   async function takeShotNow(reason) {
     if (!session) return null;
     flushOps();
+    // The strokes this shot holds, decided once, now: helper lines keep
+    // arriving while the images are made, and a stroke that finishes
+    // during the awaits below is in none of them.
     const pending = pendingStrokes(session);
+    const ids = pending.map((s) => s.id);
     const displayIds = [...new Set(pending.map((s) => s.displayId))];
     if (!displayIds.length) {
       displayIds.push(screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).id);
@@ -602,12 +625,15 @@ function createScreenModeController(deps) {
       try {
         await captureRegion(display.bounds, file);
         const entry = overlays.get(displayId);
-        const hasStrokes = await overlayCall(entry, "window.__hasStrokes()");
+        const hasStrokes = await overlayCall(entry, `window.__hasStrokes(${JSON.stringify(ids)})`);
         if (hasStrokes) {
           const raw = fs.readFileSync(file).toString("base64");
-          const composed = await overlayCall(entry, `window.__composite(${JSON.stringify(`data:image/png;base64,${raw}`)})`);
-          if (typeof composed === "string" && composed.startsWith("data:image/png;base64,")) {
-            fs.writeFileSync(file, Buffer.from(composed.slice("data:image/png;base64,".length), "base64"));
+          const composed = await overlayCall(
+            entry,
+            `window.__composite(${JSON.stringify(`${PNG_DATA_URL_PREFIX}${raw}`)}, ${JSON.stringify(ids)})`,
+          );
+          if (typeof composed === "string" && composed.startsWith(PNG_DATA_URL_PREFIX)) {
+            fs.writeFileSync(file, Buffer.from(composed.slice(PNG_DATA_URL_PREFIX.length), "base64"));
           }
         }
         files.push(file);
@@ -622,10 +648,11 @@ function createScreenModeController(deps) {
     // the batch: the strokes keep their times and places in the record and
     // the transcript, and the screen is cleared as the user asked.
     if (!files.length && !pending.length) return null;
-    const shot = recordShot(session, { at, files, reason });
+    const shot = recordShot(session, { at, files, strokeIds: ids, reason });
+    // Only the strokes the shot took leave the screen. Queued ops are
+    // kept: they belong to strokes still being drawn or begun since.
     for (const entry of overlays.values()) {
-      entry.ops = [];
-      overlayCall(entry, "window.__clear()");
+      overlayCall(entry, `window.__clear(${JSON.stringify(shot.strokeIds)})`);
       overlayCall(entry, "window.__flash()");
     }
     writeEvents();
@@ -635,7 +662,7 @@ function createScreenModeController(deps) {
 
   function writeEvents() {
     if (!session) return;
-    lastManifest = screenSessionManifest(session, { displayBoundsById: displayBoundsById() });
+    lastManifest = screenSessionManifest(session);
     try {
       fs.writeFileSync(path.join(session.dir, SCREEN_MODE.eventsFileName), `${JSON.stringify(lastManifest, null, 2)}\n`);
     } catch (e) {
@@ -715,7 +742,7 @@ function createScreenModeController(deps) {
   }
 
   const start = (id) => serialize(() => startNow(id));
-  const takeShot = (reason = "button") => serialize(() => takeShotNow(reason));
+  const takeShot = (reason) => serialize(() => takeShotNow(reason));
   const finish = (opts) => serialize(() => finishNow(opts));
 
   return { isSupported, isActive, start, takeShot, finish, teardown, refreshLayout };

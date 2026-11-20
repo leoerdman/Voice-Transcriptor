@@ -74,12 +74,21 @@ function strokeById(session, id) {
   return session.strokes.find((s) => s.id === id) || null;
 }
 
-/** Begin a stroke at a global point. Returns the new stroke. */
-function beginStroke(session, { x, y, at = Date.now(), displayId = 0 }) {
+/**
+ * Begin a stroke at a global point. Returns the new stroke.
+ *
+ * `displayBounds` are the bounds of the display the stroke is drawn on AT
+ * THIS MOMENT. Where a stroke was is a fact about when it was drawn: a
+ * display unplugged or rearranged later must not move it.
+ */
+function beginStroke(session, { x, y, at = Date.now(), displayId = 0, displayBounds = null }) {
   const stroke = {
     id: session.nextStrokeId++,
     color: session.color,
     displayId,
+    displayBounds: displayBounds
+      ? { x: displayBounds.x, y: displayBounds.y, width: displayBounds.width, height: displayBounds.height }
+      : null,
     startedAt: at,
     endedAt: at,
     points: [[x, y]],
@@ -144,17 +153,22 @@ function strokePosition(stroke, displayBounds) {
 
 /**
  * Record a screenshot: the strokes it contains are stamped with its
- * number. Returns the shot record; `files` is filled by the caller once
- * the images are written.
+ * number. `strokeIds` are the strokes the images were actually made with
+ * — decided once, by the caller, when the capture began; a stroke that
+ * finished while the images were being taken is not in them and stays
+ * pending. `reason` says what asked for the shot (`capsule`, `hotkey`,
+ * `stop`), for the log and events.json. Returns the shot record.
  */
-function recordShot(session, { at = Date.now(), files = [], reason = "button" } = {}) {
+function recordShot(session, { at = Date.now(), files, strokeIds, reason }) {
   const index = session.shots.length + 1;
-  const strokeIds = [];
+  const wanted = new Set(strokeIds);
+  const taken = [];
   for (const stroke of pendingStrokes(session)) {
+    if (!wanted.has(stroke.id)) continue;
     stroke.shot = index;
-    strokeIds.push(stroke.id);
+    taken.push(stroke.id);
   }
-  const shot = { index, at, files, strokeIds, reason };
+  const shot = { index, at, files: files.slice(), strokeIds: taken, reason };
   session.shots.push(shot);
   return shot;
 }
@@ -168,11 +182,11 @@ function shotFileName(index, displayOrdinal, displayCount) {
  * The manifest the renderer turns into transcript marks, and the
  * `events.json` written beside the screenshots. One shape for both.
  */
-function screenSessionManifest(session, { displayBoundsById = {} } = {}) {
+function screenSessionManifest(session) {
   const events = [];
   for (const stroke of session.strokes) {
     if (!stroke.shot) continue;
-    const position = strokePosition(stroke, displayBoundsById[stroke.displayId]);
+    const position = strokePosition(stroke, stroke.displayBounds);
     events.push({
       type: "stroke",
       at: stroke.startedAt,
