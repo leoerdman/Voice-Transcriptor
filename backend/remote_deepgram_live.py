@@ -74,13 +74,16 @@ logger = logging.getLogger(__name__)
 
 DEEPGRAM_LIVE_OPEN_TIMEOUT_SEC = 8.0
 DEEPGRAM_LIVE_RETRY_TIMEOUT_SEC = 4.0
-# How long a CONTROL frame (Finalize, CloseStream) may sit unwritten
-# before the socket carrying it is declared wedged and closed. The same
-# 5 s the old ``wait_for`` used, so a stuck socket is reported no later
-# than it used to be — but by closing the connection, which releases the
-# write, rather than by cancelling the write and leaving the connection
-# in the undefined state ``send_pcm``'s docstring documents.
-CONTROL_SEND_WEDGE_SEC = 5.0
+# How long ANY write to a Deepgram socket — audio (``backend.main``'s
+# send watchdog, the dual facade's second-reading feeder) or a CONTROL
+# frame (Finalize, CloseStream) — may sit unwritten before the socket
+# carrying it is declared wedged and closed. One number for one idea:
+# the same 5 s the old ``wait_for`` used, so a stuck socket is reported
+# no later than it used to be — but by closing the connection, which
+# releases the write, rather than by cancelling the write and leaving
+# the connection in the undefined state ``send_pcm``'s docstring
+# documents.
+SEND_WEDGE_SEC = 5.0
 # How long ``close()`` waits, after sending ``Finalize``, for Deepgram to
 # return the transcript that Finalize flushed — before sending
 # ``CloseStream``. The wait ends the moment the transcript arrives, so
@@ -1921,7 +1924,7 @@ class DeepgramLiveSession:
         if ws is None:
             return False
         send = asyncio.ensure_future(ws.send(json.dumps(frame)))
-        guard = asyncio.ensure_future(asyncio.sleep(CONTROL_SEND_WEDGE_SEC))
+        guard = asyncio.ensure_future(asyncio.sleep(SEND_WEDGE_SEC))
         try:
             await asyncio.wait(
                 {send, guard}, return_when=asyncio.FIRST_COMPLETED
@@ -1937,7 +1940,7 @@ class DeepgramLiveSession:
             logger.warning(
                 "deepgram-live: %s send wedged (>%.1fs); closing the socket",
                 what,
-                CONTROL_SEND_WEDGE_SEC,
+                SEND_WEDGE_SEC,
             )
             await self._close_wedged_socket(ws, send, what)
             return False

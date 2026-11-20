@@ -51,6 +51,8 @@ import asyncio
 import bisect
 import heapq
 import logging
+import time
+from collections import deque
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Optional
 
@@ -80,6 +82,8 @@ from backend.remote_deepgram_live import (
     DeepgramLiveConfig,
     DeepgramLiveSession,
     DeepgramLiveStats,
+    FINALIZE_FLUSH_WAIT_SEC,
+    SEND_WEDGE_SEC,
     SPANLESS_WORD_FLAG,
     resolve_live_language,
     segment_word_records,
@@ -907,6 +911,45 @@ def merge_readings(
     )
 
 
+#: Every key ``dual_stats`` adds to a ``final`` envelope's ``stats``. The
+#: contract fixture (``contracts/live-final-envelope.json``) is built
+#: through ``dual_stats`` too, so producer and contract cannot disagree.
+DUAL_STATS_KEYS = (
+    "dual_stream",
+    "dual_secondary_language",
+    "dual_secondary_failed",
+    "dual_filled_from_secondary",
+    "dual_filled_from_primary",
+    "dual_duplicates_removed",
+    "dual_contested_to_secondary",
+    "dual_contested_to_primary",
+)
+
+
+def dual_stats(
+    merged: MergedReading, *, secondary_language: str, secondary_failed: bool
+) -> dict:
+    """The dual-stream half of a ``final`` envelope's ``stats``.
+
+    ``dual_stream`` — the boolean the renderer reads — says whether the
+    TEXT is a merge of two readings: true exactly when the secondary
+    contributed words to it. A second reading that was dropped mid-
+    recording still delivered what it had committed before it died, and
+    that is merged; whether it failed is a separate fact
+    (``dual_secondary_failed``), so neither number misdescribes the other.
+    """
+    return {
+        "dual_stream": merged.secondary_word_count > 0,
+        "dual_secondary_language": secondary_language,
+        "dual_secondary_failed": bool(secondary_failed),
+        "dual_filled_from_secondary": merged.filled_from_secondary,
+        "dual_filled_from_primary": merged.filled_from_primary,
+        "dual_duplicates_removed": merged.duplicates_removed,
+        "dual_contested_to_secondary": merged.contested_to_secondary,
+        "dual_contested_to_primary": merged.contested_to_primary,
+    }
+
+
 # ---------------------------------------------------------------------
 # The facade
 # ---------------------------------------------------------------------
@@ -933,10 +976,15 @@ class DualLiveSession:
       recording's completeness back to where it was without this
       feature, which is not a failure worth aborting a recording for —
       it is logged once and the merge sees an empty reading.
-    * AUDIO goes to both, awaited in order. A send is never cancelled
-      (cancelling one mid-frame leaves that connection undefined), and
-      the secondary's failure to accept a frame is swallowed after the
-      first warning.
+    * AUDIO goes to both, but only the primary's write is on the
+      caller's path. The secondary is fed by its own task from its own
+      queue (``_feed_secondary_loop``): a half-open second socket whose
+      write blocks used to stop the primary's audio too, and the send
+      watchdog in ``backend.main`` then reported the RECORDING wedged
+      (BE-05). A write is never cancelled (cancelling one mid-frame
+      leaves that connection undefined); a secondary that holds audio
+      unwritten for ``SEND_WEDGE_SEC`` is dropped to one reading and its
+      socket closed, which is what releases the write.
     """
 
     def __init__(
@@ -964,6 +1012,12 @@ class DualLiveSession:
         # against a real recording's readings offline, instead of paying
         # Deepgram again for every variant of the rule.
         self.last_readings: Optional[tuple[dict, Optional[dict]]] = None
+        # The second reading's own audio path (see the class docstring):
+        # ``(monotonic enqueue time, chunk)`` waiting for the feeder task.
+        self._secondary_queue: "deque[tuple[float, bytes]]" = deque()
+        self._secondary_wakeup = asyncio.Event()
+        self._secondary_feeder: Optional[asyncio.Task] = None
+        self._secondary_closing: Optional[asyncio.Task] = None
 
     # ----- The single-session interface --------------------------------
 
@@ -1132,31 +1186,81 @@ class DualLiveSession:
 
     async def send_pcm(self, chunk: bytes) -> None:
         # The primary's exception is the caller's, unchanged: it owns
-        # the recording. The secondary's is swallowed after one warning
-        # — it owns nothing the user would notice losing.
+        # the recording. The secondary only gets the chunk queued — its
+        # write happens on its own task and can never hold this one up.
         await self.primary.send_pcm(chunk)
-        await self._feed_secondary(chunk)
+        self._offer_secondary(chunk)
 
-    async def _feed_secondary(self, chunk: bytes) -> None:
-        secondary = self.secondary
-        if secondary is None:
+    def _offer_secondary(self, chunk: bytes) -> None:
+        """Queue a chunk for the second reading. Never awaits."""
+        if self.secondary is None or self._secondary_failed:
             return
-        try:
-            await secondary.send_pcm(chunk)
-        except Exception as e:
-            self._fail_secondary(f"send failed: {e}")
+        now = time.monotonic()
+        if self._secondary_queue and now - self._secondary_queue[0][0] >= SEND_WEDGE_SEC:
+            self._fail_secondary(
+                "not accepting audio: oldest queued chunk is "
+                f"{now - self._secondary_queue[0][0]:.1f}s old"
+            )
+            return
+        self._secondary_queue.append((now, chunk))
+        self._secondary_wakeup.set()
+        if self._secondary_feeder is None:
+            self._secondary_feeder = asyncio.get_running_loop().create_task(
+                self._feed_secondary_loop(), name="deepgram-dual-secondary-feed",
+            )
+
+    async def _feed_secondary_loop(self) -> None:
+        """The second reading's only writer: queued chunks, in order."""
+        while not self._secondary_failed:
+            if not self._secondary_queue:
+                self._secondary_wakeup.clear()
+                await self._secondary_wakeup.wait()
+                continue
+            secondary = self.secondary
+            if secondary is None:
+                return
+            _enqueued_at, chunk = self._secondary_queue[0]
+            try:
+                await secondary.send_pcm(chunk)
+            except Exception as e:
+                self._fail_secondary(f"send failed: {e}")
+                return
+            if self._secondary_queue:
+                self._secondary_queue.popleft()
+            if not self._secondary_queue:
+                # ``_secondary_flushed`` waits on exactly this.
+                self._secondary_wakeup.set()
+
+    async def _secondary_flushed(self) -> None:
+        """Return once every queued chunk reached the second socket (or
+        the second reading was dropped) — Finalize must follow the audio."""
+        while self._secondary_queue and not self._secondary_failed:
+            self._secondary_wakeup.clear()
+            await self._secondary_wakeup.wait()
 
     def _fail_secondary(self, reason: str) -> None:
-        """Drop to one reading, once, loudly enough to find later."""
+        """Drop to one reading, once, loudly enough to find later.
+
+        Also releases the second socket: its queued audio is discarded
+        and the socket is closed, which makes a write the feeder may be
+        blocked in raise — the only way a write is ever unblocked here.
+        """
         if self._secondary_failed:
             return
         self._secondary_failed = True
+        self._secondary_queue.clear()
+        self._secondary_wakeup.set()
         logger.warning(
             "dual-stream: secondary reading (%s) dropped, continuing "
             "single-stream: %s",
             self._secondary_language,
             reason,
         )
+        secondary = self.secondary
+        if secondary is not None and self._secondary_closing is None:
+            self._secondary_closing = asyncio.get_running_loop().create_task(
+                secondary.close(), name="deepgram-dual-secondary-close",
+            )
 
     @property
     def secondary_failed(self) -> bool:
@@ -1216,30 +1320,51 @@ class DualLiveSession:
         own tail was covered before deciding how long the secondary may
         run: the ceiling already says so.
         """
-        secondary = self.secondary
+        secondary = None if self._secondary_failed else self.secondary
         secondary_task: Optional[asyncio.Task] = None
         announced: list[float] = []
+        loop = asyncio.get_running_loop()
+        # The announced budget is counted from the stop, so the secondary's
+        # ceiling is too: measured from HERE, not from whenever the
+        # primary's drain happened to return (BE-04).
+        started = loop.time()
 
         def _on_budget(budget_sec: float, expects_more: bool) -> None:
             announced.append(budget_sec)
             if on_budget is not None:
                 on_budget(budget_sec, expects_more)
 
+        async def _drain_secondary(session: DeepgramLiveSession) -> dict:
+            # Finalize must reach the second socket after every chunk
+            # queued for it, exactly as the primary's sentinel guarantees.
+            await self._secondary_flushed()
+            return await session.drain_transcript()
+
         if secondary is not None:
-            secondary_task = asyncio.get_running_loop().create_task(
-                secondary.drain_transcript(), name="deepgram-dual-secondary-drain",
+            secondary_task = loop.create_task(
+                _drain_secondary(secondary), name="deepgram-dual-secondary-drain",
             )
-        primary_result = await self.primary.drain_transcript(on_budget=_on_budget)
+        try:
+            primary_result = await self.primary.drain_transcript(on_budget=_on_budget)
+        except BaseException:
+            # Never orphan the second drain: it would keep writing
+            # Finalize/CloseStream on a socket the caller is about to shut
+            # down, with an exception nobody retrieves (BE-06).
+            await cancel_and_await(
+                secondary_task, what="dual-stream secondary drain", log=logger
+            )
+            raise
 
         secondary_result: Optional[dict] = None
         if secondary_task is not None:
             # The primary's own announced budget, again: whatever the
             # secondary still owes, the user has already been told how
             # long this stop may take.
-            ceiling = announced[0] if announced else 3.0
+            ceiling = announced[0] if announced else FINALIZE_FLUSH_WAIT_SEC
+            remaining = ceiling - (loop.time() - started)
             try:
                 secondary_result = await asyncio.wait_for(
-                    secondary_task, timeout=max(0.1, ceiling)
+                    secondary_task, timeout=max(0.1, remaining)
                 )
             except asyncio.TimeoutError:
                 # Wait for the cancellation to LAND before snapshotting.
@@ -1274,6 +1399,15 @@ class DualLiveSession:
                 )
             except Exception as e:
                 self._fail_secondary(f"drain failed: {e}")
+        elif self.secondary is not None:
+            # Dropped mid-recording (``_fail_secondary``): its socket is
+            # gone, so there is nothing to drain — but every final it
+            # committed before it died is real transcript, the same as
+            # a reading that merely ran late.
+            try:
+                secondary_result = self.secondary.partial_result()
+            except Exception as e:
+                logger.warning("dual-stream: dropped secondary snapshot failed: %s", e)
 
         return self._merged_envelope(primary_result, secondary_result)
 
@@ -1314,14 +1448,13 @@ class DualLiveSession:
         )
         envelope = dict(primary_result)
         envelope["text"] = merged.text
-        # ``words`` is the merged list; ``segments`` is that same list
-        # grouped at clause-length silences, built from it in one place
-        # (``_segments_from_words``) so the two are views of one
-        # transcript rather than two transcripts. Every word carries the
-        # ``source`` it came from, which is what makes a merge auditable
-        # after the fact.
+        # The merged words, grouped at clause-length silences in one place
+        # (``_segments_from_words``); each segment carries its words and
+        # every word the ``source`` it came from, which is what makes a
+        # merge auditable after the fact. There is no separate flat word
+        # list: ``envelope_from_result`` copies the named envelope fields
+        # only, so one never reached the wire (BE-14).
         envelope["segments"] = merged.segments
-        envelope["words"] = merged.words
         envelope["durationSec"] = round(merged.covered_end_sec(), 3)
         # NOT the merged end: the merge includes each reading's spliced
         # interim fallback, and ``coveredEndSec`` means "committed
@@ -1340,25 +1473,14 @@ class DualLiveSession:
         envelope["uncoveredSpeechSec"] = round(
             self._merged_uncovered_speech_sec(), 3
         )
-        # Wire contract with the renderer: ``stats.dual_stream`` is the
-        # boolean it reads to know this envelope came from the merged
-        # path. It is FALSE only when the secondary reading genuinely
-        # failed (``_fail_secondary`` — no usable transcript exists),
-        # because then the text is a single reading and saying otherwise
-        # would misdescribe what the user received. A secondary that ran
-        # past the announced budget is NOT that case: ``drain_transcript``
-        # merges in whatever it had committed by then
-        # (``DeepgramLiveSession.partial_result``), so the text genuinely
-        # is a merge, just of a shorter secondary reading.
-        merged_path = secondary_result is not None and not self._secondary_failed
         stats = dict(primary_result.get("stats") or {})
-        stats["dual_stream"] = bool(merged_path)
-        stats["dual_secondary_language"] = self._secondary_language
-        stats["dual_filled_from_secondary"] = merged.filled_from_secondary
-        stats["dual_filled_from_primary"] = merged.filled_from_primary
-        stats["dual_duplicates_removed"] = merged.duplicates_removed
-        stats["dual_contested_to_secondary"] = merged.contested_to_secondary
-        stats["dual_contested_to_primary"] = merged.contested_to_primary
+        stats.update(
+            dual_stats(
+                merged,
+                secondary_language=self._secondary_language,
+                secondary_failed=self._secondary_failed,
+            )
+        )
         envelope["stats"] = stats
         return envelope
 
@@ -1388,6 +1510,15 @@ class DualLiveSession:
                 await getattr(secondary, method)(**kwargs)
             except Exception as e:
                 logger.debug("dual-stream: secondary %s ignored: %s", method, e)
+            # The second socket is closed now, so a write the feeder is
+            # blocked in has already raised: cancelling it cannot land
+            # mid-frame.
+            await cancel_and_await(
+                self._secondary_feeder, what="dual-stream secondary feeder", log=logger
+            )
+            await cancel_and_await(
+                self._secondary_closing, what="dual-stream secondary close", log=logger
+            )
         await getattr(self.primary, method)(**kwargs)
 
 
@@ -1395,11 +1526,13 @@ __all__ = [
     "ADJACENT_SAME_STEM_MAX_GAP_SEC",
     "DUAL_SECONDARY_LANGUAGE_DEFAULT",
     "DUAL_SECONDARY_LANGUAGE_OPTIONS",
+    "DUAL_STATS_KEYS",
     "DUAL_STREAM_DEFAULT",
     "DualLiveSession",
     "MergedReading",
     "dual_applies",
     "dual_secondary_language",
+    "dual_stats",
     "dual_stream_enabled",
     "flatten_words",
     "merge_readings",

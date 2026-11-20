@@ -125,9 +125,10 @@ def live_final_stats(
     """Normalise the ``stats`` object of a ``final`` envelope.
 
     The session's own ``DeepgramLiveStats.as_dict`` and the dual reader's
-    additions pass through unchanged — this backend owns what it reports
-    about itself, and the renderer reads only the handful of keys it
-    documents (``connect_ms``, ``finalize_ms``, ``dual_stream``,
+    additions (``backend.deepgram_dual.dual_stats`` — every key it adds is
+    listed in ``DUAL_STATS_KEYS``) pass through unchanged — this backend
+    owns what it reports about itself, and the renderer reads only the
+    keys it documents (``connect_ms``, ``finalize_ms``, ``dual_stream``,
     ``dual_secondary_language``, ``dual_filled_from_secondary``,
     ``dual_filled_from_primary``, ``recovery``). The one guarantee made
     here is that ``stats`` is an OBJECT on every path, including the two

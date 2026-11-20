@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import time
 import unittest
+from unittest import mock
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -595,6 +596,8 @@ class DualLiveSessionFanOutTests(unittest.IsolatedAsyncioTestCase):
         dual = DualLiveSession(primary, secondary, secondary_language="ru")
         await dual.send_pcm(b"abc")
         self.assertEqual(primary.sent, [b"abc"])
+        # The secondary is written by its own feeder task (BE-05).
+        await dual._secondary_flushed()
         self.assertEqual(secondary.sent, [b"abc"])
 
     async def test_events_come_only_from_the_primary(self):
@@ -635,12 +638,70 @@ class DualLiveSessionFanOutTests(unittest.IsolatedAsyncioTestCase):
         dual = DualLiveSession(primary, secondary, secondary_language="ru")
         with self.assertLogs("backend.deepgram_dual", level="WARNING") as logs:
             await dual.send_pcm(b"xyz")
+            await dual._secondary_flushed()
         self.assertEqual(primary.sent, [b"xyz"])
         self.assertTrue(dual.secondary_failed)
         self.assertEqual(len(logs.output), 1, "logged once")
         # A second failing send does not log again.
         await dual.send_pcm(b"more")
         self.assertEqual(primary.sent, [b"xyz", b"more"])
+
+    async def test_a_stalled_secondary_never_holds_up_the_primary(self):
+        """BE-05: the secondary's write was awaited in the primary's send
+        path, so a half-open second socket stopped the recording's audio
+        and the send watchdog declared the RECORDING wedged."""
+        stalled = asyncio.Event()
+
+        class _Stalled(_FakeLiveSession):
+            async def send_pcm(self, chunk: bytes) -> None:
+                stalled.set()
+                await asyncio.Event().wait()  # a write that never completes
+
+            async def close(self) -> None:
+                self.close_called = True
+
+        primary = _primary()
+        secondary = _Stalled(name="secondary")
+        dual = DualLiveSession(primary, secondary, secondary_language="ru")
+        with mock.patch("backend.deepgram_dual.SEND_WEDGE_SEC", 0.05):
+            await asyncio.wait_for(dual.send_pcm(b"one"), timeout=1.0)
+            await stalled.wait()
+            await asyncio.wait_for(dual.send_pcm(b"two"), timeout=1.0)
+            await asyncio.sleep(0.08)
+            with self.assertLogs("backend.deepgram_dual", level="WARNING") as logs:
+                await asyncio.wait_for(dual.send_pcm(b"three"), timeout=1.0)
+            await asyncio.sleep(0)
+        self.assertEqual(primary.sent, [b"one", b"two", b"three"])
+        self.assertTrue(dual.secondary_failed)
+        self.assertTrue(any("not accepting audio" in line for line in logs.output))
+        self.assertTrue(secondary.close_called, "the wedged second socket was not closed")
+        await dual.shutdown()
+
+    async def test_finalize_follows_every_chunk_queued_for_the_secondary(self):
+        order: list[str] = []
+        gate = asyncio.Event()
+
+        class _Slow(_FakeLiveSession):
+            async def send_pcm(self, chunk: bytes) -> None:
+                await gate.wait()
+                order.append(f"send {chunk.decode()}")
+
+            async def drain_transcript(self, on_budget=None) -> dict:
+                order.append("drain")
+                return dict(self.drain_result)
+
+        primary = _primary()
+        secondary = _Slow(name="secondary", drain_result=_secondary().drain_result)
+        dual = DualLiveSession(primary, secondary, secondary_language="ru")
+        # Bounded: before BE-05 the primary's send path awaited this
+        # secondary's write, so these calls never returned.
+        await asyncio.wait_for(dual.send_pcm(b"a"), timeout=1.0)
+        await asyncio.wait_for(dual.send_pcm(b"b"), timeout=1.0)
+        drain = asyncio.get_running_loop().create_task(dual.drain_transcript())
+        await asyncio.sleep(0)
+        gate.set()
+        await drain
+        self.assertEqual(order, ["send a", "send b", "drain"])
 
     async def test_note_undelivered_audio_reaches_both(self):
         primary, secondary = _primary(), _secondary()
@@ -681,11 +742,64 @@ class DualLiveSessionDrainTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(envelope["stats"]["dual_secondary_language"], "ru")
         self.assertEqual(envelope["stats"]["dual_filled_from_secondary"], 1)
         self.assertEqual(envelope["stats"]["dual_filled_from_primary"], 0)
-        words = envelope["words"]
+        # The merged words travel inside the segments — the only place
+        # ``envelope_from_result`` carries them to the wire (BE-14).
+        self.assertNotIn("words", envelope)
+        words = [w for seg in envelope["segments"] for w in seg["words"]]
         self.assertEqual([w["word"] for w in words], ["before", "hole", "after"])
         self.assertTrue(all({"word", "start", "end", "source"} <= w.keys() for w in words))
-        for seg in envelope["segments"]:
-            self.assertIn("words", seg)
+
+    async def test_the_secondary_ceiling_is_counted_from_the_stop(self):
+        """BE-04: the secondary's ceiling (the primary's announced budget)
+        was measured from when the PRIMARY's drain returned, so a stop
+        could run primary time + the whole budget again."""
+
+        class _SlowPrimary(_FakeLiveSession):
+            async def drain_transcript(self, on_budget=None) -> dict:
+                if on_budget is not None:
+                    on_budget(0.3, False)
+                await asyncio.sleep(0.25)
+                return dict(self.drain_result)
+
+        primary = _SlowPrimary(name="primary", drain_result=_primary().drain_result)
+        secondary = _secondary(drain_delay=10.0)
+        dual = DualLiveSession(primary, secondary, secondary_language="ru")
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        with self.assertLogs("backend.deepgram_dual", level="WARNING"):
+            await dual.drain_transcript()
+        elapsed = loop.time() - started
+        self.assertLess(elapsed, 0.45, f"stop took {elapsed:.2f}s against a 0.3s budget")
+
+    async def test_a_failing_primary_drain_does_not_orphan_the_secondary_drain(self):
+        """BE-06."""
+        primary = _primary(drain_error=RuntimeError("primary drain failed"))
+        secondary = _secondary(drain_delay=10.0)
+        dual = DualLiveSession(primary, secondary, secondary_language="ru")
+        with self.assertRaises(RuntimeError):
+            await dual.drain_transcript()
+        orphans = [
+            t for t in asyncio.all_tasks()
+            if t.get_name() == "deepgram-dual-secondary-drain" and not t.done()
+        ]
+        self.assertEqual(orphans, [])
+        self.assertFalse(secondary.drain_running)
+
+    async def test_a_secondary_dropped_mid_recording_still_contributes_its_words(self):
+        """BE-07: a second reading that died at minute 3 of 5 delivered its
+        committed words into the merge, yet the envelope said
+        ``dual_stream: false``; with the facade no longer draining a dead
+        socket, its committed words are taken from ``partial_result``."""
+        primary = _primary()
+        secondary = _secondary()
+        dual = DualLiveSession(primary, secondary, secondary_language="ru")
+        with self.assertLogs("backend.deepgram_dual", level="WARNING"):
+            dual._fail_secondary("socket died")
+        envelope = await dual.drain_transcript()
+        self.assertEqual(envelope["text"], "before hole after")
+        self.assertIs(envelope["stats"]["dual_stream"], True)
+        self.assertIs(envelope["stats"]["dual_secondary_failed"], True)
+        await dual.shutdown()
 
     async def test_one_budget_is_announced_and_forwarded(self):
         primary, secondary = _primary(), _secondary()

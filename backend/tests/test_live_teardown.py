@@ -24,7 +24,7 @@ import unittest
 
 from backend.async_tasks import await_cancelled, cancel_and_await
 from backend.remote_deepgram_live import (
-    CONTROL_SEND_WEDGE_SEC,
+    SEND_WEDGE_SEC,
     DEEPGRAM_LIVE_OPEN_TIMEOUT_SEC,
     DEEPGRAM_LIVE_RETRY_TIMEOUT_SEC,
     DeepgramLiveSession,
@@ -152,7 +152,7 @@ class ControlFrameSendTests(unittest.IsolatedAsyncioTestCase):
         from unittest import mock
 
         with mock.patch(
-            "backend.remote_deepgram_live.CONTROL_SEND_WEDGE_SEC", 0.02
+            "backend.remote_deepgram_live.SEND_WEDGE_SEC", 0.02
         ), self.assertLogs("backend.remote_deepgram_live", level="WARNING") as logs:
             sent = await session._send_control(
                 {"type": "Finalize"}, what="Finalize"
@@ -192,7 +192,7 @@ class ControlWedgeBoundTests(unittest.TestCase):
     def test_the_wedge_bound_matches_the_one_the_audio_path_uses(self):
         # Same 5 s the removed ``wait_for`` used, so a stuck socket is
         # reported no later than before — only by a different means.
-        self.assertEqual(CONTROL_SEND_WEDGE_SEC, 5.0)
+        self.assertEqual(SEND_WEDGE_SEC, 5.0)
 
 
 class WarmSwapGraceTests(unittest.TestCase):
