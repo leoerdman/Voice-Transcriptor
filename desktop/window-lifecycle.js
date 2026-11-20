@@ -34,7 +34,11 @@
  *   3. The yellow button is a native minimise. The app keeps running:
  *      global hotkeys, recording capsule, backend. A Dock click restores it.
  *   4. Closing the window (red button, Cmd+W) and Cmd+Q both quit — on
- *      every platform. "Closed" means "not running".
+ *      every platform. "Closed" means "not running". One exception, the
+ *      user's decision of 2026-11-20 (DM-30 / S-14): closing the window
+ *      while a recording is running or its transcript is still being
+ *      produced or pasted asks first (`decideCloseRequest`) — closing
+ *      would otherwise silently throw that work away.
  *   5. Nothing else the APP does moves the window. The recording capsule
  *      in particular is a separate, non-focusable, always-on-top window:
  *      showing, updating or hiding it never hides, focuses or reorders the
@@ -238,9 +242,57 @@ function decideMainWindowBounds(options = {}) {
   return { bounds: { x, y, width, height }, source: "saved" };
 }
 
+/** What closing the window does once the app knows what is in flight. */
+const CLOSE_REQUEST_ACTIONS = Object.freeze({
+  /** Nothing would be lost: close = quit (rule 4). */
+  quit: "quit",
+  /** Something would be lost: ask, and quit only on the user's yes. */
+  confirm: "confirm",
+});
+
+/**
+ * Rule 4's exception (DM-30 / S-14, user decision 2026-11-20): the red
+ * button or Cmd+W while work is in flight asks before quitting.
+ *
+ * @param {{recording?: boolean, postStopWork?: boolean}} state
+ *   `recording` — the renderer is capturing a take (it is the only side
+ *   that knows; an unanswered query counts as not recording, so a hung
+ *   renderer can never trap the user in a window they cannot close).
+ *   `postStopWork` — main still owes a stopped take its transcript or
+ *   its paste.
+ * @returns {{action: string, reason: string, message?: string, detail?: string}}
+ */
+function decideCloseRequest(state = {}) {
+  if (state.recording === true) {
+    return {
+      action: CLOSE_REQUEST_ACTIONS.confirm,
+      reason: "recording",
+      message: "A recording is in progress.",
+      detail: "Quitting now stops it without saving a transcript.",
+    };
+  }
+  if (state.postStopWork === true) {
+    return {
+      action: CLOSE_REQUEST_ACTIONS.confirm,
+      reason: "post-stop-work",
+      message: "A transcript is still being prepared.",
+      detail: "Quitting now may lose it before it is saved or pasted.",
+    };
+  }
+  return { action: CLOSE_REQUEST_ACTIONS.quit, reason: "nothing-in-flight" };
+}
+
+/** The confirmation's buttons, in order; "Keep Running" is the default and the cancel. */
+const CLOSE_CONFIRM_BUTTONS = Object.freeze(["Keep Running", "Quit"]);
+const CLOSE_CONFIRM_QUIT_INDEX = 1;
+
 module.exports = {
   WINDOW_LIFECYCLE_EVENTS,
   WINDOW_LIFECYCLE_ACTIONS,
+  CLOSE_REQUEST_ACTIONS,
+  CLOSE_CONFIRM_BUTTONS,
+  CLOSE_CONFIRM_QUIT_INDEX,
+  decideCloseRequest,
   decideWindowAction,
   decideMainWindowBounds,
   normalizeStoredWindowState,

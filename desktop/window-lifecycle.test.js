@@ -279,3 +279,48 @@ test("every lifecycle event main.js reports is one the table knows", () => {
     assert.ok(used.has(key), `no caller reports ${key}`);
   }
 });
+
+// ── DM-30: closing with work in flight asks first (user decision 2026-11-20) ──
+{
+  const {
+    CLOSE_REQUEST_ACTIONS,
+    CLOSE_CONFIRM_BUTTONS,
+    CLOSE_CONFIRM_QUIT_INDEX,
+    decideCloseRequest,
+  } = require("./window-lifecycle");
+
+  test("nothing in flight: close is quit (rule 4)", () => {
+    assert.equal(decideCloseRequest({}).action, CLOSE_REQUEST_ACTIONS.quit);
+    assert.equal(decideCloseRequest({ recording: false, postStopWork: false }).action, CLOSE_REQUEST_ACTIONS.quit);
+  });
+
+  test("a running recording asks first", () => {
+    const d = decideCloseRequest({ recording: true });
+    assert.equal(d.action, CLOSE_REQUEST_ACTIONS.confirm);
+    assert.equal(d.reason, "recording");
+    assert.ok(d.message && d.detail);
+  });
+
+  test("a transcript still being prepared or pasted asks first", () => {
+    const d = decideCloseRequest({ postStopWork: true });
+    assert.equal(d.action, CLOSE_REQUEST_ACTIONS.confirm);
+    assert.equal(d.reason, "post-stop-work");
+  });
+
+  test("only an explicit true counts: an unanswered renderer never traps the user", () => {
+    assert.equal(decideCloseRequest({ recording: undefined }).action, CLOSE_REQUEST_ACTIONS.quit);
+    assert.equal(decideCloseRequest({ recording: "yes" }).action, CLOSE_REQUEST_ACTIONS.quit);
+  });
+
+  test("the dialog's safe answer is the default; Quit is the named index", () => {
+    assert.equal(CLOSE_CONFIRM_BUTTONS[0], "Keep Running");
+    assert.equal(CLOSE_CONFIRM_BUTTONS[CLOSE_CONFIRM_QUIT_INDEX], "Quit");
+  });
+
+  test("main holds the close and resolves it through decideCloseRequest (wiring)", () => {
+    const { topLevelFunctionSource } = require("./main-source");
+    const fn = topLevelFunctionSource("resolveMainWindowClose");
+    assert.ok(fn, "resolveMainWindowClose not found");
+    assert.match(fn, /decideCloseRequest\(/);
+  });
+}

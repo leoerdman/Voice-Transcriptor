@@ -31,6 +31,10 @@ const { formatConsoleMirrorLine, createConsoleMirrorLimiter } = require("./rende
 const {
   WINDOW_LIFECYCLE_EVENTS,
   WINDOW_LIFECYCLE_ACTIONS,
+  CLOSE_REQUEST_ACTIONS,
+  CLOSE_CONFIRM_BUTTONS,
+  CLOSE_CONFIRM_QUIT_INDEX,
+  decideCloseRequest,
   decideWindowAction,
   decideMainWindowBounds,
   normalizeStoredWindowState,
@@ -1205,6 +1209,57 @@ function applyWindowLifecycleEvent(event, context = {}) {
     quitApp(decision.reason);
   }
   return Promise.resolve();
+}
+
+// DM-30: the close held while the app asks the renderer what is in flight.
+let mainWindowCloseInFlight = false;
+let mainWindowCloseApproved = false;
+
+function approveMainWindowClose(reason) {
+  if (shortcutCaptureAbortHandler) {
+    shortcutCaptureAbortHandler("window-close");
+  }
+  mainWindowCloseApproved = true;
+  appendMainLog(`[main-window] close approved reason=${normalizeLifecycleReason(reason)}`);
+  applyWindowLifecycleEvent(WINDOW_LIFECYCLE_EVENTS.mainWindowClose);
+}
+
+/**
+ * The red button / Cmd+W, decided by ``decideCloseRequest``: quit at once
+ * when nothing is in flight, otherwise ask. The renderer is the only side
+ * that knows it is capturing; an unanswered query is "not recording", so a
+ * hung renderer never traps the user in a window that will not close.
+ */
+async function resolveMainWindowClose() {
+  const recording = await execRendererJsWithTimeout(
+    "!!window.__transcriptorIsRecording",
+    false,
+    RENDERER_STATE_QUERY_TIMEOUT_MS,
+  );
+  const decision = decideCloseRequest({
+    recording: recording === true,
+    postStopWork: hasActivePostStopWork(),
+  });
+  if (decision.action === CLOSE_REQUEST_ACTIONS.quit) {
+    approveMainWindowClose(decision.reason);
+    return;
+  }
+  appendMainLog(`[main-window] close asks first reason=${decision.reason}`);
+  const parent = win && !win.isDestroyed() ? win : undefined;
+  const { response } = await dialog.showMessageBox(parent, {
+    type: "warning",
+    message: decision.message,
+    detail: decision.detail,
+    buttons: [...CLOSE_CONFIRM_BUTTONS],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+  });
+  if (response !== CLOSE_CONFIRM_QUIT_INDEX) {
+    appendMainLog(`[main-window] close declined reason=${decision.reason}`);
+    return;
+  }
+  approveMainWindowClose(`confirmed-${decision.reason}`);
 }
 
 /**
@@ -8634,16 +8689,31 @@ async function createWindow(options = {}) {
     }
   });
 
-  win.on("close", () => {
+  win.on("close", (event) => {
     // Rule 4, every platform: the red button and Cmd+W mean "not
     // running". macOS used to preventDefault and hide instead, which is
     // how the user ended up with an app that was closed and running at
     // the same time. `before-quit` stops the backend child, the capsule
     // and the tray.
-    if (shortcutCaptureAbortHandler) {
-      shortcutCaptureAbortHandler("window-close");
+    //
+    // The exception (DM-30, user decision 2026-11-20): with a recording
+    // or its transcript in flight the close asks first. Whether it is in
+    // flight needs the renderer's answer, which is asynchronous, so the
+    // close is held here and resolved by ``resolveMainWindowClose``. A
+    // close that comes from the quit itself (isQuitting) passes.
+    if (isQuitting || mainWindowCloseApproved) {
+      applyWindowLifecycleEvent(WINDOW_LIFECYCLE_EVENTS.mainWindowClose);
+      return;
     }
-    applyWindowLifecycleEvent(WINDOW_LIFECYCLE_EVENTS.mainWindowClose);
+    event.preventDefault();
+    if (mainWindowCloseInFlight) return;
+    mainWindowCloseInFlight = true;
+    resolveMainWindowClose()
+      .catch((e) => {
+        appendMainLog(`[main-window] close check failed, quitting: ${e?.message || e}`);
+        approveMainWindowClose("close-check-failed");
+      })
+      .finally(() => { mainWindowCloseInFlight = false; });
   });
   win.on("minimize", () => {
     // Rule 3: the OS did it and the app keeps running. Recorded so the
