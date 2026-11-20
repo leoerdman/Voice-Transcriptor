@@ -1048,6 +1048,12 @@ const UI_TOKENS = {
   recordings: {
     /** Longest wait for a <audio> element to report itself playable. */
     viewerAudioReadyTimeoutMs: 1_500,
+    /**
+     * How long a downloaded recording's blob URL outlives the click, so
+     * the browser's download stream finishes reading it first. Generous
+     * for a multi-MB recording.
+     */
+    downloadRevokeDelayMs: 30_000,
     /** Cap on the first archive read, after which the view opens empty. */
     bootstrapTimeoutMs: 15_000,
     /** Coalescing window after a save, before the archive is re-read. */
@@ -1251,6 +1257,11 @@ const UI_TOKENS = {
      *   defaultEmptyRecoveryMs — the same for a recording of any length.
      */
     smallAudioUiMs: 13_000,
+    /**
+     * Longest wait for an <audio> element to report the captured
+     * container's duration while the stop picks the canonical audio.
+     */
+    containerProbeTimeoutMs: 2_500,
     shortEmptyRecoveryMs: 8_000,
     defaultEmptyRecoveryMs: 20_000,
   },
@@ -2406,12 +2417,7 @@ function base64UrlEncodeUtf8(value: string): string {
  * nothing.
  */
 function cssEscape(value: string): string {
-  const nativeEscape = globalThis.CSS?.escape;
-  if (typeof nativeEscape === "function") return nativeEscape(String(value));
-  // Quoted attribute-selector context: a backslash before every
-  // character that could end the string or the selector is sufficient
-  // and, unlike the previous attempt, cannot lose one.
-  return String(value).replace(/["'\\\]]/g, (char) => `\\${char}`);
+  return CSS.escape(String(value));
 }
 
 function websocketAuthProtocols(): string[] {
@@ -2421,11 +2427,15 @@ function websocketAuthProtocols(): string[] {
   ];
 }
 
+/**
+ * A session id: an OPFS spool filename and the backend's session key.
+ * `crypto.randomUUID` ships in every Chromium the shell runs on; the
+ * `Date.now()+Math.random()` fallback that stood here was unreachable,
+ * and the one property it would have weakened — uniqueness — is the one
+ * both consumers rely on (see `cssEscape` for why such fallbacks go).
+ */
 function createClientSessionId(): string {
-  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
-    return globalThis.crypto.randomUUID();
-  }
-  return `live-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+  return crypto.randomUUID();
 }
 
 function revokeCurrentRecordingAudioUrl(): void {
@@ -2947,10 +2957,10 @@ function setCurrentRecordingAudio(file: File | null, savedName = "", archiveDir 
     document.body.removeChild(a);
     if (revokeAfter) {
       // Defer revoke so the browser's download stream finishes reading
-      // the blob first. 30 s is generous for a multi-MB recording.
+      // the blob first.
       window.setTimeout(() => {
         try { URL.revokeObjectURL(url); } catch { /* idempotent */ }
-      }, 30_000);
+      }, UI_TOKENS.recordings.downloadRevokeDelayMs);
     }
   });
 })();
@@ -4493,8 +4503,9 @@ async function createPcmSink(sessionId: string): Promise<PcmSink> {
 async function probeAudioFileDuration(file: File): Promise<number | null> {
   if (!(file instanceof File) || file.size <= 0) return null;
   const url = URL.createObjectURL(file);
+  const audio = document.createElement("audio");
+  let timer = 0;
   try {
-    const audio = document.createElement("audio");
     audio.preload = "metadata";
     const duration = await new Promise<number | null>((resolve) => {
       let settled = false;
@@ -4508,11 +4519,19 @@ async function probeAudioFileDuration(file: File): Promise<number | null> {
         finish(Number.isFinite(value) && value > 0 ? value : null);
       };
       audio.onerror = () => finish(null);
-      window.setTimeout(() => finish(null), 2500);
+      timer = window.setTimeout(() => finish(null), UI_TOKENS.finalize.containerProbeTimeoutMs);
       audio.src = url;
     });
     return duration;
   } finally {
+    // Detach before revoking: an element still loading metadata from a
+    // revoked URL keeps a dead source (and its decoder) until GC, and
+    // the timer outlived every probe that finished first.
+    window.clearTimeout(timer);
+    audio.onloadedmetadata = null;
+    audio.onerror = null;
+    audio.removeAttribute("src");
+    audio.load();
     URL.revokeObjectURL(url);
   }
 }
@@ -4662,11 +4681,9 @@ async function stopMediaRecorderAndFlush(): Promise<void> {
     };
     recorder.addEventListener("stop", finish, { once: true });
     window.setTimeout(finish, MEDIA_RECORDER_STOP_FALLBACK_MS);
-    try {
-      recorder.requestData();
-    } catch (e) {
-      console.debug("MediaRecorder requestData rejected (harmless)", e);
-    }
+    // No ``requestData()`` first: ``stop()`` itself emits the final
+    // ``dataavailable`` before ``stop`` (MediaRecorder spec), so the
+    // extra call only split the last chunk in two.
     try {
       recorder.stop();
     } catch (e) {
@@ -4991,7 +5008,7 @@ async function remoteJobSync(
       signal: abortSignal.signal,
     });
     if (!r.ok) throw new Error(await parseError(r));
-    const js = (await r.json()) as { ok?: boolean; result?: { text?: string; provider?: string; model?: string } };
+    const js = (await r.json()) as { result?: { text?: string; provider?: string; model?: string } };
     return {
       text: String(js?.result?.text || "").trim(),
       provider: String(js?.result?.provider || opts.provider || ""),
@@ -5184,7 +5201,7 @@ async function recoverBackendAudioSessions(): Promise<void> {
     showRecordSessionNotice(
       `Recovered ${succeeded} interrupted recording${succeeded === 1 ? "" : "s"} into Recordings.`,
       "success",
-      9000,
+      UI_TOKENS.notice.longMs,
     );
     void loadRecordings(true).catch((e) => {
       console.warn("Recovery History refresh failed", e);
@@ -5193,7 +5210,7 @@ async function recoverBackendAudioSessions(): Promise<void> {
       showRecordSessionNotice(
         `Recovered ${succeeded} interrupted recording${succeeded === 1 ? "" : "s"}, but History refresh failed: ${msg}`,
         "warning",
-        9000,
+        UI_TOKENS.notice.longMs,
       );
     });
   }
@@ -5201,7 +5218,7 @@ async function recoverBackendAudioSessions(): Promise<void> {
     showRecordSessionNotice(
       `Could not recover ${failed} interrupted recording${failed === 1 ? "" : "s"}. Check the Recordings folder manually.`,
       "warning",
-      9000,
+      UI_TOKENS.notice.longMs,
     );
   }
 }
@@ -6402,7 +6419,7 @@ function handleShortcutKeydown(e: KeyboardEvent): void {
     showRecordSessionNotice(
       `That shortcut is already bound to "${taken.label}". Pick a different combination.`,
       "warning",
-      6000,
+      UI_TOKENS.notice.briefMs,
     );
     stopShortcutRecording(true);
     return;
@@ -7162,7 +7179,7 @@ async function loadCfg(): Promise<void> {
     showRecordSessionNotice(
       `Settings could not be loaded: ${msg}. Your saved preferences are intact, but changes made now will not be saved.`,
       "error",
-      9000,
+      UI_TOKENS.notice.longMs,
     );
     try {
       await loadUpscalePresets(pendingUpscalePresetId);
