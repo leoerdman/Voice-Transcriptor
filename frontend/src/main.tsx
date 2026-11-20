@@ -127,7 +127,7 @@ import { networkVerdict, type NetworkProbeOutcome } from "./network-probe";
 import { keyEventToAccelerator } from "./shortcut-capture";
 import { keyAction, performKeyAction, type KeyAction } from "./key-action";
 import { keepaliveFor } from "./keepalive";
-import { parseRuntimeLimits } from "./runtime-limits";
+import { customPresetLimitReached, parseRuntimeLimits, smallAudioUiTimeoutMs, type RuntimeLimits } from "./runtime-limits";
 import { screenThumbLabel, screensStripNote } from "./screens-strip";
 import { fallbackSourceKey, isCurrentPlayerSource } from "./player-source";
 import { parseRecordingSaveResponse, planRecordingSave, recordingSaveFormEntries } from "./recording-save";
@@ -661,6 +661,9 @@ type BackendBootstrapPayload = {
   runtime_limits?: {
     upload_queue_max_parallel?: unknown;
     upload_queue_max_persisted_items?: unknown;
+    upscale_custom_preset_limit?: unknown;
+    deepgram_small_audio_bytes?: unknown;
+    deepgram_small_audio_read_timeout_ms?: unknown;
   };
 };
 
@@ -1274,15 +1277,17 @@ const UI_TOKENS = {
      * timing lived inside it, so "all the budgets of a stop" was not
      * something you could read in one place.
      *
-     *   smallAudioUiMs      — Deepgram REST on a payload under
-     *                         ``REMOTE_SMALL_AUDIO_BYTES``; the UI gives
-     *                         up before the request does.
+     *   smallAudioUiMarginMs — Deepgram REST on a body the backend calls
+     *                         small (``runtime_limits``): the UI gives up
+     *                         this long after the backend's read timeout
+     *                         for it, so the backend's own error lands
+     *                         first (./runtime-limits smallAudioUiTimeoutMs).
      *   shortEmptyRecoveryMs — an empty transcript on a short recording:
      *                         there is little audio to re-decode, so
      *                         waiting long buys nothing.
      *   defaultEmptyRecoveryMs — the same for a recording of any length.
      */
-    smallAudioUiMs: 13_000,
+    smallAudioUiMarginMs: 1_000,
     /**
      * Longest wait for an <audio> element to report the captured
      * container's duration while the stop picks the canonical audio.
@@ -1369,6 +1374,9 @@ function quarantineCorruptSnapshot(prefix: string, raw: string): void {
 }
 let uploadQueueMaxPersistedItems = Number.MAX_SAFE_INTEGER;
 let uploadQueueMaxParallel = 1;
+/** Backend-owned numbers with no renderer default (FU-13): unknown until reported. */
+let upscaleCustomPresetLimit: number | undefined;
+let deepgramSmallAudioLimits: Pick<RuntimeLimits, "deepgramSmallAudioBytes" | "deepgramSmallAudioReadTimeoutMs"> = {};
 let LOCAL_TRANSCRIPTION_MODELS: string[] = [];
 let DEFAULT_LOCAL_TRANSCRIPTION_MODEL = "";
 let LOCAL_LIVE_ASSIST_MODELS: string[] = [];
@@ -2316,6 +2324,13 @@ function applyRuntimeLimits(limits: unknown): void {
   if (parsed.uploadQueueMaxPersistedItems !== undefined) {
     uploadQueueMaxPersistedItems = parsed.uploadQueueMaxPersistedItems;
   }
+  if (parsed.upscaleCustomPresetLimit !== undefined) upscaleCustomPresetLimit = parsed.upscaleCustomPresetLimit;
+  if (parsed.deepgramSmallAudioBytes !== undefined && parsed.deepgramSmallAudioReadTimeoutMs !== undefined) {
+    deepgramSmallAudioLimits = {
+      deepgramSmallAudioBytes: parsed.deepgramSmallAudioBytes,
+      deepgramSmallAudioReadTimeoutMs: parsed.deepgramSmallAudioReadTimeoutMs,
+    };
+  }
   if (parsed.rejected.length) {
     console.warn(`runtime_limits: ignored ${parsed.rejected.join(", ")} (not a positive integer)`);
   }
@@ -3035,8 +3050,6 @@ function isKnownProviderName(name: string): boolean {
   return !!key && !RETIRED_PROVIDER_NAMES.has(key);
 }
 
-const REMOTE_SMALL_AUDIO_BYTES = 1 * 1024 * 1024;
-const DEEPGRAM_SMALL_AUDIO_UI_TIMEOUT_MS = UI_TOKENS.finalize.smallAudioUiMs;
 const LIVE_SHORT_EMPTY_RECOVERY_TIMEOUT_MS = UI_TOKENS.finalize.shortEmptyRecoveryMs;
 const LIVE_DEFAULT_EMPTY_RECOVERY_TIMEOUT_MS = UI_TOKENS.finalize.defaultEmptyRecoveryMs;
 function isRemoteProviderReachable(provider: Provider, providerReachabilityHint = false): boolean {
@@ -3048,10 +3061,7 @@ function remoteProviderOfflineMessage(provider: Provider): string {
 }
 
 function inferRemoteJobTimeoutMs(file: File, provider: Provider): number | null {
-  if (provider === "deepgram" && file.size > 0 && file.size <= REMOTE_SMALL_AUDIO_BYTES) {
-    return DEEPGRAM_SMALL_AUDIO_UI_TIMEOUT_MS;
-  }
-  return null;
+  return smallAudioUiTimeoutMs(provider, file.size, deepgramSmallAudioLimits, UI_TOKENS.finalize.smallAudioUiMarginMs);
 }
 
 function createLinkedAbortSignal(
@@ -6506,7 +6516,7 @@ async function loadUpscalePresets(preferredId = ""): Promise<void> {
   pendingUpscalePresetId = "";
   const addBtn = $("upscalePresetAddBtn") as HTMLButtonElement;
   const customCount = upscalePresets.filter((x) => !x.builtin).length;
-  addBtn.disabled = customCount >= 3;
+  addBtn.disabled = customPresetLimitReached(customCount, upscaleCustomPresetLimit);
   syncUpscalePresetControls();
 }
 

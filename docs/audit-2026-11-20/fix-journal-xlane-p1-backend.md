@@ -150,3 +150,35 @@ before:  ERROR: test_the_schema_version_survives_the_round_trip
 after:   Ran 9 tests OK
 ```
 Suites: backend 994 OK; desktop 436; vitest 604; typecheck, lint, build clean.
+
+## C5 — FU-13a, FU-13b / FG-10: backend-owned limits published, renderer copies gone
+
+Files: `backend/remote_deepgram.py` (public `DEEPGRAM_SMALL_AUDIO_BYTES`,
+`DEEPGRAM_SMALL_AUDIO_READ_TIMEOUT_SEC`, used by `_deepgram_http_policy`),
+`backend/main.py` (`runtime_limits` gains `upscale_custom_preset_limit`,
+`deepgram_small_audio_bytes`, `deepgram_small_audio_read_timeout_ms`),
+`backend/tests/test_live.py`, `frontend/src/runtime-limits.ts` (parse +
+`customPresetLimitReached`, `smallAudioUiTimeoutMs`),
+`frontend/tests/runtime-limits.test.ts`, `frontend/src/main.tsx`
+(`applyRuntimeLimits`, `loadUpscalePresets`, `inferRemoteJobTimeoutMs`;
+`REMOTE_SMALL_AUDIO_BYTES`, `DEEPGRAM_SMALL_AUDIO_UI_TIMEOUT_MS` and
+`UI_TOKENS.finalize.smallAudioUiMs` removed, `smallAudioUiMarginMs: 1_000`).
+
+Decisions: the UI deadline is the backend's READ timeout + 1 s margin
+(today 12 s + 1 s = the old 13 s — behaviour unchanged). FG-10 suggested
+connect+read+margin (= 23 s); that would change behaviour, so the existing
+"read + 1 s" convention is kept and now derived instead of copied. No
+renderer defaults for the new numbers: until bootstrap/health reports them
+the add-preset button stays enabled (the create route still refuses past the
+limit with a 400) and small Deepgram requests have no UI deadline of their
+own. In the app the bootstrap is in the page, so they are known from the
+first render.
+
+Check: backend `test_runtime_limits_publish_what_the_renderer_used_to_copy`
+(also pins that the published read timeout IS the one the client uses for a
+small body) — against the previous main.py:
+`ERROR … KeyError: 'upscale_custom_preset_limit'`; after: OK. Frontend: 3 new
+vitest cases (the old renderer had no reading at all — `customCount >= 3`,
+literal 1 MiB / 13 s).
+
+Suites: backend 995 OK; desktop 436; vitest 607; typecheck, lint, build clean.

@@ -113,7 +113,12 @@ from backend.jobs import JobCancelledError, JobStore
 from backend.http_retry import RemoteError
 from backend.remote_openrouter import OpenRouterError, openrouter_transcribe, openrouter_upscale_text
 from backend.deepgram_keyterms import MAX_KEYTERM_TOKENS, configured_keyterms
-from backend.remote_deepgram import DeepgramRemoteError, deepgram_transcribe
+from backend.remote_deepgram import (
+    DEEPGRAM_SMALL_AUDIO_BYTES,
+    DEEPGRAM_SMALL_AUDIO_READ_TIMEOUT_SEC,
+    DeepgramRemoteError,
+    deepgram_transcribe,
+)
 from backend.deepgram_dual import (
     DualLiveSession,
     dual_secondary_language,
@@ -1944,6 +1949,14 @@ def _frontend_runtime_payload() -> dict[str, Any]:
         "runtime_limits": {
             "upload_queue_max_parallel": jobs.max_workers,
             "upload_queue_max_persisted_items": UPLOAD_QUEUE_MAX_PERSISTED_ITEMS,
+            # FU-13a: the add-preset button disables at this count; the
+            # create route refuses past it.
+            "upscale_custom_preset_limit": UPSCALE_MAX_CUSTOM_PRESETS,
+            # FU-13b / FG-10: what the Deepgram REST client treats as a
+            # small body and how long it reads one; the renderer stops
+            # waiting for such a request a margin after that.
+            "deepgram_small_audio_bytes": DEEPGRAM_SMALL_AUDIO_BYTES,
+            "deepgram_small_audio_read_timeout_ms": DEEPGRAM_SMALL_AUDIO_READ_TIMEOUT_SEC * 1000,
         },
     }
 

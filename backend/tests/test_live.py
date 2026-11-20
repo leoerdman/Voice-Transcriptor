@@ -167,6 +167,23 @@ class WebSocketAuthTokenTests(IsolatedBackendMainImportMixin, unittest.TestCase)
             self.main.jobs.max_workers,
         )
 
+    def test_runtime_limits_publish_what_the_renderer_used_to_copy(self):
+        # FU-13a/b, FG-10: the renderer reads these instead of its own 3,
+        # 1 MiB and 13 s.
+        from backend import remote_deepgram
+
+        limits = self.main.health()["runtime_limits"]
+        self.assertEqual(limits["upscale_custom_preset_limit"], self.main.UPSCALE_MAX_CUSTOM_PRESETS)
+        self.assertEqual(limits["deepgram_small_audio_bytes"], remote_deepgram.DEEPGRAM_SMALL_AUDIO_BYTES)
+        # The published read timeout is the one the client actually uses
+        # for a small body.
+        (_, read_timeout), _attempts = remote_deepgram._deepgram_http_policy(
+            limits["deepgram_small_audio_bytes"]
+        )
+        self.assertEqual(limits["deepgram_small_audio_read_timeout_ms"], read_timeout * 1000)
+        (_, bigger_read), _ = remote_deepgram._deepgram_http_policy(limits["deepgram_small_audio_bytes"] + 1)
+        self.assertNotEqual(bigger_read, read_timeout)
+
     def test_frontend_bootstrap_uses_health_runtime_ssot(self):
         health_payload = self.main.health()
         bootstrap_payload = self.main._frontend_runtime_payload()

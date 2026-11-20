@@ -46,7 +46,12 @@ from backend.deepgram_endpoints import DEEPGRAM_REST_BASE  # noqa: E402
 
 
 _DEEPGRAM_CONNECT_TIMEOUT_SEC = 10
-_DEEPGRAM_SMALL_AUDIO_BYTES = 1 * 1024 * 1024
+# A body at most this large is a short live-capture recovery: one attempt,
+# a short read timeout. Both are published to the renderer
+# (``runtime_limits``, FU-13b / FG-10), which bounds its own wait for such
+# a request by them instead of keeping copies.
+DEEPGRAM_SMALL_AUDIO_BYTES = 1 * 1024 * 1024
+DEEPGRAM_SMALL_AUDIO_READ_TIMEOUT_SEC = 12
 _DEEPGRAM_LARGE_AUDIO_BYTES = 5 * 1024 * 1024
 
 
@@ -60,8 +65,8 @@ def _deepgram_http_policy(audio_size_bytes: int) -> tuple[tuple[int, int], int]:
     size = max(0, int(audio_size_bytes or 0))
     body_mb = max(1.0, size / (1024 * 1024))
 
-    if size <= _DEEPGRAM_SMALL_AUDIO_BYTES:
-        return (_DEEPGRAM_CONNECT_TIMEOUT_SEC, 12), 1
+    if size <= DEEPGRAM_SMALL_AUDIO_BYTES:
+        return (_DEEPGRAM_CONNECT_TIMEOUT_SEC, DEEPGRAM_SMALL_AUDIO_READ_TIMEOUT_SEC), 1
     if size < _DEEPGRAM_LARGE_AUDIO_BYTES:
         return (_DEEPGRAM_CONNECT_TIMEOUT_SEC, max(45, int(body_mb * 10))), 2
     return (_DEEPGRAM_CONNECT_TIMEOUT_SEC, max(180, int(body_mb * 8))), 2
