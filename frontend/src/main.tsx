@@ -139,7 +139,7 @@ import {
   providerLabel,
   requireRemoteProvider,
 } from "./providers";
-import { waitForJob } from "./job-poll";
+import { JobPollHttpError, waitForJob } from "./job-poll";
 import {
   LIVE_DRAFT_SCHEMA_VERSION,
   LiveDraftOperationQueue,
@@ -4863,7 +4863,7 @@ async function waitForBackendJob<T>(
           headers: authHeaders(),
           signal,
         });
-        if (!r.ok) throw new Error(await parseError(r));
+        if (!r.ok) throw new JobPollHttpError(r.status, await parseError(r));
         return (await r.json()) as BackendJobState<T>;
       },
       sleep: sleepUnlessAborted,

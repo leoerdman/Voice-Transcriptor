@@ -15,6 +15,11 @@
  *     It is an AbortError only when the caller's own signal aborted.
  *   • the poll ladder (fast, then slow after a while) lived as three bare
  *     literals beside `UI_TOKENS.polling`; it is a policy object now.
+ *   • not every failed poll is a hiccup (FQ-04). A rejected fetch, a 5xx
+ *     and a 429 are transient and retried within the bounded run; a 404
+ *     (the job no longer exists — backend restarted, results swept) and
+ *     any other 4xx are answers that a retry cannot change, so the wait
+ *     ends at once. A 404 has no job left to cancel; another 4xx may.
  */
 
 export interface JobPollPolicy {
@@ -55,6 +60,29 @@ function abortError(): DOMException {
 /** A terminal answer from the backend — not a transport failure, never retried. */
 class JobTerminalError extends Error {}
 
+/**
+ * A poll the backend answered with a non-2xx status. `fetchJob` throws it
+ * so the wait can tell an HTTP answer apart from a transport failure.
+ */
+export class JobPollHttpError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "JobPollHttpError";
+    this.status = status;
+  }
+}
+
+export type JobPollFailureKind = "transient" | "job-gone" | "terminal";
+
+/** How the wait treats one failed poll: retried, or the end of the wait. */
+export function classifyJobPollFailure(error: unknown): JobPollFailureKind {
+  if (!(error instanceof JobPollHttpError)) return "transient";
+  if (error.status >= 500 || error.status === 429) return "transient";
+  if (error.status === 404) return "job-gone";
+  return "terminal";
+}
+
 export async function waitForJob<T>(
   deps: JobPollDeps<T>,
   policy: JobPollPolicy,
@@ -71,6 +99,11 @@ export async function waitForJob<T>(
         consecutiveFailures = 0;
       } catch (e) {
         if (signal?.aborted) throw abortError();
+        const kind = classifyJobPollFailure(e);
+        if (kind === "job-gone") {
+          throw new JobTerminalError(e instanceof Error ? e.message : String(e));
+        }
+        if (kind === "terminal") throw e;
         consecutiveFailures += 1;
         if (consecutiveFailures > policy.maxConsecutiveFailures) throw e;
         deps.onTransientFailure?.(e, consecutiveFailures);
