@@ -7,8 +7,8 @@
 // from fixed constants (110 px, or 110 + gap + icon in screen mode), then
 // the capsule page MEASURED that pill and sent the size back over
 // ``document.title`` so main could resize the window. Until the first
-// measurement arrived the window was 110 px, so the 126 px screen-mode
-// pill was clipped on the first frames of every screen take. The pill's
+// measurement arrived the window was ``width`` wide, so the screen-mode
+// pill (``maxWidth``) was clipped on the first frames of every screen take. The pill's
 // size is a function of one flag; so is the window's.
 //
 // DM-25: every capsule update — including the level ticks the monitor

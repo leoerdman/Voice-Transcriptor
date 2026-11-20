@@ -23,12 +23,9 @@ describe("hasUnsentFrames — the client half of the local adoption gate", () =>
 });
 
 /**
- * FL-20: the full adoption matrix, run by the frontend's own runner. It
- * used to exist only in backend/tests/test_live_coverage_policy.py, which
- * compiles this module with tsc and drives it through node — justified
- * by "the frontend has no JavaScript test runner" (false since vitest)
- * and silently skipped wherever node/tsc is missing. Same ten cases, same
- * inputs, same expected reasons.
+ * FL-20: the full adoption matrix — its only home. (A Python copy that
+ * compiled this module with tsc and drove it through node was removed:
+ * it tested no backend code and skipped wherever node/tsc was missing.)
  */
 describe("decideLiveTranscriptAdoption — the full matrix (FL-20)", () => {
   const coverage = (overrides: Partial<LiveCoverageReport> = {}): LiveCoverageReport => ({

@@ -10,7 +10,7 @@
  *
  * The decision is isolated here, as a pure function over primitives, for
  * two reasons: it is the single place the rule is defined, and it can be
- * unit tested (see ``backend/tests/test_live_coverage_policy.py``)
+ * unit tested (see ``frontend/tests/live-coverage.test.ts``)
  * without standing up a recording session.
  *
  * Coverage has two halves and both must be clean:

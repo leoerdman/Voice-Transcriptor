@@ -128,6 +128,7 @@ const { buildPwshPasteFallbackScript } = require("./windows-paste-fallback");
 // What a backend exit means: restart or not, and whose handle it clears
 // (DM-09, DM-27).
 const { backendHandleOf, decideBackendExit } = require("./backend-exit");
+const { createSingleFlight } = require("./single-flight");
 // Recording ids are unique only per renderer page: key them with the
 // page's epoch (DM-32).
 const { recordingKey, createBoundedKeySet } = require("./renderer-epoch");
@@ -1385,9 +1386,6 @@ const RECORDING_STATUS_CAPSULE = Object.freeze((() => {
   const t = {
   width: 110,
   height: 30,
-  minWidth: 110,
-  minHeight: 30,
-  maxHeight: 30,
   bottomMargin: 16,
   pillHeight: 30,
   pillPadLeft: 4,
@@ -1469,8 +1467,8 @@ function shouldSuppressActivateForRecordingStatusCapsule() {
 // The window is exactly the pill, and the pill's size is a function of
 // one flag (./capsule-geometry, DM-13). It used to be measured in the
 // capsule page and reported back over document.title, which left the
-// window 110 px wide — clipping the 126 px screen-mode pill — until the
-// first measurement arrived.
+// window at ``width`` — clipping the wider screen-mode pill (``maxWidth``)
+// — until the first measurement arrived.
 function getRecordingStatusCapsuleWindowSize() {
   return capsuleWindowSize(RECORDING_STATUS_CAPSULE, !!recordingStatusCapsuleState.screen);
 }
@@ -1548,7 +1546,7 @@ function recordingStatusCapsuleHtml() {
       gap: ${t.pillGap}px;
     }
     #pill.screen {
-      width: ${t.width + t.pillGap + t.screenIconSize}px;
+      width: ${t.maxWidth}px;
     }
     #pill.screen #core {
       grid-template-columns: ${t.statusControlSize}px minmax(0, 1fr) ${t.timerWidth}px ${t.screenIconSize}px;
@@ -2815,6 +2813,16 @@ async function toggleRecordingFromShortcut(mode = "voice") {
       appendMainLog(`[shortcut] toggle aborted: renderer probe timed out (${RENDERER_TOGGLE_BUDGET_MS}ms); the press expires unrun`);
       resetRecordingStatusState();
       traceEnd(trace, "failed", { reason: "renderer-probe-timeout" });
+      return;
+    }
+    if (result?.expired) {
+      // The renderer reached this press after its notAfter (the toggle
+      // budget minus the return margin, desktop/renderer-toggle.js) and
+      // refused to run it. The renderer is up — "App Loading" would be
+      // false; the press simply did nothing, so the user presses again.
+      appendMainLog("[shortcut] toggle press expired before the renderer ran it; nothing was toggled");
+      resetRecordingStatusState();
+      traceEnd(trace, "failed", { reason: "press-expired" });
       return;
     }
     if (!result?.ok || !result.uiReady) {
@@ -6146,6 +6154,13 @@ async function processPostStopTask(task) {
     } else if (verdict.outcome === SIGNAL_OUTCOME.PROVISIONAL) {
       // Best-known text only (§6.8/§6.9) — keep waiting for the final.
       bestKnownText = verdict.text;
+      // The renderer's explicit phase: it has the transcript and is
+      // running the paste upscale — the only signal of that state.
+      if (verdict.upscaling) {
+        void setRecordingStatus("Upscaling", RECORDING_STATUS_KIND.UPSCALING).catch((e) => {
+          appendMainLog(`[post-stop] upscaling-status failed: ${compactLogText(e?.message || e)}`);
+        });
+      }
     } else {
       // A publish with nothing to paste (no speech, error, auto-transcribe
       // off): the recording is over and there will be no final.
@@ -6379,12 +6394,26 @@ async function handlePostStopTranscriptTimeout(trace, bestKnownText = "") {
       lastTranscriptText = recovered;
       saveLastTranscriptToDisk(recovered);
     }
-    try { clipboard.writeText(recovered); } catch { }
+    // No paste happens here, so this write stands outside the clipboard
+    // lease (the exception desktop/clipboard-lease.js names).
+    let onClipboard = true;
+    try { clipboard.writeText(recovered); } catch { onClipboard = false; }
     traceStep(trace, "transcript_recovered_after_timeout", {
       len: recovered.length,
       digest: textDigest(recovered),
       source: fromBestKnown ? "best_known_text" : "latest_transcript_lookup",
+      onClipboard,
     });
+    if (!onClipboard) {
+      // The status must not claim a clipboard that does not hold it; the
+      // paste-last hotkey reads the persisted copy either way.
+      return {
+        text: pasteAccel
+          ? `Timed out — press ${pasteAccel} to paste the transcript.`
+          : "Timed out — the transcript could not be put on the clipboard.",
+        kind: RECORDING_STATUS_KIND.WARN,
+      };
+    }
     // WARN, not "still working": this IS the final answer, and it says
     // the transcript survived. It used to fall through both substring
     // ladders into "transcribing"/neutral, so the recovery status looked
@@ -7254,8 +7283,10 @@ const engineInstall = {
   reason: "",
   error: "",
   startedAtMs: 0,
-  inFlight: null,
 };
+
+/** At most one engine install at a time (DM-06, desktop/single-flight.js). */
+const engineInstallFlight = createSingleFlight();
 
 function setEnginePhase(phase, fields = {}) {
   engineInstall.phase = phase;
@@ -7298,9 +7329,6 @@ async function probeGigaamImportable(python, repoRoot) {
  * relaunch — the existing crash-restart machinery owns the respawn.
  */
 async function installGigaamEngine(python, repoRoot) {
-  if (engineInstall.inFlight) {
-    return { ok: false, status: "already-running", ...engineInstallSnapshot() };
-  }
   const marker = path.join(repoRoot, "ENABLE_GIGAAM");
   if (!fs.existsSync(marker)) {
     return { ok: false, status: "disabled", reason: "engine feature not enabled in this build" };
@@ -7310,17 +7338,12 @@ async function installGigaamEngine(python, repoRoot) {
     return { ok: false, status: "disabled", reason: "requirements-gigaam.txt missing" };
   }
   // Single flight, claimed on THIS synchronous turn — before the first
-  // await (DM-06). The flag used to be set only after the up-to-60 s
-  // import probe, so two invokes inside that window (double click, two
-  // windows, a StrictMode double effect) both passed the check above and
-  // ran two multi-GB pip installs into the same staging directory.
-  const run = runGigaamEngineInstall(python, repoRoot, req);
-  engineInstall.inFlight = run;
-  try {
-    return await run;
-  } finally {
-    if (engineInstall.inFlight === run) engineInstall.inFlight = null;
-  }
+  // await (DM-06): the up-to-60 s import probe used to run before the
+  // claim, so two invokes inside it both ran a multi-GB pip install into
+  // one staging directory. The helper makes check-and-claim one step.
+  const run = engineInstallFlight.tryRun(() => runGigaamEngineInstall(python, repoRoot, req));
+  if (!run) return { ok: false, status: "already-running", ...engineInstallSnapshot() };
+  return run;
 }
 
 async function runGigaamEngineInstall(python, repoRoot, req) {
@@ -8650,11 +8673,8 @@ async function createWindow(options = {}) {
   win.on("moved", () => noteMainWindowUserGeometry("moved"));
 
   win.on("closed", () => {
-    // The webContents and its listeners are destroyed with the window.
-    // (A removeAllListeners block used to sit here behind
-    // ``!win.isDestroyed()`` — always false inside "closed" — so it
-    // never ran; it was deleted rather than "fixed", because there is
-    // nothing left to remove.)
+    // The webContents and its listeners are destroyed with the window,
+    // so there is nothing to remove here.
     win = null;
   });
 

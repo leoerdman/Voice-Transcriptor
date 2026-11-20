@@ -22,6 +22,12 @@
 //     outcome (restore scheduled, transcript kept) or, failing that, by
 //     the caller's ``finally`` — and releasing twice is a no-op.
 //
+// One writer stands outside the lease on purpose: the post-stop timeout
+// recovery (main.js handlePostStopTranscriptTimeout) puts the transcript
+// on the clipboard WITHOUT pasting it. No paste means nothing to restore,
+// so there is no snapshot to take; and a restore window still open from
+// an earlier paste aborts by itself when it sees content it did not write.
+//
 // Chained pastes share one snapshot: a second paste that starts while the
 // first one's restore window is still open must not capture the first
 // transcript as "original" content. The shared snapshot lives until the

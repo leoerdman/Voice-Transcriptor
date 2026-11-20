@@ -26,9 +26,10 @@ import {
   type StopTranscriptSource,
 } from "./envelope-deadline";
 import {
-  attemptFinalSave,
+  createSessionMetadataSaver,
   decideDrainedSilence,
   resolveFailedStopSummary,
+  resolveSessionTitle,
   resolveTranscriptStopSummary,
   runStopEpilogue,
   type FinalSaveOutcome,
@@ -10618,14 +10619,13 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
     window.__transcriptorLastFinishedText = pasteText;
   }
 
-  // Channel 1b: the same fact, pushed to the Electron main process
-  // instead of waiting to be polled for it (§6.7). Every publish for a
-  // real recording emits one signal — a recording that ends without a
-  // transcript at all still says so, which is how the main process
-  // learns it is terminal without waiting out its deadline. The text on
-  // a non-final signal is whatever the UI is showing; judging it is the
-  // main process's job (it owns the paste decision), and a second
-  // opinion here would be a second policy.
+  // Push to the Electron main process (desktop/transcript-signal.js):
+  // every publish for a real recording emits one signal — a recording
+  // that ends without a transcript at all still says so, which is how
+  // main learns it is terminal without waiting out its deadline. Main
+  // decides from ``final`` and the kind/phase label, not by reading the
+  // text (only whole-string equality with the renderer's own no-speech
+  // placeholders); the text rides along to be pasted when ``final``.
   if (rid > 0) {
     window.transcriptor?.recordingFinal?.({
       recordingId: rid,
@@ -11916,7 +11916,6 @@ async function stopLive(
     }
     return latestSourceLiveText;
   };
-  const latestSourceTitle = (): string => _smartTitle(latestSourceForSave());
   const captureSilenceSnapshot = (liveText: string): {
     hardSilence: boolean;
     likelySilenceWithoutPreview: boolean;
@@ -12425,26 +12424,25 @@ async function stopLive(
   // the no-transcript exits, the failure catch and the success path
   // cannot disagree about what is saved or how a failed save is
   // reported (FL-02: only the archive-moved conflict used to be caught;
-  // every other failure was dropped and the stop reported success).
-  const saveSessionMetadata = (transcriptText: string, providerName: string): Promise<FinalSaveOutcome> =>
-    attemptFinalSave(
-      () => saveRecordingText({
-        name: persistedRecordingName,
-        archiveDir: persistedRecordingArchiveDir,
-        requireExisting: !!persistedRecordingName,
-        title: latestSourceTitle(),
-        sourceText: latestSourceForSave(),
-        transcriptText,
-        provider: providerName,
-        model: modelValue,
-        language: languageValue,
-        recordingCollection,
-      }),
-      {
-        isConflict: isArchiveMutationConflict,
-        describe: (e) => sanitizeUiErrorMessage(e, "History save failed."),
-      },
-    );
+  // every other failure was dropped and the stop reported success). The
+  // title it writes comes from the transcript it is handed (what was
+  // SAID), the live text only when there is none (./stop-epilogue).
+  const defaultTitle = title;
+  const saveSessionMetadata = createSessionMetadataSaver({
+    target: () => ({ name: persistedRecordingName, archiveDir: persistedRecordingArchiveDir }),
+    liveSourceText: latestSourceForSave,
+    fallbackTitle: defaultTitle,
+    save: (request) => saveRecordingText({
+      ...request,
+      model: modelValue,
+      language: languageValue,
+      recordingCollection,
+    }),
+    classify: {
+      isConflict: isArchiveMutationConflict,
+      describe: (e) => sanitizeUiErrorMessage(e, "History save failed."),
+    },
+  });
   // The no-transcript exits (D-13): each states WHAT it ends with; how
   // it ends — signal, progress row, status, metadata save, release,
   // summary — is ``runStopEpilogue`` (./stop-epilogue), one for all.
@@ -12465,7 +12463,11 @@ async function stopLive(
       }
     },
     setStatus: (label) => setStatusScoped(sessionUiToken, label),
-    save: () => saveSessionMetadata(metadata.transcriptText, metadata.provider),
+    save: () => saveSessionMetadata({
+      spokenTranscript: "",
+      transcriptText: metadata.transcriptText,
+      provider: metadata.provider,
+    }),
     release: releaseStopEpilogueBookkeeping,
     patchSummary: (summary) => patchCurrentRecordingSummary({
       title: provisionalTitle,
@@ -13248,8 +13250,13 @@ async function stopLive(
       });
     }
     setStatusScoped(sessionUiToken, "Done");
-    title = plainTranscriptRaw ? _smartTitle(plainTranscriptRaw) : provisionalTitle;
-    const finalSave = await saveSessionMetadata(transcriptRaw, provider);
+    // The summary names the entry by the same rule the save does.
+    title = resolveSessionTitle(plainTranscriptRaw, latestSourceForSave(), defaultTitle);
+    const finalSave = await saveSessionMetadata({
+      spokenTranscript: plainTranscriptRaw,
+      transcriptText: transcriptRaw,
+      provider,
+    });
     patchCurrentRecordingSummary({
       title,
       ...resolveTranscriptStopSummary({
@@ -13274,7 +13281,7 @@ async function stopLive(
       $("progressRow").hidden = true;
     }
     setStatusScoped(sessionUiToken, "Error");
-    const fallbackSave = await saveSessionMetadata("", provider);
+    const fallbackSave = await saveSessionMetadata({ spokenTranscript: "", transcriptText: "", provider });
     patchCurrentRecordingSummary({
       title: provisionalTitle,
       ...resolveFailedStopSummary({
