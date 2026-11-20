@@ -8,12 +8,16 @@
  * moments that matter, whatever started or stopped the take (hotkey,
  * button, auto-stop):
  *
- *  - start — the first audio frame arrived, i.e. the microphone is really
- *    recording and it is safe to speak;
- *  - stop  — the take stopped.
+ *  - start — it is safe to speak: at the press when the warm microphone
+ *    is adopted (it has been capturing all along), else when the first
+ *    audio frame arrives;
+ *  - stop  — the take stopped (at the press).
  *
- * The tone shapes are the overlay's original ones: a 75 ms rising
- * triangle for start, a 90 ms falling one for stop, both quiet.
+ * The tone shapes are the overlay's original ones — a 75 ms rising
+ * triangle for start, a 90 ms falling one for stop — at a gain the user
+ * can actually hear. Start sounds at the press when the warm microphone
+ * is adopted (it has been capturing all along), else at the first frame;
+ * stop sounds at the press.
  *
  * Best effort by design: a cue never throws and never delays the
  * recording path. Tested with a fake AudioContext —
@@ -30,8 +34,10 @@ export interface RecordingCueSpec {
 }
 
 export const RECORDING_CUES: Readonly<Record<RecordingCueKind, Readonly<RecordingCueSpec>>> = Object.freeze({
-  start: Object.freeze({ durationSec: 0.075, baseHz: 760, endHz: 980, gainPeak: 0.04 }),
-  stop: Object.freeze({ durationSec: 0.09, baseHz: 560, endHz: 420, gainPeak: 0.055 }),
+  // Gains raised from the overlay's 0.04 / 0.055 (user, 2026-11-20: too
+  // quiet to notice); the tones stay short so they never mask speech.
+  start: Object.freeze({ durationSec: 0.075, baseHz: 760, endHz: 980, gainPeak: 0.25 }),
+  stop: Object.freeze({ durationSec: 0.09, baseHz: 560, endHz: 420, gainPeak: 0.3 }),
 });
 
 /** Attack of the gain envelope, seconds. */

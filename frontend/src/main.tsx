@@ -10075,6 +10075,8 @@ let warmCapture: WarmCapture | null = null;
  * the support log says whether the mechanism did anything on this host.
  */
 let sessionStartedWarm = false;
+/** This start's tone has sounded (at the press when warm, else at the first frame). */
+let startCuePlayed = false;
 let sessionPreRollMs = 0;
 
 function streamHasLiveAudio(s: MediaStream | null): boolean {
@@ -10294,10 +10296,9 @@ function commitWarmCaptureHold(plan: WarmHoldPlan): boolean {
  * unusable for the next one too, and holding a microphone open for a
  * graph nobody can use is the worst of both designs.
  */
-function takeWarmCapture(requestedDeviceId: string): WarmCapture | null {
-  const held = warmCapture;
-  if (!held) return null;
-  const decision = decideWarmReuse({
+/** The one reuse question for the held graph, asked of its current state. */
+function warmReuseDecision(held: WarmCapture, requestedDeviceId: string) {
+  return decideWarmReuse({
     now: Date.now(),
     heldSince: held.heldSince,
     warmHoldMs: UI_TOKENS.capture.warmHoldMs,
@@ -10306,6 +10307,21 @@ function takeWarmCapture(requestedDeviceId: string): WarmCapture | null {
     trackLive: streamHasLiveAudio(held.stream),
     contextState: held.ac.state,
   });
+}
+
+/**
+ * Would a start right now adopt the held graph? Asked at the press, so the
+ * start tone can sound at once: a warm graph has been recording into its
+ * pre-roll ring all along, so speech from this moment is already captured.
+ */
+function warmCaptureWillBeReused(requestedDeviceId: string): boolean {
+  return !!warmCapture && warmReuseDecision(warmCapture, requestedDeviceId).reuse;
+}
+
+function takeWarmCapture(requestedDeviceId: string): WarmCapture | null {
+  const held = warmCapture;
+  if (!held) return null;
+  const decision = warmReuseDecision(held, requestedDeviceId);
   if (!decision.reuse) {
     releaseWarmCapture(decision.reason);
     return null;
@@ -11171,8 +11187,12 @@ function pushCapturedFrame(input: Float32Array, preRollMs = 0): void {
     // cost the user experiences as the capsule not doing anything yet.
     markStartPhase("first-frame");
     startFirstFrameSeen = true;
-    // The microphone is really recording now: tell the user to speak.
-    playRecordingCue("start");
+    // A cold start: the microphone is really recording only now — tell
+    // the user to speak. (A warm start already sounded at the press.)
+    if (!startCuePlayed) {
+      startCuePlayed = true;
+      playRecordingCue("start");
+    }
     const totalMs = performance.now() - startT0;
     const labels = startTimings
       .map(([label, t], i) => {
@@ -11367,6 +11387,15 @@ async function startLive(
   startT0 = performance.now();
   startTimings = [];
   startFirstFrameSeen = false;
+  // The start tone at the press when the held graph will be adopted: its
+  // ring has been capturing all along, so speech from now on is recorded
+  // even though the first frame reaches this take ~300 ms later (the
+  // session buffers open first). A cold start sounds at its first frame.
+  startCuePlayed = false;
+  if (warmCaptureWillBeReused(((document.getElementById("micSelect") as HTMLSelectElement | null)?.value || "").trim())) {
+    startCuePlayed = true;
+    playRecordingCue("start");
+  }
   const startAttemptSeq = ++liveStartAttemptSeq;
   try {
   let sessionArchiveDir = "";
@@ -11982,6 +12011,10 @@ async function stopLive(
   liveStartAttemptSeq += 1;
   const stopTransitionToken = createClientSessionId();
   stopTransitionInFlight = true;
+  // At the press: the stop tone answers the user's action. It overlaps
+  // the short tail hold below — the price of not making the user wait
+  // for it (measured 500–550 ms when it waited for the capture to detach).
+  playRecordingCue("stop");
   stopTransitionOwnerToken = stopTransitionToken;
   // ``_wsToCloseAtEnd`` is hoisted to function scope so the outer
   // ``finally`` block can close the WS AFTER the entire transcribe
@@ -12533,11 +12566,6 @@ async function stopLive(
   tearDown("workletNode.disconnect", () => {
     detachWorkletCapture("live teardown");
   });
-  // The take has stopped taking audio (the tail hold and the drain are
-  // behind us, the worklet is detached): the stop tone now cannot end up
-  // in the recording or the live stream. A discarded double-tap gets it
-  // too — every audible start is closed by an audible stop.
-  playRecordingCue("stop");
   tearDown("scriptNode.input.disconnect", () => {
     if (src && scriptNode) src.disconnect(scriptNode);
   });
