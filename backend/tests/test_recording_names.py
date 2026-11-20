@@ -328,7 +328,9 @@ class RecordingNameTests(unittest.TestCase):
             self.main._record_recovery_chunk(recovery, b"\x01\x02\x03")
 
             self.assertEqual(recovery["bytes"], 2)
-            self.assertEqual(Path(recovery["pcm_path"]).read_bytes(), b"\x01\x02")
+            # Read through the spool reader, which flushes the writer's
+            # buffer first (BW-13) — the way finalize-time recovery reads it.
+            self.assertEqual(self.main._recovery_spool_bytes(recovery), b"\x01\x02")
         finally:
             try:
                 recovery["pcm_file"].close()
@@ -403,6 +405,16 @@ class RecordingNameTests(unittest.TestCase):
 
         stats = self.main._build_recordings_stats_payload(root)
         self.assertEqual(stats["total_recordings"], 2)
+        # BM-29: a word-count estimate travels under an ``estimated_`` name.
+        for key in ("avg", "min", "max"):
+            self.assertNotIn(f"{key}_duration_sec", stats)
+            self.assertIsInstance(stats[f"estimated_{key}_duration_sec"], int)
+        words_per_rec = stats["total_words"] / stats["total_recordings"]
+        self.assertAlmostEqual(
+            stats["estimated_avg_duration_sec"],
+            words_per_rec / self.main.STATS_SPEECH_WORDS_PER_MIN * 60.0,
+            delta=1.0,
+        )
 
     def test_json_boolean_parser_matches_form_semantics(self):
         self.assertFalse(self.main._payload_bool({"enabled": "false"}, "enabled", True))

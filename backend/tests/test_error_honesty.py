@@ -172,7 +172,7 @@ class RetryReportingTests(unittest.TestCase):
             side_effect=requests.exceptions.ReadTimeout("read timed out"),
         ):
             with self.assertRaises(RemoteError) as raised:
-                request_with_retry("POST", "https://example.invalid/x", retries=3)
+                request_with_retry("POST", "https://example.invalid/x", attempts=3)
         self.assertIn("after 1 attempt:", str(raised.exception))
 
     def test_a_connection_error_reports_every_attempt_it_made(self):
@@ -185,7 +185,7 @@ class RetryReportingTests(unittest.TestCase):
             side_effect=requests.exceptions.ConnectionError("refused"),
         ), mock.patch("backend.http_retry.time.sleep"):
             with self.assertRaises(RemoteError) as raised:
-                request_with_retry("GET", "https://example.invalid/x", retries=3)
+                request_with_retry("GET", "https://example.invalid/x", attempts=3)
         self.assertIn("after 3 attempts:", str(raised.exception))
 
 

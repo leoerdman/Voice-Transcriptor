@@ -151,12 +151,16 @@ def request_with_retry(
     method: str,
     url: str,
     *,
-    retries: int = 3,
+    attempts: int = 3,
     backoff_base: float = 0.3,
     timeout: Optional["Tuple[float, float] | float"] = 60.0,
     **kwargs,
 ) -> requests.Response:
     """Send an HTTP request with automatic retry on transient failures.
+
+    *attempts* is the total number of requests sent, the first included
+    (``attempts=3`` = one request and up to two retries). It used to be
+    called ``retries`` while meaning this (BM-24).
 
     Retries use exponential backoff: first retry at *backoff_base* seconds,
     subsequent retries multiply the backoff.  Retries fire on:
@@ -176,11 +180,11 @@ def request_with_retry(
     """
     last_err: Optional[Exception] = None
     last_resp: Optional[requests.Response] = None
-    # A caller passing retries<=0 would skip the loop entirely and trip
+    # A caller passing attempts<=0 would skip the loop entirely and trip
     # the `assert last_resp is not None` below with an AssertionError —
     # an opaque HTTP 500 with no provider context. Treat it as "one
     # attempt, no retry", which is what such a caller means.
-    attempts = max(1, int(retries or 0))
+    attempts = max(1, int(attempts or 0))
     # Idempotency gate (BUG-53): a read timeout on a POST means the
     # provider MAY have already processed (and billed) the request —
     # blind retrying double-charges the user. Non-idempotent methods

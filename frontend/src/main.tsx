@@ -134,7 +134,7 @@ import { networkVerdict, type NetworkProbeOutcome } from "./network-probe";
 import { keyEventToAccelerator } from "./shortcut-capture";
 import { keyAction, performKeyAction, type KeyAction } from "./key-action";
 import { keepaliveFor } from "./keepalive";
-import { parseRuntimeLimits } from "./runtime-limits";
+import { customPresetLimitReached, parseRuntimeLimits, smallAudioUiTimeoutMs, type RuntimeLimits } from "./runtime-limits";
 import { screenThumbLabel, screensStripNote } from "./screens-strip";
 import { fallbackSourceKey, isCurrentPlayerSource } from "./player-source";
 import { parseRecordingSaveResponse, planRecordingSave, recordingSaveFormEntries } from "./recording-save";
@@ -146,7 +146,7 @@ import {
   providerLabel,
   requireRemoteProvider,
 } from "./providers";
-import { waitForJob } from "./job-poll";
+import { JobPollHttpError, waitForJob } from "./job-poll";
 import {
   LIVE_DRAFT_SCHEMA_VERSION,
   LiveDraftOperationQueue,
@@ -353,9 +353,10 @@ interface RecordingsStats {
   total_chars: number;
   avg_words_per_recording: number;
   avg_chars_per_recording: number;
-  avg_duration_sec: number;
-  min_duration_sec: number;
-  max_duration_sec: number;
+  /** Word count at the backend's speaking pace — an estimate, not audio length (BM-29). */
+  estimated_avg_duration_sec: number;
+  estimated_min_duration_sec: number;
+  estimated_max_duration_sec: number;
   top_words: Array<{ word: string; count: number }>;
   providers: Array<{ name: string; count: number }>;
   languages: Array<{ name: string; count: number }>;
@@ -673,6 +674,9 @@ type BackendBootstrapPayload = {
   runtime_limits?: {
     upload_queue_max_parallel?: unknown;
     upload_queue_max_persisted_items?: unknown;
+    upscale_custom_preset_limit?: unknown;
+    deepgram_small_audio_bytes?: unknown;
+    deepgram_small_audio_read_timeout_ms?: unknown;
   };
 };
 
@@ -1286,15 +1290,17 @@ const UI_TOKENS = {
      * timing lived inside it, so "all the budgets of a stop" was not
      * something you could read in one place.
      *
-     *   smallAudioUiMs      — Deepgram REST on a payload under
-     *                         ``REMOTE_SMALL_AUDIO_BYTES``; the UI gives
-     *                         up before the request does.
+     *   smallAudioUiMarginMs — Deepgram REST on a body the backend calls
+     *                         small (``runtime_limits``): the UI gives up
+     *                         this long after the backend's read timeout
+     *                         for it, so the backend's own error lands
+     *                         first (./runtime-limits smallAudioUiTimeoutMs).
      *   shortEmptyRecoveryMs — an empty transcript on a short recording:
      *                         there is little audio to re-decode, so
      *                         waiting long buys nothing.
      *   defaultEmptyRecoveryMs — the same for a recording of any length.
      */
-    smallAudioUiMs: 13_000,
+    smallAudioUiMarginMs: 1_000,
     /**
      * Longest wait for an <audio> element to report the captured
      * container's duration while the stop picks the canonical audio.
@@ -1381,6 +1387,9 @@ function quarantineCorruptSnapshot(prefix: string, raw: string): void {
 }
 let uploadQueueMaxPersistedItems = Number.MAX_SAFE_INTEGER;
 let uploadQueueMaxParallel = 1;
+/** Backend-owned numbers with no renderer default (FU-13): unknown until reported. */
+let upscaleCustomPresetLimit: number | undefined;
+let deepgramSmallAudioLimits: Pick<RuntimeLimits, "deepgramSmallAudioBytes" | "deepgramSmallAudioReadTimeoutMs"> = {};
 let LOCAL_TRANSCRIPTION_MODELS: string[] = [];
 let DEFAULT_LOCAL_TRANSCRIPTION_MODEL = "";
 let LOCAL_LIVE_ASSIST_MODELS: string[] = [];
@@ -2383,6 +2392,13 @@ function applyRuntimeLimits(limits: unknown): void {
   if (parsed.uploadQueueMaxPersistedItems !== undefined) {
     uploadQueueMaxPersistedItems = parsed.uploadQueueMaxPersistedItems;
   }
+  if (parsed.upscaleCustomPresetLimit !== undefined) upscaleCustomPresetLimit = parsed.upscaleCustomPresetLimit;
+  if (parsed.deepgramSmallAudioBytes !== undefined && parsed.deepgramSmallAudioReadTimeoutMs !== undefined) {
+    deepgramSmallAudioLimits = {
+      deepgramSmallAudioBytes: parsed.deepgramSmallAudioBytes,
+      deepgramSmallAudioReadTimeoutMs: parsed.deepgramSmallAudioReadTimeoutMs,
+    };
+  }
   if (parsed.rejected.length) {
     console.warn(`runtime_limits: ignored ${parsed.rejected.join(", ")} (not a positive integer)`);
   }
@@ -2468,6 +2484,11 @@ const keySavedState: Record<RemoteProvider, boolean> = {
   deepgram: false,
 };
 
+// The token comes from the desktop shell's preload (desktop/backend-auth.js,
+// BM-01), not from the page: the backend's unauthenticated `GET /` no longer
+// carries it. Outside the desktop shell (the page opened in a browser, the
+// Vite dev server) there is no token and every API call fails here — the
+// backend is reachable with full rights only through the app's own window.
 const apiToken = (): string => {
   const token = (window.__TRANSCRIPTOR_API_TOKEN || "").trim();
   if (!token) {
@@ -3097,8 +3118,6 @@ function isKnownProviderName(name: string): boolean {
   return !!key && !RETIRED_PROVIDER_NAMES.has(key);
 }
 
-const REMOTE_SMALL_AUDIO_BYTES = 1 * 1024 * 1024;
-const DEEPGRAM_SMALL_AUDIO_UI_TIMEOUT_MS = UI_TOKENS.finalize.smallAudioUiMs;
 const LIVE_SHORT_EMPTY_RECOVERY_TIMEOUT_MS = UI_TOKENS.finalize.shortEmptyRecoveryMs;
 const LIVE_DEFAULT_EMPTY_RECOVERY_TIMEOUT_MS = UI_TOKENS.finalize.defaultEmptyRecoveryMs;
 function isRemoteProviderReachable(provider: Provider, providerReachabilityHint = false): boolean {
@@ -3110,10 +3129,7 @@ function remoteProviderOfflineMessage(provider: Provider): string {
 }
 
 function inferRemoteJobTimeoutMs(file: File, provider: Provider): number | null {
-  if (provider === "deepgram" && file.size > 0 && file.size <= REMOTE_SMALL_AUDIO_BYTES) {
-    return DEEPGRAM_SMALL_AUDIO_UI_TIMEOUT_MS;
-  }
-  return null;
+  return smallAudioUiTimeoutMs(provider, file.size, deepgramSmallAudioLimits, UI_TOKENS.finalize.smallAudioUiMarginMs);
 }
 
 function createLinkedAbortSignal(
@@ -4792,8 +4808,8 @@ function getRemoteModelValue(provider: Provider): string {
  * reads first. It used to be sent three times (``model``,
  * ``remote_model``, ``openrouter_model``, the last two "legacy aliases
  * kept for older clients"), although renderer and backend ship in one
- * bundle and no older client exists; the backend side of the alias is
- * listed for removal in the audit journal.
+ * bundle and no older client exists; the backend reads only ``model`` now
+ * (FG-11).
  */
 function appendRemoteModelFormFields(fd: FormData, provider: Provider, model: string | undefined): void {
   if (!isRemoteProvider(provider)) return;
@@ -4930,7 +4946,7 @@ async function waitForBackendJob<T>(
           headers: authHeaders(),
           signal,
         });
-        if (!r.ok) throw new Error(await parseError(r));
+        if (!r.ok) throw new JobPollHttpError(r.status, await parseError(r));
         return (await r.json()) as BackendJobState<T>;
       },
       sleep: sleepUnlessAborted,
@@ -6568,7 +6584,7 @@ async function loadUpscalePresets(preferredId = ""): Promise<void> {
   pendingUpscalePresetId = "";
   const addBtn = $("upscalePresetAddBtn") as HTMLButtonElement;
   const customCount = upscalePresets.filter((x) => !x.builtin).length;
-  addBtn.disabled = customCount >= 3;
+  addBtn.disabled = customPresetLimitReached(customCount, upscaleCustomPresetLimit);
   syncUpscalePresetControls();
 }
 
@@ -8504,9 +8520,9 @@ async function loadRecordingsStats(): Promise<void> {
   $("statsWords").textContent = String(s.total_words || 0);
   $("statsChars").textContent = String(s.total_chars || 0);
   $("statsWpr").textContent = String(s.avg_words_per_recording || 0);
-  $("statsAvgDur").textContent = fmtDur(s.avg_duration_sec || 0);
-  $("statsMinDur").textContent = fmtDur(s.min_duration_sec || 0);
-  $("statsMaxDur").textContent = fmtDur(s.max_duration_sec || 0);
+  $("statsAvgDur").textContent = fmtDur(s.estimated_avg_duration_sec || 0);
+  $("statsMinDur").textContent = fmtDur(s.estimated_min_duration_sec || 0);
+  $("statsMaxDur").textContent = fmtDur(s.estimated_max_duration_sec || 0);
   const top = $("statsTopWords");
   top.innerHTML = "";
   if (!s.top_words?.length) {

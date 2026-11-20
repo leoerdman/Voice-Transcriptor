@@ -49,7 +49,16 @@ _CPU_COUNT = max(1, os.cpu_count() or 1)
 
 
 def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name, "").strip()
+    """Parse an integer env var with graceful fallback — the backend's one
+    parser for it (``main`` and ``transcribe_gigaam`` import this; BE-22).
+
+    A non-numeric value (e.g. ``TRANSCRIPTOR_RESULT_RETENTION_SEC=1h``)
+    would otherwise crash module import with ValueError before FastAPI
+    ever starts, and Electron would see the backend child die repeatedly
+    with no diagnostic. Degrade to the documented default with a warning
+    so the backend boots and the misconfiguration is visible in the log.
+    """
+    raw = (os.environ.get(name) or "").strip()
     if not raw:
         return default
     try:

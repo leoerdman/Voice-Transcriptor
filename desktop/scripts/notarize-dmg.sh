@@ -63,13 +63,10 @@ elif [ -n "${NOTARYTOOL_KEY:-}${NOTARYTOOL_KEY_ID:-}${NOTARYTOOL_ISSUER:-}" ]; t
   [ -n "${NOTARYTOOL_KEY_ID:-}" ] || die "Missing NOTARYTOOL_KEY_ID for App Store Connect API key notarization"
   auth_args+=(--key "$NOTARYTOOL_KEY" --key-id "$NOTARYTOOL_KEY_ID")
   [ -z "${NOTARYTOOL_ISSUER:-}" ] || auth_args+=(--issuer "$NOTARYTOOL_ISSUER")
-elif [ -n "${NOTARYTOOL_APPLE_ID:-}${NOTARYTOOL_TEAM_ID:-}${NOTARYTOOL_PASSWORD:-}" ]; then
-  [ -n "${NOTARYTOOL_APPLE_ID:-}" ] || die "Missing NOTARYTOOL_APPLE_ID for Apple ID notarization"
-  [ -n "${NOTARYTOOL_TEAM_ID:-}" ] || die "Missing NOTARYTOOL_TEAM_ID for Apple ID notarization"
-  [ -n "${NOTARYTOOL_PASSWORD:-}" ] || die "Missing NOTARYTOOL_PASSWORD for Apple ID notarization"
-  auth_args+=(--apple-id "$NOTARYTOOL_APPLE_ID" --team-id "$NOTARYTOOL_TEAM_ID" --password "$NOTARYTOOL_PASSWORD")
 else
-  die "Set NOTARYTOOL_KEYCHAIN_PROFILE, or NOTARYTOOL_KEY + NOTARYTOOL_KEY_ID, or NOTARYTOOL_APPLE_ID + NOTARYTOOL_TEAM_ID + NOTARYTOOL_PASSWORD."
+  # No Apple ID + password branch (DX-21): `--password` puts the secret on
+  # the command line, readable in `ps` for the whole --wait.
+  die "Set NOTARYTOOL_KEYCHAIN_PROFILE (Apple ID credentials stored once with \`xcrun notarytool store-credentials\`), or NOTARYTOOL_KEY + NOTARYTOOL_KEY_ID."
 fi
 
 echo "[notarize-dmg] Submitting $DMG_PATH"

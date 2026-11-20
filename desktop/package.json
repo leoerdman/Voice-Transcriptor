@@ -62,6 +62,8 @@
       "backend-exit.js",
       "single-flight.js",
       "log-retention.js",
+      "backend-auth.js",
+      "private-log.js",
       "renderer-epoch.js",
       "shortcut-runtime.js",
       "capsule-geometry.js",

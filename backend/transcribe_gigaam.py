@@ -26,8 +26,12 @@ from bisect import bisect_left, bisect_right
 from collections import OrderedDict
 import logging
 import os
+import socket
+import ssl
 import tempfile
 import threading
+import time
+import urllib.error
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -77,6 +81,71 @@ _MODEL_LOCKS: "dict[str, threading.Lock]" = {}
 # failure with no mention of the variable.
 _GIGAAM_CACHE_MAX = max(1, _env_int("TRANSCRIPTOR_GIGAAM_CACHE_SIZE", 1))
 
+# A model whose load failed because its checkpoint host could not be
+# reached is not tried again for this long (BL-11). The upstream loader
+# downloads on a cache miss with its own retries, and every warm-up
+# trigger (a network flip, a settings change, a live session) used to
+# start the whole download again against the same dead host — ten
+# attempts in a minute against a CDN whose TLS certificate had expired.
+# A load that fails for any other reason is not remembered.
+GIGAAM_UNREACHABLE_RETRY_SEC = 600
+# The failures that mean "the host is out of reach": every stdlib
+# transport error the upstream urllib download raises (URLError wraps an
+# expired certificate; ssl.SSLError, socket errors and timeouts are
+# OSErrors underneath it). ``HTTPError`` is a URLError too, but it is the
+# host ANSWERING — not remembered.
+_UNREACHABLE_ERRORS = (urllib.error.URLError, ssl.SSLError, ConnectionError, TimeoutError, socket.gaierror)
+
+
+class GigaamHostUnreachableError(ConnectionError):
+    """A load refused without trying, because the same model's host was
+    unreachable moments ago. Chained (``__cause__``) to that failure, so
+    callers classifying "the network is not there" by walking the cause
+    chain (``backend.main._is_hub_offline_error``) see the original."""
+
+
+class _UnreachableMemory:
+    """Which model ids failed to load for an unreachable host, and when."""
+
+    def __init__(self, retry_after_sec: float, clock=time.monotonic) -> None:
+        self._retry_after_sec = retry_after_sec
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._failed: dict[str, tuple[float, BaseException]] = {}
+
+    def check(self, model_id: str) -> None:
+        """Raise ``GigaamHostUnreachableError`` while a recent failure stands."""
+        with self._lock:
+            entry = self._failed.get(model_id)
+            if entry is None:
+                return
+            failed_at, cause = entry
+            remaining = self._retry_after_sec - (self._clock() - failed_at)
+            if remaining <= 0:
+                del self._failed[model_id]
+                return
+        raise GigaamHostUnreachableError(
+            f"GigaAM model {model_id} is unavailable: its download host was unreachable "
+            f"{int(self._clock() - failed_at)} s ago (next attempt in {int(remaining)} s)"
+        ) from cause
+
+    def record(self, model_id: str, error: BaseException) -> None:
+        if isinstance(error, urllib.error.HTTPError) or not isinstance(error, _UNREACHABLE_ERRORS):
+            return
+        with self._lock:
+            self._failed[model_id] = (self._clock(), error)
+        logger.warning(
+            "gigaam: %s download host unreachable (%s); not retrying for %d s",
+            model_id, type(error).__name__, int(self._retry_after_sec),
+        )
+
+    def forget(self, model_id: str) -> None:
+        with self._lock:
+            self._failed.pop(model_id, None)
+
+
+_UNREACHABLE = _UnreachableMemory(GIGAAM_UNREACHABLE_RETRY_SEC)
+
 def gigaam_import_error() -> Optional[str]:
     """Return why the engine is unavailable, or None when usable.
 
@@ -114,11 +183,17 @@ def _load_model(model_id: str) -> Any:
                 # coldest model.
                 _MODEL_CACHE.move_to_end(model_id)
                 return model
+        _UNREACHABLE.check(model_id)
         import gigaam
 
         upstream_name = model_id.removeprefix("gigaam-").replace("-", "_")
         logger.info("gigaam: loading %s (upstream name %s)", model_id, upstream_name)
-        model = gigaam.load_model(upstream_name)
+        try:
+            model = gigaam.load_model(upstream_name)
+        except Exception as e:
+            _UNREACHABLE.record(model_id, e)
+            raise
+        _UNREACHABLE.forget(model_id)
         with _MODEL_LOCKS_GUARD:
             _MODEL_CACHE[model_id] = model
             _MODEL_CACHE.move_to_end(model_id)

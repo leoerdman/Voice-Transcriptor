@@ -28,12 +28,10 @@ recording (``cli_save_request_refusal``). It is not the renderer's token
 with a different name: with it alone a client cannot read or write the
 config, provider keys, the archive listing or the live socket.
 
-What this boundary does NOT cover: the renderer's own token is injected
-into the page served by the unauthenticated ``GET /`` (backend/main.py
-``index``), so a local process that fetches that page holds the full
-token. Closing that needs the desktop shell to hand the token to its
-window itself (audit BM-01, open); until then the CLI token limits what a
-holder of only the CLI token can do, not what any local process can.
+The renderer's own token is not reachable from the CLI token: the
+unauthenticated ``GET /`` no longer carries it (audit BM-01). The desktop
+shell mints it per launch, starts the backend with it in the environment
+and hands it to its window over IPC (desktop/backend-auth.js).
 
 Pure where it can be: the wrapper text, the command cards, the route
 rule, the address-from-scope reader and the defaults derivation take

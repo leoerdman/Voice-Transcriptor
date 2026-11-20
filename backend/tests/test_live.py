@@ -167,6 +167,23 @@ class WebSocketAuthTokenTests(IsolatedBackendMainImportMixin, unittest.TestCase)
             self.main.jobs.max_workers,
         )
 
+    def test_runtime_limits_publish_what_the_renderer_used_to_copy(self):
+        # FU-13a/b, FG-10: the renderer reads these instead of its own 3,
+        # 1 MiB and 13 s.
+        from backend import remote_deepgram
+
+        limits = self.main.health()["runtime_limits"]
+        self.assertEqual(limits["upscale_custom_preset_limit"], self.main.UPSCALE_MAX_CUSTOM_PRESETS)
+        self.assertEqual(limits["deepgram_small_audio_bytes"], remote_deepgram.DEEPGRAM_SMALL_AUDIO_BYTES)
+        # The published read timeout is the one the client actually uses
+        # for a small body.
+        (_, read_timeout), _attempts = remote_deepgram._deepgram_http_policy(
+            limits["deepgram_small_audio_bytes"]
+        )
+        self.assertEqual(limits["deepgram_small_audio_read_timeout_ms"], read_timeout * 1000)
+        (_, bigger_read), _ = remote_deepgram._deepgram_http_policy(limits["deepgram_small_audio_bytes"] + 1)
+        self.assertNotEqual(bigger_read, read_timeout)
+
     def test_frontend_bootstrap_uses_health_runtime_ssot(self):
         health_payload = self.main.health()
         bootstrap_payload = self.main._frontend_runtime_payload()
@@ -206,6 +223,71 @@ class WebSocketAuthTokenTests(IsolatedBackendMainImportMixin, unittest.TestCase)
             set(payload["audio_ext_to_mime"].keys()),
             {ext.lstrip(".") for ext in self.main.ALLOWED_AUDIO_EXTS},
         )
+
+
+class LiveRecoverySpoolWriterTests(IsolatedBackendMainImportMixin, unittest.TestCase):
+    """BW-13: the spool is written through a buffer (not one syscall per
+    renderer frame on the event loop), and every reader that looks at the
+    file while the session still holds it sees every accepted chunk."""
+
+    def _open(self):
+        from datetime import datetime
+
+        self.main.LIVE_RECOVERY_DIR.mkdir(parents=True, exist_ok=True)
+        recovery = self.main._open_live_recovery(
+            session_id="bw13",
+            started_at=datetime(2026, 11, 20, 12, 0, 0),
+            provider="deepgram",
+            model="nova-3",
+            language="auto",
+            archive_dir="",
+            recording_collection="live",
+        )
+        self.addCleanup(lambda: recovery["pcm_file"].closed or recovery["pcm_file"].close())
+        return recovery
+
+    def test_small_frames_are_buffered_not_written_one_by_one(self):
+        recovery = self._open()
+        frame = b"\x01\x00" * 1600  # 100 ms of 16 kHz mono PCM16
+        for _ in range(4):
+            self.main._record_recovery_chunk(recovery, frame)
+        self.assertEqual(recovery["bytes"], 4 * len(frame))
+        self.assertLess(recovery["pcm_path"].stat().st_size, recovery["bytes"])
+
+    def test_readers_during_the_session_see_every_accepted_chunk(self):
+        recovery = self._open()
+        frame = b"\x02\x00" * 1600
+        for _ in range(3):
+            self.main._record_recovery_chunk(recovery, frame)
+        self.assertEqual(self.main._recovery_spool_bytes(recovery), frame * 3)
+        self.assertAlmostEqual(
+            self.main._recovery_spool_seconds(recovery),
+            3 * len(frame) / float(self.main.LIVE_PCM_BYTES_PER_SEC),
+        )
+        self.assertFalse(recovery["had_error"])
+
+    def test_finalize_lands_the_buffer_on_disk(self):
+        recovery = self._open()
+        frame = b"\x03\x00" * 16000  # 1 s, above the 1 s keep floor with the next
+        self.main._record_recovery_chunk(recovery, frame)
+        self.main._record_recovery_chunk(recovery, frame)
+        self.main._finalize_live_recovery(recovery)
+        self.assertEqual(recovery["pcm_path"].read_bytes(), frame * 2)
+
+
+class EnvIntParserTests(IsolatedBackendMainImportMixin, unittest.TestCase):
+    """BE-22: one integer-env parser for the backend, shared by main."""
+
+    def test_main_uses_the_shared_parser(self):
+        from backend import transcribe
+
+        self.assertIs(self.main._env_int, transcribe._env_int)
+
+    def test_a_malformed_value_degrades_to_the_default(self):
+        with mock.patch.dict(os.environ, {"TRANSCRIPTOR_TEST_INT": " 1h "}):
+            self.assertEqual(self.main._env_int("TRANSCRIPTOR_TEST_INT", 7), 7)
+        with mock.patch.dict(os.environ, {"TRANSCRIPTOR_TEST_INT": " 42 "}):
+            self.assertEqual(self.main._env_int("TRANSCRIPTOR_TEST_INT", 7), 42)
 
 
 class FrontendLiveDefaultsFixtureTests(IsolatedBackendMainImportMixin, unittest.TestCase):

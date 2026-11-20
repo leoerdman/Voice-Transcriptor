@@ -1,5 +1,21 @@
 const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
+// The backend's API token (Ultra-Audit 2026-11-20 BM-01). The backend no
+// longer writes it into its unauthenticated page; main minted it for this
+// launch and answers this one fixed, synchronous channel only for the main
+// window showing the backend's page (desktop/backend-auth.js). Read once
+// per page load, before the renderer's first request — under the same
+// global name the renderer has always read, so it has one source.
+// (A sandboxed preload cannot require ./backend-auth, so the channel name
+// is spelled here; desktop/ipc-contract.test.js holds both sides to it.)
+contextBridge.exposeInMainWorld("__TRANSCRIPTOR_API_TOKEN", (() => {
+  try {
+    return String(ipcRenderer.sendSync("backend:api-token") || "");
+  } catch {
+    return "";
+  }
+})());
+
 contextBridge.exposeInMainWorld("__transcriptorFilePathForFile", (file) => {
   try {
     if (!file || typeof webUtils?.getPathForFile !== "function") return "";

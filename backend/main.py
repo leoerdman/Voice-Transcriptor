@@ -118,7 +118,12 @@ from backend.deepgram_language import (
     LANGUAGE_HINT_OPTIONS,
     configured_language_hints,
 )
-from backend.remote_deepgram import DeepgramRemoteError, deepgram_transcribe
+from backend.remote_deepgram import (
+    DEEPGRAM_SMALL_AUDIO_BYTES,
+    DEEPGRAM_SMALL_AUDIO_READ_TIMEOUT_SEC,
+    DeepgramRemoteError,
+    deepgram_transcribe,
+)
 from backend.deepgram_dual import (
     DualLiveSession,
     dual_secondary_language,
@@ -148,6 +153,7 @@ from backend.remote_deepgram_live import (
     resolve_live_language,
 )
 from backend.transcribe import (
+    _env_int,  # the one integer-env parser (BE-22); transcribe_gigaam uses it too
     merge_channel_transcripts,
     model_is_resident,
     start_idle_model_sweeper,
@@ -631,10 +637,11 @@ WS_CONNECT_LIMIT_PER_MIN = 120
 # ``http://attacker.example:<port>/`` as SAME-ORIGIN with the attacker's
 # page, so CORS never applies and the attacker can read our responses.
 #
-# ``GET /`` injects ``window.__TRANSCRIPTOR_API_TOKEN`` into the HTML and
-# is intentionally unauthenticated (the renderer has no other way to
-# bootstrap the token). A rebinding attack could therefore lift the API
-# token and, with it, read every transcript, recording and audio file.
+# ``GET /`` and ``/api/health`` are unauthenticated, and every other
+# route answers to a token a rebound page could otherwise try to reach
+# through the user's own browser session. (``GET /`` no longer carries
+# the API token — BM-01: the desktop shell mints it and hands it to its
+# window over IPC, see desktop/backend-auth.js.)
 #
 # Requiring the Host header to be a literal loopback address closes it:
 # a rebound request carries the ATTACKER's hostname in Host, never
@@ -697,26 +704,6 @@ def _websocket_accept_subprotocol(websocket: WebSocket) -> Optional[str]:
     raw_protocols = websocket.headers.get("sec-websocket-protocol") or ""
     offered = {item.strip() for item in raw_protocols.split(",") if item.strip()}
     return WS_AUTH_SUBPROTOCOL if WS_AUTH_SUBPROTOCOL in offered else None
-
-
-def _env_int(name: str, default: int) -> int:
-    """Parse an integer env var with graceful fallback.
-
-    A non-numeric value (e.g., ``TRANSCRIPTOR_RESULT_RETENTION_SEC=1h``)
-    would otherwise crash module import with ValueError before FastAPI
-    ever starts, and Electron would see the backend child die
-    repeatedly with no diagnostic. Degrade to the documented default
-    with a warning so the backend boots and the misconfiguration is
-    visible in the log.
-    """
-    raw = (os.environ.get(name) or "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        logger.warning("invalid integer env %s=%r; using default=%d", name, raw, default)
-        return default
 
 
 RESULT_RETENTION_SEC = _env_int("TRANSCRIPTOR_RESULT_RETENTION_SEC", 86400)
@@ -1833,8 +1820,8 @@ _ASSETS_CACHE_HEADERS = {
 @app.middleware("http")
 async def guard_host_and_set_cache_control(request: Request, call_next):
     # Host allowlist runs BEFORE the route so the unauthenticated
-    # token-bearing ``GET /`` is covered too. See _host_header_allowed
-    # for the DNS-rebinding rationale.
+    # ``GET /`` is covered too. See _host_header_allowed for the
+    # DNS-rebinding rationale.
     if not _host_header_allowed(request.headers.get("host")):
         logger.warning(
             "rejected request with non-loopback Host header path=%s",
@@ -1874,6 +1861,14 @@ async def guard_host_and_set_cache_control(request: Request, call_next):
 
 @app.get("/", response_class=HTMLResponse)
 def index():
+    # Unauthenticated, so it carries only public facts (the same payload
+    # ``/api/health`` serves) and NEVER the API token (BM-01): anything
+    # that can reach the loopback port could read it here — another local
+    # process, another OS user, a holder of only the CLI token. The desktop
+    # shell owns the token (it starts this process with
+    # ``TRANSCRIPTOR_API_TOKEN``) and gives it to its window over IPC
+    # (desktop/backend-auth.js). Opening this page in an ordinary browser
+    # therefore shows a renderer without API access — by design.
     index_path = frontend_dist_dir / "index.html"
     if not index_path.exists():
         return "frontend/dist/index.html not found. Run `npm --prefix frontend run build`."
@@ -1881,7 +1876,6 @@ def index():
     bootstrap_payload = _frontend_runtime_payload()
     injected = (
         "<script>"
-        f'window.__TRANSCRIPTOR_API_TOKEN={json.dumps(API_TOKEN)};'
         f'window.__TRANSCRIPTOR_BOOTSTRAP={json.dumps(bootstrap_payload)};'
         "</script>"
     )
@@ -1945,6 +1939,14 @@ def _frontend_runtime_payload() -> dict[str, Any]:
         "runtime_limits": {
             "upload_queue_max_parallel": jobs.max_workers,
             "upload_queue_max_persisted_items": UPLOAD_QUEUE_MAX_PERSISTED_ITEMS,
+            # FU-13a: the add-preset button disables at this count; the
+            # create route refuses past it.
+            "upscale_custom_preset_limit": UPSCALE_MAX_CUSTOM_PRESETS,
+            # FU-13b / FG-10: what the Deepgram REST client treats as a
+            # small body and how long it reads one; the renderer stops
+            # waiting for such a request a margin after that.
+            "deepgram_small_audio_bytes": DEEPGRAM_SMALL_AUDIO_BYTES,
+            "deepgram_small_audio_read_timeout_ms": DEEPGRAM_SMALL_AUDIO_READ_TIMEOUT_SEC * 1000,
         },
     }
 
@@ -2509,12 +2511,14 @@ def _first_nonempty_text(*values: Any) -> str:
 
 
 def _remote_model_from_payload(payload: Optional[dict]) -> str:
-    data = payload or {}
-    return _first_nonempty_text(
-        data.get("model"),
-        data.get("remote_model"),
-        data.get("openrouter_model"),  # legacy alias kept for older clients
-    )
+    """The remote model a JSON request names — under ``model`` only.
+
+    ``remote_model`` / ``openrouter_model`` were "legacy aliases kept for
+    older clients" (FG-11); renderer and backend ship in one bundle, the
+    renderer sends only ``model`` (bf3cb2f) and so does the CLI, so no
+    older client exists to keep them for.
+    """
+    return _first_nonempty_text((payload or {}).get("model"))
 
 
 def _form_bool(value: Any, default: bool = False) -> bool:
@@ -2819,6 +2823,13 @@ def _bounded_text(value: object, max_len: int) -> str:
     return str(value or "").strip()[:max_len]
 
 
+def _bounded_text_tail(value: object, max_len: int) -> str:
+    """Like ``_bounded_text`` but keeps the END: for text that grows at the
+    end (a live transcript), the newest words are the ones worth keeping."""
+    text = str(value or "").strip()
+    return text[-max_len:] if len(text) > max_len else text
+
+
 def _nonneg_finite(value: object) -> Optional[float]:
     if value is None:
         return None
@@ -2899,6 +2910,10 @@ def _read_upload_queue_state() -> dict[str, Any]:
 
 LIVE_DRAFT_STATE_PATH = UI_STATE_DIR / "live_draft.json"
 LIVE_DRAFT_STATE_VERSION = 1
+# A draft's text past this length keeps its TAIL (FG-06): about four hours
+# of continuous speech, and a draft that long is the crash net of a take
+# still growing at its end — dropping the end lost the newest words while
+# the response said ok.
 LIVE_DRAFT_MAX_TEXT_CHARS = 200_000
 
 
@@ -2909,6 +2924,14 @@ def _default_live_draft_state() -> dict[str, Any]:
     }
 
 
+
+
+def _live_draft_schema_version(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 1
+    if not math.isfinite(value) or value < 1 or int(value) != value:
+        return 1
+    return int(value)
 
 
 def _normalize_live_draft(payload: object) -> Optional[dict[str, Any]]:
@@ -2935,14 +2958,20 @@ def _normalize_live_draft(payload: object) -> Optional[dict[str, Any]]:
     if not isinstance(draft_src, dict):
         raise HTTPException(status_code=400, detail="live draft must be an object")
     return {
+        # The renderer's payload schema version (FG-04). Kept, not
+        # interpreted: the renderer's reader discards a draft written by a
+        # NEWER schema than it knows (a downgraded app), which it can only
+        # do if the number survives the round trip. Absent or malformed →
+        # 1, the renderer's own reading of a pre-versioning draft.
+        "schema_version": _live_draft_schema_version(draft_src.get("schema_version")),
         "session_id": _bounded_text(draft_src.get("session_id"), 128),
         "started_at": _nonneg_finite(draft_src.get("started_at")) or 0,
         "updated_at": _nonneg_finite(draft_src.get("updated_at")) or int(time.time() * 1000),
         "recording": bool(draft_src.get("recording") is True),
         "timer": _bounded_text(draft_src.get("timer"), 32),
         "title": _bounded_text(draft_src.get("title"), 512),
-        "source_text": _bounded_text(draft_src.get("source_text"), LIVE_DRAFT_MAX_TEXT_CHARS),
-        "transcript_text": _bounded_text(draft_src.get("transcript_text"), LIVE_DRAFT_MAX_TEXT_CHARS),
+        "source_text": _bounded_text_tail(draft_src.get("source_text"), LIVE_DRAFT_MAX_TEXT_CHARS),
+        "transcript_text": _bounded_text_tail(draft_src.get("transcript_text"), LIVE_DRAFT_MAX_TEXT_CHARS),
         "provider": _bounded_text(draft_src.get("provider"), 32),
         "model": _bounded_text(draft_src.get("model"), 256),
         "language": _bounded_text(draft_src.get("language"), 32),
@@ -4608,6 +4637,16 @@ def _normalize_live_provider(raw: Optional[str]) -> str:
     return "local"
 
 
+# The recovery spool is written through a buffer of this size (BW-13).
+# It used to be opened unbuffered: one ``write()`` syscall per renderer
+# frame, on the event loop, for every live session. 16 KiB is half a
+# second of 16 kHz mono PCM16 — what a backend PROCESS crash can cost
+# (the kernel keeps everything already flushed); the readers that look
+# at the spool while the session still holds it flush it first
+# (``_flush_recovery_spool``), and finalize flushes and fsyncs.
+LIVE_RECOVERY_WRITE_BUFFER_BYTES = 16 * 1024
+
+
 def _open_live_recovery(
     *,
     session_id: str,
@@ -4667,7 +4706,7 @@ def _open_live_recovery(
     atomic_write_json(meta_path, meta_payload)
 
     try:
-        pcm_file = pcm_path.open("wb", buffering=0)
+        pcm_file = pcm_path.open("wb", buffering=LIVE_RECOVERY_WRITE_BUFFER_BYTES)
     except BaseException:
         _best_effort_unlink(pcm_path, context="live recovery open rollback")
         _best_effort_unlink(meta_path, context="live recovery open rollback")
@@ -4697,6 +4736,27 @@ def _open_live_recovery(
 def _mark_recovery_error(recovery: Optional[dict]) -> None:
     if recovery is not None:
         recovery["had_error"] = True
+
+
+def _flush_recovery_spool(recovery: Optional[dict]) -> None:
+    """Push what the spool's write buffer holds to the file, so a reader
+    that opens the file by path while the session still holds the handle
+    sees every chunk ``_record_recovery_chunk`` accepted.
+
+    A failed flush means accepted audio did not land: the session stops
+    writing and is marked degraded, the same as a failed write."""
+    if not recovery:
+        return
+    f = recovery.get("pcm_file")
+    if f is None or getattr(f, "closed", False):
+        return
+    try:
+        f.flush()
+    except OSError as e:
+        recovery["write_failed"] = True
+        recovery["had_error"] = True
+        recovery["write_error"] = _safe_error_text(e)
+        logger.warning("live recovery flush failed; disabling recovery writes for this session: %s", e)
 
 
 def _record_recovery_chunk(recovery: Optional[dict], data: bytes) -> None:
@@ -4798,6 +4858,9 @@ def _finalize_live_recovery(recovery: dict) -> None:
                 # all we can promise on those platforms.
                 logger.debug("live recovery fsync skipped: %s", fsync_err)
         except OSError as flush_err:
+            # With a buffered writer a flush failure is lost audio, not
+            # just lost durability: the take is degraded.
+            recovery["had_error"] = True
             logger.warning("live recovery flush/fsync failed: %s", flush_err)
     finally:
         # Close ALWAYS runs — even on flush() failure. FD never leaks.
@@ -4854,9 +4917,9 @@ def _recovery_spool_bytes(recovery: Optional[dict]) -> bytes:
       pre-connect reader, by the receiver, and by the finalize drain, so
       audio captured while ``connect()`` was still in flight (or after
       the upstream died) is in it too;
-    * the file is opened UNBUFFERED (``_open_live_recovery``), so
-      everything ``_record_recovery_chunk`` accepted is already visible
-      to this read even though the writer still holds the handle;
+    * the writer's buffer is flushed first (``_flush_recovery_spool``),
+      so everything ``_record_recovery_chunk`` accepted is visible to
+      this read even though the writer still holds the handle;
     * nothing deletes it while the WebSocket handler owns it: a save or
       discard that arrives meanwhile is deferred until the handler's
       ``finally`` has finalized it (``_safe_delete_live_recovery``) —
@@ -4872,6 +4935,7 @@ def _recovery_spool_bytes(recovery: Optional[dict]) -> bytes:
     pcm_path = recovery.get("pcm_path")
     if pcm_path is None:
         return b""
+    _flush_recovery_spool(recovery)
     try:
         size = Path(pcm_path).stat().st_size
     except OSError as e:
@@ -4910,6 +4974,7 @@ def _recovery_spool_seconds(recovery: Optional[dict]) -> float:
     pcm_path = recovery.get("pcm_path")
     if pcm_path is None:
         return 0.0
+    _flush_recovery_spool(recovery)
     try:
         size = Path(pcm_path).stat().st_size
     except OSError:
@@ -6847,7 +6912,6 @@ def _run_remote_transcribe_once(
     diarize: bool,
     num_speakers: str,
     remote_model: str = "",
-    openrouter_model: str = "",
     cfg: Optional[dict] = None,
     cancel_event: Optional[threading.Event] = None,
     progress_cb: Optional[Callable[[float], None]] = None,
@@ -6891,7 +6955,7 @@ def _run_remote_transcribe_once(
         or ((cfg.get("preferences") or {}).get("remote_provider"))
         or DEFAULT_REMOTE_TRANSCRIPTION_PROVIDER
     ).strip()
-    explicit_model = _first_nonempty_text(remote_model, openrouter_model)
+    explicit_model = _first_nonempty_text(remote_model)
 
     _raise_if_cancelled()
     if prov == "openrouter":
@@ -7178,8 +7242,6 @@ async def create_remote_job(
     diarize: bool = Form(False),
     num_speakers: str = Form(""),
     model: str = Form(""),
-    remote_model: str = Form(""),
-    openrouter_model: str = Form(""),
 ):
     _cleanup_expired_files()
     provider_norm = _form_text(provider, "").strip()
@@ -7202,11 +7264,7 @@ async def create_remote_job(
         language=lang_opt,
         diarize=_form_bool(diarize, False),
         num_speakers=_form_text(num_speakers, ""),
-        remote_model=_first_nonempty_text(
-            _form_text(model, ""),
-            _form_text(remote_model, ""),
-            _form_text(openrouter_model, ""),
-        ),
+        remote_model=_form_text(model, ""),
         cleanup_upload_path=True,
     )
     return {"job_id": job_id}
@@ -7256,8 +7314,6 @@ async def remote_transcribe_sync(
     diarize: bool = Form(False),
     num_speakers: str = Form(""),
     model: str = Form(""),
-    remote_model: str = Form(""),
-    openrouter_model: str = Form(""),
 ):
     provider_norm = _form_text(provider, "").strip()
     if provider_norm and provider_norm not in ALLOWED_REMOTE_PROVIDERS:
@@ -7285,11 +7341,7 @@ async def remote_transcribe_sync(
                 language=lang_opt,
                 diarize=_form_bool(diarize, False),
                 num_speakers=_form_text(num_speakers, ""),
-                remote_model=_first_nonempty_text(
-                    _form_text(model, ""),
-                    _form_text(remote_model, ""),
-                    _form_text(openrouter_model, ""),
-                ),
+                remote_model=_form_text(model, ""),
                 cfg=cfg,
             ),
         )
@@ -7336,7 +7388,7 @@ async def transcribe_recording_on_disk(
         language:        ISO-639-1 / "auto" (default: auto)
         diarize:         bool (default: false)
         num_speakers:    str (deepgram only)
-        model/remote_model: str (legacy alias: openrouter_model)
+        model:           str — the remote model (default: the provider's preference)
         archive_dir:     str — same as the GET endpoint
 
     Returns same shape as ``/api/remote/transcribe-sync``.
@@ -7452,9 +7504,10 @@ async def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require
                 break
             except OpenRouterError as e:
                 last_err = e
-                msg = str(e)
-                # Retry with fallback models only for invalid/non-existing model issues.
-                if ("HTTP 404" in msg) or ("not found" in msg.lower()):
+                # Fall back to the next model only when OpenRouter says
+                # this one does not exist (HTTP 404) — decided on the
+                # status, not on words in the message (BM-13).
+                if e.status_code == 404:
                     continue
                 raise
             except RemoteError as e:
@@ -8388,6 +8441,11 @@ _STATS_CACHE_TTL = 30.0
 _stats_cache_rebuild_lock: Optional[asyncio.Lock] = None
 
 
+# The speaking pace the archive stats turn a transcript's word count into
+# an ESTIMATED duration with (BM-29).
+STATS_SPEECH_WORDS_PER_MIN = 150.0
+
+
 def _build_recordings_stats_payload(d: "Path") -> dict:
     """Heavy sync stats scan extracted for `asyncio.to_thread` offload.
     Reads + tokenises every transcript in the archive — O(N) on file
@@ -8418,8 +8476,7 @@ def _build_recordings_stats_payload(d: "Path") -> dict:
         total_chars += len(text)
         tokens = _tokenize_words(text)
         total_words += len(tokens)
-        # Lightweight estimate: speech pace ~150 words/min.
-        dur = int(round((len(tokens) / 150.0) * 60.0)) if tokens else 0
+        dur = int(round((len(tokens) / STATS_SPEECH_WORDS_PER_MIN) * 60.0)) if tokens else 0
         durations_sec.append(dur)
         for w in tokens:
             word_freq[w] += 1
@@ -8428,6 +8485,9 @@ def _build_recordings_stats_payload(d: "Path") -> dict:
     avg_duration_sec = int(round(sum(durations_sec) / len(durations_sec))) if durations_sec else 0
     max_duration_sec = max(durations_sec) if durations_sec else 0
     min_duration_sec = min(durations_sec) if durations_sec else 0
+    # ``estimated_``: these are word counts at STATS_SPEECH_WORDS_PER_MIN,
+    # not audio lengths (BM-29) — they used to travel under plain duration
+    # names, and many recordings have no audio left to measure (retention).
     avg_words_per_recording = round(total_words / total_recordings, 1) if total_recordings else 0.0
     avg_chars_per_recording = round(total_chars / total_recordings, 1) if total_recordings else 0.0
     return {
@@ -8436,9 +8496,9 @@ def _build_recordings_stats_payload(d: "Path") -> dict:
         "total_chars": total_chars,
         "avg_words_per_recording": avg_words_per_recording,
         "avg_chars_per_recording": avg_chars_per_recording,
-        "avg_duration_sec": avg_duration_sec,
-        "min_duration_sec": min_duration_sec,
-        "max_duration_sec": max_duration_sec,
+        "estimated_avg_duration_sec": avg_duration_sec,
+        "estimated_min_duration_sec": min_duration_sec,
+        "estimated_max_duration_sec": max_duration_sec,
         "top_words": [{"word": w, "count": c} for w, c in top_words],
         "providers": [{"name": k, "count": v} for k, v in sorted(providers.items(), key=lambda kv: kv[1], reverse=True)],
         "languages": [{"name": k, "count": v} for k, v in sorted(languages.items(), key=lambda kv: kv[1], reverse=True)],

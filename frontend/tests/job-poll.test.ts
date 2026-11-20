@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { nextJobPollDelayMs, waitForJob, type JobPollPolicy, type JobPollState } from "../src/job-poll";
+import { classifyJobPollFailure, JobPollHttpError, nextJobPollDelayMs, waitForJob, type JobPollPolicy, type JobPollState } from "../src/job-poll";
 
 const policy: JobPollPolicy = { fastMs: 900, slowMs: 3_000, slowAfterMs: 30_000, maxConsecutiveFailures: 3 };
 
@@ -69,5 +69,45 @@ describe("waitForJob (FG-13)", () => {
   it("slows the ladder once the job is old", () => {
     expect(nextJobPollDelayMs(1_000, policy)).toBe(900);
     expect(nextJobPollDelayMs(30_001, policy)).toBe(3_000);
+  });
+});
+
+describe("waitForJob failure classes (FQ-04)", () => {
+  it("retries a 5xx and a 429 like a transport hiccup", async () => {
+    const { deps, log } = harness([
+      new JobPollHttpError(503, "HTTP 503"),
+      new JobPollHttpError(429, "HTTP 429"),
+      { status: "done", result: "text" },
+    ]);
+    await expect(waitForJob(deps, policy)).resolves.toBe("text");
+    expect(log).not.toContain("cancel");
+  });
+
+  it("ends the wait on a 404 at once, without retrying or cancelling a job that is gone", async () => {
+    const { deps, log } = harness([
+      { status: "running" },
+      new JobPollHttpError(404, "HTTP 404: job not found"),
+      { status: "done", result: "never polled" },
+    ]);
+    await expect(waitForJob(deps, policy)).rejects.toThrow("job not found");
+    expect(log.filter((l) => l.startsWith("sleep"))).toHaveLength(1);
+    expect(log).not.toContain("cancel");
+  });
+
+  it("ends the wait on another 4xx at once and cancels the job it may leave running", async () => {
+    const { deps, log } = harness([
+      new JobPollHttpError(401, "HTTP 401"),
+      { status: "done", result: "never polled" },
+    ]);
+    await expect(waitForJob(deps, policy)).rejects.toThrow("HTTP 401");
+    expect(log).toEqual(["cancel"]);
+  });
+
+  it("classifies failures", () => {
+    expect(classifyJobPollFailure(new TypeError("Failed to fetch"))).toBe("transient");
+    expect(classifyJobPollFailure(new JobPollHttpError(500, ""))).toBe("transient");
+    expect(classifyJobPollFailure(new JobPollHttpError(429, ""))).toBe("transient");
+    expect(classifyJobPollFailure(new JobPollHttpError(404, ""))).toBe("job-gone");
+    expect(classifyJobPollFailure(new JobPollHttpError(400, ""))).toBe("terminal");
   });
 });
