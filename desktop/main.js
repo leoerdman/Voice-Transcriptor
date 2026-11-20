@@ -136,6 +136,8 @@ const { recordingKey, createBoundedKeySet } = require("./renderer-epoch");
 const { normalizeShortcutSet, applyShortcutUpdate, screenShotSlotStatus } = require("./shortcut-runtime");
 // The capsule window's size (one flag) and when it is placed (DM-13, DM-25).
 const { capsuleWindowSize, capsuleBoundsIn, capsuleNeedsPlacement } = require("./capsule-geometry");
+// What to do once screenMode.start() answered for a take (DM-31).
+const { AFTER_SCREEN_START, decideAfterScreenStart } = require("./screen-session-start");
 // The record hotkey's renderer round trip, with a press that expires
 // when main stops waiting for it (DM-05).
 const {
@@ -2299,6 +2301,10 @@ function screenModeStagingRoot() {
 }
 
 const SCREEN_MODE_WARNINGS = Object.freeze({
+  "start-failed": {
+    title: "Screen mode didn't start",
+    body: "The recording goes on as a voice recording. See the log for the reason, then try screen mode again.",
+  },
   "screenshot-hotkey": {
     title: "Screenshot key is taken",
     body: "Another app holds the screenshot key, so it does nothing in this take. Use the camera button on the capsule, or pick another key in Settings.",
@@ -2920,6 +2926,23 @@ async function toggleRecordingFromShortcut(mode = "voice") {
           error: e?.message || String(e),
         }));
         traceStep(trace, "screen_mode_started", { ok: !!started?.ok, error: started?.error || "" });
+        // The take may have ended while its session was starting (DM-31):
+        // ask once more, and end an orphaned session now rather than at
+        // some later stop. A failed start is told to the user.
+        const after = decideAfterScreenStart({
+          started,
+          renderer: started?.ok ? await queryRendererRecordingState() : null,
+          recordingId: Number(confirmedStart.recordingId || 0),
+        });
+        if (after === AFTER_SCREEN_START.END_ORPHAN && screenMode.isActive()) {
+          appendMainLog(`[screen-mode] take ended while its session was starting; ending session ${startDetail.screenSessionId}`);
+          await screenMode.finish({ id: startDetail.screenSessionId, discard: false }).catch((e) => {
+            appendMainLog(`[screen-mode] finish of orphaned session failed: ${e?.message || e}`);
+          });
+        } else if (after === AFTER_SCREEN_START.FAILED) {
+          notifyScreenModeWarning("start-failed");
+        }
+        traceStep(trace, "screen_mode_after_start", { decision: after });
       }
       traceEnd(trace, "recording-started", { mode: startDetail.mode });
       return;
