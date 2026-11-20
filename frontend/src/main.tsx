@@ -7257,7 +7257,7 @@ async function loadCfg(): Promise<void> {
     const autoStopSecondsEl = $("autoStopSilenceSeconds") as HTMLInputElement;
     const autoStopDbEl = $("autoStopSilenceDb") as HTMLInputElement;
     autoStopEnabledEl.checked = ui.auto_stop_silence_enabled === true;
-    ($("screenClicksToggle") as HTMLInputElement).checked = ui.screen_clicks !== false;
+    ($("screenClicksToggle") as HTMLInputElement).checked = ui.screen_clicks === true;
     autoStopSecondsEl.value = String(clampAutoStopSeconds(Number(ui.auto_stop_silence_seconds)));
     autoStopDbEl.value = String(clampAutoStopThresholdDb(Number(ui.auto_stop_silence_db)));
     const upscaleToggle = $("upscaleToggle") as HTMLInputElement;

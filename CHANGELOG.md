@@ -3,6 +3,16 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.15] - 2026-11-21
+
+### Changed
+
+- **Clicks in screen mode are off by default.** Turn them on in Settings → "Record clicks in screen mode".
+
+### Fixed
+
+- The README (Russian and English) describes screen takes as they are now — sections per screenshot, unnamed rectangles, clicks, expected alphabets — and the Russian README explains the new file names in Russian.
+
 ## [1.6.14] - 2026-11-21
 
 ### Changed
