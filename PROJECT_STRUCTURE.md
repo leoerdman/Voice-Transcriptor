@@ -158,6 +158,7 @@ desktop/
 ├── screen-mode-controller.js       # screen-mode I/O: overlays + red frame, palette, native helper (its taps on our controls delivered in-process), display hot-plug, screencapture + compositing
 ├── native/screen-input/            # CGEventTap helper (main.swift) + PressClassifier.swift, the one click-vs-stroke rule (built by scripts/build-native.sh)
 ├── child-io.js                     # child-process text-output decoding SSOT (UTF-16LE on win32) (pure, node --test)
+├── backend-runtime-check.js        # boot import check verdict: a timeout blames nobody, a real failure is attributed engine-site vs bundle (pure, node --test)
 ├── python-version.js               # interpreter version reader: the ONE file that declares it is .python-version (pure, node --test)
 ├── shortcut-migration.js           # retired-hotkey migration rule SSOT, shared with the renderer (pure, node --test)
 ├── linux-wm-class.js               # WM_CLASS split from `wmctrl -lpGx` for Linux window activation (pure, node --test)

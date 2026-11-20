@@ -196,6 +196,12 @@ const {
   recordingStatusIsLive,
   recordingStatusPresentation,
 } = require("./recording-status");
+const {
+  IMPORT_CHECK_TIMEOUT_MS,
+  VERDICT: RUNTIME_VERDICT,
+  importCheckVerdict,
+  needsCleanRerun,
+} = require("./backend-runtime-check");
 
 // Screen mode: a recording during which the user draws on the screen and
 // takes screenshots. Rules in ./screen-mode, windows/helper/capture in
@@ -6764,7 +6770,7 @@ function runCommand(cmd, args, options = {}) {
       try {
         child.kill("SIGKILL");
       } catch { }
-      settleOnce({ ok: false, code: -1, stdout: finalStdout(), stderr: `${finalStderr()}\nTimed out` });
+      settleOnce({ ok: false, code: -1, timedOut: true, stdout: finalStdout(), stderr: `${finalStderr()}\nTimed out` });
     }, timeoutMs);
 
     // A UTF-16LE stream (cscript //U) opens with a BOM, which survives
@@ -7675,7 +7681,7 @@ async function ensureBackendRuntime(python, repoRoot) {
   const importCheck = await runCommand(
     python,
     ["-c", BACKEND_RUNTIME_IMPORT_CHECK],
-    { cwd: repoRoot, timeoutMs: 12000, env: buildPythonEnv(python) }
+    { cwd: repoRoot, timeoutMs: IMPORT_CHECK_TIMEOUT_MS, env: buildPythonEnv(python) }
   );
 
   if (importCheck.ok) {
@@ -7705,15 +7711,34 @@ async function ensureBackendRuntime(python, repoRoot) {
     // the IDENTICAL check in a clean environment: pass → the engine
     // site is the culprit (point at its reinstall path); fail → the
     // bundle really is damaged (keep the AV diagnosis).
-    const cleanEnv = { ...process.env };
-    for (const key of PYTHON_ENV_SCRUB_KEYS) delete cleanEnv[key];
-    delete cleanEnv.PYTHONPATH;
-    const attribution = await runCommand(
-      python,
-      ["-c", BACKEND_RUNTIME_IMPORT_CHECK],
-      { cwd: repoRoot, timeoutMs: 12000, env: cleanEnv }
-    );
-    if (attribution.ok) {
+    // A timed-out check says nothing about who is at fault
+    // (./backend-runtime-check): only a real failure is re-run clean.
+    let attribution = null;
+    if (needsCleanRerun(importCheck)) {
+      const cleanEnv = { ...process.env };
+      for (const key of PYTHON_ENV_SCRUB_KEYS) delete cleanEnv[key];
+      delete cleanEnv.PYTHONPATH;
+      attribution = await runCommand(
+        python,
+        ["-c", BACKEND_RUNTIME_IMPORT_CHECK],
+        { cwd: repoRoot, timeoutMs: IMPORT_CHECK_TIMEOUT_MS, env: cleanEnv }
+      );
+    }
+    const verdict = importCheckVerdict(importCheck, attribution);
+    const output = (importCheck.stderr || importCheck.stdout || "").trim();
+    if (verdict === RUNTIME_VERDICT.TOO_SLOW) {
+      appendMainLog(`[backend-runtime] import check did not finish in ${IMPORT_CHECK_TIMEOUT_MS / 1000}s — no fault attributed`);
+      return {
+        ok: false,
+        details: [
+          `The bundled Python runtime did not finish loading in ${IMPORT_CHECK_TIMEOUT_MS / 1000} s.`,
+          "Close Transcriptor fully and open it again; if this repeats, send the log file.",
+          `python: ${python}`,
+          output,
+        ].filter(Boolean).join("\n"),
+      };
+    }
+    if (verdict === RUNTIME_VERDICT.ENGINE_SITE) {
       appendMainLog("[backend-runtime] import check passes WITHOUT engine-site — engine-site is shadowing the bundle");
       return {
         ok: false,
@@ -7721,7 +7746,7 @@ async function ensureBackendRuntime(python, repoRoot) {
           "The optional engine install (userData/engine-site) is breaking the bundled runtime's imports.",
           "Fix: Settings → Local models → reinstall the engine, or delete the engine-site folder.",
           `python: ${python}`,
-          (importCheck.stderr || importCheck.stdout || "").trim(),
+          output,
         ].filter(Boolean).join("\n"),
       };
     }
@@ -7731,7 +7756,7 @@ async function ensureBackendRuntime(python, repoRoot) {
         "Bundled Python runtime is missing one or more pre-installed dependencies.",
         "This usually means an antivirus quarantined a file inside the app bundle.",
         `python: ${python}`,
-        (importCheck.stderr || importCheck.stdout || "").trim(),
+        output,
       ].filter(Boolean).join("\n"),
     };
   }
@@ -7831,7 +7856,7 @@ async function ensureBackendRuntime(python, repoRoot) {
   const recheck = await runCommand(
     python,
     ["-c", BACKEND_RUNTIME_IMPORT_CHECK],
-    { cwd: repoRoot, timeoutMs: 12000, env: buildPythonEnv(python) }
+    { cwd: repoRoot, timeoutMs: IMPORT_CHECK_TIMEOUT_MS, env: buildPythonEnv(python) }
   );
 
   if (!recheck.ok) {

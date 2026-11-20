@@ -85,6 +85,7 @@
       "screen-surfaces.js",
       "shortcut-migration.js",
       "linux-wm-class.js",
+      "backend-runtime-check.js",
       "python-version.js",
       "window-lifecycle.js",
       "user-data-dir.js",
