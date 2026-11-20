@@ -40,6 +40,8 @@
  * this change exists to remove.
  */
 
+import { LOCAL_ASSIST_SOURCE } from "./live-envelope";
+
 /**
  * True when this session dropped captured audio on the client side —
  * discarded at the pending-buffer cap, lost to a failed ``send``, or
@@ -112,7 +114,7 @@ export function decideLiveTranscriptAdoption(input: AdoptionInput): AdoptionDeci
   const { envelope } = input;
   if (!envelope) return { adopt: false, reason: "no-envelope" };
   if (envelope.error) return { adopt: false, reason: "envelope-error" };
-  if (envelope.source !== "local-assist") {
+  if (envelope.source !== LOCAL_ASSIST_SOURCE) {
     return { adopt: false, reason: "not-local-assist" };
   }
   if (hasUnsentFrames(input.framesNeverSent)) {

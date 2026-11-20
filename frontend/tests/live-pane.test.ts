@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 
 import { livePaneDisplayText, LIVE_PANE_STATUS_PREFIX } from "../src/live-pane";
 
-const base = { previewEnabled: false, recording: false, started: false, timerText: "00:00" };
+const base = { recording: false, started: false, timerText: "00:00" };
 
 describe("livePaneDisplayText", () => {
   it("is empty when idle with preview off (placeholder shows through)", () => {
@@ -26,9 +26,12 @@ describe("livePaneDisplayText", () => {
     expect(livePaneDisplayText({ ...base, recording: false, started: true, timerText: "1:03" })).toBe("");
   });
 
-  it("refuses to own preview-on rendering — that stays in the caller", () => {
-    expect(() =>
-      livePaneDisplayText({ ...base, previewEnabled: true, recording: true, started: true }),
-    ).toThrow(/preview-off/);
+  it("cannot be asked to own preview-on rendering — that stays in the caller (FL-21)", () => {
+    // Compile-time: ``npm run typecheck`` covers tests/, so a caller that
+    // passes a preview flag no longer builds. The run-time half: the
+    // function answers only from the preview-off inputs.
+    // @ts-expect-error previewEnabled is not part of LivePaneInput
+    const text = livePaneDisplayText({ ...base, previewEnabled: true, recording: true, started: true });
+    expect(text.startsWith(LIVE_PANE_STATUS_PREFIX)).toBe(true);
   });
 });

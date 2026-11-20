@@ -198,13 +198,41 @@ describe("stopLive has exactly one transcript delivery site (F/7 / U-022)", () =
     expect(around).toMatch(/domText:\s*transcriptRaw/);
   });
 
-  it("the seven no-transcript epilogues share one bookkeeping helper, not a copy each", () => {
-    const helperCalls = stopLiveBody.match(/releaseStopEpilogueBookkeeping\(\);/g) || [];
-    // Six early returns extracted; the seventh (finalization-failed
-    // catch) shares the success path's own `finally` instead — see the
-    // helper's doc comment for why that one is deliberately left alone.
-    expect(helperCalls.length).toBe(6);
-    expect(stopLiveBody).toContain("const releaseStopEpilogueBookkeeping = (): void =>");
+  it("FL-01: the drained-silence branch asks decideDrainedSilence, so mic health cannot veto a spoken session", () => {
+    expect(stopLiveBody).toContain("decideDrainedSilence({");
+    expect(stopLiveBody).toMatch(/carriedSpeech:\s*summarizeCaptureLevel\(captureLevel\)\.carriedSpeech/);
+    // The pre-fix gate: any bad mic-health state ended the stop as empty.
+    expect(stopLiveBody).not.toMatch(/\(!!provider && micHealthBad\)/);
+  });
+
+  it("the six no-transcript exits end through one epilogue, not a copy each (D-13)", () => {
+    // Each early return states its plan; runStopEpilogue (./stop-epilogue,
+    // behaviour-tested in stop-epilogue.test.ts) does the ending.
+    const exits = stopLiveBody.match(/await endWithoutTranscript\(\{/g) || [];
+    expect(exits.length).toBe(6);
+    expect(stopLiveBody).toContain("runStopEpilogue(plan, {");
+    // The bookkeeping is handed to the epilogue, never called inline by an exit.
+    expect(stopLiveBody).toContain("release: releaseStopEpilogueBookkeeping,");
+    expect(stopLiveBody.match(/releaseStopEpilogueBookkeeping\(\);/g) || []).toHaveLength(0);
+  });
+
+  it("FL-02: exactly two saves in stopLive — the provisional audio save and the one classified metadata save", () => {
+    // A third inline saveRecordingText is how a save whose failure nobody
+    // reads comes back.
+    expect(stopLiveBody.match(/saveRecordingText\(\{/g) || []).toHaveLength(2);
+    expect(stopLiveBody).toMatch(/const saveSessionMetadata = [\s\S]{0,200}attemptFinalSave\(/);
+    // The conflict test lives only in the classifier handed to attemptFinalSave.
+    expect(stopLiveBody.match(/isArchiveMutationConflict/g) || []).toHaveLength(1);
+  });
+
+  it("FL-04: every exit ends the mic-health session through the one session-ending step", () => {
+    const endBlock = /const endStopSession = \(\): void => \{([\s\S]*?)\n {2}\};/.exec(stopLiveBody)?.[1];
+    expect(endBlock, "endStopSession not found in stopLive").toBeTruthy();
+    expect(String(endBlock)).toContain('micHealth.observe({ kind: "session-stop" });');
+    const bookkeeping = /const releaseStopEpilogueBookkeeping = \(\): void => \{([\s\S]*?)\n {2}\};/.exec(stopLiveBody)?.[1];
+    expect(String(bookkeeping)).toContain("endStopSession();");
+    // The observation exists once: in endStopSession, not per exit.
+    expect(stopLiveBody.match(/kind: "session-stop"/g) || []).toHaveLength(1);
   });
 });
 
@@ -413,5 +441,209 @@ describe("the live preview defers to a resolved envelope, verbatim (B-041)", () 
     // to the displayed text.
     const ternaryCondition = body.slice(0, composeCall).slice(-80);
     expect(ternaryCondition).toMatch(/resolvedEnvelopeText\s*!==\s*null\s*\n?\s*\?\s*$/);
+  });
+});
+
+describe("live half: one rule per fact, no dead state (FL-05/06/09/14/15/16/17/18)", () => {
+  const liveCoverageSrc = readFileSync(resolve(process.cwd(), "src/live-coverage.ts"), "utf8");
+  const screenAnnotationsSrc = readFileSync(resolve(process.cwd(), "src/screen-annotations.ts"), "utf8");
+
+  it("FL-14: the dead projections, aliases and the never-reassigned promise are gone", () => {
+    for (const dead of [
+      "liveTranscriptSegments",
+      "let liveWsMode",
+      "clearRecordingFinalSignal",
+      "publishRecordingFinalSignal",
+      "remoteApiPromise",
+      "signalText",
+    ]) {
+      expect(mainTsx, dead).not.toContain(dead);
+    }
+  });
+
+  it("FL-15: live-coverage compares against the exported source constant, not a literal", () => {
+    expect(liveCoverageSrc).toContain("envelope.source !== LOCAL_ASSIST_SOURCE");
+    expect(liveCoverageSrc).not.toContain('"local-assist"');
+  });
+
+  it("FL-18: screen-annotations counts words with text-match's countWords", () => {
+    expect(screenAnnotationsSrc).toContain('import { countWords } from "./text-match";');
+    expect(screenAnnotationsSrc).not.toMatch(/function countWords\(/);
+  });
+
+  it("FL-06: the pre-open buffer cap is a duration at the live sample rate, not 64 000 samples", () => {
+    expect(mainTsx).not.toContain("WS_PENDING_MAX_SAMPLES");
+    expect(mainTsx).toContain("LIVE_SAMPLE_RATE_HZ * WS_PENDING_MAX_SEC");
+    expect(mainTsx).toContain("wsPendingFrameSamples + ds.length <= wsPendingMaxSamples()");
+  });
+
+  it("FL-17: no PCM16 encode without a socket to send it to", () => {
+    const fn = mainTsxSlice("function pushCapturedFrame(", "\nasync function flushWorkletPort(");
+    expect(fn, "pushCapturedFrame not found").toBeTruthy();
+    const guard = fn.indexOf("if (!ws) return;");
+    const encode = fn.indexOf("new ArrayBuffer(ds.length * 2)");
+    expect(guard).toBeGreaterThan(0);
+    expect(encode).toBeGreaterThan(guard);
+  });
+
+  it("FL-05: the final envelope is the parsed message minus its type, and the WS diarize comes from the snapshot", () => {
+    const handler = /case "final": \{([\s\S]*?)\n {8}\}/.exec(mainTsx)?.[1] || "";
+    expect(handler).toContain("const { type: _type, ...fields } = msg;");
+    expect(handler).toContain("...fields,");
+    expect(mainTsx).toContain('diarize: activeLiveSessionSnapshot.diarize ? "true" : "false",');
+  });
+
+  it("FL-09: the mic-fallback notice is a session notice, not text the next preview event overwrites", () => {
+    const fn = mainTsxSlice("function showMicFallbackNotice(): void {", "\n}\n");
+    expect(fn).toContain("showRecordSessionNotice(");
+    expect(fn).not.toContain("setLiveDraftState(");
+  });
+
+  it("FL-16: comments name functions that exist", () => {
+    expect(mainTsx).not.toContain("holdWarmCapture");
+    expect(mainTsx).not.toContain("through the same ``transcribe-on-disk`` chain the manual");
+  });
+});
+
+describe("boot, update check and History bootstrap (FQ-13/FQ-14/FQ-15/FQ-22)", () => {
+  it("FQ-13: a failed update check is not stamped as 'checked today'", () => {
+    const fn = mainTsxSlice("async function runUpdateCheck(): Promise<void> {", "\n}\n");
+    const guard = fn.indexOf('if (result.status !== "unknown") {');
+    const stamp = fn.indexOf("localStorage.setItem(UPDATE_CHECK_CACHE_KEY");
+    expect(guard).toBeGreaterThan(0);
+    expect(stamp).toBeGreaterThan(guard);
+    expect(mainTsx).not.toMatch(/\}, 4000\);/);
+  });
+
+  it("FQ-14: the classifier lives in ./boot-error and every raw error gets its disclosure", () => {
+    expect(mainTsx).toContain('import { classifyBootError } from "./boot-error";');
+    expect(mainTsx).not.toMatch(/function classifyBootError\(/);
+    expect(mainTsx).not.toContain("raw !== detail");
+  });
+
+  it("FQ-15: bootstrap failures reach the status line, and the boot race clears only its own promise", () => {
+    const init = mainTsxSlice("async function initRecordingsBootstrap(): Promise<void> {", "\n}\n");
+    expect(init).toContain('setStatus(`${said.charAt(0).toUpperCase()}${said.slice(1)}. Restart the app to try again.`, "warning");');
+    expect(mainTsx).toMatch(/if \(recordingsBootstrapPromise === bootRecordingsBootstrap\) \{\s*recordingsBootstrapPromise = null;/);
+  });
+
+  it("FQ-22: no overlay state written right before the page reloads", () => {
+    const retry = mainTsxSlice('_bootRetry.addEventListener("click", () => {', "window.location.reload();");
+    expect(retry).toBeTruthy();
+    expect(retry).not.toContain("_bootOverlayHidden");
+  });
+});
+
+describe("live socket close handler (FL-03)", () => {
+  const handler = /ws\.onclose = \(ev\) => \{([\s\S]*?)\n {4}\};/.exec(mainTsx)?.[1] || "";
+
+  it("records the error envelope through liveCloseOwesErrorEnvelope, without bailing out on a missing slot", () => {
+    expect(handler, "ws.onclose handler not found").toBeTruthy();
+    expect(handler).toContain("liveCloseOwesErrorEnvelope({");
+    expect(handler).toContain("resolveLiveFinal(sessionUiToken, {");
+    expect(handler).not.toMatch(/if \(!slot\) return;/);
+  });
+});
+
+/** Slice one top-level function of main.tsx, from its header to the next marker. */
+function mainTsxSlice(header: string, next: string): string {
+  const start = mainTsx.indexOf(header);
+  const end = mainTsx.indexOf(next, start + header.length);
+  return start !== -1 && end > start ? mainTsx.slice(start, end) : "";
+}
+
+/**
+ * FQ-01 / FQ-05 / FQ-18: the upload queue's "transcript finished, History
+ * save failed" state. The decisions are behaviour-tested in
+ * upload-item.test.ts; this pins that the queue actually uses them.
+ */
+describe("upload queue wiring for a failed History save (FQ-01/FQ-05/FQ-18)", () => {
+  it("both the queue row and the result pane render the error state through uploadErrorView", () => {
+    const row = mainTsxSlice("function renderUploadQueue(): void {", "\nfunction renderUploadResultPane(");
+    const pane = mainTsxSlice("function renderUploadResultPane(): void {", "\ninstallRevealRecordingBridge();");
+    expect(row).toContain("uploadErrorView(item)");
+    expect(pane).toContain("uploadErrorView(item)");
+  });
+
+  it("Retry asks uploadRetryPlan and a save-only retry goes through the one save helper", () => {
+    const retry = mainTsxSlice("async function retryUploadItem(", "\n}\n");
+    expect(retry).toContain('uploadRetryPlan(item) === "save"');
+    expect(retry).toContain("await saveUploadItemToHistory(item,");
+    // The processor and the retry share the save; nothing else saves uploads.
+    const processor = mainTsxSlice("async function processUploadItem(", "\nasync function saveUploadItemToHistory(");
+    expect(processor).toContain("await saveUploadItemToHistory(item, text,");
+    expect(processor).not.toContain("saveRecordingText(");
+  });
+
+  it("'Clear done' filters by isUploadClearable", () => {
+    expect(mainTsx).toMatch(/if \(isUploadClearable\(uploadQueue\[i\]\)\) \{\s*uploadQueue\.splice\(i, 1\);/);
+  });
+
+  it("FQ-02: a failed queue snapshot write re-arms the dirty flag and goes through the retry policy", () => {
+    const flush = mainTsxSlice("async function flushUploadQueueSnapshotNow(", "\nfunction saveUploadQueueSnapshot(");
+    const catchBlock = /\.catch\(\(e\) => \{([\s\S]*?)\n {4}\}\);/.exec(flush)?.[1];
+    expect(catchBlock, "the PUT's catch block was not found").toBeTruthy();
+    expect(String(catchBlock)).toContain("uploadQueueSavePending = true;");
+    expect(flush).toContain("nextQueueSaveRetry(uploadQueueSaveFailures)");
+    expect(flush).toContain("setStatus(UPLOAD_QUEUE_SAVE_FAILED_STATUS, \"warning\")");
+  });
+
+  it("FQ-03: the unload flush listens to pagehide only", () => {
+    expect(mainTsx).toContain('window.addEventListener("pagehide", flushUploadQueueSnapshotBestEffort');
+    expect(mainTsx).not.toContain('window.addEventListener("beforeunload", flushUploadQueueSnapshotBestEffort');
+  });
+
+  it("FQ-06/FQ-07: no invented progress, and a poll tick re-renders only when the stage changes", () => {
+    expect(mainTsx).not.toContain("uploadProgress");
+    expect(mainTsx).toContain('if (item.status !== "transcribing" || item.stage === "processing") return;');
+  });
+
+  it("FQ-08: the pump starts the oldest queued item", () => {
+    const pump = mainTsxSlice("function runUploadProcessor(): void {", "\nasync function processUploadItem(");
+    expect(pump).toContain("pickNextQueuedUpload(uploadQueue)");
+    expect(pump).not.toContain('uploadQueue.find((it) => it.status === "queued")');
+  });
+
+  it("FQ-09: nothing is enqueued while the server queue is unknown", () => {
+    const fn = mainTsxSlice("function afterUploadQueueSnapshotLoaded(", "\nfunction flushUploadQueueSnapshotBestEffort(");
+    expect(fn).toMatch(/\.then\(\(\) => \{\s*if \(uploadQueueSnapshotLoaded\) \{\s*action\(\);/);
+  });
+
+  it("FQ-10/FQ-11: one provider normaliser and one source validator", () => {
+    const norm = mainTsxSlice("function normalizeUploadProvider(", "\n}\n");
+    expect(norm).toContain("normalizeProviderSelection(value, UI_TOKENS.upload.defaultProvider)");
+    expect(mainTsx).not.toMatch(/function uploadExtensionFromName\(/);
+    expect(mainTsx.match(/uploadSourceValidationError\(\{/g) || []).toHaveLength(1);
+  });
+
+  it("FQ-16/FQ-19: rows are keyboard buttons, the title counts done only, one filter rule, one pane render", () => {
+    const row = mainTsxSlice("function renderUploadQueue(): void {", "\nfunction renderUploadResultPane(");
+    expect(row).toContain('li.setAttribute("role", "button");');
+    expect(row).toContain("li.tabIndex = 0;");
+    expect(row).toContain("uploadQueueTitle(uploadQueue.map((it) => it.status))");
+    expect(row).toContain("uploadQueue.filter(isUploadVisibleUnderCurrentFilter)");
+    expect(row.match(/renderUploadPersistenceNote\(\);/g) || []).toHaveLength(1);
+    expect(mainTsx).not.toContain("isUploadPastItem");
+  });
+
+  it("FQ-20: the window-level drop blocker cancels file drags only", () => {
+    expect(mainTsx).toContain('.includes("Files")) return;');
+  });
+
+  it("FQ-21: upload timings are one clock (epoch ms)", () => {
+    const upload = mainTsx.slice(mainTsx.indexOf("async function processUploadItem("), mainTsx.indexOf("function renderUploadPersistenceNote("));
+    expect(upload).not.toMatch(/(startedAt|endedAt) = performance\.now\(\)/);
+  });
+
+  it("FQ-22: no dead File.path fallback, no abort of a settled item, Retry for cancelled items", () => {
+    expect(mainTsx).not.toContain("{ path?: string }).path");
+    const retry = mainTsxSlice("async function retryUploadItem(", "\n}\n");
+    expect(retry).not.toContain("abortController?.abort()");
+    expect(retry).toContain("uploadItemRetryable(item.status)");
+  });
+
+  it("the save stage cannot be 'stopped': cancel ignores it and the Stop button is disabled", () => {
+    expect(mainTsx).toContain('if (item.cancelRequested || item.stage === "saving") return;');
+    expect(mainTsx).toContain('stopBtn.disabled = item.cancelRequested === true || item.stage === "saving";');
   });
 });

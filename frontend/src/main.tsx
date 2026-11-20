@@ -13,6 +13,7 @@ import {
 import { decideLiveTranscriptAdoption } from "./live-coverage";
 import {
   describeLiveFinalStats,
+  liveCloseOwesErrorEnvelope,
   parseLiveFinalEnvelope,
   type LiveFinalEnvelopeFields as LiveFinalEnvelopeBody,
   type LiveFinalStats,
@@ -24,6 +25,26 @@ import {
   type FinalizeBudgetAnnouncement,
   type StopTranscriptSource,
 } from "./envelope-deadline";
+import {
+  attemptFinalSave,
+  decideDrainedSilence,
+  resolveFailedStopSummary,
+  resolveTranscriptStopSummary,
+  runStopEpilogue,
+  type FinalSaveOutcome,
+  type StopEpiloguePlan,
+} from "./stop-epilogue";
+import {
+  isUploadClearable,
+  pickNextQueuedUpload,
+  uploadErrorView,
+  uploadItemRetryable,
+  uploadQueueTitle,
+  uploadRetryPlan,
+  uploadSourceValidationError,
+} from "./upload-item";
+import { UPLOAD_QUEUE_SAVE_FAILED_STATUS, nextQueueSaveRetry } from "./upload-queue-persist";
+import { classifyBootError } from "./boot-error";
 import {
   captureElapsedMs,
   decidePreRoll,
@@ -9383,16 +9404,6 @@ function shouldLivePreview(): boolean {
 });
 
 /**
- * Fill the dual-stream secondary-language select from ``#language``.
- *
- * The language list is written out once, in index.html, on ``#language``.
- * Copying it into a second markup block — or into a constant here —
- * would be a second source that drifts the first time a language is
- * added. "Auto" is the one option that cannot appear: the secondary
- * stream exists precisely to be monolingual, and an Auto secondary would
- * be the multi stream twice.
- */
-/**
  * Copy ``#language``'s options onto ``#uploadLanguage``.
  *
  * The comment on the live language wiring states the rule outright —
@@ -9415,6 +9426,16 @@ function fillUploadLanguageOptions(): void {
   }
 }
 
+/**
+ * Fill the dual-stream secondary-language select from ``#language``.
+ *
+ * The language list is written out once, in index.html, on ``#language``.
+ * Copying it into a second markup block — or into a constant here —
+ * would be a second source that drifts the first time a language is
+ * added. "Auto" is the one option that cannot appear: the secondary
+ * stream exists precisely to be monolingual, and an Auto secondary would
+ * be the multi stream twice.
+ */
 function fillDualSecondaryLanguageOptions(): void {
   const target = dualSecondaryLanguageSelect();
   if (!target || target.options.length) return;
@@ -9482,8 +9503,12 @@ let wsPendingFrames: ArrayBuffer[] = [];
 // holds the worklet's input quantum (e.g. 128 samples at 48 kHz),
 // which downsamples to ~42.7 output samples — 500 frames were ~1.3 s
 // of audio, not the 4 s the old comment promised, so a slow handshake
-// silently dropped opening words. 64 000 samples = 4 s at 16 kHz.
-const WS_PENDING_MAX_SAMPLES = 64_000;
+// silently dropped opening words. The cap is a DURATION, so it is
+// derived from the live sample rate the backend reports (8-96 kHz)
+// rather than written as 64 000 samples — which is 4 s only at 16 kHz
+// and 1.3 s at 48 kHz, the same regression again (FL-06).
+const WS_PENDING_MAX_SEC = 4;
+const wsPendingMaxSamples = (): number => LIVE_SAMPLE_RATE_HZ * WS_PENDING_MAX_SEC;
 let wsPendingFrameSamples = 0;
 /**
  * Frames captured for this session that never reached the backend —
@@ -9575,10 +9600,6 @@ function liveRecordingCollection(mode: LiveRecordingMode): RecordingCollection {
 }
 
 /**
- * Ask main to end the screen-mode session of the take that is stopping.
- * Never throws: a failure means "no marks", not "no transcript".
- */
-/**
  * The screen marks of a recording already in the archive, from its
  * archived manifest — empty for any recording that is not a screen-mode
  * one. Every transcript produced for a saved recording goes through this
@@ -9605,6 +9626,10 @@ async function screenMarksForSavedRecording(
   }
 }
 
+/**
+ * Ask main to end the screen-mode session of the take that is stopping.
+ * Never throws: a failure means "no marks", not "no transcript".
+ */
 async function finishScreenSession(id: string, discard: boolean): Promise<ReturnType<typeof parseScreenManifest>> {
   if (!id || typeof window.transcriptor?.screenFinish !== "function") return null;
   try {
@@ -9714,7 +9739,6 @@ let captureLevel = createCaptureLevel();
 let liveDraftText = "";
 let liveDraftDisplayText = "";
 let liveInterimText = "";
-let liveTranscriptSegments: TranscriptSegment[] = [];
 let liveRecordingSeq = 0;
 let currentRecordingId = 0;
 let stopTransitionInFlight = false;
@@ -9745,7 +9769,6 @@ function markStartPhase(label: string): void {
 }
 let flushRequestSeq = 0;
 const pendingWorkletFlushes = new Map<string, () => void>();
-let liveWsMode: LiveWsMode = "none";
 
 function liveStatusSnapshot(): LiveStatusSnapshot {
   return {
@@ -9828,11 +9851,20 @@ function commitPreArmedFallback(): void {
   for (const frame of buffered) pushCapturedFrame(frame);
 }
 
+/**
+ * Tell the user the capture fell back to the ScriptProcessor path. A
+ * session notice, not a line in the preview text: every ``segments`` /
+ * ``interim`` event rewrites the preview several times a second, and with
+ * preview off it was never shown at all — the only durable trace was a
+ * console line (FL-09).
+ */
 function showMicFallbackNotice(): void {
-  if (!shouldLivePreview()) return;
-  const cur = liveDraftDisplayText || "";
-  if (cur.includes("[Mic fallback engaged]")) return;
-  setLiveDraftState(liveDraftText, (cur ? `${cur}\n` : "") + "[Mic fallback engaged]");
+  showRecordSessionNotice(
+    "Mic fallback engaged: the audio worklet delivered no frames, so capture switched to the compatibility path. The recording continues.",
+    "warning",
+    UI_TOKENS.notice.defaultMs,
+    activeLiveSessionId,
+  );
 }
 
 /**
@@ -9936,7 +9968,7 @@ async function releaseOrphanedAudioContext(reason: string): Promise<void> {
 //     are null;
 //   • it does not exist.
 //
-// Ownership MOVES, it is never shared: ``holdWarmCapture`` empties the
+// Ownership MOVES, it is never shared: ``commitWarmCaptureHold`` empties the
 // module slots as it fills the hold, ``takeWarmCapture`` empties the
 // hold as the next session fills the slots. That is what keeps a
 // failed start from closing a context the hold still points at, and a
@@ -10209,7 +10241,7 @@ function takeWarmCapture(requestedDeviceId: string): WarmCapture | null {
 // because ``decideWarmReuse`` hands it its own rejection reasons; this
 // wrapper is what holds the lifecycle listeners to the named set.
 // Declared, not assigned to a const: the expiry timer in
-// ``holdWarmCapture`` above refers to it, and a hoisted declaration
+// ``commitWarmCaptureHold`` refers to it, and a hoisted declaration
 // cannot be reached before it exists.
 function releaseWarmCaptureOnLifecycle(reason: WarmHoldLifecycleRelease): void {
   releaseWarmCapture(reason);
@@ -10573,7 +10605,6 @@ function hasStreamingActivity(buffer: LiveTranscriptBuffer | null): boolean {
 }
 
 function projectLiveTranscriptBufferToActiveState(buffer: LiveTranscriptBuffer): void {
-  liveTranscriptSegments = buffer.segments;
   liveInterimText = buffer.interimText;
   setLiveDraftState(buffer.committedText, buffer.committedDisplayText);
 }
@@ -10686,9 +10717,9 @@ function logger_warn_client(message: string): void {
  *      that need to know what the UI is currently showing. This is also
  *      what drives the ``$finalOutput`` DOM element.
  *
- * All callers go through ``publishRecordingFinalSignal`` (which passes a
- * session token) or ``publishRecordingOutput`` directly. One call = one
- * atomic update of both channels plus the DOM.
+ * All callers go through ``publishRecordingOutput`` (with a session
+ * token where the call belongs to one). One call = one atomic update of
+ * both channels plus the DOM.
  */
 /**
  * How many finished recordings stay on ``window.__transcriptorFinishedRecords``.
@@ -10826,28 +10857,6 @@ function clearRecordingOutput(): void {
   window.__transcriptorLastUiFinalKind = "";
 }
 
-function clearRecordingFinalSignal(): void {
-  clearRecordingOutput();
-}
-
-function publishRecordingFinalSignal(opts: {
-  recordingId: number;
-  signalText?: string;
-  domText?: string;
-  kind?: RecordingFinalSignalKind;
-  phase?: string;
-  sessionToken?: string;
-}): void {
-  publishRecordingOutput({
-    recordingId: opts.recordingId,
-    pasteText: opts.signalText,
-    domText: opts.domText,
-    kind: opts.kind,
-    phase: opts.phase,
-    sessionToken: opts.sessionToken,
-  });
-}
-
 /**
  * Live-output render coalescing.
  *
@@ -10880,7 +10889,6 @@ function scheduleLiveOutputRender(): void {
       // The display contract (including the exact status wording) is
       // the unit-tested pure function in ./live-pane.
       const status = livePaneDisplayText({
-        previewEnabled: false,
         recording: isRecording,
         started: startAt > 0,
         timerText: liveTimerText,
@@ -10935,7 +10943,6 @@ function resetLiveDraftState(): void {
   liveDraftText = "";
   liveDraftDisplayText = "";
   liveInterimText = "";
-  liveTranscriptSegments = [];
   syncLiveOutputFromState();
 }
 
@@ -11226,6 +11233,10 @@ function pushCapturedFrame(input: Float32Array, preRollMs = 0): void {
   // producing frames immediately on mic connect, but the WS handshake
   // can take 50-300 ms. Without buffering those early frames were
   // silently dropped and Deepgram never heard the first syllables.
+  //
+  // No socket (an audio-only session) means nobody reads the PCM16
+  // bytes, so they are not encoded (FL-17).
+  if (!ws) return;
   const pcm = new ArrayBuffer(ds.length * 2);
   const dv = new DataView(pcm);
   for (let i = 0; i < ds.length; i++) {
@@ -11237,7 +11248,6 @@ function pushCapturedFrame(input: Float32Array, preRollMs = 0): void {
     // stop contain bit-identical samples for the same input.
     dv.setInt16(i * 2, Math.round(x < 0 ? x * 0x8000 : x * 0x7fff), true);
   }
-  if (!ws) return;
   if (ws.readyState === WebSocket.OPEN) {
     // Buffered frames go first so FIFO order is preserved.
     flushPendingWsFrames(ws);
@@ -11258,7 +11268,7 @@ function pushCapturedFrame(input: Float32Array, preRollMs = 0): void {
     // worklet frame downsamples to ~42.7 samples at 16 kHz, so slow
     // handshakes silently dropped opening words and failed the
     // coverage contract.
-    if (wsPendingFrameSamples + ds.length <= WS_PENDING_MAX_SAMPLES) {
+    if (wsPendingFrameSamples + ds.length <= wsPendingMaxSamples()) {
       wsPendingFrames.push(pcm);
       wsPendingFrameSamples += ds.length;
     } else {
@@ -11420,8 +11430,7 @@ async function startLive(
   wsBytesSent = 0;
   resetLiveDraftState();
   clearLiveStreamState();
-  liveWsMode = resolveLiveWsMode(activeLiveSessionSnapshot);
-  const sessionWsMode = liveWsMode;
+  const sessionWsMode = resolveLiveWsMode(activeLiveSessionSnapshot);
   liveTranscriptBuffers.set(sessionUiToken, createLiveTranscriptBuffer(sessionWsMode));
   setBusy(true, sessionUiToken);
   currentRecordingId = ++liveRecordingSeq;
@@ -11432,7 +11441,7 @@ async function startLive(
   // the new currentRecordingId, so Electron main can never observe
   // "new currentRecordingId + old paste-ready text" in a transient
   // race during startLive.
-  clearRecordingFinalSignal();
+  clearRecordingOutput();
   window.__transcriptorCurrentRecordingId = currentRecordingId;
   setRecordButton(true);
   setStatusScoped(sessionUiToken, "Starting");
@@ -11472,7 +11481,9 @@ async function startLive(
       session_id: activeLiveSessionId,
       archive_dir: activeLiveArchiveDir,
       recording_collection: liveRecordingCollection(liveRecordingMode),
-      diarize: readDiarizeEnabled() ? "true" : "false",
+      // The session snapshot, not a second DOM read: the stop path decodes
+      // with ``activeLiveSessionSnapshot.diarize`` too (FL-05 / F-006).
+      diarize: activeLiveSessionSnapshot.diarize ? "true" : "false",
     });
     if (sessionWsMode === "deepgram-stream") {
       wsQuery.set("model", activeLiveSessionSnapshot.model || getRemoteModelValue("deepgram"));
@@ -11520,20 +11531,23 @@ async function startLive(
       // close before finalize means the stream died; release any pending
       // waiters for THIS session with a synthetic error envelope so
       // stopLive doesn't hang on waitForLiveFinalEnvelope.
+      //
+      // stopLive arms its waiter lazily, so at the moment of an unclean
+      // close there is usually no slot and nobody waiting yet. The
+      // envelope is recorded regardless (``resolveLiveFinal`` creates the
+      // slot): bailing out on a missing slot meant the later waiter had
+      // nothing to resolve against and burned its whole budget (FL-03).
+      // The real ``final`` message always arrives before ``onclose``.
       const slot = liveFinalSlots.get(sessionUiToken);
-      if (!slot) return;
-      if (slot.envelope) return;
-      // No ``waiters.length === 0`` bail-out. stopLive now arms its
-      // waiter lazily (see below), so at the moment of an unclean close
-      // there is often nobody waiting yet — and dropping the synthetic
-      // error envelope here meant the later waiter had nothing to
-      // resolve against and burned its whole timeout. Recording the
-      // envelope in the slot is safe either way: ``resolveLiveFinal``
-      // is a no-op once ``slot.envelope`` is set, and the real ``final``
-      // message always arrives before ``onclose``.
-      console.log(`[trace ws-close] code=${ev.code} reason="${ev.reason || ""}" wasClean=${ev.wasClean} hadEnvelope=${!!slot.envelope} waiters=${slot.waiters.length}`);
-      if (ev.wasClean && (ev.code === 1000 || ev.code === 1005)) return;
+      console.log(`[trace ws-close] code=${ev.code} reason="${ev.reason || ""}" wasClean=${ev.wasClean} hadEnvelope=${!!slot?.envelope} waiters=${slot?.waiters.length ?? 0}`);
+      if (!liveCloseOwesErrorEnvelope({ hadEnvelope: !!slot?.envelope, wasClean: ev.wasClean, code: ev.code })) return;
       console.warn(`live ws unexpectedly closed (code=${ev.code}, reason=${ev.reason || "?"})`);
+      if (activeUiSessionToken === sessionUiToken && isRecording) {
+        patchCurrentRecordingSummary({
+          status: "Live stream lost. The recording continues and will be transcribed from the saved audio.",
+          tone: "warning",
+        }, sessionUiToken);
+      }
       resolveLiveFinal(sessionUiToken, {
         text: "",
         segments: [],
@@ -11621,26 +11635,19 @@ async function startLive(
           if (isActiveSession) {
             projectLiveTranscriptBufferToActiveState(sessionBuffer);
           }
+          // The parsed message minus its ``type`` IS the envelope — one
+          // contract (./live-envelope). It used to be copied field by
+          // field, so a field added to the contract was silently dropped
+          // here (FL-05). Coverage diagnostics (BUG-20 / C5:
+          // ``uncoveredSpeechSec``, ``streamedSec``, ``coveredEndSec``,
+          // ``stats``) ride along to explain a stop in the log; the
+          // backend has already closed its own gaps before sending.
+          const { type: _type, ...fields } = msg;
           const envelope: LiveFinalEnvelope = {
-            text: normalizeTranscriptWhitespace(msg.text),
-            segments: msg.segments,
-            durationSec: msg.durationSec,
-            source: msg.source || sessionWsMode,
+            ...fields,
+            text: normalizeTranscriptWhitespace(fields.text),
+            source: fields.source || sessionWsMode,
           };
-          if (msg.error) envelope.error = msg.error;
-          if (msg.coverage) envelope.coverage = msg.coverage;
-          // BUG-20 / PROTOCOL CONTRACT C5. Carried onto the envelope as
-          // diagnostics: the backend closes its own coverage gaps before
-          // it sends (``stats.recovery``), so these numbers explain a
-          // stop in the log rather than steering it. A renderer that
-          // escalated on them would be re-decoding audio the envelope
-          // already accounts for.
-          if (typeof msg.uncoveredSpeechSec === "number" && msg.uncoveredSpeechSec > 0) {
-            envelope.uncoveredSpeechSec = msg.uncoveredSpeechSec;
-          }
-          if (typeof msg.streamedSec === "number") envelope.streamedSec = msg.streamedSec;
-          if (typeof msg.coveredEndSec === "number") envelope.coveredEndSec = msg.coveredEndSec;
-          if (msg.stats) envelope.stats = msg.stats;
           resolveLiveFinal(sessionUiToken, envelope);
           return;
         }
@@ -12003,31 +12010,23 @@ async function stopLive(
     }
   };
   /**
-   * The one piece every "stop without a transcript" epilogue shares
-   * (F/7): release the live draft, drop the busy flag, and let the next
-   * capture start.
-   *
-   * F/7 found seven near-identical ~20-line epilogues below (discarded
-   * take, aborted startup, silence, transcription skipped, no provider,
-   * missing key, and the finalization-failed catch). This triplet —
-   * ``clearLiveDraft``, ``setBusy(false)``, ``releaseStopTransition
-   * AfterCaptureDetach`` — is the only part that is byte-for-byte
-   * identical across all six of the early returns below (the seventh,
-   * the finalization-failed catch, releases through the shared
-   * ``finally`` it has with the success path instead, and is left
-   * alone). Everything AROUND this triplet is not: whether
-   * ``#progressRow`` is hidden, whether ``saveRecordingText`` runs first
-   * or the summary patch does, and the exact status/tone text differ
-   * per site in ways that are not safe to normalize without live-
-   * recording verification this environment cannot perform — see the
-   * backend-fix-journal "Швы" entry for the scoping decision. Extracting
-   * only this order-independent, argument-independent triplet is a pure
-   * mechanical de-duplication with no behaviour change.
+   * Ends this stop's session: the live draft, the mic-health session
+   * (``session-stop`` hides the topbar pill — FL-04: the early exits used
+   * to skip it, so "Mic live" outlived every take with Auto transcribe
+   * off), and the stop transition. Every exit runs it exactly once: the
+   * no-transcript exits through ``runStopEpilogue``'s ``release``, the
+   * transcription path in its ``finally``.
    */
-  const releaseStopEpilogueBookkeeping = (): void => {
+  const endStopSession = (): void => {
     clearLiveDraft(sessionUiToken);
-    setBusy(false, sessionUiToken);
+    micHealth.observe({ kind: "session-stop" });
     releaseStopTransitionAfterCaptureDetach();
+  };
+  /** The no-transcript exits also drop the busy flag right away; the
+   *  transcription path keeps it until the outer ``finally``. */
+  const releaseStopEpilogueBookkeeping = (): void => {
+    endStopSession();
+    setBusy(false, sessionUiToken);
   };
   // ── Trailing capture ────────────────────────────────────────────────
   // The microphone stays open a moment past the press so the last word
@@ -12192,7 +12191,6 @@ async function stopLive(
   };
   const provider = effectiveProvider;
   const metadataProvider = provider || (providerValue ? providerValue : "none");
-  let remoteApiPromise: Promise<{ text: string; provider: string; model?: string }> | null = null;
   let savedAudioFile: File | null = null;
   let transcribeInputFile: File | null = null;
   const sessionArchiveDir = String(activeLiveArchiveDir || currentArchiveDirSnapshot()).trim();
@@ -12262,7 +12260,7 @@ async function stopLive(
   // AFTER CloseStream and get dropped. Reordering the pipeline freeze to
   // step 1 fixes this at the root.
   const stopEntryBuffer = getLiveTranscriptBuffer(sessionUiToken);
-  console.log(`[trace stopLive] enter recordedSec=${recordedSec.toFixed(2)} sessionToken=${sessionUiToken.slice(0, 8)} provider=${provider} wsState=${ws ? ws.readyState : "null"} wsPendingFrames=${wsPendingFrames.length} segmentCount=${stopEntryBuffer?.segments.length ?? liveTranscriptSegments.length} liveDraftLen=${stopEntryBuffer?.committedText.length ?? liveDraftText.length} liveInterimLen=${stopEntryBuffer?.interimText.length ?? liveInterimText.length}`);
+  console.log(`[trace stopLive] enter recordedSec=${recordedSec.toFixed(2)} sessionToken=${sessionUiToken.slice(0, 8)} provider=${provider} wsState=${ws ? ws.readyState : "null"} wsPendingFrames=${wsPendingFrames.length} segmentCount=${stopEntryBuffer?.segments.length ?? 0} liveDraftLen=${stopEntryBuffer?.committedText.length ?? liveDraftText.length} liveInterimLen=${stopEntryBuffer?.interimText.length ?? liveInterimText.length}`);
   // §4.7: the graph outlives the recording when it may, and the question
   // "may it?" is asked while the track is still live. The ordering lives
   // in ./capture-warm with the rest of the warm-capture policy, so it is
@@ -12330,7 +12328,7 @@ async function stopLive(
   }
   mark("waitForCaptureDrain");
   const drainDur = performance.now() - t0Drain - flushDur;
-  console.log(`[trace stopLive] drained ackBarrier=${workletAcked ? 1 : 0} flush=${flushDur.toFixed(0)}ms drain=${drainDur.toFixed(0)}ms wsPendingFrames=${wsPendingFrames.length} segmentCount=${getLiveTranscriptBuffer(sessionUiToken)?.segments.length ?? liveTranscriptSegments.length}`);
+  console.log(`[trace stopLive] drained ackBarrier=${workletAcked ? 1 : 0} flush=${flushDur.toFixed(0)}ms drain=${drainDur.toFixed(0)}ms wsPendingFrames=${wsPendingFrames.length} segmentCount=${getLiveTranscriptBuffer(sessionUiToken)?.segments.length ?? 0}`);
 
   // Tell the backend to finalize the upstream provider (Deepgram or local)
   // BEFORE we close the socket. The backend will send a {type:"final", ...}
@@ -12342,8 +12340,8 @@ async function stopLive(
   // session's envelope.
   //
   // We snapshot ``liveStreamError`` only — the committed segments
-  // snapshot is NOT taken here. Instead we read the LIVE
-  // ``liveTranscriptSegments`` after awaiting ``liveFinalPromise`` so
+  // snapshot is NOT taken here. Instead we read the session's LIVE
+  // transcript buffer after awaiting ``liveFinalPromise`` so
   // interim segments that arrive while the envelope is in flight
   // (very common: Deepgram streams one more ``is_final`` message
   // covering the tail of the utterance AFTER CloseStream) still make
@@ -12398,7 +12396,7 @@ async function stopLive(
     if (strandedFrames > 0) {
       wsFramesNeverSent += strandedFrames;
       wsPendingFrames = [];
-  wsPendingFrameSamples = 0;
+      wsPendingFrameSamples = 0;
       console.warn(`[trace stopLive] ${strandedFrames} captured frames never reached the live transport`);
     }
     if (discarding) {
@@ -12464,11 +12462,6 @@ async function stopLive(
     savedAudioFile = canonicalCapture.file;
     transcribeInputFile = canonicalCapture.file;
   }
-
-  // OpenRouter has no streaming API, so it still needs a full-audio REST pass.
-  // Start it only after the durable save path below has created/fetched the
-  // canonical audio. Starting here with the OPFS-backed File can race with
-  // deferredSinkDestroy and upload an empty/truncated body.
 
   // ── Cleanup (runs while provider is finalizing) ─────────────────────────
   if (timer) {
@@ -12606,6 +12599,65 @@ async function stopLive(
   setRecordButton(false);
   resetVU();
 
+  // ── How every stop ends ─────────────────────────────────────────────
+  let persistedRecordingName = "";
+  let persistedRecordingArchiveDir = "";
+  const provisionalTitle = _smartTitle(sourceLiveText);
+  // The session-metadata write every exit makes (bar the discarded take
+  // and the aborted start, which have nothing to record). One call, so
+  // the no-transcript exits, the failure catch and the success path
+  // cannot disagree about what is saved or how a failed save is
+  // reported (FL-02: only the archive-moved conflict used to be caught;
+  // every other failure was dropped and the stop reported success).
+  const saveSessionMetadata = (transcriptText: string, providerName: string): Promise<FinalSaveOutcome> =>
+    attemptFinalSave(
+      () => saveRecordingText({
+        name: persistedRecordingName,
+        archiveDir: persistedRecordingArchiveDir,
+        requireExisting: !!persistedRecordingName,
+        title: latestSourceTitle(),
+        sourceText: latestSourceForSave(),
+        transcriptText,
+        provider: providerName,
+        model: modelValue,
+        language: languageValue,
+        recordingCollection,
+      }),
+      {
+        isConflict: isArchiveMutationConflict,
+        describe: (e) => sanitizeUiErrorMessage(e, "History save failed."),
+      },
+    );
+  // The no-transcript exits (D-13): each states WHAT it ends with; how
+  // it ends — signal, progress row, status, metadata save, release,
+  // summary — is ``runStopEpilogue`` (./stop-epilogue), one for all.
+  const endWithoutTranscript = (
+    plan: StopEpiloguePlan,
+    metadata: { transcriptText: string; provider: string } = { transcriptText: "", provider: metadataProvider },
+  ): Promise<FinalSaveOutcome> => runStopEpilogue(plan, {
+    publish: (signal) => publishRecordingOutput({
+      recordingId,
+      pasteText: "",
+      domText: signal.domText,
+      kind: signal.kind,
+      sessionToken: sessionUiToken,
+    }),
+    hideProgress: () => {
+      if (isCurrentUiSession(sessionUiToken)) {
+        $("progressRow").hidden = true;
+      }
+    },
+    setStatus: (label) => setStatusScoped(sessionUiToken, label),
+    save: () => saveSessionMetadata(metadata.transcriptText, metadata.provider),
+    release: releaseStopEpilogueBookkeeping,
+    patchSummary: (summary) => patchCurrentRecordingSummary({
+      title: provisionalTitle,
+      status: summary.status,
+      tone: summary.tone,
+      transcribeLatencyMs: performance.now() - transcribeStartedAt,
+    }, sessionUiToken),
+  });
+
   if (discarding) {
     // Everything is torn down; nothing is written. No transcript, no
     // history entry, no audio on disk, and no post-stop work for the
@@ -12615,13 +12667,6 @@ async function stopLive(
       `[trace stopLive] discarded ${recordedMs.toFixed(0)}ms recording ` +
       `(below the ${UI_TOKENS.capture.minRecordingMs}ms floor) rec=${recordingId}`,
     );
-    publishRecordingFinalSignal({
-      recordingId,
-      signalText: "",
-      domText: "",
-      kind: "status",
-      sessionToken: sessionUiToken,
-    });
     if (liveSessionId) {
       void discardLiveRecovery(liveSessionId).catch((e) => {
         console.warn("discardLiveRecovery failed for a discarded recording", e);
@@ -12630,11 +12675,12 @@ async function stopLive(
     if (deferredSinkDestroy) {
       void deferredSinkDestroy.destroy();
     }
-    releaseStopEpilogueBookkeeping();
-    setStatusScoped(sessionUiToken, "Idle");
-    if (isCurrentUiSession(sessionUiToken)) {
-      $("progressRow").hidden = true;
-    }
+    await endWithoutTranscript({
+      signal: { domText: "", kind: "status" },
+      statusLabel: "Idle",
+      save: false,
+      summary: null,
+    });
     return;
   }
 
@@ -12643,8 +12689,6 @@ async function stopLive(
   }
   releaseStopTransitionAfterCaptureDetach();
 
-  let persistedRecordingName = "";
-  let persistedRecordingArchiveDir = "";
   // Screen mode: the session is complete (main took the last screenshot
   // and wrote events.json) before the audio is saved, because the save
   // is what moves the screenshots beside the recording. The marks are
@@ -12652,7 +12696,6 @@ async function stopLive(
   // transcript are the screenshots' permanent ones.
   const stagedScreenManifest = await screenSessionPromise;
   let screenManifest = stagedScreenManifest;
-  const provisionalTitle = _smartTitle(sourceLiveText);
   if (savedAudioFile) {
     // Two-attempt save: first with the configured archive dir, then
     // with the DEFAULT dir. The most common cause of "initial save
@@ -12745,164 +12788,70 @@ async function stopLive(
   }
 
   if (startupAbortReason && !savedAudioFile && !transcribeInputFile && captureLevel.frames === 0) {
-    publishRecordingFinalSignal({
-      recordingId,
-      signalText: "",
-      domText: startupAbortReason,
-      kind: "error",
-      sessionToken: sessionUiToken,
+    await endWithoutTranscript({
+      signal: { domText: startupAbortReason, kind: "error" },
+      statusLabel: "Error",
+      save: false,
+      summary: { status: startupAbortReason, tone: "error" },
     });
-    if (isCurrentUiSession(sessionUiToken)) {
-      $("progressRow").hidden = true;
-    }
-    releaseStopEpilogueBookkeeping();
-    setStatusScoped(sessionUiToken, "Error");
-    patchCurrentRecordingSummary({
-      title: provisionalTitle,
-      status: startupAbortReason,
-      tone: "error",
-      transcribeLatencyMs: performance.now() - transcribeStartedAt,
-    }, sessionUiToken);
     return;
   }
 
   const drainedSourceLiveText = latestSourceForSave();
   const drainedSilence = provider ? captureSilenceSnapshot(drainedSourceLiveText) : null;
   const drainedFailureReason = provider ? stopFailureReason(drainedSourceLiveText) : null;
-  const drainedIsSilent = !!drainedSilence?.silentCapture || (!!provider && micHealthBad);
-  if (drainedIsSilent) {
-    const drainedDomText = micHealthBad ? "[ Mic not delivering audio ]" : "[ Silence ]";
-    publishRecordingFinalSignal({
-      recordingId,
-      signalText: "",
-      domText: drainedDomText,
-      kind: micHealthBad ? "error" : "status",
-      sessionToken: sessionUiToken,
-    });
-    setStatusScoped(sessionUiToken, "Done");
-    try {
-      await saveRecordingText({
-        name: persistedRecordingName,
-        archiveDir: persistedRecordingArchiveDir,
-        requireExisting: !!persistedRecordingName,
-        title: latestSourceTitle(),
-        sourceText: latestSourceForSave(),
-        transcriptText: drainedDomText,
-        provider: metadataProvider,
-        model: modelValue,
-        language: languageValue,
-        recordingCollection,
-      });
-    } catch (e) {
-      if (isArchiveMutationConflict(e)) {
-        patchCurrentRecordingSummary({
-          title: provisionalTitle,
-          status: drainedFailureReason?.notice ||
-            "Silence was detected, but the original archive changed before the session could be finalized. The entry was not recreated elsewhere.",
-          tone: "warning",
-        }, sessionUiToken);
-      }
-    }
-    releaseStopEpilogueBookkeeping();
-    patchCurrentRecordingSummary({
-      title: provisionalTitle,
-      status: drainedFailureReason?.status || "Silence detected. Audio remains available for review.",
-      tone: drainedFailureReason?.tone || "success",
-      transcribeLatencyMs: performance.now() - transcribeStartedAt,
-    }, sessionUiToken);
+  // The mic-health verdict explains an empty session; it never vetoes
+  // one that held speech (./stop-epilogue).
+  const drained = decideDrainedSilence({
+    silentCapture: !!drainedSilence?.silentCapture,
+    hasProvider: !!provider,
+    micHealthBad,
+    carriedSpeech: summarizeCaptureLevel(captureLevel).carriedSpeech,
+    liveText: drainedSourceLiveText,
+  });
+  if (drained.silent) {
+    const drainedDomText = drained.micFault ? "[ Mic not delivering audio ]" : "[ Silence ]";
+    await endWithoutTranscript({
+      signal: { domText: drainedDomText, kind: drained.micFault ? "error" : "status" },
+      statusLabel: "Done",
+      save: true,
+      summary: {
+        status: drainedFailureReason?.status || "Silence detected. Audio remains available for review.",
+        tone: drainedFailureReason?.tone === "neutral" ? "info" : drainedFailureReason?.tone || "success",
+      },
+      conflictStatus: drainedFailureReason?.notice ||
+        "Silence was detected, but the original archive changed before the session could be finalized. The entry was not recreated elsewhere.",
+    }, { transcriptText: drainedDomText, provider: metadataProvider });
     return;
   }
 
   if (!enhance || !transcribeInputFile) {
     const skippedBySetting = !enhance;
-    publishRecordingFinalSignal({
-      recordingId,
-      signalText: "",
-      domText: skippedBySetting
-        ? "Auto transcribe is off. Audio was saved locally and is ready to review."
-        : "Audio was saved locally, but the canonical transcription input is unavailable for this session.",
-      kind: skippedBySetting ? "status" : "error",
-      sessionToken: sessionUiToken,
+    await endWithoutTranscript({
+      signal: {
+        domText: skippedBySetting
+          ? "Auto transcribe is off. Audio was saved locally and is ready to review."
+          : "Audio was saved locally, but the canonical transcription input is unavailable for this session.",
+        kind: skippedBySetting ? "status" : "error",
+      },
+      statusLabel: skippedBySetting ? "Idle" : "Error",
+      save: true,
+      summary: skippedBySetting
+        ? { status: "Audio saved. Final transcription was skipped for this session.", tone: "success" }
+        : { status: "Audio saved, but the canonical transcription input is unavailable for this session.", tone: "warning" },
+      conflictStatus: "Audio is available, but the original archive changed before the session metadata could be finalized.",
     });
-    if (isCurrentUiSession(sessionUiToken)) {
-      $("progressRow").hidden = true;
-    }
-    try {
-      await saveRecordingText({
-        name: persistedRecordingName,
-        archiveDir: persistedRecordingArchiveDir,
-        requireExisting: !!persistedRecordingName,
-        title: latestSourceTitle(),
-        sourceText: latestSourceForSave(),
-        transcriptText: "",
-        provider: metadataProvider,
-        model: modelValue,
-        language: languageValue,
-        recordingCollection,
-      });
-    } catch (e) {
-      if (isArchiveMutationConflict(e)) {
-        patchCurrentRecordingSummary({
-          title: provisionalTitle,
-          status: "Audio is available, but the original archive changed before the session metadata could be finalized.",
-          tone: "warning",
-        }, sessionUiToken);
-      }
-    }
-    releaseStopEpilogueBookkeeping();
-    setStatusScoped(sessionUiToken, skippedBySetting ? "Idle" : "Error");
-    patchCurrentRecordingSummary({
-      title: provisionalTitle,
-      status: skippedBySetting
-        ? "Audio saved. Final transcription was skipped for this session."
-        : "Audio saved, but the canonical transcription input is unavailable for this session.",
-      tone: skippedBySetting ? "success" : "warning",
-      transcribeLatencyMs: performance.now() - transcribeStartedAt,
-    }, sessionUiToken);
     return;
   }
 
   if (!provider) {
-    publishRecordingFinalSignal({
-      recordingId,
-      signalText: "",
-      domText: "No transcription provider is selected. Audio was saved locally.",
-      kind: "status",
-      sessionToken: sessionUiToken,
+    await endWithoutTranscript({
+      signal: { domText: "No transcription provider is selected. Audio was saved locally.", kind: "status" },
+      statusLabel: "Idle",
+      save: true,
+      summary: { status: "Audio saved. No transcription provider is selected.", tone: "warning" },
+      conflictStatus: "No provider is selected, and the original archive changed before the session metadata could be finalized.",
     });
-    if (isCurrentUiSession(sessionUiToken)) {
-      $("progressRow").hidden = true;
-    }
-    try {
-      await saveRecordingText({
-        name: persistedRecordingName,
-        archiveDir: persistedRecordingArchiveDir,
-        requireExisting: !!persistedRecordingName,
-        title: latestSourceTitle(),
-        sourceText: latestSourceForSave(),
-        transcriptText: "",
-        provider: metadataProvider,
-        model: modelValue,
-        language: languageValue,
-        recordingCollection,
-      });
-    } catch (e) {
-      if (isArchiveMutationConflict(e)) {
-        patchCurrentRecordingSummary({
-          title: provisionalTitle,
-          status: "No provider is selected, and the original archive changed before the session metadata could be finalized.",
-          tone: "warning",
-        }, sessionUiToken);
-      }
-    }
-    releaseStopEpilogueBookkeeping();
-    setStatusScoped(sessionUiToken, "Idle");
-    patchCurrentRecordingSummary({
-      title: provisionalTitle,
-      status: "Audio saved. No transcription provider is selected.",
-      tone: "warning",
-      transcribeLatencyMs: performance.now() - transcribeStartedAt,
-    }, sessionUiToken);
     return;
   }
 
@@ -12913,47 +12862,13 @@ async function stopLive(
   }
   if (provider !== "local" && !isProviderKeyConfigured(provider)) {
     const msg = providerKeyErrorMessage(provider);
-    publishRecordingFinalSignal({
-      recordingId,
-      signalText: "",
-      domText: msg,
-      kind: "error",
-      sessionToken: sessionUiToken,
-    });
-    if (isCurrentUiSession(sessionUiToken)) {
-      $("progressRow").hidden = true;
-    }
-    setStatusScoped(sessionUiToken, "Error");
-    patchCurrentRecordingSummary({
-      title: provisionalTitle,
-      status: `${msg} Audio is still saved locally.`,
-      tone: "error",
-      transcribeLatencyMs: performance.now() - transcribeStartedAt,
-    }, sessionUiToken);
-    try {
-      await saveRecordingText({
-        name: persistedRecordingName,
-        archiveDir: persistedRecordingArchiveDir,
-        requireExisting: !!persistedRecordingName,
-        title: latestSourceTitle(),
-        sourceText: latestSourceForSave(),
-        transcriptText: "",
-        provider,
-        model: modelValue,
-        language: languageValue,
-        recordingCollection,
-      });
-    } catch (e) {
-      if (isArchiveMutationConflict(e)) {
-        patchCurrentRecordingSummary({
-          title: provisionalTitle,
-          status: `${msg} The original archive changed before the session metadata could be finalized.`,
-          tone: "warning",
-          transcribeLatencyMs: performance.now() - transcribeStartedAt,
-        }, sessionUiToken);
-      }
-    }
-    releaseStopEpilogueBookkeeping();
+    await endWithoutTranscript({
+      signal: { domText: msg, kind: "error" },
+      statusLabel: "Error",
+      save: true,
+      summary: { status: `${msg} Audio is still saved locally.`, tone: "error" },
+      conflictStatus: `${msg} The original archive changed before the session metadata could be finalized.`,
+    }, { transcriptText: "", provider });
     return;
   }
   // (``transcribeStartedAt`` is captured at the top of ``stopLive``)
@@ -13196,7 +13111,6 @@ async function stopLive(
     };
     let transcriptRaw = "";
     let transcriptForPaste = "";
-    let finalSaveConflict = false;
     // Provenance of ``transcriptRaw`` for the ``[trace stopLive] FINAL``
     // line. On the Deepgram path there are exactly two possible values —
     // ``envelope`` or ``ondisk-fallback`` — and which one a stop printed
@@ -13315,9 +13229,10 @@ async function stopLive(
         // The ONLY fallback: no envelope reached us at all — the socket
         // closed or errored before or during the stop, or the deadline
         // expired with no ``final``. The backend produced no reading of
-        // this recording, so the renderer decodes the audio it saved,
-        // through the same ``transcribe-on-disk`` chain the manual
-        // Re-transcribe button uses.
+        // this recording, so the renderer decodes the audio it saved
+        // (``recoverFromEmptyTranscript``: Deepgram REST on the saved
+        // file, then local Whisper). Re-transcribe runs its own,
+        // separate decode of the saved audio (FL-08).
         //
         // An envelope with EMPTY text and no error is NOT missing: that
         // is the backend saying the recording holds no speech, and
@@ -13380,20 +13295,17 @@ async function stopLive(
           tone: "info",
         }, sessionUiToken);
       }
-      if (!remoteApiPromise && isProviderKeyConfigured(provider)) {
-        const finalAudioFile = await fetchRecoveryAudioFile();
-        if (finalAudioFile) {
-          remoteApiPromise = remoteJobSync(finalAudioFile, {
+      // Started only now, from the durably saved recording: the
+      // in-memory OPFS-backed File can be gone by this point.
+      const finalAudioFile = isProviderKeyConfigured(provider) ? await fetchRecoveryAudioFile() : null;
+      if (finalAudioFile) {
+        try {
+          const syncOut = await remoteJobSync(finalAudioFile, {
             provider,
             language: languageValue,
             diarize: diarizeValue,
             remoteModel: modelValue,
           });
-        }
-      }
-      if (remoteApiPromise) {
-        try {
-          const syncOut = await remoteApiPromise;
           transcriptRaw = String(syncOut.text || "").trim();
           transcriptSource = "remote";
         } catch (e) {
@@ -13479,9 +13391,9 @@ async function stopLive(
       transcribeLatencyMs: transcriptReadyLatencyMs,
     }, sessionUiToken);
 
-    publishRecordingFinalSignal({
+    publishRecordingOutput({
       recordingId,
-      signalText: "",
+      pasteText: "",
       domText: finalUiText,
       kind: "status",
       // The provisional publish §6.8 is about: this text is what the
@@ -13510,57 +13422,33 @@ async function stopLive(
       pasteReadyText = transcriptForPaste
         ? withScreenMarks(transcriptForPaste, transcriptForPaste === plainTranscriptRaw)
         : transcriptRaw;
-      publishRecordingFinalSignal({
+      publishRecordingOutput({
         recordingId,
-        signalText: pasteReadyText,
+        pasteText: pasteReadyText,
         domText: transcriptRaw,
         kind: "transcript",
         sessionToken: sessionUiToken,
       });
     }
     setStatusScoped(sessionUiToken, "Done");
-    // saveRecordingText is non-blocking for recordings list reload.
-    try {
-      title = plainTranscriptRaw ? _smartTitle(plainTranscriptRaw) : provisionalTitle;
-      await saveRecordingText({
-        name: persistedRecordingName,
-        archiveDir: persistedRecordingArchiveDir,
-        requireExisting: !!persistedRecordingName,
-        title,
-        sourceText: latestSourceForSave(),
-        transcriptText: transcriptRaw,
-        provider,
-        model: modelValue,
-        language: languageValue,
-        recordingCollection,
-      });
-    } catch (e) {
-      if (isArchiveMutationConflict(e)) {
-        finalSaveConflict = true;
-        patchCurrentRecordingSummary({
-          title,
-          status: "Transcript finished, but the original archive changed before final save. The session was not recreated in a different archive.",
-          tone: "warning",
-        }, sessionUiToken);
-      }
-    }
+    title = plainTranscriptRaw ? _smartTitle(plainTranscriptRaw) : provisionalTitle;
+    const finalSave = await saveSessionMetadata(transcriptRaw, provider);
     patchCurrentRecordingSummary({
       title,
-      status: finalSaveConflict
-        ? "Transcript is ready in memory, but the original archive changed before the final save completed."
-        : transcriptRaw
-          ? "Final transcript is ready. Audio and transcript are both available."
-          : noSpeechFinalStatus,
-      tone: finalSaveConflict ? "warning" : "success",
+      ...resolveTranscriptStopSummary({
+        transcriptReady: !!transcriptRaw,
+        noSpeechStatus: noSpeechFinalStatus,
+        persistedName: persistedRecordingName,
+        outcome: finalSave,
+      }),
       transcribeLatencyMs: transcriptReadyLatencyMs,
-      ...(persistedRecordingName && !finalSaveConflict ? { savedName: persistedRecordingName } : { savedName: "" }),
     }, sessionUiToken);
   } catch (e) {
     console.error("Live transcription finalization failed", e);
     const safeMessage = sanitizeUiErrorMessage(e, "Transcription failed. Audio is still saved.");
-    publishRecordingFinalSignal({
+    publishRecordingOutput({
       recordingId,
-      signalText: "",
+      pasteText: "",
       domText: safeMessage,
       kind: "error",
       sessionToken: sessionUiToken,
@@ -13569,45 +13457,18 @@ async function stopLive(
       $("progressRow").hidden = true;
     }
     setStatusScoped(sessionUiToken, "Error");
-    let fallbackSaveConflict = false;
-    try {
-      await saveRecordingText({
-        name: persistedRecordingName,
-        archiveDir: persistedRecordingArchiveDir,
-        requireExisting: !!persistedRecordingName,
-        title: latestSourceTitle(),
-        sourceText: latestSourceForSave(),
-        transcriptText: "",
-        provider,
-        model: modelValue,
-        language: languageValue,
-        recordingCollection,
-      });
-    } catch (saveError) {
-      if (isArchiveMutationConflict(saveError)) {
-        fallbackSaveConflict = true;
-        patchCurrentRecordingSummary({
-          title: provisionalTitle,
-          status: `${safeMessage} The original archive changed before fallback save completed.`,
-          tone: "warning",
-          transcribeLatencyMs: performance.now() - transcribeStartedAt,
-        }, sessionUiToken);
-      }
-    }
-    const latencyMs = performance.now() - transcribeStartedAt;
+    const fallbackSave = await saveSessionMetadata("", provider);
     patchCurrentRecordingSummary({
       title: provisionalTitle,
-      status: fallbackSaveConflict
-        ? `${safeMessage} The original archive changed before fallback save completed.`
-        : `${safeMessage} Audio is still available.`,
-      tone: fallbackSaveConflict ? "warning" : "error",
-      transcribeLatencyMs: latencyMs,
-      ...(persistedRecordingName && !fallbackSaveConflict ? { savedName: persistedRecordingName } : { savedName: "" }),
+      ...resolveFailedStopSummary({
+        failureMessage: safeMessage,
+        persistedName: persistedRecordingName,
+        outcome: fallbackSave,
+      }),
+      transcribeLatencyMs: performance.now() - transcribeStartedAt,
     }, sessionUiToken);
   } finally {
-    clearLiveDraft(sessionUiToken);
-    micHealth.observe({ kind: "session-stop" });
-    releaseStopTransitionAfterCaptureDetach();
+    endStopSession();
     mark("stopLive:done");
     // The hold runs before this timer starts, so it is added back: the
     // number that matters is the whole distance from the press.
@@ -13731,22 +13592,32 @@ window.addEventListener("transcriptor-hotkey-stop", (ev) => {
 
 async function initRecordingsBootstrap(): Promise<void> {
   recordingsBootstrapReady = false;
+  // Each failure was console-only: the History pane just stayed empty
+  // and an unrecovered interrupted recording said nothing (FQ-15).
+  const failed: string[] = [];
   try {
     await loadRecordings(false);
   } catch (e) {
     console.warn("Initial recordings load failed", e);
+    failed.push("History could not be loaded");
   }
   try {
     await recoverBackendAudioSessions();
   } catch (e) {
     console.warn("Recovery import failed", e);
+    failed.push("interrupted recordings could not be recovered");
   }
   try {
     await recoverLiveDraftIfAny();
   } catch (e) {
     console.warn("Draft recovery failed", e);
+    failed.push("an interrupted transcript draft could not be recovered");
   }
   recordingsBootstrapReady = !!currentArchiveDirSnapshot();
+  if (failed.length) {
+    const said = failed.join("; ");
+    setStatus(`${said.charAt(0).toUpperCase()}${said.slice(1)}. Restart the app to try again.`, "warning");
+  }
 }
 
 // Graph interactions are disabled with the Graph view. Restore together with
@@ -13795,10 +13666,15 @@ async function runUpdateCheck(): Promise<void> {
   updateBtnEl.disabled = true;
   renderUpdateStatus("Checking…", "neutral");
   const result = await checkForUpdate(__APP_UPDATE_META__, fetch);
-  try {
-    localStorage.setItem(UPDATE_CHECK_CACHE_KEY, String(Date.now()));
-  } catch {
-    /* quota/private-mode: the throttle just resets each launch */
+  // Only a check that got an answer counts as "checked today". Stamping
+  // the failed one too meant an offline launch silenced the daily check
+  // for 24 h (FQ-13).
+  if (result.status !== "unknown") {
+    try {
+      localStorage.setItem(UPDATE_CHECK_CACHE_KEY, String(Date.now()));
+    } catch {
+      /* quota/private-mode: the throttle just resets each launch */
+    }
   }
   switch (result.status) {
     case "update-available": {
@@ -13833,8 +13709,10 @@ if (updateBtnEl) {
     void runUpdateCheck();
   });
 }
-// Passive boot check at most once per day — silent on failure so an
-// offline start never nags.
+// Passive boot check at most once per day, a few seconds after launch
+// so it never competes with the backend boot. A failure is shown in
+// Settings and not stamped, so the next launch tries again.
+const UPDATE_CHECK_BOOT_DELAY_MS = 4_000;
 (() => {
   let lastChecked = 0;
   try {
@@ -13845,7 +13723,7 @@ if (updateBtnEl) {
   if (!shouldAutoCheck(Date.now(), lastChecked)) return;
   window.setTimeout(() => {
     void runUpdateCheck();
-  }, 4000);
+  }, UPDATE_CHECK_BOOT_DELAY_MS);
 })();
 
 applyBackendBootstrap();
@@ -13926,7 +13804,7 @@ window.addEventListener("pagehide", stopGatedPolls, { once: true });
 // to resume. On timeout the recordings list stays empty; the user can still
 // record and the list reloads on the next manual refresh.
 let recordingsBootstrapTimeoutHandle = 0;
-recordingsBootstrapPromise = Promise.race([
+const bootRecordingsBootstrap: Promise<void> = Promise.race([
   initRecordingsBootstrap(),
   new Promise<void>((_, rej) => {
     recordingsBootstrapTimeoutHandle = window.setTimeout(
@@ -13935,15 +13813,24 @@ recordingsBootstrapPromise = Promise.race([
     );
   }),
 ])
-  .catch((e) => { console.warn("[bootstrap]", e?.message ?? e); })
+  .catch((e) => {
+    console.warn("[bootstrap]", e?.message ?? e);
+    setStatus("History is taking unusually long to load. Recording still works; the list reloads on the next refresh.", "warning");
+  })
   .finally(() => {
     // The loser of a race is not cancelled by winning it. Without this
     // the timer stayed armed for the full 15 s after a bootstrap that
     // finished in 40 ms, holding its closure and keeping the process
     // from going idle.
     window.clearTimeout(recordingsBootstrapTimeoutHandle);
-    recordingsBootstrapPromise = null;
+    // Clear only our own promise: a settings archive-folder change made
+    // during the boot race installs its own, and nulling it here made
+    // ``ensureRecordingsArchiveReady`` stop waiting for it (FQ-15).
+    if (recordingsBootstrapPromise === bootRecordingsBootstrap) {
+      recordingsBootstrapPromise = null;
+    }
   });
+recordingsBootstrapPromise = bootRecordingsBootstrap;
 // Platform marker on <body> so the stylesheet can gate macOS-specific
 // chrome offsets (traffic-light padding under hiddenInset). Without
 // this, Windows/Linux users see a 42px dead zone at the top of the
@@ -13984,68 +13871,7 @@ window.__setBackendBootStatus = (msg: string) => {
   setStatus(msg);
 };
 
-/**
- * Map a raw backend-startup error string to a user-actionable message.
- *
- * The backend sends us ``uvicorn`` stderr tails verbatim via
- * ``__setBackendBootError`` — those can include absolute filesystem
- * paths, Python tracebacks, or obscure OS error codes (``EADDRINUSE``,
- * ``WinError 10013``). Rendering them raw is (a) scary to non-technical
- * users, (b) info-leaky to anyone who photographs the window. We
- * classify the known families into actionable copy and keep the raw
- * text behind a "Show details" disclosure for anyone debugging.
- */
-function classifyBootError(raw: string): { headline: string; detail: string } {
-  const low = (raw || "").toLowerCase();
-  if (!low) {
-    return {
-      headline: "Backend failed to start.",
-      detail: "Unknown startup failure — check the main.log in the data directory.",
-    };
-  }
-  if (low.includes("address already in use") ||
-      low.includes("eaddrinuse") ||
-      low.includes("winerror 10048") ||
-      low.includes("only one usage of each socket address")) {
-    // Do NOT name a port here. The backend scans upward from
-    // TRANSCRIPTOR_PORT (default 8321) through 24 candidates before
-    // falling back to an OS-assigned port, so the number that actually
-    // collided is rarely 8321. Telling the user to free 8321 when the
-    // conflict was on 8327 sends them chasing the wrong process; the
-    // real port is in the technical-details disclosure below.
-    return {
-      headline: "The backend port is already in use.",
-      detail: "Another copy of Transcriptor is still running. Close it via the tray icon (or reboot if that doesn't work) and try again. The exact port is in the technical details below.",
-    };
-  }
-  if (low.includes("permission denied") ||
-      low.includes("eacces") ||
-      low.includes("winerror 5")) {
-    return {
-      headline: "Transcriptor couldn't access its data directory.",
-      detail: "Check that Transcriptor's data directory is writable by your user account. On Windows, verify no antivirus is blocking %APPDATA%\\Transcriptor.",
-    };
-  }
-  if (low.includes("no module named") || low.includes("modulenotfounderror")) {
-    return {
-      headline: "A Python dependency is missing.",
-      detail: "The bundled runtime is incomplete. Reinstall Transcriptor from the same installer (.exe / .dmg / .AppImage) to restore it.",
-    };
-  }
-  if (low.includes("python 3 interpreter was not found") ||
-      low.includes("python: not found") ||
-      low.includes("python was not found")) {
-    return {
-      headline: "Python 3 is required.",
-      detail: "Install Python 3.10+ from python.org, then reopen Transcriptor. Linux users: `sudo apt install python3 python3-venv python3-pip`.",
-    };
-  }
-  // Unknown family — generic copy + let the user open the log.
-  return {
-    headline: "Backend failed to start.",
-    detail: "Open the log file from the support section below and share the tail with support, or reinstall from the latest installer.",
-  };
-}
+// The raw-stderr → actionable-copy mapping lives in ./boot-error.
 
 window.__setBackendBootError = (msg: string) => {
   const raw = String(msg || "").trim();
@@ -14067,7 +13893,7 @@ window.__setBackendBootError = (msg: string) => {
     const friendly = document.createElement("div");
     friendly.textContent = detail;
     detailEl.appendChild(friendly);
-    if (raw && raw !== detail) {
+    if (raw) {
       const details = document.createElement("details");
       details.style.marginTop = "8px";
       details.style.fontSize = "12px";
@@ -14105,10 +13931,7 @@ if (_bootRetry) {
     const statusEl = document.getElementById("bootOverlayStatus");
     if (statusEl) statusEl.textContent = "Reloading…";
     const overlay = document.getElementById("bootOverlay");
-    if (overlay) {
-      _bootOverlayHidden = false;
-      overlay.dataset.state = "loading";
-    }
+    if (overlay) overlay.dataset.state = "loading";
     window.location.reload();
   });
 }
@@ -14188,15 +14011,11 @@ interface UploadQueueItem {
   //   uploading → Uploading … (file body in flight to backend)
   //   processing → Processing … (backend is decoding video / running
   //                Deepgram REST / OpenRouter audio model)
+  //   saving    → Saving to History … (the job is done; the transcript
+  //                is being written to the archive — no longer stoppable)
   //   none      → status's own label (done/error/cancelled)
   status: UploadQueueStatus;
-  stage?: "queued" | "uploading" | "processing" | "done";
-  /**
-   * 0..1 fraction of known upload progress. Browser fetch does not
-   * expose request-body progress, so this remains undefined for the
-   * job-based Upload flow and the UI uses stage labels instead.
-   */
-  uploadProgress?: number;
+  stage?: "queued" | "uploading" | "processing" | "saving" | "done";
   text?: string;
   error?: string;
   startedAt?: number;
@@ -14238,6 +14057,8 @@ let uploadQueueSaveTimer: number | null = null;
 let uploadQueueSaveInFlight: Promise<void> = Promise.resolve();
 let uploadQueueSavePending = false;
 let uploadQueueLastSaveOk = false;
+/** Consecutive failed snapshot writes (./upload-queue-persist). */
+let uploadQueueSaveFailures = 0;
 let uploadRevealReconcileInFlight: Promise<void> | null = null;
 const UPLOAD_EMPTY_TRANSCRIPT_TEXT = "[No speech captured]";
 // Per-file ceiling for the Upload tab. This must match MAX_FILE_BYTES,
@@ -14253,26 +14074,18 @@ function uploadFileSizeCap(): number {
 // JS level once the backend-owned set is known.
 const UPLOAD_ALLOWED_EXTS = ACCEPTED_AUDIO_VIDEO_EXTS;
 
-function uploadExtensionFromName(name: string): string {
-  const leaf = String(name || "").split(/[\\/]/).filter(Boolean).pop() || "";
-  const dot = leaf.lastIndexOf(".");
-  if (dot <= 0 || dot >= leaf.length - 1) return "";
-  return leaf.slice(dot + 1).toLowerCase();
+function uploadSourceError(name: string, sizeBytes: number): string {
+  return uploadSourceValidationError({
+    name,
+    sizeBytes,
+    capBytes: uploadFileSizeCap(),
+    allowedExts: UPLOAD_ALLOWED_EXTS,
+    formatBytes: fmtBytes,
+  });
 }
 
 function uploadFileValidationError(file: File): string {
-  const cap = uploadFileSizeCap();
-  if (cap > 0 && file.size > cap) {
-    return `File too large (${fmtBytes(file.size)} > ${fmtBytes(cap)} cap).`;
-  }
-  const ext = uploadExtensionFromName(file.name);
-  if (!ext) {
-    return "Unsupported file type. Drop an audio or video file with a supported extension.";
-  }
-  if (UPLOAD_ALLOWED_EXTS.size > 0 && !UPLOAD_ALLOWED_EXTS.has(ext)) {
-    return `Unsupported file type ".${ext}". Drop an audio or video file.`;
-  }
-  return "";
+  return uploadSourceError(file.name, file.size);
 }
 
 function normalizeUploadSourcePath(rawPath: unknown): string {
@@ -14295,9 +14108,9 @@ function uploadSourcePathFromFile(file: File): string {
   } catch (e) {
     console.debug("Upload source path bridge failed", e);
   }
-  // Development/older-Electron fallback. Browser File does not define
-  // this field; Electron historically did on selected files.
-  return normalizeUploadSourcePath((file as unknown as { path?: string }).path);
+  // No ``File.path`` fallback: Electron removed it in 32 (this app ships
+  // 42), so the preload bridge is the only source of a path (FQ-22).
+  return "";
 }
 
 function uploadPathBasename(sourcePath: string): string {
@@ -14308,18 +14121,7 @@ function uploadPathBasename(sourcePath: string): string {
 function uploadSourcePathValidationError(sourcePath: string, sizeBytes = 0): string {
   const path = normalizeUploadSourcePath(sourcePath);
   if (!path) return "Source file path is missing. Choose the file again.";
-  const cap = uploadFileSizeCap();
-  if (cap > 0 && sizeBytes > cap) {
-    return `File too large (${fmtBytes(sizeBytes)} > ${fmtBytes(cap)} cap).`;
-  }
-  const ext = uploadExtensionFromName(uploadPathBasename(path));
-  if (!ext) {
-    return "Unsupported file type. Choose an audio or video file with a supported extension.";
-  }
-  if (UPLOAD_ALLOWED_EXTS.size > 0 && !UPLOAD_ALLOWED_EXTS.has(ext)) {
-    return `Unsupported file type ".${ext}". Drop an audio or video file.`;
-  }
-  return "";
+  return uploadSourceError(uploadPathBasename(path), sizeBytes);
 }
 
 function uploadItemName(item: UploadQueueItem): string {
@@ -14331,11 +14133,10 @@ function uploadItemSize(item: UploadQueueItem): number {
   return Number.isFinite(size) && size > 0 ? size : 0;
 }
 
+/** The provider enum is ``normalizeProviderSelection``'s; uploads only
+ *  add that "none" means the upload default (FQ-10). */
 function normalizeUploadProvider(value: unknown): Provider {
-  const provider = String(value || "").trim();
-  return provider === "local" || provider === "openrouter" || provider === "deepgram"
-    ? provider
-    : UI_TOKENS.upload.defaultProvider;
+  return normalizeProviderSelection(value, UI_TOKENS.upload.defaultProvider) || UI_TOKENS.upload.defaultProvider;
 }
 
 function currentUploadTranscriptionOptions(): {
@@ -14523,12 +14324,8 @@ function isUploadTerminalStatus(status: UploadQueueStatus): boolean {
   return status === "done" || status === "error" || status === "cancelled";
 }
 
-function isUploadPastItem(item: UploadQueueItem): boolean {
-  return isUploadTerminalStatus(item.status);
-}
-
 function isUploadVisibleUnderCurrentFilter(item: UploadQueueItem): boolean {
-  return !uploadHideFinished || !isUploadPastItem(item);
+  return !uploadHideFinished || !isUploadTerminalStatus(item.status);
 }
 
 function uploadQueueSnapshotItem(item: UploadQueueItem): UploadQueueSnapshotItem {
@@ -14647,12 +14444,35 @@ async function flushUploadQueueSnapshotNow(unloading = false): Promise<void> {
         { keepalive: unloading },
       );
       uploadQueueLastSaveOk = true;
+      uploadQueueSaveFailures = 0;
     })
     .catch((e) => {
       uploadQueueLastSaveOk = false;
-      console.warn("Upload queue backend snapshot save failed", e);
+      // FQ-02: the backend does not hold this state, so the queue is
+      // still dirty — a failed write must not read as a finished one.
+      uploadQueueSavePending = true;
+      uploadQueueSaveFailures += 1;
+      console.warn(`Upload queue backend snapshot save failed (attempt ${uploadQueueSaveFailures})`, e);
     });
   await uploadQueueSaveInFlight;
+  if (!uploadQueueLastSaveOk) {
+    if (unloading) return;
+    const retry = nextQueueSaveRetry(uploadQueueSaveFailures);
+    if (retry) {
+      if (uploadQueueSaveTimer === null) {
+        uploadQueueSaveTimer = window.setTimeout(() => {
+          uploadQueueSaveTimer = null;
+          void flushUploadQueueSnapshotNow();
+        }, retry.retryInMs);
+      }
+    } else {
+      // Out of retries: say so once. The queue stays dirty, and the next
+      // change to it starts a fresh retry budget.
+      uploadQueueSaveFailures = 0;
+      setStatus(UPLOAD_QUEUE_SAVE_FAILED_STATUS, "warning");
+    }
+    return;
+  }
   if (uploadQueueSavePending) {
     uploadQueueSavePending = false;
     await flushUploadQueueSnapshotNow(unloading);
@@ -14768,15 +14588,29 @@ function afterUploadQueueSnapshotLoaded(action: () => void): void {
     action();
     return;
   }
-  void beginUploadQueueSnapshotRestore().then(action);
+  // The restore promise resolves after a FAILED read too. Running the
+  // action then would process work no save can persist (every save is a
+  // no-op until the latch is up), and a later successful restore would
+  // splice those live rows away under their running processors (FQ-09).
+  // Unknown server state blocks writes — the restore module's rule —
+  // and the restore-failed status is already on screen.
+  void beginUploadQueueSnapshotRestore().then(() => {
+    if (uploadQueueSnapshotLoaded) {
+      action();
+    } else {
+      setStatus(UPLOAD_QUEUE_RESTORE_FAILED_STATUS, "warning");
+    }
+  });
 }
 
 function flushUploadQueueSnapshotBestEffort(): void {
   void flushUploadQueueSnapshotNow(true);
 }
 
+// ``pagehide`` alone: it fires on every unload (close, reload, navigate),
+// after ``beforeunload``. Listening to both sent the same keepalive PUT
+// twice, and the two shared the browser's 64 KiB keepalive budget (FQ-03).
 window.addEventListener("pagehide", flushUploadQueueSnapshotBestEffort, { capture: true });
-window.addEventListener("beforeunload", flushUploadQueueSnapshotBestEffort, { capture: true });
 
 function addUploadQueueItem(item: UploadQueueItem): void {
   uploadQueue.unshift(item);
@@ -14804,6 +14638,9 @@ function enqueueUploadFiles(files: File[]): void {
   window.addEventListener(ev, (e) => {
     // Inside the drop zone the per-element listeners already handle it.
     if ((e.target as HTMLElement)?.closest("#uploadLargeDrop")) return;
+    // Only FILE drags navigate the window. Cancelling every drag also
+    // disabled moving selected text inside a textarea (FQ-20).
+    if (!Array.from((e as DragEvent).dataTransfer?.types || []).includes("Files")) return;
     e.preventDefault();
     e.stopPropagation();
   });
@@ -14893,8 +14730,10 @@ function setupUploadView(): void {
       afterUploadQueueSnapshotLoaded(() => {
         // Drop only finished items so an in-flight transcription is
         // never aborted by an accidental Clear click.
+        // A transcript whose History save failed exists nowhere else, so
+        // the bulk clear keeps it (./upload-item); × removes it explicitly.
         for (let i = uploadQueue.length - 1; i >= 0; i--) {
-          if (isUploadTerminalStatus(uploadQueue[i].status)) {
+          if (isUploadClearable(uploadQueue[i])) {
             uploadQueue.splice(i, 1);
           }
         }
@@ -15012,7 +14851,7 @@ function runUploadProcessor(): void {
   queueMicrotask(() => {
     uploadProcessorPumpScheduled = false;
     while (uploadActiveProcessors < uploadQueueMaxParallel) {
-      const next = uploadQueue.find((it) => it.status === "queued");
+      const next = pickNextQueuedUpload(uploadQueue);
       if (!next) break;
       uploadActiveProcessors += 1;
       void processUploadItem(next).finally(() => {
@@ -15042,7 +14881,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
   if (!sourceFile && !useSourcePath) {
     item.status = "error";
     item.error = pathValidationError || "Source file is no longer available. Choose the file again to retry.";
-    item.endedAt = performance.now();
+    item.endedAt = Date.now();
     item.completedAt = Date.now();
     saveUploadQueueSnapshot();
     renderUploadQueue();
@@ -15051,7 +14890,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
   item.status = "transcribing";
   item.stage = useSourcePath ? "processing" : "uploading";
   item.cancelRequested = false;
-  item.startedAt = performance.now();
+  item.startedAt = Date.now();
   // Per-item AbortController. Threaded through every fetch so
   // the user's Stop button can yank the in-flight request even
   // if the network is mid-stream. We attach it to the item so
@@ -15145,10 +14984,12 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
         // for upload + ffmpeg + provider processing. Large videos can
         // legitimately run past the old 5-minute XHR ceiling; the
         // backend job owns the long work and this renderer only polls.
+        // Every poll tick (0.9 s, then 3 s) lands here; only the first
+        // changes anything. Re-rendering on each tick rebuilt the whole
+        // queue DOM and dropped focus/hover once a second (FQ-07).
         onProcessingProgress: () => {
-          if (item.status !== "transcribing") return;
+          if (item.status !== "transcribing" || item.stage === "processing") return;
           item.stage = "processing";
-          item.uploadProgress = undefined;
           renderUploadQueue();
         },
       };
@@ -15167,57 +15008,15 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
     if (item.cancelRequested) {
       item.status = "cancelled";
       item.stage = undefined;
-      item.endedAt = performance.now();
+      item.endedAt = Date.now();
       item.completedAt = Date.now();
       return;
     }
-    // Persist to the History tab's archive. We pass the original
-    // file so the audio is saved alongside the transcript and is
-    // playable from the History row. `refreshList: true` triggers a
-    // single archive reload at the end of each successful save.
-    const sourceName = sourceFile?.name || uploadPathBasename(sourcePath) || uploadItemName(item);
-    let saveOut: SavedRecordingRef;
-    try {
-      saveOut = await saveRecordingText({
-        title: (sourceName.replace(/\.[^.]+$/, "") || "Uploaded file").slice(0, 80),
-        sourceText: text,
-        transcriptText: text,
-        provider,
-        model: modelLabel,
-        language,
-        recordingCollection: RECORDING_COLLECTIONS.uploads,
-        audioFile: useSourcePath ? null : sourceFile,
-        audioSourcePath: useSourcePath ? saveAudioSourcePath : "",
-        consumeAudioSourcePath: useSourcePath ? consumeSaveAudioSourcePath : false,
-        refreshList: true,
-      });
-    } catch (saveErr) {
-      console.warn("Upload: saveRecordingText failed", saveErr);
-      item.text = text;
-      item.status = "error";
-      item.stage = undefined;
-      item.error = `Transcript finished, but History save failed: ${sanitizeUiErrorMessage(
-        saveErr,
-        "Could not save this upload to History.",
-      )}`;
-      item.endedAt = performance.now();
-      item.completedAt = Date.now();
-      return;
-    }
-    item.text = text;
-    item.status = "done";
-    item.stage = "done";
-    item.endedAt = performance.now();
-    item.completedAt = Date.now();
-    item.savedName = String(saveOut.name || "");
-    item.savedArchiveDir = String(saveOut.archiveDir || "");
-    // Auto-select the just-completed item in the result pane unless
-    // the user has already clicked another item — gives a clear
-    // visual confirmation of "this is your transcript" without
-    // them having to hunt for it.
-    if (uploadSelectedId === null) {
-      uploadSelectedId = item.id;
-    }
+    await saveUploadItemToHistory(item, text, {
+      file: useSourcePath ? null : sourceFile,
+      sourcePath: useSourcePath ? saveAudioSourcePath : "",
+      consumeSourcePath: useSourcePath ? consumeSaveAudioSourcePath : false,
+    });
   } catch (e) {
     // Distinguish user-cancelled from genuine error so the queue UI
     // shows "Cancelled" instead of "Failed" — and so the user
@@ -15232,13 +15031,75 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
       item.stage = undefined;
       item.error = sanitizeUiErrorMessage(e, "Transcription failed.");
     }
-    item.endedAt = performance.now();
+    item.endedAt = Date.now();
     item.completedAt = Date.now();
   } finally {
     clearTimeout(_stageTimer);
     item.abortController = undefined;
     item.cancelRequested = false;
     renderUploadQueue();
+  }
+}
+
+/**
+ * Persist a finished upload to the History archive and settle the item.
+ * One path for the processor and for a save-only Retry (FQ-05): on
+ * failure the transcript stays on the item, shown and copyable, and
+ * Retry comes back here instead of transcribing again (./upload-item).
+ * The ``saving`` stage takes the Stop button away: the job is done, and
+ * a stop pressed during the save used to be acknowledged ("Stopping")
+ * and then ignored (FQ-18).
+ */
+async function saveUploadItemToHistory(
+  item: UploadQueueItem,
+  text: string,
+  audio: { file: File | null; sourcePath: string; consumeSourcePath: boolean },
+): Promise<void> {
+  item.stage = "saving";
+  renderUploadQueue();
+  const sourceName = audio.file?.name || uploadPathBasename(audio.sourcePath) || uploadItemName(item);
+  try {
+    // The original file (or its path) goes with the transcript, so the
+    // audio is playable from the History row; ``refreshList`` reloads
+    // the archive once per successful save.
+    const saveOut = await saveRecordingText({
+      title: (sourceName.replace(/\.[^.]+$/, "") || "Uploaded file").slice(0, 80),
+      sourceText: text,
+      transcriptText: text,
+      provider: item.provider || "",
+      model: item.model || "",
+      language: item.language || "",
+      recordingCollection: RECORDING_COLLECTIONS.uploads,
+      audioFile: audio.file,
+      audioSourcePath: audio.sourcePath,
+      consumeAudioSourcePath: audio.consumeSourcePath,
+      refreshList: true,
+    });
+    item.text = text;
+    item.error = "";
+    item.status = "done";
+    item.stage = "done";
+    item.savedName = String(saveOut.name || "");
+    item.savedArchiveDir = String(saveOut.archiveDir || "");
+    // Auto-select the just-completed item in the result pane unless
+    // the user has already clicked another item — gives a clear
+    // visual confirmation of "this is your transcript" without
+    // them having to hunt for it.
+    if (uploadSelectedId === null) {
+      uploadSelectedId = item.id;
+    }
+  } catch (saveErr) {
+    console.warn("Upload: saveRecordingText failed", saveErr);
+    item.text = text;
+    item.status = "error";
+    item.stage = undefined;
+    item.error = `Transcript finished, but History save failed: ${sanitizeUiErrorMessage(
+      saveErr,
+      "Could not save this upload to History.",
+    )}`;
+  } finally {
+    item.endedAt = Date.now();
+    item.completedAt = Date.now();
   }
 }
 
@@ -15251,19 +15112,14 @@ function uploadStatusLabel(item: UploadQueueItem): string {
       // Three labelled phases inside the outer "transcribing" status:
       //   uploading  → request body is being handed to the backend.
       //                fetch does not expose browser upload progress,
-      //                so this is a stage label unless a future transport
-      //                supplies a determinate fraction.
+      //                so this is a stage label, never a percentage.
       //   processing → backend is decoding video / running provider
       //                ("Processing…" — better than a stuck percentage).
       //   none       → fallback when neither stage was set (transient
       //                window between latch and first progress event).
-      if (item.stage === "uploading") {
-        const pct = typeof item.uploadProgress === "number"
-          ? Math.round(item.uploadProgress * 100)
-          : null;
-        return pct !== null ? `Uploading · ${pct}%` : "Uploading…";
-      }
+      if (item.stage === "uploading") return "Uploading…";
       if (item.stage === "processing") return "Processing…";
+      if (item.stage === "saving") return "Saving to History…";
       return "Transcribing…";
     case "done": {
       const ms = item.endedAt && item.startedAt ? item.endedAt - item.startedAt : 0;
@@ -15303,14 +15159,15 @@ function cancelUploadItem(id: string): void {
   if (item.status === "queued") {
     // Not started yet — just drop it.
     item.status = "cancelled";
-    item.endedAt = performance.now();
+    item.endedAt = Date.now();
     item.completedAt = Date.now();
     saveUploadQueueSnapshot();
     renderUploadQueue();
     return;
   }
   if (item.status === "transcribing") {
-    if (item.cancelRequested) return;
+    // Nothing left to stop once the job is done and the save is running.
+    if (item.cancelRequested || item.stage === "saving") return;
     item.cancelRequested = true;
     // Abort the in-flight fetch. The processor's catch will
     // see DOMException name === "AbortError" and mark it
@@ -15362,7 +15219,27 @@ function assignUploadRetryFile(item: UploadQueueItem, file: File): void {
 
 async function retryUploadItem(id: string): Promise<void> {
   const item = uploadQueue.find((it) => it.id === id);
-  if (!item || item.status !== "error") return;
+  if (!item || !uploadItemRetryable(item.status)) return;
+  if (uploadRetryPlan(item) === "save") {
+    // The transcript exists; only the History save failed (FQ-05). The
+    // audio goes with it when its source is still at hand, else the
+    // transcript is saved on its own rather than paid for twice.
+    const keptPath = normalizeUploadSourcePath(item.sourcePath || "");
+    const pathUsable = !!keptPath && !uploadSourcePathValidationError(keptPath, uploadItemSize(item));
+    item.status = "transcribing";
+    item.error = "";
+    item.startedAt = Date.now();
+    item.endedAt = undefined;
+    uploadSelectedId = item.id;
+    await saveUploadItemToHistory(item, String(item.text || ""), {
+      file: pathUsable ? null : item.file || null,
+      sourcePath: pathUsable ? keptPath : "",
+      consumeSourcePath: false,
+    });
+    saveUploadQueueSnapshot();
+    renderUploadQueue();
+    return;
+  }
   if (!item.file && !normalizeUploadSourcePath(item.sourcePath || "")) {
     const file = await pickUploadRetryFile();
     if (!file) return;
@@ -15382,7 +15259,6 @@ async function retryUploadItem(id: string): Promise<void> {
   const uploadOptions = currentUploadTranscriptionOptions();
   item.status = "queued";
   item.stage = "queued";
-  item.uploadProgress = undefined;
   item.text = "";
   item.error = "";
   item.startedAt = undefined;
@@ -15398,12 +15274,9 @@ async function retryUploadItem(id: string): Promise<void> {
   item.requestedDiarize = uploadOptions.diarize;
   item.savedName = "";
   item.savedArchiveDir = "";
-  try { item.abortController?.abort(); } catch { /* idempotent */ }
-  item.abortController = undefined;
   uploadSelectedId = item.id;
   saveUploadQueueSnapshot();
   renderUploadQueue();
-  renderUploadResultPane();
   runUploadProcessor();
 }
 
@@ -15443,9 +15316,7 @@ function renderUploadQueue(): void {
   const hideBtn = document.getElementById("uploadQueueHideBtn") as HTMLButtonElement | null;
   const titleEl = document.getElementById("uploadQueueTitle");
   if (!list || !empty || !clearBtn) return;
-  const visibleItems = uploadHideFinished
-    ? uploadQueue.filter((it) => !isUploadPastItem(it))
-    : uploadQueue;
+  const visibleItems = uploadQueue.filter(isUploadVisibleUnderCurrentFilter);
   renderUploadPersistenceNote();
   if (uploadQueue.length === 0) {
     // The result pane is rendered at the END of this function, and this
@@ -15464,7 +15335,7 @@ function renderUploadQueue(): void {
     applyStaticUiCopy(document);
     clearBtn.hidden = true;
     if (hideBtn) hideBtn.hidden = true;
-    if (titleEl) titleEl.textContent = "Queue";
+    if (titleEl) titleEl.textContent = uploadQueueTitle([]);
     renderUploadResultPane();
     return;
   }
@@ -15475,10 +15346,7 @@ function renderUploadQueue(): void {
     hideBtn.textContent = uploadHideFinished ? "Show past" : "Hide past";
     hideBtn.setAttribute("aria-pressed", uploadHideFinished ? "true" : "false");
   }
-  if (titleEl) {
-    const total = uploadQueue.length;
-    titleEl.textContent = `Queue · ${finished}/${total} done`;
-  }
+  if (titleEl) titleEl.textContent = uploadQueueTitle(uploadQueue.map((it) => it.status));
   empty.hidden = visibleItems.length > 0;
   if (visibleItems.length === 0) {
     const emptyTitle = empty.querySelector(".upload-empty-state-title");
@@ -15486,7 +15354,6 @@ function renderUploadQueue(): void {
     if (emptyTitle) emptyTitle.textContent = UI_COPY.upload.hiddenPastTitle;
     if (emptySub) emptySub.textContent = UI_COPY.upload.hiddenPastSub;
   }
-  renderUploadPersistenceNote();
   // Clear + rebuild. Queue length is bounded by user clicks (rarely
   // > 50); full re-render is fine and avoids stale-DOM state issues
   // (per-item refs, status class drift across status transitions).
@@ -15498,10 +15365,22 @@ function renderUploadQueue(): void {
     // Click anywhere on the item swaps the result-pane to it. The
     // per-item Stop / × button stops propagation so they don't double-
     // trigger the selection.
-    li.addEventListener("click", () => {
+    // A row is a button for the keyboard too: it was mouse-only, so the
+    // result pane could not be reached without a pointer (FQ-16).
+    const selectRow = (): void => {
       uploadSelectedId = item.id;
       renderUploadQueue();
-      renderUploadResultPane();
+    };
+    li.tabIndex = 0;
+    li.setAttribute("role", "button");
+    li.setAttribute("aria-pressed", item.id === uploadSelectedId ? "true" : "false");
+    li.addEventListener("click", selectRow);
+    li.addEventListener("keydown", (ev: KeyboardEvent) => {
+      if (ev.target !== li) return;
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        selectRow();
+      }
     });
 
     const header = document.createElement("div");
@@ -15545,7 +15424,7 @@ function renderUploadQueue(): void {
       stopBtn.className = "upload-queue-item-stop";
       stopBtn.setAttribute("aria-label", "Stop transcription");
       stopBtn.title = "Stop transcription";
-      stopBtn.disabled = item.cancelRequested === true;
+      stopBtn.disabled = item.cancelRequested === true || item.stage === "saving";
       stopBtn.textContent = item.cancelRequested ? "Stopping" : "Stop";
       stopBtn.addEventListener("click", (ev) => {
         ev.stopPropagation();
@@ -15553,7 +15432,7 @@ function renderUploadQueue(): void {
       });
       tail.appendChild(stopBtn);
     } else {
-      if (item.status === "error") {
+      if (uploadItemRetryable(item.status)) {
         const retrySourcePath = normalizeUploadSourcePath(item.sourcePath || "");
         const retryBlockReason = item.file
           ? uploadFileValidationError(item.file)
@@ -15588,20 +15467,12 @@ function renderUploadQueue(): void {
     li.appendChild(header);
 
     if (item.status === "transcribing") {
-      // Determinate bar only when a transport supplied a real fraction;
-      // otherwise use the indeterminate animation for both upload and
-      // processing so the UI does not invent progress.
+      // Indeterminate for every stage: no transport reports a real
+      // fraction, and the UI does not invent one.
       const progress = document.createElement("div");
       progress.className = "upload-queue-item-progress";
       const bar = document.createElement("div");
-      const hasPct = item.stage === "uploading"
-        && typeof item.uploadProgress === "number";
-      if (hasPct) {
-        bar.className = "upload-queue-item-progress-bar is-determinate";
-        bar.style.width = `${Math.max(2, Math.round((item.uploadProgress || 0) * 100))}%`;
-      } else {
-        bar.className = "upload-queue-item-progress-bar";
-      }
+      bar.className = "upload-queue-item-progress-bar";
       progress.appendChild(bar);
       li.appendChild(progress);
     }
@@ -15637,11 +15508,40 @@ function renderUploadQueue(): void {
       const revealItemBtn = createUploadRevealButton(item);
       if (revealItemBtn) actions.appendChild(revealItemBtn);
       li.appendChild(actions);
-    } else if (item.status === "error" && item.error) {
-      const err = document.createElement("div");
-      err.className = "upload-queue-item-error";
-      err.textContent = item.error;
-      li.appendChild(err);
+    } else if (item.status === "error") {
+      // FQ-01: a transcript whose History save failed is shown and
+      // copyable beside the error, not just mentioned by it.
+      const view = uploadErrorView(item);
+      if (view.error) {
+        const err = document.createElement("div");
+        err.className = "upload-queue-item-error";
+        err.textContent = view.error;
+        li.appendChild(err);
+      }
+      if (view.transcript) {
+        const body = document.createElement("div");
+        body.className = "upload-queue-item-body";
+        body.textContent = view.transcript;
+        li.appendChild(body);
+        const actions = document.createElement("div");
+        actions.className = "upload-queue-item-actions";
+        const copyBtn = document.createElement("button");
+        copyBtn.className = "btn btn-ghost upload-queue-item-action";
+        copyBtn.type = "button";
+        copyBtn.textContent = "Copy";
+        copyBtn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          void (async () => {
+            const ok = await writeTextToClipboard(view.transcript);
+            flashButtonFeedback(copyBtn, ok ? "Copied" : "Copy failed", "Copy transcript", {
+              durationMs: UI_TOKENS.feedback.flashMs,
+              swapLabel: true,
+            });
+          })();
+        });
+        actions.appendChild(copyBtn);
+        li.appendChild(actions);
+      }
     }
     list.appendChild(li);
   }
@@ -15733,10 +15633,28 @@ function renderUploadResultPane(): void {
         revealUploadItem(item);
       };
     }
-  } else if (item.status === "error" && item.error) {
-    textEl.textContent = item.error;
-    metaEl.hidden = true;
-    if (copyBtn) copyBtn.hidden = true;
+  } else if (item.status === "error" && (item.error || item.text)) {
+    // FQ-01: the held transcript is the body; the error is its one meta line.
+    const view = uploadErrorView(item);
+    textEl.textContent = view.transcript || view.error;
+    metaEl.innerHTML = "";
+    metaEl.hidden = !view.transcript || !view.error;
+    if (view.transcript && view.error) {
+      const line = document.createElement("span");
+      line.textContent = view.error;
+      metaEl.appendChild(line);
+    }
+    if (copyBtn) {
+      copyBtn.hidden = !view.copyable;
+      copyBtn.onclick = () => {
+        void (async () => {
+          const ok = await writeTextToClipboard(view.transcript);
+          flashButtonFeedback(copyBtn, ok ? "Copied" : "Copy failed", "Copy transcript", {
+            durationMs: UI_TOKENS.feedback.flashMs,
+          });
+        })();
+      };
+    }
     if (revealBtn) revealBtn.hidden = true;
   } else {
     // queued / transcribing / cancelled — show stage label as the

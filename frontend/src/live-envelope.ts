@@ -231,3 +231,23 @@ export function parseLiveFinalEnvelope<Segment>(
     stats: parseLiveFinalStats(obj.stats),
   };
 }
+
+/**
+ * Does a closing live socket owe its session a synthetic error envelope?
+ *
+ * FL-03. Yes when the close is unclean and no ``final`` arrived — whether
+ * or not anyone is waiting yet. The handler used to bail out when the
+ * session had no envelope slot, and a slot only exists once stopLive arms
+ * its (lazy) waiter, so a socket that died mid-recording recorded
+ * nothing: the stop then waited out its whole envelope budget (1.5 s
+ * Deepgram, 4 s local) for a message that could no longer come before
+ * falling back to the saved audio.
+ */
+export function liveCloseOwesErrorEnvelope(close: {
+  hadEnvelope: boolean;
+  wasClean: boolean;
+  code: number;
+}): boolean {
+  if (close.hadEnvelope) return false;
+  return !(close.wasClean && (close.code === 1000 || close.code === 1005));
+}

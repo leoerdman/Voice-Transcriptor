@@ -25,6 +25,8 @@
  * timings of its own.
  */
 
+import { countWords } from "./text-match";
+
 export interface ScreenManifestEvent {
   type: "stroke" | "shot";
   at: number;
@@ -153,11 +155,6 @@ export function screenMarksFromManifest(manifest: ScreenManifest, fallbackStartA
       : " — не сохранён (нет доступа к записи экрана)";
     return { atMs, text: `[📸 ${time} скрин ${e.shot ?? ""}${files}]` };
   });
-}
-
-function countWords(text: string): number {
-  const m = text.match(/\S+/g);
-  return m ? m.length : 0;
 }
 
 /** Each word's start time, ms, spread evenly over its segment. */
