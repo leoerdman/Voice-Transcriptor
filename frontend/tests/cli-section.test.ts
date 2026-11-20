@@ -7,6 +7,18 @@ import {
   normalizeCliStatus,
 } from "../src/cli-section";
 
+describe("defaults are never shared between statuses (FU-22)", () => {
+  it("hands out a fresh defaults object per status", () => {
+    const a = normalizeCliStatus({ enabled: false });
+    const b = normalizeCliStatus(null);
+    expect(a.defaults).not.toBe(b.defaults);
+    expect(a.defaults).not.toBe(CLI_ACCESS_OFF.defaults);
+    a.defaults.engines.push("local");
+    expect(b.defaults.engines).toEqual([]);
+    expect(CLI_ACCESS_OFF.defaults.engines).toEqual([]);
+  });
+});
+
 const ON_PAYLOAD = {
   enabled: true,
   base_url: "http://127.0.0.1:8321",

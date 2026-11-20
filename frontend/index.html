@@ -14,8 +14,11 @@
     - 'unsafe-inline' for script-src is required: the backend injects
       the bootstrap <script> (API token + runtime config) into this
       document at serve time.
-    - connect-src stays same-origin so the renderer can only reach the
-      local backend over HTTP and the /ws/transcribe WebSocket. 'self'
+    - connect-src is same-origin plus exactly one outside origin,
+      https://api.github.com, which the update check reads release
+      metadata from (src/update-check.ts). Otherwise the renderer can
+      only reach the local backend over HTTP and the /ws/transcribe
+      WebSocket. 'self'
       is what expresses that, including for the socket: CSP3 matches
       ws:// against 'self' when the host and port are the page's own,
       and the renderer builds its socket URL from ``location.host``

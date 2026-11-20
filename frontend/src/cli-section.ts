@@ -60,23 +60,22 @@ export interface CliSectionView {
   showCards: boolean;
 }
 
-const EMPTY_DEFAULTS: CliDefaults = {
-  engine: "",
-  model: "",
-  language: "",
-  diarize: false,
-  engines: [],
-  localModels: [],
-};
+/**
+ * A fresh value every time. One shared object used to be handed out as
+ * the `defaults` of `CLI_ACCESS_OFF` AND of every payload without
+ * defaults, so a write to any of them (its arrays included) would have
+ * changed all of them.
+ */
+function emptyDefaults(): CliDefaults {
+  return { engine: "", model: "", language: "", diarize: false, engines: [], localModels: [] };
+}
 
-export const CLI_ACCESS_OFF: CliAccessStatus = {
-  enabled: false,
-  baseUrl: "",
-  commandPath: "",
-  cliDir: "",
-  cards: [],
-  defaults: EMPTY_DEFAULTS,
-};
+function cliAccessOff(): CliAccessStatus {
+  return { enabled: false, baseUrl: "", commandPath: "", cliDir: "", cards: [], defaults: emptyDefaults() };
+}
+
+/** The "off" state, for a renderer that has not read the backend yet. Frozen: it is shared. */
+export const CLI_ACCESS_OFF: Readonly<CliAccessStatus> = Object.freeze(cliAccessOff());
 
 function text(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
@@ -103,7 +102,7 @@ function normalizeCard(raw: unknown): CliCard | null {
 }
 
 function normalizeDefaults(raw: unknown): CliDefaults {
-  if (!raw || typeof raw !== "object") return EMPTY_DEFAULTS;
+  if (!raw || typeof raw !== "object") return emptyDefaults();
   const source = raw as Record<string, unknown>;
   return {
     engine: text(source.engine),
@@ -125,7 +124,7 @@ function normalizeDefaults(raw: unknown): CliDefaults {
  * cannot use.
  */
 export function normalizeCliStatus(payload: unknown): CliAccessStatus {
-  if (!payload || typeof payload !== "object") return CLI_ACCESS_OFF;
+  if (!payload || typeof payload !== "object") return cliAccessOff();
   const source = payload as Record<string, unknown>;
   const commandPath = text(source.command_path);
   const enabled = source.enabled === true && commandPath.length > 0;

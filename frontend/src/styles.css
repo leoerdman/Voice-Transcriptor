@@ -2921,6 +2921,13 @@ canvas {
   }
 }
 
+/*
+ * Reduced motion, stated once. A `:root.reduce-motion` copy of this block
+ * stood below it with the same declarations: the class is only ever set
+ * by main.tsx mirroring this very media query, so the two were always
+ * true together and drifted apart on every edit. The media query also
+ * covers the boot overlay before any script runs.
+ */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -2942,27 +2949,6 @@ canvas {
   .shortcut-btn.recording {
     animation: none;
   }
-}
-
-:root.reduce-motion *,
-:root.reduce-motion *::before,
-:root.reduce-motion *::after {
-  transition: none !important;
-  transition-delay: 0ms !important;
-  animation-duration: 0.01ms !important;
-  animation-iteration-count: 1 !important;
-  scroll-behavior: auto !important;
-}
-
-:root.reduce-motion .btn:active,
-:root.reduce-motion .upload-droplarge.drag {
-  transform: none;
-}
-
-:root.reduce-motion .boot-overlay-spinner,
-:root.reduce-motion .icon-btn.is-busy .reload-ico,
-:root.reduce-motion .shortcut-btn.recording {
-  animation: none;
 }
 
 @media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {

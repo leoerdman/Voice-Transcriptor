@@ -913,19 +913,13 @@ function installAppearanceStateClasses(): void {
     root.dataset.colorScheme = scheme;
   };
 
+  // ``MediaQueryList.addEventListener`` exists in every Chromium the shell
+  // ships (the build targets chrome142); the ``addListener`` branch that
+  // stood here for older engines could not run.
   const bindMedia = (mql: MediaQueryList) => {
     const listener = () => apply();
-    if (typeof mql.addEventListener === "function") {
-      mql.addEventListener("change", listener);
-      cleanupFns.push(() => mql.removeEventListener("change", listener));
-      return;
-    }
-    const legacy = mql as MediaQueryList & {
-      addListener?: (listener: () => void) => void;
-      removeListener?: (listener: () => void) => void;
-    };
-    legacy.addListener?.(listener);
-    cleanupFns.push(() => legacy.removeListener?.(listener));
+    mql.addEventListener("change", listener);
+    cleanupFns.push(() => mql.removeEventListener("change", listener));
   };
 
   for (const { mql } of media) bindMedia(mql);
@@ -1475,8 +1469,8 @@ function invalidateTranscriptionCatalog(): void {
 /**
  * Render BOTH toolbars (Transcribe + Upload mirror) from the single
  * state. Idempotent rebuild (BUG-58 pattern): options are rewritten only
- * when their value:availability signature changes, so the 2 s health
- * poll never closes an open dropdown.
+ * when their value:availability signature changes, so the 10 s health
+ * poll (``_networkPoll``) never closes an open dropdown.
  */
 function renderTranscriptionSelectors(): void {
   const groups = transcriptionCatalog();
