@@ -194,3 +194,16 @@ test("screen-mode:finish is invoked by the renderer bridge and handled by main",
   // Only the main window may end a session.
   assert.match(mainSource, /"screen-mode:finish", async \(event, payload\) => \{\n    if \(!win \|\| win\.isDestroyed\(\) \|\| event\.sender !== win\.webContents\)/);
 });
+
+test("the backend API token is asked for on backend-auth's channel and answered by main (BM-01)", () => {
+  const { API_TOKEN_CHANNEL } = require("./backend-auth");
+  // The sandboxed preload cannot require ./backend-auth, so it spells the
+  // channel; this is what holds the two spellings together.
+  assert.ok(
+    preloadSource.includes(`ipcRenderer.sendSync("${API_TOKEN_CHANNEL}")`),
+    "preload must ask on API_TOKEN_CHANNEL",
+  );
+  assert.match(preloadSource, /exposeInMainWorld\("__TRANSCRIPTOR_API_TOKEN"/);
+  assert.match(mainSource, /ipcMain\.on\(API_TOKEN_CHANNEL,/);
+  assert.match(mainSource, /TRANSCRIPTOR_API_TOKEN: BACKEND_API_TOKEN,/);
+});

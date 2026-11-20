@@ -61,6 +61,7 @@
       "data-dir.js",
       "backend-exit.js",
       "single-flight.js",
+      "backend-auth.js",
       "renderer-epoch.js",
       "shortcut-runtime.js",
       "capsule-geometry.js",

@@ -2401,6 +2401,11 @@ const keySavedState: Record<RemoteProvider, boolean> = {
   deepgram: false,
 };
 
+// The token comes from the desktop shell's preload (desktop/backend-auth.js,
+// BM-01), not from the page: the backend's unauthenticated `GET /` no longer
+// carries it. Outside the desktop shell (the page opened in a browser, the
+// Vite dev server) there is no token and every API call fails here — the
+// backend is reachable with full rights only through the app's own window.
 const apiToken = (): string => {
   const token = (window.__TRANSCRIPTOR_API_TOKEN || "").trim();
   if (!token) {

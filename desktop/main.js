@@ -178,6 +178,11 @@ const { readPythonVersion } = require("./python-version");
 // the PowerShell UTF-8 prelude and the `cscript //U` UTF-16LE receipt.
 const { childStreamEncoding, stripBom, withUtf8OutputPrelude } = require("./child-io");
 
+// SSOT for the backend's API token and who may read it (BM-01): minted
+// here once per launch, given to the backend in its environment and to the
+// main window over API_TOKEN_CHANNEL — never served in the page.
+const { API_TOKEN_CHANNEL, createLaunchApiToken, isSameOrigin, apiTokenForRequest } = require("./backend-auth");
+
 const MIRROR_RENDERER_TRACE_LOGS =
   process.env.TRANSCRIPTOR_RENDERER_TRACE_LOGS === "1" ||
   process.env.NODE_ENV === "development";
@@ -690,6 +695,7 @@ const DEFAULT_BACKEND_PORT = 8321;
 let PORT = DEFAULT_BACKEND_PORT;
 let BASE_URL = `http://${HOST}:${PORT}`;
 let BACKEND_BOOT_NONCE = "";
+const BACKEND_API_TOKEN = createLaunchApiToken();
 const LAST_TRANSCRIPT_FILE = "last_transcript.json";
 const singleInstanceLock = app.requestSingleInstanceLock();
 if (!singleInstanceLock) {
@@ -7824,6 +7830,7 @@ async function startBackend() {
     PYTHONPYCACHEPREFIX: pythonCacheDir,
     TRANSCRIPTOR_DATA_DIR: dataDir(),
     TRANSCRIPTOR_BOOT_NONCE: BACKEND_BOOT_NONCE,
+    TRANSCRIPTOR_API_TOKEN: BACKEND_API_TOKEN,
     TRANSCRIPTOR_PARENT_WATCHDOG: "1",
   });
   // Every handler below closes over THIS child, never the mutable
@@ -8175,16 +8182,7 @@ async function createWindow(options = {}) {
   // because the dot/slash boundary is not enforced. URL.parse strips
   // ambiguity — same protocol + host + port = same origin. We also
   // match the backend's host:port exactly instead of any-port loopback.
-  const _isBackendOrigin = (rawUrl) => {
-    if (typeof rawUrl !== "string") return false;
-    let parsed;
-    try { parsed = new URL(rawUrl); } catch { return false; }
-    let backend;
-    try { backend = new URL(BASE_URL); } catch { return false; }
-    return parsed.protocol === backend.protocol
-        && parsed.hostname === backend.hostname
-        && parsed.port === backend.port;
-  };
+  const _isBackendOrigin = (rawUrl) => isSameOrigin(rawUrl, BASE_URL);
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (_isBackendOrigin(url)) return { action: "allow" };
     if (typeof url === "string" && (url.startsWith("http://") || url.startsWith("https://"))) {
@@ -9137,6 +9135,21 @@ app.whenReady().then(async () => {
     appendMainLog(`[ipc] ${channel} refused: sender is not the main window`);
     return { ok: false, error: "sender" };
   };
+
+  // The backend's API token for the main window's page (BM-01, see
+  // ./backend-auth). Synchronous because the renderer reads it at load,
+  // before its first request; anyone else is answered with "".
+  ipcMain.on(API_TOKEN_CHANNEL, (event) => {
+    const fromMainWindow = isFromMainWindow(event);
+    const token = apiTokenForRequest({
+      token: BACKEND_API_TOKEN,
+      fromMainWindow,
+      senderUrl: event?.senderFrame?.url,
+      backendBaseUrl: BASE_URL,
+    });
+    if (!token) appendMainLog(`[ipc] ${API_TOKEN_CHANNEL} refused (main window: ${fromMainWindow})`);
+    event.returnValue = token;
+  });
 
   ipcMain.handle("engine:get-status", (event) =>
     (isFromMainWindow(event) ? engineInstallSnapshot() : refusedSender("engine:get-status")));

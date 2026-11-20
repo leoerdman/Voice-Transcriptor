@@ -454,6 +454,36 @@ class CliSaveScopeTests(unittest.TestCase):
         self.assertNotEqual(r.status_code, 403, r.text)
 
 
+class IndexPageCarriesNoTokenTests(unittest.TestCase):
+    """BM-01: the unauthenticated ``GET /`` is reachable by anything that
+    can reach the port — including a holder of only the CLI token — so it
+    must not carry the renderer's full token. The desktop shell hands the
+    token to its window over IPC instead."""
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old_data_dir = os.environ.get("TRANSCRIPTOR_DATA_DIR")
+        self.main = _reload_backend_main(self._tmp.name)
+        dist = Path(self._tmp.name) / "dist"
+        dist.mkdir()
+        (dist / "index.html").write_text("<html><body><div id=app></div></body></html>", encoding="utf-8")
+        patcher = mock.patch.object(self.main, "frontend_dist_dir", dist)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.client = TestClient(self.main.app, base_url="http://127.0.0.1:8321")
+
+    tearDown = CliAuthBoundaryTests.tearDown
+
+    def test_the_page_serves_the_bootstrap_but_not_the_token(self):
+        r = self.client.get("/")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("window.__TRANSCRIPTOR_BOOTSTRAP=", r.text)
+        self.assertNotIn(self.main.API_TOKEN, r.text)
+        self.assertNotIn("__TRANSCRIPTOR_API_TOKEN", r.text)
+
+
 class CliRouteTests(unittest.TestCase):
     """The three routes, called the way FastAPI calls them."""
 

@@ -40,3 +40,53 @@ after:   Tests  10 passed (10)
 
 Suites: backend 991 OK; desktop 427 pass; vitest 604 pass; typecheck, lint,
 build clean.
+
+## C2 — BM-01 (security): the API token leaves the unauthenticated page
+
+Files: `desktop/backend-auth.js` (new, pure) + `desktop/backend-auth.test.js`,
+`desktop/main.js` (require, `BACKEND_API_TOKEN`, child env, `_isBackendOrigin`
+now calls `isSameOrigin`, `ipcMain.on(API_TOKEN_CHANNEL)`), `desktop/preload.js`,
+`desktop/ipc-contract.test.js`, `desktop/package.json` (build.files),
+`PROJECT_STRUCTURE.md`, `backend/main.py` (`index`, two comments),
+`backend/cli_access.py` (docstring), `backend/tests/test_cli_access.py`,
+`frontend/src/main.tsx` (comment on `apiToken`).
+
+Design: the desktop shell mints one token per LAUNCH
+(`createLaunchApiToken`, 32 random bytes) and starts the backend with it in
+`TRANSCRIPTOR_API_TOKEN` — an input `_load_or_create_api_token` already
+honoured, so the backend has no new code path; a process environment is
+readable only by its own user (argv would have been world-readable, so not
+`additionalArguments`). The preload asks `backend:api-token` synchronously
+once per page load and exposes the answer under the SAME global the renderer
+always read (`window.__TRANSCRIPTOR_API_TOKEN`) — the renderer has one source
+and no code change. Main answers only the main window's webContents showing a
+page of the backend's origin (`apiTokenForRequest`), "" to anyone else.
+Per launch, not per spawn: the backend is restarted under a living page
+(engine install, crash recovery). `BACKEND_BOOT_NONCE` was not used
+(`/api/health` publishes it).
+
+Non-Electron path, decided explicitly: the page opened in an ordinary browser
+or via the Vite dev server (`npm --prefix frontend run dev`, which has no API
+proxy anyway) has no token, so API calls fail with "API token is missing".
+That is the point of the fix — full access only through the app's window.
+Documented at `index()` and `apiToken()`. Side effect for the user to know:
+in the desktop app `<data>/api_token.txt` is no longer the live token (it is
+left on disk, untouched); manual `curl` against the running app should use
+the CLI (`transcriptor`) or a backend started by hand.
+
+Checks:
+```
+backend  IndexPageCarriesNoTokenTests — with the old injection line put back:
+         FAIL: test_the_page_serves_the_bootstrap_but_not_the_token  (FAILED failures=1)
+         after: Ran 38 tests OK
+desktop  backend-auth.test.js 4 tests (new module); ipc-contract channel test
+         (preload spells API_TOKEN_CHANNEL; main answers it; env carries it)
+```
+Live check in a real Electron (the repo's own electron binary, a probe app in
+the scratchpad: sandboxed + contextIsolated window, same preload code,
+loopback page): `senderFrame.url= http://127.0.0.1:61160/ … isMain= true`,
+page saw `T:secret123` — the sync IPC from a sandboxed preload works and
+`senderFrame.url` is the page URL at preload time. The full app was not
+launched.
+
+Suites: backend 992 OK; desktop 432 pass; vitest 604; typecheck, lint, build clean.

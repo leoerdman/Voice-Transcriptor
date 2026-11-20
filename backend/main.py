@@ -626,10 +626,11 @@ WS_CONNECT_LIMIT_PER_MIN = 120
 # ``http://attacker.example:<port>/`` as SAME-ORIGIN with the attacker's
 # page, so CORS never applies and the attacker can read our responses.
 #
-# ``GET /`` injects ``window.__TRANSCRIPTOR_API_TOKEN`` into the HTML and
-# is intentionally unauthenticated (the renderer has no other way to
-# bootstrap the token). A rebinding attack could therefore lift the API
-# token and, with it, read every transcript, recording and audio file.
+# ``GET /`` and ``/api/health`` are unauthenticated, and every other
+# route answers to a token a rebound page could otherwise try to reach
+# through the user's own browser session. (``GET /`` no longer carries
+# the API token — BM-01: the desktop shell mints it and hands it to its
+# window over IPC, see desktop/backend-auth.js.)
 #
 # Requiring the Host header to be a literal loopback address closes it:
 # a rebound request carries the ATTACKER's hostname in Host, never
@@ -1828,8 +1829,8 @@ _ASSETS_CACHE_HEADERS = {
 @app.middleware("http")
 async def guard_host_and_set_cache_control(request: Request, call_next):
     # Host allowlist runs BEFORE the route so the unauthenticated
-    # token-bearing ``GET /`` is covered too. See _host_header_allowed
-    # for the DNS-rebinding rationale.
+    # ``GET /`` is covered too. See _host_header_allowed for the
+    # DNS-rebinding rationale.
     if not _host_header_allowed(request.headers.get("host")):
         logger.warning(
             "rejected request with non-loopback Host header path=%s",
@@ -1869,6 +1870,14 @@ async def guard_host_and_set_cache_control(request: Request, call_next):
 
 @app.get("/", response_class=HTMLResponse)
 def index():
+    # Unauthenticated, so it carries only public facts (the same payload
+    # ``/api/health`` serves) and NEVER the API token (BM-01): anything
+    # that can reach the loopback port could read it here — another local
+    # process, another OS user, a holder of only the CLI token. The desktop
+    # shell owns the token (it starts this process with
+    # ``TRANSCRIPTOR_API_TOKEN``) and gives it to its window over IPC
+    # (desktop/backend-auth.js). Opening this page in an ordinary browser
+    # therefore shows a renderer without API access — by design.
     index_path = frontend_dist_dir / "index.html"
     if not index_path.exists():
         return "frontend/dist/index.html not found. Run `npm --prefix frontend run build`."
@@ -1876,7 +1885,6 @@ def index():
     bootstrap_payload = _frontend_runtime_payload()
     injected = (
         "<script>"
-        f'window.__TRANSCRIPTOR_API_TOKEN={json.dumps(API_TOKEN)};'
         f'window.__TRANSCRIPTOR_BOOTSTRAP={json.dumps(bootstrap_payload)};'
         "</script>"
     )
