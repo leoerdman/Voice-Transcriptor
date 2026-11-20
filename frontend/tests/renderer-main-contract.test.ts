@@ -467,6 +467,33 @@ describe("live half: one rule per fact, no dead state (FL-05/06/09/14/15/16/17/1
     expect(screenAnnotationsSrc).not.toMatch(/function countWords\(/);
   });
 
+  // The screen-marks composer adds a header and a summary on every call,
+  // so it must only ever be handed spoken words. The one input that could
+  // carry an annotated final is a crash draft's transcript (the panel's
+  // text): the panel is cleared before a take's first autosave, and the
+  // draft is written for the last time when the stop begins — before any
+  // final, with or without marks, reaches the panel.
+  it("a crash draft never holds an annotated final: the panel is cleared before the first autosave, the last one precedes the final", () => {
+    expect(mainTsx).toContain('transcript_text: ($("finalOutput").textContent || "").trim()');
+    expect(mainTsx.match(/persistLiveDraft\((true|false)\)/g)).toEqual([
+      "persistLiveDraft(true)",
+      "persistLiveDraft(true)",
+      "persistLiveDraft(false)",
+    ]);
+    const startLive = mainTsx.slice(mainTsx.indexOf("async function startLive("));
+    expect(startLive.indexOf("resetOutputs();")).toBeGreaterThan(0);
+    expect(startLive.indexOf("resetOutputs();")).toBeLessThan(startLive.indexOf("persistLiveDraft(true)"));
+    const lastAutosave = mainTsx.indexOf("persistLiveDraft(false)");
+    const firstScreenAnnotate = mainTsx.indexOf("annotateTranscript(text, screenAnnotation");
+    expect(lastAutosave).toBeGreaterThan(0);
+    expect(firstScreenAnnotate).toBeGreaterThan(lastAutosave);
+    // Every composer call in the renderer starts from words, never from
+    // the panel's text.
+    for (const call of mainTsx.match(/annotateTranscript\([^,]+,/g) || []) {
+      expect(call, call).not.toContain("finalOutput");
+    }
+  });
+
   it("FL-06: the pre-open buffer cap is a duration at the live sample rate, not 64 000 samples", () => {
     expect(mainTsx).not.toContain("WS_PENDING_MAX_SAMPLES");
     expect(mainTsx).toContain("LIVE_SAMPLE_RATE_HZ * WS_PENDING_MAX_SEC");

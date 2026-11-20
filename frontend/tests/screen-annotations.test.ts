@@ -12,7 +12,6 @@ import {
   screenAnnotationFromManifest,
   screenSessionDurationMs,
   speechFractionAt,
-  stripScreenAnnotation,
   wordStartsFromSegments,
   type ScreenAnnotation,
   type ScreenMark,
@@ -263,32 +262,22 @@ describe("header and summary", () => {
   });
 });
 
-describe("no duplicates on annotating again", () => {
-  const annotated = annotateTranscript(SPOKEN, v2Annotation, { durationMs: 60_000 });
-
-  it("an annotated text annotated again is the same text: one header, one summary, one mark each", () => {
-    expect(annotateTranscript(annotated, v2Annotation, { durationMs: 60_000 })).toBe(annotated);
-    expect(annotateTranscript(annotateTranscript(annotated, v2Annotation, { durationMs: 60_000 }), v2Annotation, { durationMs: 60_000 })).toBe(annotated);
+describe("one header and one summary per transcript", () => {
+  it("the spoken final gets the header above, the summary below, each once", () => {
+    const out = annotateTranscript(SPOKEN, v2Annotation, { durationMs: 60_000 });
+    expect(out.match(/Диктовка с рисованием по экрану/g)).toHaveLength(1);
+    expect(out.match(/Сводка по скринам/g)).toHaveLength(1);
   });
 
-  it("taking the annotation off gives the spoken words back", () => {
-    expect(stripScreenAnnotation(annotated)).toBe(SPOKEN);
-    expect(stripScreenAnnotation(annotateTranscript("", v2Annotation))).toBe("");
-  });
-
-  it("marks of the earlier format come off too", () => {
-    expect(stripScreenAnnotation("вот тут [✏️ 00:12 линия вверху справа (82%, 14%) → скрин 1] кнопка [📸 00:15 скрин 1: /d/shot-01.png]"))
-      .toBe("вот тут кнопка");
-  });
-
-  it("an upscaled rewrite gets the marks by share, with one header and one summary", () => {
+  it("an upscaled rewrite is composed the same way: marks by share, one header, one summary", () => {
     const rewrite = "Сейчас обведу жёлтым шапку: она съехала. Здесь всё нормально.";
     const out = annotateTranscript(rewrite, v2Annotation, { durationMs: 60_000 });
-    expect(out.startsWith(V2_HEADER)).toBe(true);
-    expect(out.endsWith(V2_SUMMARY)).toBe(true);
-    expect(out.match(/Диктовка с рисованием/g)).toHaveLength(1);
-    expect(out.match(/Сводка по скринам/g)).toHaveLength(1);
-    expect(stripScreenAnnotation(out)).toBe(rewrite);
+    const blocks = out.split("\n\n");
+    expect(blocks).toHaveLength(3);
+    expect(blocks[0]).toBe(V2_HEADER);
+    expect(blocks[2]).toBe(V2_SUMMARY);
+    expect(blocks[1].match(/\[✏️/g)).toHaveLength(3);
+    expect(blocks[1].match(/\[📸/g)).toHaveLength(3);
   });
 });
 
@@ -396,13 +385,22 @@ describe("contracts/screen-session.json", () => {
     expect(m.audioStartedAt).toBe(contract.archivedManifest.audioStartedAt);
   });
 
-  it("its manifest reads in full and yields one mark per event, the folder in the header", () => {
-    const m = parseScreenManifest(contract.manifest)!;
-    expect(m.events.length).toBe(contract.manifest.events.length);
-    const a = screenAnnotationFromManifest(m, contract.manifest.startedAt);
-    expect(a.marks.map((x) => x.text)).toEqual(["[✏️1 скрин 1: красный штрих, вверху справа]", "[📸 00:15 скрин 1]"]);
-    expect(a.header).toContain(`папка: ${contract.manifest.dir}`);
-    expect(a.summary).toContain("Скрин 1 · shot-01.png");
+  // Every manifest example the contract carries — `manifest`, and
+  // `manifestV1` (what 1.6.x wrote) where the contract keeps one beside a
+  // newer `manifest` — reads in full and composes the same way.
+  const examples = [contract.manifest, contract.manifestV1].filter(Boolean);
+
+  it("each manifest example yields one mark per event, the folder once in the header, no path in any mark", () => {
+    for (const raw of examples) {
+      const m = parseScreenManifest(raw)!;
+      expect(m.events.length).toBe(raw.events.length);
+      expect(m.version).toBe(raw.version);
+      const a = screenAnnotationFromManifest(m, raw.startedAt);
+      expect(a.marks).toHaveLength(raw.events.length);
+      expect(a.header).toContain(`папка: ${raw.dir}`);
+      for (const mark of a.marks) expect(mark.text).not.toContain(raw.dir);
+      expect(a.summary).toContain("Скрин 1 · shot-01.png");
+    }
   });
 });
 

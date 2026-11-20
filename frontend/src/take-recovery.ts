@@ -31,7 +31,6 @@ import {
   parseScreenManifest,
   screenAnnotationFromManifest,
   screenSessionDurationMs,
-  stripScreenAnnotation,
   type ScreenManifest,
 } from "./screen-annotations";
 
@@ -129,10 +128,7 @@ export function planTakeRecovery(
   for (const take of promoted) {
     const fromDraft = !!draft && !!draftSession && take.sessionId === draftSession;
     if (fromDraft) draftMatched = true;
-    // The draft's transcript is the panel's text, which can already be a
-    // screen take's annotated final: its words only, for the title and
-    // for the composer (which would take the marks off anyway).
-    const spoken = fromDraft ? stripScreenAnnotation(spokenInDraft) : "";
+    const spoken = fromDraft ? spokenInDraft : "";
     const transcriptText = recoveredTakeTranscript(spoken, take.screens);
     if (!transcriptText) continue;
     const draftSource = fromDraft ? String(draft?.source_text || "").trim() : "";

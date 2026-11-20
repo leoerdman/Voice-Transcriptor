@@ -41,10 +41,12 @@
  * segments describe AND for an upscaled rewrite of it, which has no
  * timings of its own.
  *
- * The composer always starts from the spoken words: a text that already
- * carries a header, marks or a summary (the live panel's text saved into
- * a crash draft, an older transcript) has them taken off first, so the
- * result has one header and one summary however often it is annotated.
+ * Every caller hands the composer the SPOKEN words — the final as
+ * transcribed, its upscaled rewrite, the live text, a crash draft's words
+ * (the panel is cleared when a take starts and the draft is last written
+ * when its stop begins, so a draft never holds an annotated final) — and
+ * the composer adds the header and the summary once per call. Annotated
+ * text is never annotated again, so nothing is ever doubled.
  */
 
 import { countWords } from "./text-match";
@@ -117,7 +119,7 @@ export interface ScreenMark {
 /** Everything a screen take adds to its transcript. */
 export interface ScreenAnnotation {
   /** Inline marks, in time order. */
-  marks: ScreenMark[];
+  marks: ReadonlyArray<ScreenMark>;
   /** The lines above the text; "" for none. */
   header: string;
   /** The lines below the text; "" for none. */
@@ -125,10 +127,10 @@ export interface ScreenAnnotation {
 }
 
 export const EMPTY_SCREEN_ANNOTATION: ScreenAnnotation = Object.freeze({
-  marks: [] as ScreenMark[],
+  marks: Object.freeze([]),
   header: "",
   summary: "",
-}) as ScreenAnnotation;
+});
 
 export interface TimedSegment {
   /** Seconds from the start of the audio. */
@@ -329,19 +331,18 @@ function numberedStrokes(manifest: ScreenManifest, origin: number): NumberedStro
   for (const e of strokes) {
     const atMs = Math.max(0, e.at - origin);
     const endMs = e.endedAt !== undefined && e.endedAt > e.at ? Math.max(0, e.endedAt - origin) : undefined;
-    if (!v2) {
-      const key = `${fmtOffset(atMs)}|${e.xPct ?? ""},${e.yPct ?? ""}|${e.shot ?? ""}`;
-      const same = v1Groups.get(key);
-      if (same) {
-        if (endMs !== undefined && (same.endMs === undefined || endMs > same.endMs)) same.endMs = endMs;
-        continue;
-      }
+    // v1: what the old mark said — second, place, shot — is the stroke's identity.
+    const v1Key = v2 ? "" : `${fmtOffset(atMs)}|${e.xPct ?? ""},${e.yPct ?? ""}|${e.shot ?? ""}`;
+    const same = v2 ? undefined : v1Groups.get(v1Key);
+    if (same) {
+      if (endMs !== undefined && (same.endMs === undefined || endMs > same.endMs)) same.endMs = endMs;
+      continue;
     }
     const shotKey = String(e.shot ?? "");
     const next = (ordinal.get(shotKey) || 0) + 1;
     ordinal.set(shotKey, next);
     const stroke: NumberedStroke = { n: v2 && e.n ? e.n : next, shot: e.shot, atMs, endMs, event: e };
-    if (!v2) v1Groups.set(`${fmtOffset(atMs)}|${e.xPct ?? ""},${e.yPct ?? ""}|${e.shot ?? ""}`, stroke);
+    if (!v2) v1Groups.set(v1Key, stroke);
     out.push(stroke);
   }
   return out;
@@ -482,29 +483,6 @@ export function hasScreenAnnotation(annotation: ScreenAnnotation): boolean {
   return annotation.marks.length > 0 || !!annotation.header || !!annotation.summary;
 }
 
-/**
- * The spoken words of a text this module annotated: the header, the
- * summary and every inline mark taken off (marks of the earlier format
- * included). A text with none of them comes back trimmed.
- */
-export function stripScreenAnnotation(text: string): string {
-  let body = String(text || "");
-  if (body.trimStart().startsWith(HEADER_TITLE)) {
-    const trimmed = body.trimStart();
-    const end = trimmed.indexOf("\n\n");
-    body = end >= 0 ? trimmed.slice(end + 2) : "";
-  }
-  const summaryAt = body.startsWith(SUMMARY_TITLE) ? 0 : body.lastIndexOf(`\n\n${SUMMARY_TITLE}`);
-  if (summaryAt >= 0) body = body.slice(0, summaryAt);
-  // A mark always stands apart from the words (the composer puts a space
-  // or a line break on each side): one goes with the spaces after it.
-  return body
-    .replace(/(?<!\S)(?:\[(?:✏️|📸)[^\]\n]*\]|\[\/\d+\])[ \t]*/g, "")
-    .replace(/[ \t]+$/gm, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
 /** Each word's start time, ms, spread evenly over its segment. */
 export function wordStartsFromSegments(segments: ReadonlyArray<TimedSegment>): number[] {
   const out: number[] = [];
@@ -585,9 +563,8 @@ function placeMarks(
 /**
  * The transcript of a screen take: the header, the spoken words with the
  * marks placed in them, the summary — blocks separated by a blank line.
- * `text` is read for its spoken words only (``stripScreenAnnotation``),
- * so a text annotated before gets one header and one summary, never two.
- * With an empty annotation the text is returned as it is.
+ * `text` is the spoken words (see the module comment). With an empty
+ * annotation the text is returned as it is.
  */
 export function annotateTranscript(
   text: string,
@@ -595,6 +572,6 @@ export function annotateTranscript(
   opts: { wordStartsMs?: number[]; durationMs?: number } = {},
 ): string {
   if (!hasScreenAnnotation(annotation)) return text;
-  const body = placeMarks(stripScreenAnnotation(text), annotation.marks, opts);
+  const body = placeMarks(String(text || "").trim(), annotation.marks, opts);
   return [annotation.header, body, annotation.summary].filter((block) => block.trim()).join("\n\n");
 }
