@@ -2007,6 +2007,16 @@ async function ensureRecordingStatusCapsuleWindow() {
     },
   });
 
+  // The capsule is a static data: page that needs no permission at all;
+  // its own partition would otherwise keep Electron's default, which
+  // grants every request (DM-35).
+  try {
+    const capsuleSession = recordingStatusWindow.webContents.session;
+    capsuleSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
+    capsuleSession.setPermissionCheckHandler(() => false);
+  } catch (e) {
+    appendMainLog(`[recording-capsule] permission handlers not installed: ${e?.message || e}`);
+  }
   recordingStatusWindow.setMenuBarVisibility(false);
   try { recordingStatusWindow.setAlwaysOnTop(true, "floating"); } catch { }
   if (recordingStatusCapsuleState.screen) applyCapsuleScreenModeLayer(true);
