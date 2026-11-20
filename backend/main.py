@@ -5024,6 +5024,39 @@ async def _discard_secondary_acquire(task: "Optional[asyncio.Task]") -> None:
         logger.debug("dual-stream: second reading close ignored: %s", e)
 
 
+async def _release_abandoned_upstream(
+    pre_task: "Optional[asyncio.Task]",
+    secondary_task: "Optional[asyncio.Task]",
+    session: Any,
+) -> None:
+    """Release what a recording that is being abandoned already holds.
+
+    Runs in a task of its own: the usual reason a recording is abandoned
+    here is that the handler itself is being CANCELLED, and inside a
+    cancelled task ``await_cancelled`` (correctly) re-raises the moment
+    it sees our own cancellation pending — which would stop this cleanup
+    at its first step. Shielded so the release finishes even then.
+    """
+
+    async def _release() -> None:
+        await cancel_and_await(pre_task, what="deepgram pre-connect reader", log=logger)
+        await _discard_secondary_acquire(secondary_task)
+        if session is not None:
+            try:
+                await session.discard()
+            except Exception as e:
+                logger.warning(
+                    "deepgram: releasing an abandoned upstream failed: %s", e,
+                    exc_info=True,
+                )
+
+    await asyncio.shield(
+        asyncio.get_running_loop().create_task(
+            _release(), name="deepgram-abandoned-upstream-release",
+        )
+    )
+
+
 async def _prewarm_deepgram_at_boot() -> None:
     """Open the first warm socket at backend start, if a key is set.
 
@@ -5076,11 +5109,13 @@ async def _run_deepgram_live_session(
 
     On a hard Deepgram failure (connect error, mid-stream fatal error,
     socket drop) we do NOT swallow the failure — we surface it to the
-    frontend via ``{"type":"error","fatal":true}`` and the subsequent
-    ``{"type":"final","error":...}``. The frontend then falls back to
-    the Deepgram REST endpoint on the saved canonical WAV. This gives
-    us two independent paths into Deepgram (WS + REST) without coupling
-    the server state machine to either one.
+    frontend via ``{"type":"error","fatal":true}`` at once, and the
+    recording goes on: every frame the user keeps sending is spooled
+    until THEY stop (``finalize``) or disconnect, and the
+    ``{"type":"final","error":...}`` envelope is completed from that
+    spool by the REST recovery pass (``_apply_live_recovery``). One rule
+    for every way the upstream can die — the connect failure, a close,
+    a fatal error, a wedge (BW-01).
 
     Stop-chain wire protocol (wave 2, audit §2/§3.5-3.7):
 
@@ -5187,6 +5222,18 @@ async def _run_deepgram_live_session(
         budget_sends.add(task)
         task.add_done_callback(budget_sends.discard)
 
+    async def _join_finalizing_sends() -> None:
+        """Wait for every announcement already in flight.
+
+        Each one is its own task (the announcing callbacks are
+        synchronous), so nothing orders them against the ``final``
+        envelope: a slow client could receive a ``finalizing`` AFTER the
+        ``final`` it bounds, re-arming a deadline whose stop is already
+        over (BW-12). Joined before the envelope goes out.
+        """
+        if budget_sends:
+            await asyncio.gather(*list(budget_sends), return_exceptions=True)
+
     # Both readings are asked for at once. The pool no longer holds its
     # lock across a connect, so two cold connects for a dual-stream
     # recording overlap instead of running back to back — the difference
@@ -5235,8 +5282,14 @@ async def _run_deepgram_live_session(
             # dead session running and pretend to deliver an envelope
             # nobody can receive.
             raise
-        except Exception:
-            pass
+        except Exception as reader_error:
+            # The spool may now be short of what the user said; the
+            # recovery below still re-decodes what it holds, and the log
+            # says why it may be incomplete (BW-10).
+            logger.warning(
+                "deepgram pre-connect reader failed; the spool may be "
+                "incomplete: %s", reader_error, exc_info=True,
+            )
         # The primary never opened, so the second reading has nothing to
         # read alongside. Its socket is a billed connection against the
         # account's concurrency limit, so it is disposed of rather than
@@ -5257,6 +5310,12 @@ async def _run_deepgram_live_session(
             source=DEEPGRAM_LIVE_SOURCE,
             error=connect_error,
         )
+        if preconnect_disconnected:
+            # Nobody is left to receive an envelope: a billed re-decode
+            # for a closed socket is money spent on nothing. The spool is
+            # kept (marked above) for the renderer's own recovery (BW-11).
+            logger.info("ws deepgram: client gone before finalize; recovery skipped")
+            return
         final_payload = await _apply_live_recovery(
             payload=final_payload,
             session=None,
@@ -5265,42 +5324,75 @@ async def _run_deepgram_live_session(
             api_key=api_key,
             announce=lambda budget: _send_finalizing(budget, True),
         )
+        # Every ``finalizing`` announcement reaches the renderer BEFORE
+        # the envelope it bounds (BW-12).
+        await _join_finalizing_sends()
         await _ws_send_json(websocket, final_payload)
         return
+    except BaseException:
+        # Anything else — our own cancellation (server shutdown) above
+        # all — must not leave the pre-connect reader consuming the
+        # renderer's socket or the second reading's socket billed and
+        # open: nothing past this point would ever release them (BW-15).
+        await _release_abandoned_upstream(pre_task, secondary_task, None)
+        raise
 
-    # The second reading, if this recording is running two. Its failure
-    # is not the recording's: everything it would have added is what the
-    # user got before this feature existed, so it degrades to one
-    # reading with a warning and never to an aborted recording.
-    if secondary_task is not None:
-        try:
-            secondary = await secondary_task
-            primary_language = resolve_live_language(language)
-            session = DualLiveSession(
-                primary=session,
-                secondary=secondary.session,
-                secondary_language=dual_language,
-                primary_language=primary_language,
-            )
-            logger.info(
-                "dual-stream: second reading opened primary=%s secondary=%s "
-                "(adopted=%s)",
-                primary_language,
-                dual_language,
-                secondary.adopted,
-            )
-        except Exception as e:
-            logger.warning(
-                "dual-stream: second reading (%s) could not be opened, "
-                "continuing single-stream: %s",
-                dual_language,
-                e,
-            )
+    # From here the recording OWNS a live (billed) upstream. Until the
+    # main ``try`` below takes over, a cancellation landing in one of
+    # these awaits used to leave that socket open with its keepalive
+    # running, the second reading's acquire unreleased and the
+    # pre-connect reader still consuming the renderer's socket (BW-15).
+    try:
+        # The second reading, if this recording is running two. Its failure
+        # is not the recording's: everything it would have added is what the
+        # user got before this feature existed, so it degrades to one
+        # reading with a warning and never to an aborted recording.
+        if secondary_task is not None:
+            try:
+                secondary = await secondary_task
+                primary_language = resolve_live_language(language)
+                session = DualLiveSession(
+                    primary=session,
+                    secondary=secondary.session,
+                    secondary_language=dual_language,
+                    primary_language=primary_language,
+                )
+                logger.info(
+                    "dual-stream: second reading opened primary=%s secondary=%s "
+                    "(adopted=%s)",
+                    primary_language,
+                    dual_language,
+                    secondary.adopted,
+                )
+            except Exception as e:
+                logger.warning(
+                    "dual-stream: second reading (%s) could not be opened, "
+                    "continuing single-stream: %s",
+                    dual_language,
+                    e,
+                )
 
-    await cancel_and_await(pre_task, what="deepgram pre-connect reader", log=logger)
+        await cancel_and_await(pre_task, what="deepgram pre-connect reader", log=logger)
+    except BaseException:
+        await _release_abandoned_upstream(pre_task, secondary_task, session)
+        raise
 
     stop = asyncio.Event()
     upstream_fatal = False
+    # The renderer's socket is gone (disconnect, or a send that failed):
+    # nobody can receive an envelope, so the billed recovery pass and the
+    # envelope itself are skipped at stop (BW-11).
+    client_gone = preconnect_disconnected
+
+    def _upstream_dead() -> bool:
+        """Audio offered now would reach no Deepgram reading.
+
+        Closed, or reported FATAL (a wedge closes the socket only after
+        reporting it): either way the recording goes on — the user is
+        still talking and the spool is the transcript's only source for
+        what follows (BW-01) — but nothing more is pushed upstream.
+        """
+        return session.is_closed or session.last_fatal
 
     # ---- Warm-socket liveness (audit §3.7) ---------------------------
     #
@@ -5511,7 +5603,7 @@ async def _run_deepgram_live_session(
     async def sender() -> None:
         """Own the upstream socket: batch queued audio, write it, stop
         at the finalize sentinel."""
-        nonlocal queued_bytes, pending_since
+        nonlocal queued_bytes, pending_since, upstream_fatal
         buf = bytearray()
         try:
             while True:
@@ -5539,10 +5631,16 @@ async def _run_deepgram_live_session(
                 buf.extend(data)
                 while len(buf) >= _SEND_BATCH_BYTES:
                     await _flush_frame(buf, _SEND_BATCH_BYTES)
-        except asyncio.CancelledError:
-            raise
         except Exception as e:
+            # The only writer to the upstream is gone: nothing queued will
+            # ever reach Deepgram. Said so the way every other upstream
+            # death is said — through the session, so ``events()``,
+            # ``last_error``, ``stream_death_sec`` and the envelope agree,
+            # and the recovery pass re-decodes what follows (BW-06).
             logger.error("deepgram sender failed: %s", e, exc_info=True)
+            _mark_recovery_error(recovery)
+            upstream_fatal = True
+            session.report_fatal(f"Deepgram sender failed: {e}")
 
     async def send_watchdog() -> None:
         """Declare the upstream wedged from the age of unsent audio."""
@@ -5568,20 +5666,23 @@ async def _run_deepgram_live_session(
                 queued_bytes,
             )
             # Reported through the session so ``events()``, ``last_error``
-            # and the final envelope all tell the same story.
+            # and the final envelope all tell the same story. NOT a stop:
+            # the user is still talking, and everything they say from
+            # here on goes to the spool for the recovery pass (BW-01).
             session.report_fatal(
                 f"Deepgram upstream wedged: audio queued {age:.1f}s ago was "
                 "never accepted"
             )
             upstream_fatal = True
-            stop.set()
+            # Closing is what unblocks the pending write — the write
+            # itself is never cancelled. ``close()`` bounds itself (a
+            # close frame nobody accepts aborts the connection), and a
+            # bounded WAIT around it used to cancel the teardown halfway
+            # (BW-03).
             try:
-                # Closing is what unblocks the pending write — the write
-                # itself is never cancelled. Bounded because this is the
-                # one path where the socket is known to be sick.
-                await asyncio.wait_for(session.close(), timeout=3.0)
-            except (asyncio.TimeoutError, Exception) as e:
-                logger.warning("deepgram wedge close failed: %s", e)
+                await session.close()
+            except Exception as e:
+                logger.warning("deepgram wedge close failed: %s", e, exc_info=True)
             return
 
     snd = asyncio.create_task(sender(), name="ws-dg-send")
@@ -5605,6 +5706,17 @@ async def _run_deepgram_live_session(
     if preconnect_disconnected:
         stop.set()
 
+    def _ingest(data: bytes) -> None:
+        """One renderer frame: counted, spooled, and offered upstream
+        unless no reading is left to take it — the one rule the drain and
+        the receiver used to write out twice each (BW-08)."""
+        nonlocal frames_received, bytes_received
+        frames_received += 1
+        bytes_received += len(data)
+        _record_recovery_chunk(recovery, data)
+        if not _upstream_dead():
+            _offer_pcm(data)
+
     async def _drain_finalize_tail(payload: dict) -> None:
         """C1/C2: drain in-flight binary frames on ``finalize``.
 
@@ -5624,7 +5736,7 @@ async def _run_deepgram_live_session(
         nothing more is coming. An older renderer that omits the counts
         gets the previous unconditional timed drain, unchanged.
         """
-        nonlocal frames_received, bytes_received
+        nonlocal client_gone
         target_frames = payload.get("framesSent")
         target_bytes = payload.get("bytesSent")
         has_counts = isinstance(target_frames, int) and isinstance(target_bytes, int)
@@ -5648,16 +5760,10 @@ async def _run_deepgram_live_session(
                 break
             tail_kind = tail_msg["kind"]
             if tail_kind == "bytes":
-                tail_data = tail_msg["data"]
-                frames_received += 1
-                bytes_received += len(tail_data)
-                if session.is_closed:
-                    _record_recovery_chunk(recovery, tail_data)
-                    continue
-                _record_recovery_chunk(recovery, tail_data)
-                _offer_pcm(tail_data)
+                _ingest(tail_msg["data"])
                 continue
             if tail_kind == "disconnect":
+                client_gone = True
                 break
             # Any non-bytes non-disconnect frame (stray control msg,
             # text, etc.) ends the drain.
@@ -5679,7 +5785,7 @@ async def _run_deepgram_live_session(
             )
 
     async def receiver() -> None:
-        nonlocal frames_received, bytes_received
+        nonlocal client_gone
         try:
             if preconnect_finalize_payload is not None:
                 # Stop was pressed before connect() even resolved (rare)
@@ -5693,22 +5799,15 @@ async def _run_deepgram_live_session(
                 msg = await _ws_recv_next(websocket)
                 kind = msg["kind"]
                 if kind == "disconnect":
+                    client_gone = True
                     stop.set()
                     return
                 if kind == "bytes":
-                    data = msg["data"]
-                    frames_received += 1
-                    bytes_received += len(data)
-                    if session.is_closed:
-                        # Upstream already died; keep recording the
-                        # PCM locally so the REST fallback has the full
-                        # audio but don't waste cycles pushing it.
-                        _record_recovery_chunk(recovery, data)
-                        continue
-                    _record_recovery_chunk(recovery, data)
                     # Hand off and go straight back to reading the
                     # renderer's socket — the whole point of the queue.
-                    _offer_pcm(data)
+                    # A dead upstream still gets every byte SPOOLED: the
+                    # recovery pass re-decodes it at stop.
+                    _ingest(msg["data"])
                     continue
                 if kind == "control":
                     if msg["payload"].get("type") == "finalize":
@@ -5735,19 +5834,22 @@ async def _run_deepgram_live_session(
         recording onto its replacement instead, and still returns the
         moment a stream ends without one.
         """
-        nonlocal upstream_fatal
+        nonlocal upstream_fatal, client_gone
         try:
             while True:
                 current = session
                 async for event in current.events():
                     if not await _ws_send_json(websocket, event):
+                        client_gone = True
                         stop.set()
                         return
                     if event.get("type") == "error":
                         _mark_recovery_error(recovery)
                         if event.get("fatal"):
+                            # The upstream is dead, the RECORDING is not:
+                            # the join below keeps the receiver spooling
+                            # until the user stops (BW-01).
                             upstream_fatal = True
-                            stop.set()
                             return
                 if session is current or stop.is_set():
                     return
@@ -5761,16 +5863,29 @@ async def _run_deepgram_live_session(
     fw = asyncio.create_task(forwarder(), name="ws-dg-fw")
     try:
         done, _pending = await asyncio.wait({rx, fw}, return_when=asyncio.FIRST_COMPLETED)
-        if fw in done and not rx.done() and session.is_closed and not session.last_fatal:
-            # Deepgram can close the upstream WS before the user presses Stop,
-            # especially on long idle/unstable links. Keep consuming client PCM
-            # until finalize/disconnect so REST/local recovery has the complete
-            # audio instead of only the prefix sent before upstream closed.
+        if fw in done and not rx.done() and _upstream_dead():
+            # Deepgram can close the upstream WS — or fail fatally, or wedge
+            # — before the user presses Stop. Either way the user is still
+            # talking: keep consuming client PCM until finalize/disconnect
+            # so the recovery pass has the complete audio instead of only
+            # the prefix sent before the upstream died. A fatal upstream
+            # used to be the one death that ended the session at once,
+            # sending ``final`` while the microphone was still open
+            # (BW-01) — the same decision the connect-failure path above
+            # already makes the other way.
             _mark_recovery_error(recovery)
             await rx
     finally:
         stop.set()
         await cancel_and_await(rx, what="deepgram websocket receiver", log=logger)
+        # A swap OWNS the session object: it connects a replacement,
+        # rebinds ``session`` and then ``discard()``s the old one — the
+        # very socket ``drain_transcript`` is about to send ``Finalize``
+        # on. So the request is withdrawn FIRST — the probe that raises
+        # it is stopped, then the flag cleared — before the sentinel
+        # gives the sender its last reason to look at the flag (BW-16).
+        await cancel_and_await(warm_probe, what="deepgram warm probe", log=logger)
+        warm_swap_requested = False
 
         # Finalize must reach Deepgram AFTER every byte the renderer
         # sent (audit §3.6). The receiver has now stopped, so everything
@@ -5785,18 +5900,11 @@ async def _run_deepgram_live_session(
             # the audio behind the bound is already accounted for as
             # undelivered, and the sender is cancelled below.
             logger.warning("deepgram send queue full at finalize; sentinel dropped")
-        # A swap OWNS the session object: it connects a replacement,
-        # rebinds ``session`` and then ``discard()``s the old one — the
-        # very socket ``drain_transcript`` is about to send ``Finalize``
-        # on. ``_swap_warm_socket``'s docstring calls the sender "the
-        # only writer to the upstream socket", and that stops being true
-        # the moment the wait below gives up on the sender. So the
-        # request is withdrawn FIRST (the watchdog used to be cancelled
-        # after this wait, which is too late to prevent one starting),
-        # and a swap already running is given the connect budget it can
+        # ``_swap_warm_socket``'s docstring calls the sender "the only
+        # writer to the upstream socket", and that stops being true the
+        # moment the wait below gives up on the sender — so a swap
+        # already running is given the connect budget it can
         # legitimately need before the stop proceeds without it.
-        await cancel_and_await(warm_probe, what="deepgram warm probe", log=logger)
-        warm_swap_requested = False
         send_flush_deadline = _SEND_FLUSH_DEADLINE_SEC + (
             _WARM_SWAP_GRACE_SEC if warm_swap_in_progress else 0.0
         )
@@ -5922,19 +6030,27 @@ async def _run_deepgram_live_session(
         # sent. The renderer has no second reading to fall back on any
         # more, which is the point — two owners of one transcript is
         # what produced every duplication defect of 2026-09-03/04.
-        final_payload = await _apply_live_recovery(
-            payload=final_payload,
-            session=session,
-            recovery=recovery,
-            cfg=dg_cfg,
-            api_key=api_key,
-            announce=_announce_recovery_extension,
-            announced_recovery_sec=announced_recovery_sec,
-        )
-
-        # Envelope out FIRST (C4) — everything below is teardown the
-        # client no longer waits on.
-        await _ws_send_json(websocket, final_payload)
+        if client_gone:
+            # The renderer's socket is gone: a billed re-decode and an
+            # envelope for nobody would be spent on nothing. The spool is
+            # retained (marked) for the renderer's own recovery (BW-11).
+            _mark_recovery_error(recovery)
+            logger.info("ws deepgram: client gone before the envelope; recovery skipped")
+        else:
+            final_payload = await _apply_live_recovery(
+                payload=final_payload,
+                session=session,
+                recovery=recovery,
+                cfg=dg_cfg,
+                api_key=api_key,
+                announce=_announce_recovery_extension,
+                announced_recovery_sec=announced_recovery_sec,
+            )
+            # Envelope out FIRST (C4) — everything below is teardown the
+            # client no longer waits on — and after every ``finalizing``
+            # announcement it bounds (BW-12).
+            await _join_finalizing_sends()
+            await _ws_send_json(websocket, final_payload)
 
         try:
             await session.shutdown(wait_timeout=3.0)

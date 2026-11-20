@@ -229,8 +229,26 @@ class SendQueueTests(IsolatedBackendMainImportMixin, unittest.IsolatedAsyncioTes
                 await ws.messages.put(
                     {"type": "websocket.receive", "bytes": bytes([i]) * 800}
                 )
-            # No finalize: the wedge alone must end the session.
+            # The wedge is reported, but it does NOT end the recording:
+            # the user is still talking (BW-01).
+            for _ in range(100):
+                if upstream.fatal_reports:
+                    break
+                await asyncio.sleep(0.02)
+            await asyncio.sleep(0.05)
+            self.assertFalse(task.done(), "a fatal upstream ended the recording")
+            self.assertFalse(
+                [m for m in ws.sent if m.get("type") == "final"],
+                "final was sent while the microphone was still open",
+            )
+            # Speech after the upstream died still reaches the spool.
+            await ws.messages.put({"type": "websocket.receive", "bytes": b"\x09" * 800})
+            await ws.messages.put(
+                {"type": "websocket.receive", "text": json.dumps({"type": "finalize"})}
+            )
             await asyncio.wait_for(task, timeout=5.0)
+        self.assertEqual(recovery["bytes"], 6 * 800)
+        self.assertEqual(ws.sent[-1]["type"], "final")
 
         self.assertTrue(
             upstream.fatal_reports,
@@ -260,6 +278,13 @@ class SendQueueTests(IsolatedBackendMainImportMixin, unittest.IsolatedAsyncioTes
                 await ws.messages.put(
                     {"type": "websocket.receive", "bytes": bytes([i]) * 500}
                 )
+            for _ in range(100):
+                if upstream.fatal_reports:
+                    break
+                await asyncio.sleep(0.02)
+            await ws.messages.put(
+                {"type": "websocket.receive", "text": json.dumps({"type": "finalize"})}
+            )
             await asyncio.wait_for(task, timeout=5.0)
 
         # 5000 bytes captured, at most 2000 could be queued: the rest is
@@ -267,6 +292,157 @@ class SendQueueTests(IsolatedBackendMainImportMixin, unittest.IsolatedAsyncioTes
         # recording (B1 / _tail_coverage).
         self.assertGreater(upstream.undelivered, 0)
         self.assertEqual(recovery["bytes"], 5000)
+
+
+class _BrokenSender(_FakeUpstream):
+    """An upstream whose write raises something no handler expected."""
+
+    async def send_pcm(self, chunk):
+        raise RuntimeError("bug in the send path")
+
+
+class _SlowAnnouncementSocket(_FakeWebSocket):
+    """A renderer socket that is slow to accept ``finalizing`` frames."""
+
+    async def send_text(self, text):
+        if json.loads(text).get("type") == "finalizing":
+            await asyncio.sleep(0.1)
+        await super().send_text(text)
+
+
+class StopPathTests(IsolatedBackendMainImportMixin, unittest.IsolatedAsyncioTestCase):
+    """BW-06 / BW-10 / BW-11 / BW-12."""
+
+    def setUp(self):
+        super().setUp()
+        _FakeUpstream.instances.clear()
+
+    def _run(self, ws, recovery):
+        return asyncio.create_task(
+            self.main._run_deepgram_live_session(
+                websocket=ws, api_key="dg", model="nova-3", language="auto",
+                diarize=False, recovery=recovery,
+            )
+        )
+
+    async def test_a_failing_sender_is_reported_as_the_upstream_dying(self):
+        ws = _FakeWebSocket()
+        recovery = _recovery()
+        with mock.patch.object(self.main, "DeepgramLiveSession", _BrokenSender):
+            task = self._run(ws, recovery)
+            await asyncio.sleep(0.02)
+            await ws.messages.put({"type": "websocket.receive", "bytes": b"\x01" * 3200})
+            await asyncio.sleep(0.2)
+            upstream = _FakeUpstream.instances[0]
+            await ws.messages.put(
+                {"type": "websocket.receive", "text": json.dumps({"type": "finalize"})}
+            )
+            await asyncio.wait_for(task, timeout=5.0)
+        self.assertTrue(upstream.fatal_reports, "the sender died silently")
+        self.assertIn("sender failed", upstream.fatal_reports[0])
+        self.assertTrue(recovery["had_error"])
+        self.assertIn("sender failed", ws.sent[-1]["error"])
+
+    async def test_a_client_gone_before_finalize_gets_no_paid_recovery(self):
+        ws = _FakeWebSocket()
+        recovery = _recovery()
+        recover = mock.AsyncMock(side_effect=lambda **kw: kw["payload"])
+        with mock.patch.object(self.main, "DeepgramLiveSession", _FakeUpstream), \
+                mock.patch.object(self.main, "_apply_live_recovery", recover):
+            task = self._run(ws, recovery)
+            await asyncio.sleep(0.02)
+            await ws.messages.put({"type": "websocket.receive", "bytes": b"\x01" * 3200})
+            await ws.messages.put({"type": "websocket.disconnect"})
+            await asyncio.wait_for(task, timeout=5.0)
+        recover.assert_not_called()
+        self.assertFalse([m for m in ws.sent if m.get("type") == "final"])
+        self.assertTrue(recovery["had_error"], "the spool must be kept for the renderer")
+
+    async def test_every_finalizing_announcement_precedes_the_final(self):
+        ws = _SlowAnnouncementSocket()
+        recovery = _recovery()
+
+        original = _FakeUpstream.drain_transcript
+
+        async def drain(self_, on_budget=None):
+            on_budget(1.0, True)
+            return await original(self_)
+
+        with mock.patch.object(self.main, "DeepgramLiveSession", _FakeUpstream), \
+                mock.patch.object(_FakeUpstream, "drain_transcript", drain):
+            task = self._run(ws, recovery)
+            await asyncio.sleep(0.02)
+            await ws.messages.put(
+                {"type": "websocket.receive", "text": json.dumps({"type": "finalize"})}
+            )
+            await asyncio.wait_for(task, timeout=5.0)
+        kinds = [m["type"] for m in ws.sent]
+        self.assertIn("finalizing", kinds)
+        self.assertEqual(kinds[-1], "final", kinds)
+
+    async def test_a_failing_preconnect_reader_is_logged(self):
+        from backend.remote_deepgram_live import DeepgramLiveError
+
+        class _Refused(_FakeUpstream):
+            async def connect(self):
+                await asyncio.sleep(0.05)
+                raise DeepgramLiveError("refused")
+
+        class _BrokenSocket(_FakeWebSocket):
+            async def receive(self):
+                raise RuntimeError("renderer socket broke")
+
+        ws = _BrokenSocket()
+        recovery = _recovery()
+        with mock.patch.object(self.main, "DeepgramLiveSession", _Refused), \
+                self.assertLogs("backend.main", level="WARNING") as logs:
+            await asyncio.wait_for(self._run(ws, recovery), timeout=5.0)
+        self.assertTrue(
+            any("pre-connect reader failed" in line for line in logs.output), logs.output
+        )
+
+
+class OwnershipBeforeTheMainTryTests(IsolatedBackendMainImportMixin, unittest.IsolatedAsyncioTestCase):
+    """BW-15: a cancellation between the primary's acquire and the main
+    ``try`` left the billed primary socket open and the second reading's
+    acquire running."""
+
+    async def test_a_cancel_while_the_second_reading_connects_releases_everything(self):
+        primary = _FakeUpstream()
+        primary_discarded = asyncio.Event()
+
+        async def discard():
+            primary_discarded.set()
+
+        primary.discard = discard
+        second_started = asyncio.Event()
+        second_cancelled = asyncio.Event()
+
+        async def acquire(api_key, cfg):
+            if cfg.language == "ru":
+                second_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    second_cancelled.set()
+                    raise
+            return mock.Mock(session=primary, adopted=False)
+
+        ws = _FakeWebSocket()
+        with mock.patch.object(self.main.DEEPGRAM_WARM_POOL, "acquire", acquire):
+            task = asyncio.create_task(
+                self.main._run_deepgram_live_session(
+                    websocket=ws, api_key="dg", model="nova-3", language="auto",
+                    diarize=False, recovery=_recovery(), dual_language="ru",
+                )
+            )
+            await asyncio.wait_for(second_started.wait(), timeout=2.0)
+            await asyncio.sleep(0.02)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=2.0)
+        self.assertTrue(primary_discarded.is_set(), "the primary upstream was left open")
+        self.assertTrue(second_cancelled.is_set(), "the second reading's acquire kept running")
 
 
 if __name__ == "__main__":

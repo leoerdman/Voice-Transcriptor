@@ -188,6 +188,61 @@ class ControlFrameSendTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class _UnclosableSocket:
+    """A connection whose graceful close never completes — the close frame
+    queues behind a wedged write — until its transport is aborted."""
+
+    def __init__(self) -> None:
+        self.aborted = asyncio.Event()
+        self.close_calls = 0
+        test = self
+
+        class _Transport:
+            def abort(self_inner) -> None:
+                test.aborted.set()
+
+        self.transport = _Transport()
+
+    async def close(self):
+        self.close_calls += 1
+        await self.aborted.wait()
+
+
+class BoundedCloseTests(unittest.IsolatedAsyncioTestCase):
+    """BL-09 / BW-03: closing a wedged socket is bounded, and a bounded
+    WAIT for the close never leaves the teardown half done."""
+
+    async def test_a_close_that_is_never_accepted_aborts_the_connection(self):
+        from unittest import mock
+
+        ws = _UnclosableSocket()
+        session = _session_with(ws)
+        with mock.patch("backend.remote_deepgram_live.SEND_WEDGE_SEC", 0.05), \
+                self.assertLogs("backend.remote_deepgram_live", level="WARNING") as logs:
+            await asyncio.wait_for(session.close(), timeout=1.0)
+        self.assertTrue(ws.aborted.is_set(), "the wedged connection was never aborted")
+        self.assertTrue(any("aborting the connection" in line for line in logs.output))
+
+    async def test_a_cancelled_close_still_finishes_the_teardown(self):
+        from unittest import mock
+
+        ws = _UnclosableSocket()
+        session = _session_with(ws)
+
+        async def recv_forever():
+            await asyncio.Event().wait()
+
+        session._recv_task = asyncio.get_running_loop().create_task(recv_forever())
+        with mock.patch("backend.remote_deepgram_live.SEND_WEDGE_SEC", 0.1):
+            # The send watchdog's shape: wait a little, give up waiting.
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(session.close(), timeout=0.02)
+            # The "idempotent backstop" must actually finish the job.
+            await asyncio.wait_for(session.close(), timeout=1.0)
+        self.assertTrue(session._recv_task.done(), "the receive task outlived close()")
+        self.assertEqual(ws.close_calls, 1)
+
+
 class ControlWedgeBoundTests(unittest.TestCase):
     def test_the_wedge_bound_matches_the_one_the_audio_path_uses(self):
         # Same 5 s the removed ``wait_for`` used, so a stuck socket is

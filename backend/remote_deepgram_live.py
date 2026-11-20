@@ -1493,6 +1493,34 @@ class DeepgramLiveStats:
         }
 
 
+async def _close_socket_bounded(ws) -> None:
+    """Close a Deepgram socket, never for longer than ``SEND_WEDGE_SEC``.
+
+    The graceful close writes a close frame; on a wedged connection that
+    write queues behind the one that will not complete, and
+    ``websockets`` then waits out its own handshake and TCP timeouts —
+    measured 73 s between "closing the socket" and the 1006 on a single
+    wedged stop (2026-11-08 06:54:42 → 06:55:55, finalize_ms=81669;
+    BL-09), holding the stop path, the dual partner and the re-warm the
+    whole time. A close frame not accepted within the same bound any
+    other write gets is a wedge: the transport is aborted, which drops
+    the connection at once and makes every pending write raise. The
+    graceful close is never cancelled mid-frame — the abort ends it.
+    """
+    closer = asyncio.ensure_future(ws.close())
+    done, _pending = await asyncio.wait({closer}, timeout=SEND_WEDGE_SEC)
+    if not done:
+        logger.warning(
+            "deepgram-live: close handshake not accepted within %.1fs; "
+            "aborting the connection",
+            SEND_WEDGE_SEC,
+        )
+        ws.transport.abort()
+    for result in await asyncio.gather(closer, return_exceptions=True):
+        if isinstance(result, Exception):
+            logger.debug("deepgram-live: close ignored: %s", result)
+
+
 class DeepgramLiveSession:
     """A single-use Deepgram streaming session.
 
@@ -1620,13 +1648,14 @@ class DeepgramLiveSession:
         # Separate "consumer-visible closed" (self._closed, flipped by
         # recv_loop.finally as soon as the upstream drops so events()
         # consumers see termination) from "close() has been called"
-        # (self._close_ran, used as the idempotency guard inside close()).
-        # Without this split, when recv_loop sets _closed=True on its
-        # exit path and THEN a caller invokes close(), the early-return
-        # at the top of close() fired, leaking the upstream WebSocket
-        # socket (never sent the WS close frame) and the keepalive task
-        # (never cancelled). TCP FIN-WAITs piled up until OS reclaim.
-        self._close_ran = False
+        # (self._close_task, the one teardown task close() shares between
+        # its callers). Without this split, when recv_loop sets
+        # _closed=True on its exit path and THEN a caller invokes close(),
+        # the early-return at the top of close() fired, leaking the
+        # upstream WebSocket socket (never sent the WS close frame) and
+        # the keepalive task (never cancelled). TCP FIN-WAITs piled up
+        # until OS reclaim.
+        self._close_task: Optional[asyncio.Task] = None
         # Set by ``discard()``: this socket is being replaced on purpose,
         # so its teardown must not reach the consumer as an error event.
         self._discarded = False
@@ -1958,10 +1987,7 @@ class DeepgramLiveSession:
     @staticmethod
     async def _close_wedged_socket(ws, send: "asyncio.Future", what: str) -> None:
         """Close ``ws`` to release a write that will not complete."""
-        try:
-            await ws.close()
-        except Exception as e:  # pragma: no cover - teardown is best-effort
-            logger.debug("deepgram-live: closing a wedged socket: %s", e)
+        await _close_socket_bounded(ws)
         # The write raises now that the socket is gone. Collected so it
         # is never an unretrieved task exception.
         await asyncio.gather(send, return_exceptions=True)
@@ -3128,10 +3154,24 @@ class DeepgramLiveSession:
         await self.close()
 
     async def close(self) -> None:
-        """Idempotently release the upstream socket and background tasks."""
-        if self._close_ran:
-            return
-        self._close_ran = True
+        """Idempotently release the upstream socket and background tasks.
+
+        The teardown runs as ONE task that every caller awaits through a
+        shield. A caller that bounds its wait (``backend.main``'s send
+        watchdog) or is cancelled therefore stops waiting without
+        stopping the teardown halfway — it used to be gated by a single
+        flag set on entry, so a cancelled first call left the receive
+        task and the events sentinel undone and every later "idempotent
+        backstop" call returned at once (BW-03). The teardown bounds
+        itself instead (``_close_socket_bounded``).
+        """
+        if self._close_task is None:
+            self._close_task = asyncio.get_running_loop().create_task(
+                self._close_once(), name="deepgram-live-close",
+            )
+        await asyncio.shield(self._close_task)
+
+    async def _close_once(self) -> None:
         self._closed = True
 
         await cancel_and_await(
@@ -3141,10 +3181,7 @@ class DeepgramLiveSession:
         ws = self._ws
         self._ws = None
         if ws is not None:
-            try:
-                await ws.close()
-            except Exception as e:
-                logger.debug("deepgram-live: close() ignored: %s", e)
+            await _close_socket_bounded(ws)
 
         # Also cancel and await the recv task. Without this, if the
         # upstream TCP connection is wedged such that `ws.close()`
