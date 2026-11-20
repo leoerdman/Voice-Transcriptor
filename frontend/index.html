@@ -775,23 +775,22 @@
               </div>
             </div>
             <div class="field-stack">
+              <!--
+                The keycaps are painted by the renderer at boot from
+                desktop/shortcut-defaults.json (the one source of the
+                default hotkeys) and repainted with the stored set by
+                loadCfg; the markup carries none of its own.
+              -->
               <label class="field">
                 <span class="lbl">Record (click to change)</span>
                 <button class="shortcut-btn" id="shortcutRecord" type="button" data-shortcut-id="record">
-                  <span class="shortcut-keys" aria-label="Option ←">
-                    <span class="shortcut-key">Option</span>
-                    <span class="shortcut-key">←</span>
-                  </span>
+                  <span class="shortcut-keys"></span>
                 </button>
               </label>
               <label class="field">
                 <span class="lbl">Paste (click to change)</span>
                 <button class="shortcut-btn" id="shortcutPaste" type="button" data-shortcut-id="paste">
-                  <span class="shortcut-keys" aria-label="Option Shift V">
-                    <span class="shortcut-key">Option</span>
-                    <span class="shortcut-key">Shift</span>
-                    <span class="shortcut-key">V</span>
-                  </span>
+                  <span class="shortcut-keys"></span>
                 </button>
               </label>
               <!--
@@ -803,19 +802,13 @@
               <label class="field" id="shortcutScreenField" hidden>
                 <span class="lbl">Screen mode — record with drawing and screenshots</span>
                 <button class="shortcut-btn" id="shortcutScreen" type="button" data-shortcut-id="screen">
-                  <span class="shortcut-keys" aria-label="Option →">
-                    <span class="shortcut-key">Option</span>
-                    <span class="shortcut-key">→</span>
-                  </span>
+                  <span class="shortcut-keys"></span>
                 </button>
               </label>
               <label class="field" id="shortcutScreenShotField" hidden>
                 <span class="lbl">Screenshot in screen mode (also the screen button on the capsule)</span>
                 <button class="shortcut-btn" id="shortcutScreenShot" type="button" data-shortcut-id="screenShot">
-                  <span class="shortcut-keys" aria-label="Option ↓">
-                    <span class="shortcut-key">Option</span>
-                    <span class="shortcut-key">↓</span>
-                  </span>
+                  <span class="shortcut-keys"></span>
                 </button>
               </label>
               <div class="btn-row">

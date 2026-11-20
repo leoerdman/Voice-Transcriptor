@@ -1,6 +1,27 @@
 import { describe, it, expect } from "vitest";
 
-import { normalizeAcceleratorForDisplay, acceleratorToDisplayTokens } from "../src/shortcut-display";
+import { normalizeAcceleratorForDisplay, acceleratorToDisplayTokens, shortcutBadge } from "../src/shortcut-display";
+
+describe("shortcutBadge (FU-26: the conflict rule had no test)", () => {
+  it("flags a registration the OS refused, with its reason", () => {
+    expect(shortcutBadge("record", { desired: "Alt+Left", error: "taken" }, false)).toEqual({
+      conflict: true,
+      title: "Not registered: taken",
+    });
+  });
+
+  it("treats an inactive screenshot key at rest as normal, but its error as a conflict", () => {
+    expect(shortcutBadge("screenShot", { desired: "Alt+Down" }, false).conflict).toBe(false);
+    expect(shortcutBadge("screenShot", { desired: "Alt+Down", error: "x" }, false).conflict).toBe(true);
+    expect(shortcutBadge("record", { desired: "Alt+Left" }, false).conflict).toBe(true);
+  });
+
+  it("flags F1–F12 only when macOS treats them as media keys", () => {
+    expect(shortcutBadge("record", { active: "F9", desired: "F9" }, true).conflict).toBe(true);
+    expect(shortcutBadge("record", { active: "F9", desired: "F9" }, false)).toEqual({ conflict: false, title: "" });
+    expect(shortcutBadge("record", { active: "F13", desired: "F13" }, true).conflict).toBe(false);
+  });
+});
 
 describe("normalizeAcceleratorForDisplay", () => {
   it("leaves non-modifier tokens untouched", () => {

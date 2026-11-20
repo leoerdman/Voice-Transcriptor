@@ -40,7 +40,7 @@ import {
 } from "./deepgram-dual";
 import { UI_COPY, applyStaticUiCopy, renderAcceptedFormatsHint, resultPaneTitle } from "./ui-copy";
 import { flashButtonFeedback } from "./button-feedback";
-import { acceleratorToDisplayTokens } from "./shortcut-display";
+import { acceleratorToDisplayTokens, shortcutBadge } from "./shortcut-display";
 // D-015: the ONE retired-shortcut-pair rule, shared with desktop/main.js
 // rather than re-derived here. See the module's own docstring for why —
 // two hand-written copies of "this stored pair is retired" drifted when
@@ -99,6 +99,7 @@ import { smartRecordingTitle } from "./recording-title";
 import { historyFailureSurfaces, noticeSurfaces } from "./notice-surface";
 import { recoverySummary } from "./recovery-summary";
 import { networkVerdict, type NetworkProbeOutcome } from "./network-probe";
+import { keyEventToAccelerator } from "./shortcut-capture";
 import { waitForJob } from "./job-poll";
 import {
   LIVE_DRAFT_SCHEMA_VERSION,
@@ -5364,6 +5365,10 @@ function parseViewName(value: string): ViewName {
 function switchView(view: ViewName): void {
   if (view === "settings") {
     void refreshLocalModels();
+    // Read the shortcut status now rather than on the gated poll's first
+    // tick 2 s later: the screen-mode rows are un-hidden by it, and they
+    // popped in after the form had already been laid out.
+    refreshShortcutConflictState();
     // Cheap, and the answer moves without the renderer touching it:
     // the backend rewrites the connection file when its port changes,
     // and the defaults line follows the Upload tab. Re-read on every
@@ -6166,96 +6171,6 @@ function renderShortcutCapturePrompt(container: Element): void {
   container.setAttribute("aria-label", "Press keys");
 }
 
-/** Convert KeyboardEvent → Electron accelerator string */
-function keyEventToAccelerator(e: KeyboardEvent): string | null {
-  // Ignore standalone modifier keys (still being held down).
-  if (["Alt", "Control", "Meta", "Shift"].includes(e.key)) return null;
-  // Standalone (no-modifier) keys are allowed when the key is a
-  // function-row key (F1–F12), an arrow / nav key, or another
-  // dedicated control key. These are safe to bind alone because
-  // they don't conflict with normal text input. Letter / digit /
-  // punctuation standalone bindings would steal user typing in
-  // the renderer, so those still REQUIRE at least one modifier.
-  // Without this gate the Settings → Shortcuts capture refused
-  // every press of F9/F10/Arrow/etc. and silently never bound.
-  const hasModifier = e.altKey || e.ctrlKey || e.metaKey || e.shiftKey;
-  const code = String(e.code || "").trim();
-  const key = String(e.key || "").trim();
-  const isFunctionKey = /^F\d{1,2}$/.test(key) || /^F\d{1,2}$/.test(code);
-  const isStandaloneAllowed = (
-    isFunctionKey
-    || key === "ArrowLeft" || key === "ArrowRight" || key === "ArrowUp" || key === "ArrowDown"
-    || code === "ArrowLeft" || code === "ArrowRight" || code === "ArrowUp" || code === "ArrowDown"
-    || key === "Home" || key === "End" || key === "PageUp" || key === "PageDown"
-    || key === "Insert" || key === "Delete"
-    || code === "Home" || code === "End" || code === "PageUp" || code === "PageDown"
-    || code === "Insert" || code === "Delete"
-  );
-  if (!hasModifier && !isStandaloneAllowed) return null;
-
-  const parts: string[] = [];
-  // Separate Control (Ctrl) from Command (Meta/Cmd) unless BOTH are
-  // held (extremely rare; fall back to the generic CommandOrControl).
-  // The old `ctrlKey || metaKey → CommandOrControl` collapse silently
-  // hijacked Cmd+X bindings on macOS users who meant Ctrl+X, and vice
-  // versa. Electron accepts all three forms; this produces the most
-  // precise binding the user actually pressed.
-  if (e.ctrlKey && e.metaKey) parts.push("CommandOrControl");
-  else if (e.metaKey) parts.push("Command");
-  else if (e.ctrlKey) parts.push("Control");
-  if (e.altKey) parts.push("Alt");
-  if (e.shiftKey) parts.push("Shift");
-
-  // Prefer KeyboardEvent.code for layout-stable keys so the shortcut
-  // survives non-Latin keyboard layouts and remains consistent across
-  // macOS / Windows / Linux. For punctuation we still accept the
-  // actual emitted ASCII symbol first because Electron accelerators
-  // are defined in terms of symbols, not DOM code names.
-  // (`code` and `key` already declared above for the standalone-allowed
-  // gate; reuse those values here.)
-  let mapped: string | null = null;
-  if (/^Key[A-Z]$/.test(code)) mapped = code.slice(3);
-  else if (/^Digit[0-9]$/.test(code)) mapped = code.slice(5);
-  else if (/^Numpad[0-9]$/.test(code)) mapped = `num${code.slice(6)}`;
-  else if (code === "NumpadDecimal") mapped = "numdec";
-  else if (code === "NumpadAdd") mapped = "numadd";
-  else if (code === "NumpadSubtract") mapped = "numsub";
-  else if (code === "NumpadMultiply") mapped = "nummult";
-  else if (code === "NumpadDivide") mapped = "numdiv";
-  else if (key === "ArrowLeft" || code === "ArrowLeft") mapped = "Left";
-  else if (key === "ArrowRight" || code === "ArrowRight") mapped = "Right";
-  else if (key === "ArrowUp" || code === "ArrowUp") mapped = "Up";
-  else if (key === "ArrowDown" || code === "ArrowDown") mapped = "Down";
-  else if (key === " " || code === "Space") mapped = "Space";
-  else if (key === "Enter" || code === "Enter" || code === "NumpadEnter") mapped = "Enter";
-  else if (key === "Backspace" || code === "Backspace") mapped = "Backspace";
-  else if (key === "Delete" || code === "Delete") mapped = "Delete";
-  else if (key === "Insert" || code === "Insert") mapped = "Insert";
-  else if (key === "Home" || code === "Home") mapped = "Home";
-  else if (key === "End" || code === "End") mapped = "End";
-  else if (key === "PageUp" || code === "PageUp") mapped = "PageUp";
-  else if (key === "PageDown" || code === "PageDown") mapped = "PageDown";
-  else if (key === "Tab" || code === "Tab") mapped = "Tab";
-  else if (key === "Escape" || code === "Escape") mapped = "Escape";
-  else if (/^F\d{1,2}$/.test(key)) mapped = key.toUpperCase();
-  else if (key.length === 1 && /^[!@#$%^&*()_+\-=\]{}\\|;:'",.<>/?`~]$/.test(key)) mapped = key;
-  else if (code === "Backquote") mapped = "`";
-  else if (code === "Minus") mapped = "-";
-  else if (code === "Equal") mapped = "=";
-  else if (code === "BracketLeft") mapped = "[";
-  else if (code === "BracketRight") mapped = "]";
-  else if (code === "Backslash") mapped = "\\";
-  else if (code === "Semicolon") mapped = ";";
-  else if (code === "Quote") mapped = "'";
-  else if (code === "Comma") mapped = ",";
-  else if (code === "Period") mapped = ".";
-  else if (code === "Slash") mapped = "/";
-  if (!mapped) return null;
-  parts.push(mapped);
-
-  return parts.join("+");
-}
-
 function shortcutSlot(id: string | undefined): (typeof SHORTCUT_SLOTS)[number] | undefined {
   return SHORTCUT_SLOTS.find((slot) => slot.id === id);
 }
@@ -6270,6 +6185,12 @@ function updateShortcutDisplay(btnId: string, accelerator: string): void {
   const keysSpan = btn.querySelector(".shortcut-keys");
   if (keysSpan) renderShortcutKeys(keysSpan, accelerator);
 }
+
+// Paint the platform defaults now. They are known at module load (from
+// desktop/shortcut-defaults.json, through vite.config.ts); waiting for a
+// successful /api/config showed the markup's macOS keycaps on every
+// platform until then, and forever when the load failed.
+updateAllShortcutDisplays();
 
 /**
  * Poll `window.__transcriptorShortcutStatus` (published by Electron main
@@ -6293,35 +6214,14 @@ function refreshShortcutConflictState(): void {
   // succeeds but the handler never fires. Badge the affected shortcut
   // button with a hint so the user can diagnose.
   const isMacFnCollision = status.platform === "darwin" && status.macFnState === false;
-  const isFKeyAccel = (accel: string | undefined): boolean => !!accel && /^F([1-9]|1[0-2])$/.test(accel);
   for (const slot of SHORTCUT_SLOTS) {
-    const id = slot.id;
-    const entry = status[id];
+    const entry = status[slot.id];
     if (!entry) continue;
     const btn = document.getElementById(slot.buttonId) as HTMLButtonElement | null;
     if (!btn) continue;
-    // The screenshot key is bound only while screen mode runs, so "not
-    // active" is its normal state at rest, not a conflict.
-    const active = id === "screenShot" ? !entry.error : !!entry.active;
-    const desired = entry.desired || "";
-    // A shortcut is "conflicted" if (a) registration failed OR (b)
-    // registration succeeded but macOS is going to intercept it as a
-    // media key. Case (b) is invisible without this extra check.
-    const macBlocked = isMacFnCollision && isFKeyAccel(desired);
-    const hasConflict = !active || macBlocked;
-    btn.classList.toggle("shortcut-conflict", hasConflict);
-    if (!active) {
-      btn.title = `Not registered: ${entry.error || "unknown reason"}`;
-    } else if (macBlocked) {
-      btn.title = (
-        `macOS is intercepting ${desired} as a media key. ` +
-        `Either enable System Settings → Keyboard → Keyboard Shortcuts → Function Keys → "Use F1, F2 as standard function keys", ` +
-        `or hold Fn while pressing ${desired}, ` +
-        `or pick a non-F-key accelerator here.`
-      );
-    } else {
-      btn.title = "";
-    }
+    const badge = shortcutBadge(slot.id, entry, isMacFnCollision);
+    btn.classList.toggle("shortcut-conflict", badge.conflict);
+    btn.title = badge.title;
   }
 }
 // Conflict-state badge on Settings → Shortcuts. The badge only exists
@@ -6453,10 +6353,10 @@ function handleShortcutKeydown(e: KeyboardEvent): void {
   // Persist to config
   queueUiPreferencesSave();
 
-  // Signal the Electron main process to reload shortcuts immediately.
-  // The window flag remains as a fallback for older/polling paths, but
-  // the title bridge is the durable transport: it avoids the debounce
-  // race with /api/config writes and temporarily-suspended hotkeys are
+  // Signal the Electron main process to reload shortcuts immediately,
+  // through the title bridge (there is no window-flag fallback any more,
+  // see publishShortcutUpdateToMain): it avoids the debounce race with
+  // /api/config writes, and temporarily-suspended hotkeys are
   // re-registered in the same path that received the captured keys.
   publishShortcutUpdateToMain();
   void flushUiPreferencesSaveNow();
