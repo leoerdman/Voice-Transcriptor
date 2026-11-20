@@ -116,10 +116,18 @@ import {
 } from "./text-match";
 import {
   composeLivePreviewText,
-  joinTranscriptSegments,
   richerTranscript,
 } from "./transcript-merge";
 import { mergeInterim } from "./live-source";
+import {
+  applyLiveStreamEvent,
+  canonicalTextFromBuffer,
+  createLiveTranscriptBuffer,
+  hasStreamingActivity,
+  type LiveTranscriptBuffer,
+  type LiveWsMode,
+  type TranscriptSegment,
+} from "./live-transcript-buffer";
 import { createOfflineWarmupGate } from "./offline-warmup";
 import { checkForUpdate, shouldAutoCheck, updateCheckOutcome, type UpdateCheckTrigger } from "./update-check";
 import { catalogChoiceForSave, mayAutosaveUiPreferences } from "./settings-autosave";
@@ -458,14 +466,6 @@ interface OpenRecordingOptions {
   silent?: boolean;
 }
 
-interface TranscriptSegment {
-  start: number;
-  end: number;
-  text: string;
-  /** Deepgram diarization index when enabled. undefined otherwise. */
-  speaker?: number;
-}
-
 interface LocalTranscriptionResult {
   text: string;
   segments: TranscriptSegment[];
@@ -515,8 +515,6 @@ interface LiveSessionSnapshot {
   assistLocalModel: string;
   finalLocalModel: string;
 }
-
-type LiveWsMode = "local-assist" | "deepgram-stream";
 
 /**
  * The stop envelope's fields, owned by ``./live-envelope`` — the
@@ -1274,7 +1272,7 @@ const UI_TOKENS = {
   },
   finalize: {
     // Tolerance for "these two segments describe the same moment" in
-    // ``mergeTranscriptSegments`` below — the renderer's own dedup of
+    // ``mergeTranscriptSegments`` (./live-transcript-buffer) — the renderer's own dedup of
     // segments ALREADY SENT, by any provider, in its preview pane.
     //
     // NOT ``backend/live.py``'s ``LiveConfig.emit_epsilon_sec`` (0.05),
@@ -3340,123 +3338,6 @@ function normalizeTranscriptSegment(raw: unknown, timeOffsetSec = 0): Transcript
     }
   }
   return segment;
-}
-
-function mergeTranscriptSegments(segments: TranscriptSegment[]): TranscriptSegment[] {
-  if (!segments.length) return [];
-  const epsilon = UI_TOKENS.finalize.segmentEpsilonSec;
-  // Speaker-aware equality. Both undefined ↔ both undefined (mono
-  // stream); a numbered speaker on one side and undefined on the
-  // other counts as DIFFERENT (don't conflate diarized into mono).
-  // Two distinct speaker indices are ALWAYS different — even when
-  // the text and timing happen to match, they're genuinely two
-  // utterances and must both be kept. Without this gate, a
-  // call-recording with cross-talk where speaker 0 and speaker 1
-  // utter "yeah" within the same epsilon window had ONE of them
-  // silently dropped from the transcript and the auto-paste was
-  // missing a turn. Subtle data-loss bug visible only with
-  // diarize=on.
-  const sameSpeaker = (a: TranscriptSegment, b: TranscriptSegment): boolean =>
-    a.speaker === b.speaker;
-  // Sort by start asc, then end DESC, then speaker asc. The
-  // longer / later-ending segment for the same (start, speaker)
-  // lands FIRST in the merged list, so the shorter overlapping
-  // interim that follows is dropped by the is-prefix-of-prev test
-  // below. Without the descending end-tie-break the shorter
-  // interim arrived first and the longer final was kept,
-  // leaving both in the transcript and producing visible
-  // duplication — exactly the user-reported "Просто расскажу," +
-  // "Просто расскажу кратко. И ты тоже" pattern within a single
-  // recording. The speaker tertiary keeps diarized output
-  // deterministic when two speakers share a start tick.
-  const ordered = [...segments].sort(
-    (a, b) =>
-      (a.start - b.start) ||
-      (b.end - a.end) ||
-      ((a.speaker ?? -1) - (b.speaker ?? -1)),
-  );
-  const merged: TranscriptSegment[] = [];
-  for (const segment of ordered) {
-    const prev = merged[merged.length - 1];
-    // 1. Exact duplicate (same speaker, same timing, same text): drop.
-    if (
-      prev &&
-      sameSpeaker(prev, segment) &&
-      Math.abs(prev.start - segment.start) <= epsilon &&
-      Math.abs(prev.end - segment.end) <= epsilon &&
-      prev.text === segment.text
-    ) {
-      continue;
-    }
-    // 2. Prefix-overlap dedup: when a later interim emission shares
-    //    the same start AND speaker as a kept segment AND its text
-    //    is a strict prefix of the kept segment's text (within
-    //    whitespace normalisation), drop the shorter interim.
-    //    Deepgram streaming emits this pattern: an interim
-    //    "Сергей привет" is followed by the final "Сергей привет,
-    //    как дела" — both arrive with identical start times. The
-    //    previous merge only dropped EXACT duplicates so both ended
-    //    up in the transcript, the user saw their utterance twice
-    //    in the paste, and the auto-paste delivered both halves
-    //    back-to-back. Comparing on whitespace-normalised lowercase
-    //    guards against trailing-comma / spacing differences
-    //    between the two emissions ("hello world," vs "hello world
-    //    , "). Speaker-aware: cross-talk between two speakers at
-    //    the same start is preserved.
-    if (
-      prev &&
-      sameSpeaker(prev, segment) &&
-      Math.abs(prev.start - segment.start) <= epsilon
-    ) {
-      const prevNorm = prev.text.replace(/\s+/g, " ").trim().toLowerCase();
-      const curNorm = segment.text.replace(/\s+/g, " ").trim().toLowerCase();
-      if (prevNorm.startsWith(curNorm)) {
-        // Current segment's text is wholly contained in prev (which
-        // ended later thanks to the descending end-tie-break) → drop.
-        continue;
-      }
-      if (curNorm.startsWith(prevNorm)) {
-        // Reverse case — shouldn't happen with the desc-end sort
-        // but defensive: replace prev with the longer segment.
-        merged[merged.length - 1] = segment;
-        continue;
-      }
-    }
-    merged.push(segment);
-  }
-  return merged;
-}
-
-/**
- * Format an ordered list of transcript segments for display.
- *
- * When ``speaker`` is populated (Deepgram diarize), consecutive
- * segments from the same speaker are coalesced under one ``Speaker N:``
- * prefix. Speaker transitions start a new paragraph so the user can
- * visually separate voices in the live preview.
- */
-function formatSegmentsForDisplay(segments: TranscriptSegment[], separator: string): string {
-  if (!segments.length) return "";
-  const parts: string[] = [];
-  let lastSpeaker: number | undefined;
-  for (const seg of segments) {
-    const t = seg.text.trim();
-    if (!t) continue;
-    if (seg.speaker !== undefined && seg.speaker !== lastSpeaker) {
-      // New speaker — add a speaker-prefixed chunk.
-      if (parts.length) parts.push("\n");
-      // Deepgram numbers speakers from 0. "Speaker 0:" is an array
-      // index shown to a person; the first speaker is Speaker 1.
-      parts.push(`Speaker ${seg.speaker + 1}: ${t}`);
-      lastSpeaker = seg.speaker;
-    } else {
-      if (parts.length && parts[parts.length - 1] !== "\n") {
-        parts.push(separator);
-      }
-      parts.push(t);
-    }
-  }
-  return parts.join("").trim();
 }
 
 function recordingTitleFromName(name: string): string {
@@ -10559,31 +10440,6 @@ interface LiveFinalSlot {
   waiters: Array<(envelope: LiveFinalEnvelope | null) => void>;
 }
 
-/**
- * Per-session live PREVIEW state: the committed finals and the current
- * hypothesis for the tail, and nothing else.
- *
- * It used to carry two more fields — ``lastInterimText`` (the
- * hypothesis the last final displaced) and ``recoveredTailText`` (what
- * every earlier final dropped from its own interim, accumulated) —
- * because the stop path read this buffer and delivered what it found.
- * It no longer does. Recovering a word the provider's finals dropped is
- * the backend's word-level splice's job, where the word goes back where
- * it was spoken; the renderer's version of it could only append, which
- * put "трёх в" on the end of session ``a9fd3fd9``'s transcript. The
- * preview never regresses visibly without them either: the display floor
- * in ``scheduleLiveOutputRender`` is monotonic.
- */
-interface LiveTranscriptBuffer {
-  segments: TranscriptSegment[];
-  committedText: string;
-  committedDisplayText: string;
-  interimText: string;
-  interimSegment: TranscriptSegment | null;
-  committedDisplayCache: string;
-  wsMode: LiveWsMode;
-}
-
 const liveFinalSlots = new Map<string, LiveFinalSlot>();
 const liveTranscriptBuffers = new Map<string, LiveTranscriptBuffer>();
 // Session-scoped live-stream error map. Was previously a single
@@ -10604,18 +10460,6 @@ function setLiveStreamError(token: string, err: string): void {
   else liveStreamErrors.delete(token);
 }
 
-function createLiveTranscriptBuffer(wsMode: LiveWsMode): LiveTranscriptBuffer {
-  return {
-    segments: [],
-    committedText: "",
-    committedDisplayText: "",
-    interimText: "",
-    interimSegment: null,
-    committedDisplayCache: "",
-    wsMode,
-  };
-}
-
 function getLiveTranscriptBuffer(token: string): LiveTranscriptBuffer | null {
   if (!token) return null;
   return liveTranscriptBuffers.get(token) || null;
@@ -10624,81 +10468,14 @@ function getLiveTranscriptBuffer(token: string): LiveTranscriptBuffer | null {
 function ensureLiveTranscriptBuffer(token: string, wsMode: LiveWsMode): LiveTranscriptBuffer {
   const existing = getLiveTranscriptBuffer(token);
   if (existing) return existing;
-  const buffer = createLiveTranscriptBuffer(wsMode);
+  const buffer = createLiveTranscriptBuffer(wsMode, UI_TOKENS.finalize.segmentEpsilonSec);
   liveTranscriptBuffers.set(token, buffer);
   return buffer;
-}
-
-function canonicalTextFromBuffer(buffer: LiveTranscriptBuffer): string {
-  return mergeInterim(buffer.committedText, buffer.interimText);
 }
 
 function getSessionCanonicalLiveSourceText(token: string): string {
   const buffer = getLiveTranscriptBuffer(token);
   return buffer ? canonicalTextFromBuffer(buffer) : getCanonicalLiveSourceText();
-}
-
-function appendSegmentsToBuffer(
-  buffer: LiveTranscriptBuffer,
-  rawSegments: unknown[],
-): void {
-  const nextSegments = Array.isArray(rawSegments)
-    ? rawSegments
-      .map((segment) => normalizeTranscriptSegment(segment))
-      .filter((segment): segment is TranscriptSegment => !!segment)
-    : [];
-  if (!nextSegments.length) return;
-
-  const prevLen = buffer.segments.length;
-  const combined = buffer.segments.concat(nextSegments);
-  const merged = mergeTranscriptSegments(combined);
-  const appendOnly =
-    merged.length === combined.length &&
-    merged.length >= prevLen &&
-    merged.slice(0, prevLen).every((seg, i) => seg === buffer.segments[i]);
-
-  buffer.segments = merged;
-  // The final retires the hypothesis that produced it. Whatever the
-  // final did not carry over is the backend's to splice back in, at the
-  // time it was spoken — see the LiveTranscriptBuffer doc.
-  buffer.interimText = "";
-  buffer.interimSegment = null;
-
-  const separator = buffer.wsMode === "deepgram-stream" ? " " : "\n";
-  const hasDiarization = buffer.segments.some((s) => s.speaker !== undefined);
-  if (hasDiarization) {
-    buffer.committedDisplayCache = formatSegmentsForDisplay(buffer.segments, separator);
-  } else if (appendOnly) {
-    let delta = "";
-    for (let i = prevLen; i < merged.length; i++) {
-      const t = merged[i].text;
-      if (!t) continue;
-      if (delta) delta += separator;
-      delta += t;
-    }
-    if (delta) {
-      buffer.committedDisplayCache = buffer.committedDisplayCache
-        ? `${buffer.committedDisplayCache}${separator}${delta}`
-        : delta;
-    }
-  } else {
-    buffer.committedDisplayCache = merged
-      .map((segment) => segment.text)
-      .filter(Boolean)
-      .join(separator)
-      .trim();
-  }
-  buffer.committedText = joinTranscriptSegments(buffer.segments);
-  buffer.committedDisplayText = buffer.committedDisplayCache || buffer.committedText;
-}
-
-function hasStreamingActivity(buffer: LiveTranscriptBuffer | null): boolean {
-  if (!buffer) return false;
-  return (
-    buffer.segments.length > 0 ||
-    !!buffer.committedText.trim() ||
-    !!buffer.interimText.trim()
-  );
 }
 
 function projectLiveTranscriptBufferToActiveState(buffer: LiveTranscriptBuffer): void {
@@ -11480,7 +11257,8 @@ async function startLive(
   resetLiveDraftState();
   clearLiveStreamState();
   const sessionWsMode = resolveLiveWsMode(activeLiveSessionSnapshot);
-  liveTranscriptBuffers.set(sessionUiToken, createLiveTranscriptBuffer(sessionWsMode));
+  liveTranscriptBuffers.delete(sessionUiToken);
+  ensureLiveTranscriptBuffer(sessionUiToken, sessionWsMode);
   setBusy(true, sessionUiToken);
   currentRecordingId = ++liveRecordingSeq;
   // Recording started — transcription happens on stop via single sync call.
@@ -11640,7 +11418,7 @@ async function startLive(
       case "segments": {
         const lastNew = msg.segments.length > 0 ? msg.segments[msg.segments.length - 1] : null;
         console.log(`[trace ws-segments] session=${sessionUiToken.slice(0, 8)} active=${isActiveSession} count=${msg.segments.length} ${lastNew ? `lastEnd=${lastNew.end.toFixed(2)} ${traceTextStats("lastText", lastNew.text)}` : "(empty)"}`);
-        appendSegmentsToBuffer(sessionBuffer, msg.segments);
+        applyLiveStreamEvent(sessionBuffer, msg);
         if (isActiveSession) {
           // No draft write here. Deepgram commits segments several
           // times a second and this handler runs on the main thread —
@@ -11667,8 +11445,7 @@ async function startLive(
         return;
       }
       case "interim": {
-        sessionBuffer.interimText = normalizeTranscriptWhitespace(msg.segment.text);
-        sessionBuffer.interimSegment = msg.segment;
+        applyLiveStreamEvent(sessionBuffer, msg);
         if (isActiveSession) {
           projectLiveTranscriptBufferToActiveState(sessionBuffer);
         }
@@ -11677,10 +11454,10 @@ async function startLive(
       case "final": {
         const lastSeg = msg.segments.length > 0 ? msg.segments[msg.segments.length - 1] : null;
         console.log(`[trace ws-final] session=${sessionUiToken.slice(0, 8)} active=${isActiveSession} textLen=${msg.text.length} segCount=${msg.segments.length} ${lastSeg ? `lastEnd=${lastSeg.end.toFixed(2)} ${traceTextStats("lastText", lastSeg.text)}` : "(empty)"} durationSec=${msg.durationSec.toFixed(2)} error="${msg.error || ""}"`);
-        appendSegmentsToBuffer(sessionBuffer, msg.segments);
-        if (isActiveSession) {
-          projectLiveTranscriptBufferToActiveState(sessionBuffer);
-        }
+        // ./live-transcript-buffer decides what the envelope does to the
+        // live reading (nothing — see its ``final`` case), so there is
+        // no buffer change to project onto the preview here.
+        applyLiveStreamEvent(sessionBuffer, msg);
         // The parsed message minus its ``type`` IS the envelope — one
         // contract (./live-envelope). It used to be copied field by
         // field, so a field added to the contract was silently dropped
