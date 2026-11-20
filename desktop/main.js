@@ -1449,10 +1449,14 @@ const RECORDING_STATUS_CAPSULE = Object.freeze((() => {
   // floor(30 / 2.4) = 12 bars in the narrowed column.
   waveBarWidth: 1.0,
   waveBarGap: 1.4,
-  // The line under the bars: drawn from the press for as long as the
-  // capsule is active, so a silent take still shows it is recording (user,
-  // 2026-11-20: "the thinnest red line must run at once, even if I say
-  // nothing"). Silence alone gives bars of height 0, which draw nothing.
+  // The line under the bars: from the press for as long as the capsule is
+  // active, so a silent take still shows it is recording (user, 2026-11-20:
+  // "the thinnest red line must run at once, even if I say nothing").
+  // Silence alone gives bars of height 0, which draw nothing. It comes in
+  // from the right edge and grows left at the bars' own scroll speed (one
+  // bar step per level tick), the way the waveform itself arrives — never
+  // across the whole width at once (user: "it must come out from the
+  // right edge and go left").
   waveBaselineHeight: 1,
   waveFrameMs: 16,
   waveLevelTickMs: 220,
@@ -1809,6 +1813,8 @@ function recordingStatusCapsuleHtml() {
     let waveMode = "recording";
     /** The baseline is on the canvas now (it is erased when the page goes inactive). */
     let baselineDrawn = false;
+    /** When this activation's line started coming in from the right edge. */
+    let baselineSince = 0;
     let stateIconModeClass = "";
     let pointerEmitLocked = false;
     function fmt(ms) {
@@ -1861,10 +1867,16 @@ function recordingStatusCapsuleHtml() {
     function renderWave(now = Date.now()) {
       ctx.clearRect(0, 0, waveW, waveH);
       baselineDrawn = pageIsActive();
-      if (!baselineDrawn) return;
+      if (!baselineDrawn) {
+        baselineSince = 0;
+        return;
+      }
+      if (!baselineSince) baselineSince = now;
       ctx.fillStyle = waveColor();
       const lineH = ${t.waveBaselineHeight};
-      ctx.fillRect(0, (waveH - lineH) / 2, waveW, lineH);
+      const grown = ((now - baselineSince) / ${t.waveLevelTickMs}) * (bw + gap);
+      const lineX = Math.max(0, waveW - Math.max(1, grown));
+      ctx.fillRect(lineX, (waveH - lineH) / 2, waveW - lineX, lineH);
       const tickMs = (waveMode === "recording" || waveMode === "autostop")
         ? ${t.waveLevelTickMs}
         : ${t.waveIdleTickMs};

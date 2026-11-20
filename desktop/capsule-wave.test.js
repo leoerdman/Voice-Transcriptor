@@ -54,6 +54,9 @@ function loadCapsule() {
   const elements = new Map();
   const canvas = { ...element(), width: 0, height: 0, getContext: () => ctx };
   let frame = null;
+  // The page reads Date.now(); the test owns that clock and moves it one
+  // 100 ms frame per step.
+  let clock = 1000;
   const window = { devicePixelRatio: 1, __capsule: { pointer() {}, shot() {}, stop() {} } };
   const sandbox = {
     window,
@@ -69,13 +72,12 @@ function loadCapsule() {
     requestAnimationFrame(fn) { frame = fn; return 1; },
     cancelAnimationFrame() { frame = null; },
     setTimeout() { return 0; },
-    Date,
+    Date: { now: () => clock },
     Math,
     Number,
     String,
   };
   vm.runInNewContext(script, sandbox);
-  let clock = 1000;
   return {
     draws,
     setState: (next) => window.__setCapsuleState(next),
@@ -93,30 +95,40 @@ const { RECORDING_STATUS_CAPSULE_FOR_TEST: tokens } = vm.runInNewContext(
   {},
 );
 
-test("a silent take shows a thin red line across the waveform from the press", () => {
+test("a silent take shows a thin red line that comes in from the right edge", () => {
   const capsule = loadCapsule();
   // What the main process publishes at the press: "Starting" maps to the
   // recording mode (./recording-status), and nothing has been heard yet.
   capsule.setState({ status: "Starting", mode: "recording", level: 0, timerRunning: false });
   capsule.step();
-  const line = capsule.draws.find((d) => d.w === tokens.waveWidth);
-  assert.ok(line, "a full-width line is drawn in the first frame");
-  assert.equal(line.h, tokens.waveBaselineHeight);
-  assert.ok(line.h <= 1, "the thinnest line, not a bar");
-  assert.equal(line.y, (tokens.waveHeight - line.h) / 2, "centred");
-  assert.match(line.color, /^rgba\(255,77,77,/, "in the recording red");
+  const lineAt = () => capsule.draws.find((d) => d.h === tokens.waveBaselineHeight && d.x + d.w === tokens.waveWidth);
+  const first = lineAt();
+  assert.ok(first, "a line is drawn in the first frame, anchored to the right edge");
+  assert.ok(first.w < tokens.waveWidth, "not across the whole width at once");
+  assert.ok(first.h <= 1, "the thinnest line, not a bar");
+  assert.equal(first.y, (tokens.waveHeight - first.h) / 2, "centred");
+  assert.match(first.color, /^rgba\(255,77,77,/, "in the recording red");
 
-  // Still silent a while later: still the line, still red.
-  for (let i = 0; i < 5; i += 1) capsule.step();
-  assert.ok(capsule.draws.some((d) => d.w === tokens.waveWidth && /^rgba\(255,77,77,/.test(d.color)));
+  // It grows leftward, frame by frame, until it spans the waveform.
+  let previous = first.w;
+  for (let i = 0; i < 5; i += 1) {
+    capsule.step();
+    const line = lineAt();
+    assert.ok(line && line.w > previous, "it keeps growing to the left");
+    previous = line.w;
+  }
+  for (let i = 0; i < 60; i += 1) capsule.step();
+  const full = lineAt();
+  assert.equal(full.x, 0, "and then runs across the whole waveform");
+  assert.match(full.color, /^rgba\(255,77,77,/);
 });
 
 test("bars rise above the line, in the same colour", () => {
   const capsule = loadCapsule();
   capsule.setState({ status: "Recording", mode: "recording", level: 0.8 });
   for (let i = 0; i < 4; i += 1) capsule.step();
-  const line = capsule.draws.find((d) => d.w === tokens.waveWidth);
-  const bars = capsule.draws.filter((d) => d.w !== tokens.waveWidth);
+  const line = capsule.draws.find((d) => d.h === tokens.waveBaselineHeight);
+  const bars = capsule.draws.filter((d) => d !== line);
   assert.ok(line);
   assert.ok(bars.length > 0, "speech draws bars");
   assert.ok(bars.every((b) => b.h > line.h && b.color === line.color));
