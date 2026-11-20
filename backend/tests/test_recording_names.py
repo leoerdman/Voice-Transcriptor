@@ -405,6 +405,16 @@ class RecordingNameTests(unittest.TestCase):
 
         stats = self.main._build_recordings_stats_payload(root)
         self.assertEqual(stats["total_recordings"], 2)
+        # BM-29: a word-count estimate travels under an ``estimated_`` name.
+        for key in ("avg", "min", "max"):
+            self.assertNotIn(f"{key}_duration_sec", stats)
+            self.assertIsInstance(stats[f"estimated_{key}_duration_sec"], int)
+        words_per_rec = stats["total_words"] / stats["total_recordings"]
+        self.assertAlmostEqual(
+            stats["estimated_avg_duration_sec"],
+            words_per_rec / self.main.STATS_SPEECH_WORDS_PER_MIN * 60.0,
+            delta=1.0,
+        )
 
     def test_json_boolean_parser_matches_form_semantics(self):
         self.assertFalse(self.main._payload_bool({"enabled": "false"}, "enabled", True))

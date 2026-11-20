@@ -8421,6 +8421,11 @@ _STATS_CACHE_TTL = 30.0
 _stats_cache_rebuild_lock: Optional[asyncio.Lock] = None
 
 
+# The speaking pace the archive stats turn a transcript's word count into
+# an ESTIMATED duration with (BM-29).
+STATS_SPEECH_WORDS_PER_MIN = 150.0
+
+
 def _build_recordings_stats_payload(d: "Path") -> dict:
     """Heavy sync stats scan extracted for `asyncio.to_thread` offload.
     Reads + tokenises every transcript in the archive — O(N) on file
@@ -8451,8 +8456,7 @@ def _build_recordings_stats_payload(d: "Path") -> dict:
         total_chars += len(text)
         tokens = _tokenize_words(text)
         total_words += len(tokens)
-        # Lightweight estimate: speech pace ~150 words/min.
-        dur = int(round((len(tokens) / 150.0) * 60.0)) if tokens else 0
+        dur = int(round((len(tokens) / STATS_SPEECH_WORDS_PER_MIN) * 60.0)) if tokens else 0
         durations_sec.append(dur)
         for w in tokens:
             word_freq[w] += 1
@@ -8461,6 +8465,9 @@ def _build_recordings_stats_payload(d: "Path") -> dict:
     avg_duration_sec = int(round(sum(durations_sec) / len(durations_sec))) if durations_sec else 0
     max_duration_sec = max(durations_sec) if durations_sec else 0
     min_duration_sec = min(durations_sec) if durations_sec else 0
+    # ``estimated_``: these are word counts at STATS_SPEECH_WORDS_PER_MIN,
+    # not audio lengths (BM-29) — they used to travel under plain duration
+    # names, and many recordings have no audio left to measure (retention).
     avg_words_per_recording = round(total_words / total_recordings, 1) if total_recordings else 0.0
     avg_chars_per_recording = round(total_chars / total_recordings, 1) if total_recordings else 0.0
     return {
@@ -8469,9 +8476,9 @@ def _build_recordings_stats_payload(d: "Path") -> dict:
         "total_chars": total_chars,
         "avg_words_per_recording": avg_words_per_recording,
         "avg_chars_per_recording": avg_chars_per_recording,
-        "avg_duration_sec": avg_duration_sec,
-        "min_duration_sec": min_duration_sec,
-        "max_duration_sec": max_duration_sec,
+        "estimated_avg_duration_sec": avg_duration_sec,
+        "estimated_min_duration_sec": min_duration_sec,
+        "estimated_max_duration_sec": max_duration_sec,
         "top_words": [{"word": w, "count": c} for w, c in top_words],
         "providers": [{"name": k, "count": v} for k, v in sorted(providers.items(), key=lambda kv: kv[1], reverse=True)],
         "languages": [{"name": k, "count": v} for k, v in sorted(languages.items(), key=lambda kv: kv[1], reverse=True)],

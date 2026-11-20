@@ -343,9 +343,10 @@ interface RecordingsStats {
   total_chars: number;
   avg_words_per_recording: number;
   avg_chars_per_recording: number;
-  avg_duration_sec: number;
-  min_duration_sec: number;
-  max_duration_sec: number;
+  /** Word count at the backend's speaking pace — an estimate, not audio length (BM-29). */
+  estimated_avg_duration_sec: number;
+  estimated_min_duration_sec: number;
+  estimated_max_duration_sec: number;
   top_words: Array<{ word: string; count: number }>;
   providers: Array<{ name: string; count: number }>;
   languages: Array<{ name: string; count: number }>;
@@ -8443,9 +8444,9 @@ async function loadRecordingsStats(): Promise<void> {
   $("statsWords").textContent = String(s.total_words || 0);
   $("statsChars").textContent = String(s.total_chars || 0);
   $("statsWpr").textContent = String(s.avg_words_per_recording || 0);
-  $("statsAvgDur").textContent = fmtDur(s.avg_duration_sec || 0);
-  $("statsMinDur").textContent = fmtDur(s.min_duration_sec || 0);
-  $("statsMaxDur").textContent = fmtDur(s.max_duration_sec || 0);
+  $("statsAvgDur").textContent = fmtDur(s.estimated_avg_duration_sec || 0);
+  $("statsMinDur").textContent = fmtDur(s.estimated_min_duration_sec || 0);
+  $("statsMaxDur").textContent = fmtDur(s.estimated_max_duration_sec || 0);
   const top = $("statsTopWords");
   top.innerHTML = "";
   if (!s.top_words?.length) {
