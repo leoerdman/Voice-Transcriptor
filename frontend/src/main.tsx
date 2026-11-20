@@ -96,6 +96,7 @@ import {
   type CliAccessStatus,
 } from "./cli-section";
 import { smartRecordingTitle } from "./recording-title";
+import { waitForJob } from "./job-poll";
 import {
   LIVE_DRAFT_SCHEMA_VERSION,
   LiveDraftOperationQueue,
@@ -986,6 +987,13 @@ let LIVE_SAMPLE_RATE_HZ = 16_000;
 const UI_TOKENS = {
   polling: {
     remoteChunkSettleTimeoutMs: 3_000,
+    /** Waiting for a backend job: see ./job-poll for what each field decides. */
+    backendJob: {
+      fastMs: 900,
+      slowMs: 3_000,
+      slowAfterMs: 30_000,
+      maxConsecutiveFailures: 3,
+    },
   },
   draft: {
     autosaveIntervalMs: 1_200,
@@ -4791,6 +4799,26 @@ async function cancelBackendJob(jobId: string): Promise<void> {
   }
 }
 
+function sleepUnlessAborted(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let timer = 0;
+    const cleanup = () => {
+      window.clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    timer = window.setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/** How a job wait reacts to failures and when it gives up: ./job-poll. */
 async function waitForBackendJob<T>(
   jobId: string,
   opts: {
@@ -4798,47 +4826,25 @@ async function waitForBackendJob<T>(
     onProgress?: (job: BackendJobState<T>) => void;
   } = {},
 ): Promise<T> {
-  const startedAt = performance.now();
-  while (true) {
-    if (opts.signal?.aborted) {
-      throw new DOMException("Aborted", "AbortError");
-    }
-    const r = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
-      headers: authHeaders(),
-      signal: opts.signal,
-    });
-    if (!r.ok) throw new Error(await parseError(r));
-    const job = (await r.json()) as BackendJobState<T>;
-    opts.onProgress?.(job);
-    if (job.status === "done") {
-      if (!job.result) throw new Error("Job finished without a result.");
-      return job.result;
-    }
-    if (job.status === "error") {
-      throw new Error(String(job.error || "Transcription failed."));
-    }
-    if (job.status === "cancelled") {
-      throw new DOMException("Aborted", "AbortError");
-    }
-    const pollMs = performance.now() - startedAt > 30_000 ? 3_000 : 900;
-    await new Promise<void>((resolve, reject) => {
-      const signal = opts.signal;
-      let timer = 0;
-      const cleanup = () => {
-        window.clearTimeout(timer);
-        signal?.removeEventListener("abort", onAbort);
-      };
-      const onAbort = () => {
-        cleanup();
-        reject(new DOMException("Aborted", "AbortError"));
-      };
-      timer = window.setTimeout(() => {
-        cleanup();
-        resolve();
-      }, pollMs);
-      signal?.addEventListener("abort", onAbort, { once: true });
-    });
-  }
+  return waitForJob<T>(
+    {
+      fetchJob: async (signal) => {
+        const r = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
+          headers: authHeaders(),
+          signal,
+        });
+        if (!r.ok) throw new Error(await parseError(r));
+        return (await r.json()) as BackendJobState<T>;
+      },
+      sleep: sleepUnlessAborted,
+      cancel: () => cancelBackendJob(jobId),
+      now: () => performance.now(),
+      onProgress: (job) => opts.onProgress?.(job as BackendJobState<T>),
+      onTransientFailure: (e, n) => console.warn(`job ${jobId}: poll failed (${n} in a row), retrying`, e),
+    },
+    UI_TOKENS.polling.backendJob,
+    opts.signal,
+  );
 }
 
 async function waitForQueuedRemoteJob(
