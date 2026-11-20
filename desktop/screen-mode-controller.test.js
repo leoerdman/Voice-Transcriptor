@@ -15,7 +15,8 @@ const os = require("node:os");
 const path = require("node:path");
 const vm = require("node:vm");
 
-const { createScreenModeController } = require("./screen-mode-controller");
+const { SCREEN_START_OUTCOME, createScreenModeController } = require("./screen-mode-controller");
+const { screenModeWarningCopy } = require("./screen-mode-warnings");
 
 const PNG = "data:image/png;base64,";
 const tick = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -164,8 +165,12 @@ function createWorld({ displays, helperReady = true, failLoad = () => false, hit
     fs,
     path,
     platform: "darwin",
-    helperPath: () => process.execPath, // a file that exists, so isSupported() is true
-    stagingRoot: () => staging,
+    // A file that exists, so isSupported() is true — unless a test says not.
+    helperPath: () => (world.helperMissing ? path.join(staging, "no-such-helper") : process.execPath),
+    stagingRoot: () => {
+      if (world.stagingFails) throw new Error("no data directory");
+      return staging;
+    },
     log: (line) => world.logs.push(line),
     capsuleWindow: () => world.capsule,
     onActiveChange: (active) => world.active.push(active),
@@ -186,6 +191,11 @@ function createWorld({ displays, helperReady = true, failLoad = () => false, hit
   world.cleanup = () => {
     world.controller.teardown();
     fs.rmSync(staging, { recursive: true, force: true });
+    // D1: every warning any test made the controller raise is one main
+    // has copy for — a kind without copy reaches the log and nobody else.
+    for (const kind of world.warnings) {
+      assert.ok(screenModeWarningCopy(kind), `the controller raised "${kind}", which has no copy for the user`);
+    }
   };
   return world;
 }
@@ -283,7 +293,9 @@ test("a stop that reaches the controller before its start wins: the late start i
     const stopped = await world.controller.finish({ id: ID, discard: false });
     assert.equal(stopped.ok, false);
     const started = await world.controller.start(ID);
-    assert.deepEqual(started, { ok: false, error: "ended" });
+    // D3: a distinct outcome, not a failure — and nobody is warned.
+    assert.deepEqual(started, { ok: false, outcome: SCREEN_START_OUTCOME.ENDED });
+    assert.deepEqual(world.warnings, [], "a quick stop is not a failed start");
     assert.equal(world.children.length, 0, "no mouse helper for a take that ended");
     assert.equal(world.overlays().length, 0);
     assert.deepEqual(world.active, []);
@@ -300,7 +312,7 @@ test("a new take while an old session is still up closes the old one and starts 
     await world.controller.start(ID);
     drawStroke(world, [[100, 100], [200, 100]]);
     const started = await world.controller.start(NEXT);
-    assert.deepEqual(started, { ok: true, id: NEXT });
+    assert.deepEqual(started, { ok: true, outcome: SCREEN_START_OUTCOME.STARTED, id: NEXT });
     // The old take's screenshots stay staged with its finished manifest.
     const old = JSON.parse(fs.readFileSync(path.join(world.staging, ID, "events.json"), "utf8"));
     assert.ok(old.endedAt > 0);
@@ -351,6 +363,37 @@ test("a helper that cannot be spawned fails the start", async () => {
   }
 });
 
+// D2: the controller is the one owner of the failed-start notification,
+// so EVERY failed start warns — and no start rejects, so main has nothing
+// to report on its own.
+test("a start on a machine without the helper fails, warned, instead of answering silently", async () => {
+  const world = createWorld();
+  world.helperMissing = true;
+  try {
+    const started = await world.controller.start(ID);
+    assert.equal(started.ok, false);
+    assert.equal(started.outcome, SCREEN_START_OUTCOME.FAILED);
+    assert.deepEqual(world.warnings, ["start-failed"]);
+    assert.equal(world.children.length, 0);
+  } finally {
+    world.cleanup();
+  }
+});
+
+test("a start that throws on the way resolves FAILED and warns, it never rejects", async () => {
+  const world = createWorld();
+  world.stagingFails = true;
+  try {
+    const started = await world.controller.start(ID);
+    assert.equal(started.outcome, SCREEN_START_OUTCOME.FAILED);
+    assert.match(started.error, /no data directory/);
+    assert.deepEqual(world.warnings, ["start-failed"]);
+    assert.equal(world.controller.isActive(), false);
+  } finally {
+    world.cleanup();
+  }
+});
+
 test("no overlay that can be shown fails the start", async () => {
   const world = createWorld({ failLoad: (w) => w.opts.title === "Transcriptor Screen Mode" });
   try {
@@ -384,7 +427,7 @@ test("one display's overlay failing, or the palette failing, still starts the ta
   });
   try {
     const started = await world.controller.start(ID);
-    assert.deepEqual(started, { ok: true, id: ID });
+    assert.deepEqual(started, { ok: true, outcome: SCREEN_START_OUTCOME.STARTED, id: ID });
     assert.equal(world.overlays().length, 1);
     assert.deepEqual(world.active, [true]);
   } finally {

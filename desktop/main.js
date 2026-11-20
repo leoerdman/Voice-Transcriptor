@@ -169,6 +169,8 @@ const {
 // ./screen-mode-controller; the instance is `screenMode` below.
 const { SCREEN_MODE, isScreenSessionId, screenSessionId } = require("./screen-mode");
 const { createScreenModeController } = require("./screen-mode-controller");
+// What the user is told for each screen-mode warning (D1).
+const { SCREEN_SHOT_HOTKEY_WARNING, screenModeWarningCopy } = require("./screen-mode-warnings");
 
 // SSOT for the interpreter version: `.python-version` at the repo root, the
 // same file prepare-runtime.sh builds the bundled runtime from and CI installs.
@@ -2256,7 +2258,7 @@ function bindScreenShotHotkey() {
   if (screenShotHotkeyError) {
     // The user is in a take and this is the key they will press: say so
     // now, not by a press that does nothing.
-    notifyScreenModeWarning("screenshot-hotkey");
+    notifyScreenModeWarning(SCREEN_SHOT_HOTKEY_WARNING);
   }
 }
 
@@ -2317,24 +2319,16 @@ function screenModeStagingRoot() {
   return path.join(dataDir(), SCREEN_MODE.stagingDirName);
 }
 
-const SCREEN_MODE_WARNINGS = Object.freeze({
-  "start-failed": {
-    title: "Screen mode didn't start",
-    body: "The recording goes on as a voice recording. See the log for the reason, then try screen mode again.",
-  },
-  "screenshot-hotkey": {
-    title: "Screenshot key is taken",
-    body: "Another app holds the screenshot key, so it does nothing in this take. Use the camera button on the capsule, or pick another key in Settings.",
-  },
-  accessibility: {
-    title: "Screen mode can't draw",
-    body: "Allow Transcriptor in System Settings → Privacy & Security → Accessibility, then start screen mode again.",
-  },
-  "screen-recording": {
-    title: "Screen mode can't take screenshots",
-    body: "Allow Transcriptor in System Settings → Privacy & Security → Screen & System Audio Recording.",
-  },
-});
+// The screen take main started a session for, until that take ends (its
+// renderer's screen-mode:finish, a start that did not open a session, or
+// the renderer being lost). A renderer lost before the session finished
+// starting retires this id, so the start cannot open a session nobody
+// will finish (S-02 / DM-31).
+let screenTakeId = "";
+
+function retireScreenTake(id) {
+  if (id && screenTakeId === id) screenTakeId = "";
+}
 
 const screenMode = createScreenModeController({
   BrowserWindow,
@@ -2366,7 +2360,7 @@ const screenMode = createScreenModeController({
 });
 
 function notifyScreenModeWarning(kind) {
-  const copy = SCREEN_MODE_WARNINGS[kind];
+  const copy = screenModeWarningCopy(kind);
   appendMainLog(`[screen-mode] warning ${kind}`);
   if (!copy) return;
   try {
@@ -2380,13 +2374,35 @@ function notifyScreenModeWarning(kind) {
  * its stopLive will never ask for the session, so main ends it here and
  * keeps the screenshots staged — the backend's recovery sweep owns them
  * from then on, exactly like the take's audio spool.
+ *
+ * The take's id is named even when no session is live yet: a start still
+ * on its way is then refused by the controller (its ended-id tombstone)
+ * instead of opening overlays for a take that is gone (DM-31).
  */
 function endScreenModeForLostRenderer(reason) {
-  if (!screenMode.isActive()) return;
-  appendMainLog(`[screen-mode] renderer lost (${reason}); ending the session`);
-  void screenMode.finish({ discard: false }).catch((e) => {
+  const id = screenTakeId;
+  screenTakeId = "";
+  if (!id) return;
+  appendMainLog(`[screen-mode] renderer lost (${reason}); ending session ${id}`);
+  void screenMode.finish({ id, discard: false }).catch((e) => {
     appendMainLog(`[screen-mode] finish after renderer loss failed: ${e?.message || e}`);
   });
+}
+
+/**
+ * The screen session of a take could not start: the controller warned the
+ * user, and the renderer — told "screen take" with the press — files the
+ * take as a voice take (Live, not Screen Sessions) from now on (S-04).
+ * Main → main window only; the renderer drops a notice for a take it is
+ * no longer recording.
+ */
+function notifyRendererVoiceTake(screenSessionId) {
+  if (!win || win.isDestroyed() || !win.webContents) return;
+  try {
+    win.webContents.send("screen-mode:voice-take", { screenSessionId: String(screenSessionId || "") });
+  } catch (e) {
+    appendMainLog(`[screen-mode] voice-take notify failed: ${compactLogText(e?.message || e)}`);
+  }
 }
 
 function cancelRecordingStatusCapsuleTeardown() {
@@ -2923,6 +2939,15 @@ async function toggleRecordingFromShortcut(mode = "voice") {
         traceEnd(trace, "failed", { reason: "recording-start-not-confirmed" });
         return;
       }
+      // Screen mode starts the moment the take is confirmed, not behind the
+      // frontmost-app lookup and the capsule session below: every await
+      // before start() widened the window in which the take could end
+      // with no session to end (S-02 / DM-31). Awaited after them.
+      let screenStart = null;
+      if (startDetail.mode === "screen") {
+        screenTakeId = startDetail.screenSessionId;
+        screenStart = screenMode.start(startDetail.screenSessionId);
+      }
       // The frontmost-app lookup was fired at the press, so it reports
       // the app the user was in when they hit the key no matter when it
       // is read. It is awaited here rather than before the dispatch: it
@@ -2947,28 +2972,15 @@ async function toggleRecordingFromShortcut(mode = "voice") {
         recordingId: Number(confirmedStart.recordingId || 0),
       });
       await beginRecordingStatusSession();
-      if (startDetail.mode === "screen") {
-        const started = await screenMode.start(startDetail.screenSessionId).catch((e) => ({
-          ok: false,
-          error: e?.message || String(e),
-        }));
-        traceStep(trace, "screen_mode_started", { ok: !!started?.ok, error: started?.error || "" });
-        // The take may have ended while its session was starting (DM-31):
-        // ask once more, and end an orphaned session now rather than at
-        // some later stop. A failed start is told to the user.
-        const after = decideAfterScreenStart({
-          started,
-          renderer: started?.ok ? await queryRendererRecordingState() : null,
-          recordingId: Number(confirmedStart.recordingId || 0),
-        });
-        if (after === AFTER_SCREEN_START.END_ORPHAN && screenMode.isActive()) {
-          appendMainLog(`[screen-mode] take ended while its session was starting; ending session ${startDetail.screenSessionId}`);
-          await screenMode.finish({ id: startDetail.screenSessionId, discard: false }).catch((e) => {
-            appendMainLog(`[screen-mode] finish of orphaned session failed: ${e?.message || e}`);
-          });
-        } else if (after === AFTER_SCREEN_START.FAILED) {
-          notifyScreenModeWarning("start-failed");
-        }
+      if (screenStart) {
+        // The controller never rejects a start and has already warned the
+        // user about a failed one; a take whose stop got there first was
+        // refused there, silently (D2 / D3).
+        const started = await screenStart;
+        traceStep(trace, "screen_mode_started", { outcome: started?.outcome || "", error: started?.error || "" });
+        const after = decideAfterScreenStart(started);
+        if (after !== AFTER_SCREEN_START.KEEP) retireScreenTake(startDetail.screenSessionId);
+        if (after === AFTER_SCREEN_START.VOICE_TAKE) notifyRendererVoiceTake(startDetail.screenSessionId);
         traceStep(trace, "screen_mode_after_start", { decision: after });
       }
       traceEnd(trace, "recording-started", { mode: startDetail.mode });
@@ -9244,6 +9256,7 @@ app.whenReady().then(async () => {
     try {
       const id = String(p.id || "");
       if (!isScreenSessionId(id)) return { ok: false, error: "bad-session-id" };
+      retireScreenTake(id);
       return await screenMode.finish({ id, discard: p.discard === true });
     } catch (e) {
       appendMainLog(`[screen-mode] finish failed: ${e?.message || e}`);

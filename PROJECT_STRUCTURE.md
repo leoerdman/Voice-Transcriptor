@@ -110,6 +110,7 @@ frontend/
     ├── live-pane.ts                  # Live Preview pane display contract: preview on/off, status line (pure)
     ├── live-envelope.ts              # the `final` stop-envelope wire type: one reader, matches backend/live_envelope.py
     ├── screen-annotations.ts         # screen-mode marks: manifest → bracketed marks placed in the transcript by their moment in speech (pure)
+    ├── take-collection.ts            # which History collection a live take is filed under, on every path (live socket, save, draft, recovery) (pure)
     ├── transcription-catalog.ts      # transcription catalog + selection SSOT for every model picker (pure)
     ├── shortcut-display.ts           # Electron accelerator → Settings keycap labels, per platform (pure)
     ├── cli-section.ts                # Settings → Command line: parses /api/cli and decides what the section shows (the backend composes every command)
@@ -170,7 +171,8 @@ desktop/
 ├── renderer-epoch.js               # which renderer a recording id belongs to, so a reloaded renderer's ids are never confused (pure, node --test)
 ├── shortcut-runtime.js             # the accelerators bound right now and how a Settings update changes them (pure, node --test)
 ├── capsule-geometry.js             # the recording capsule's window size and placement (pure, node --test)
-├── screen-session-start.js         # what main does once screenMode.start() has answered for a take already recording (pure, node --test)
+├── screen-session-start.js         # what main does once screenMode.start() has answered: keep, already ended, or a voice take (pure, node --test)
+├── screen-mode-warnings.js         # the one copy table for screen-mode warnings, keyed by the controller's kinds (pure, node --test)
 ├── capsule-preload.js              # the recording capsule's preload bridge to main (stop, screenshot, geometry) — replaces the document.title channel
 ├── ipc-contract.test.js            # main.js/preload.js IPC channel-name contract test (node --test)
 ├── preload.js                      # safe renderer bridge (path-for-file, engine lifecycle invoke-only, recordingFinal send-only, system-suspend receive-only)

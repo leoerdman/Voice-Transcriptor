@@ -109,6 +109,37 @@ contextBridge.exposeInMainWorld("transcriptor", {
       }
     };
   },
+  /**
+   * Subscribe to "this screen take's session could not start: it is a
+   * voice take" (S-04).
+   *
+   *   const off = window.transcriptor.onScreenVoiceTake(({ screenSessionId }) => …)
+   *
+   * Main told the renderer "screen take" with the press; when the
+   * session then fails to start, the take must be filed as a voice take
+   * (Live), not under Screen Sessions. Same shape as onSystemSuspend: one
+   * fixed channel, a fresh plain payload, an unsubscribe handed back, and
+   * a throwing subscriber swallowed.
+   */
+  onScreenVoiceTake: (callback) => {
+    if (typeof callback !== "function") return () => { };
+    const listener = (_event, payload) => {
+      try {
+        const p = payload && typeof payload === "object" ? payload : {};
+        callback({ screenSessionId: String(p.screenSessionId || "") });
+      } catch {
+        // A subscriber's failure is not main's problem.
+      }
+    };
+    ipcRenderer.on("screen-mode:voice-take", listener);
+    return () => {
+      try {
+        ipcRenderer.removeListener("screen-mode:voice-take", listener);
+      } catch {
+        // Already removed, or the bridge is torn down.
+      }
+    };
+  },
   recordingFinal: (payload) => {
     try {
       const p = payload && typeof payload === "object" ? payload : {};

@@ -132,6 +132,16 @@ import { screenThumbLabel, screensStripNote } from "./screens-strip";
 import { fallbackSourceKey, isCurrentPlayerSource } from "./player-source";
 import { parseRecordingSaveResponse, planRecordingSave, recordingSaveFormEntries } from "./recording-save";
 import {
+  RECORDING_COLLECTIONS,
+  liveRecordingCollection,
+  liveTakeAfterVoiceTakeNotice,
+  liveTakeFromRequest,
+  recordingCollectionFromDraft,
+  recoveryPromoteBody,
+  type LiveRecordingMode,
+  type RecordingCollection,
+} from "./take-collection";
+import {
   PROVIDER_DISPLAY_ORDER,
   isRemoteProvider,
   normalizeProviderSelection,
@@ -419,15 +429,6 @@ interface LoadRecordingsOptions {
 interface OpenRecordingOptions {
   silent?: boolean;
 }
-
-const RECORDING_COLLECTIONS = {
-  live: "live",
-  uploads: "uploads",
-  // Screen-mode takes (drawing + screenshots); the backend keeps the
-  // audio of the newest five.
-  screen: "screen",
-} as const;
-type RecordingCollection = typeof RECORDING_COLLECTIONS[keyof typeof RECORDING_COLLECTIONS];
 
 interface TranscriptSegment {
   start: number;
@@ -809,6 +810,14 @@ declare global {
        */
       onSystemSuspend?: (
         callback: (payload: { reason: string }) => void,
+      ) => (() => void);
+      /**
+       * "The screen session of this take could not start: it is a voice
+       * take." Main told the renderer "screen take" with the press; see
+       * desktop/preload.js. Returns an unsubscribe function.
+       */
+      onScreenVoiceTake?: (
+        callback: (payload: { screenSessionId: string }) => void,
       ) => (() => void);
     };
   }
@@ -5180,10 +5189,7 @@ async function recoverBackendAudioSessions(): Promise<void> {
           ...authHeaders(),
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          ...(archiveDir ? { archive_dir: archiveDir } : {}),
-          recording_collection: RECORDING_COLLECTIONS.live,
-        }),
+        body: JSON.stringify(recoveryPromoteBody(archiveDir)),
       });
       if (!resp.ok) {
         failed += 1;
@@ -5867,7 +5873,7 @@ function buildLiveDraftPayload(recording: boolean): PersistedLiveDraft {
     model: activeLiveSessionSnapshot?.model || getRemoteModelValue(provider),
     language: activeLiveSessionSnapshot?.language || (($("language") as HTMLSelectElement).value || "auto"),
     archive_dir: activeLiveArchiveDir || currentArchiveDirSnapshot(),
-    recording_collection: RECORDING_COLLECTIONS.live,
+    recording_collection: liveRecordingCollection(liveRecordingMode),
   };
 }
 
@@ -5973,7 +5979,7 @@ async function recoverLiveDraftIfAny(): Promise<void> {
       provider: recoveredDraftProvider(draft),
       model: String(draft.model || "-"),
       language: String(draft.language || "auto"),
-      recordingCollection: RECORDING_COLLECTIONS.live,
+      recordingCollection: recordingCollectionFromDraft(draft.recording_collection),
     });
     const recoveredText = transcriptText || sourceText;
     publishRecordingOutput({
@@ -9447,16 +9453,40 @@ let timer: number | null = null;
 let vuIntervalId: ReturnType<typeof setInterval> | null = null;
 let pipelineFailsafeId: ReturnType<typeof setTimeout> | null = null;
 let startAt = 0;
-// What the current take is: an ordinary voice recording, or a screen-mode
-// one (started by its own hotkey; main owns the overlays and screenshots
+// What the current take is (./take-collection): an ordinary voice
+// recording, or a screen-mode one (main owns the overlays and screenshots
 // under ``liveScreenSessionId`` and hands them back at stop).
-type LiveRecordingMode = "voice" | "screen";
 let liveRecordingMode: LiveRecordingMode = "voice";
 let liveScreenSessionId = "";
 
-function liveRecordingCollection(mode: LiveRecordingMode): RecordingCollection {
-  return mode === "screen" ? RECORDING_COLLECTIONS.screen : RECORDING_COLLECTIONS.live;
+// Holds the unsubscribe ``onScreenVoiceTake`` returns, so a second run of
+// the subscription (a Vite HMR re-run of top-level code) retires the first.
+let screenVoiceTakeUnsubscribe: (() => void) | null = null;
+
+/**
+ * S-04: main says this take's screen session could not start (the user
+ * has been told by main). From now on the take is a voice take — its
+ * draft, its save and its stop file it under Live, not Screen Sessions,
+ * and its stop asks main for no session.
+ */
+function subscribeToScreenVoiceTake(): void {
+  try {
+    screenVoiceTakeUnsubscribe?.();
+    screenVoiceTakeUnsubscribe = window.transcriptor?.onScreenVoiceTake?.(({ screenSessionId }) => {
+      const take = liveTakeAfterVoiceTakeNotice(
+        { mode: liveRecordingMode, screenSessionId: liveScreenSessionId },
+        screenSessionId,
+      );
+      if (take.mode === liveRecordingMode) return;
+      console.warn(`[trace screen] session ${screenSessionId} did not start; the take goes on as a voice take`);
+      liveRecordingMode = take.mode;
+      liveScreenSessionId = take.screenSessionId;
+    }) ?? null;
+  } catch (e) {
+    console.debug("screen mode: voice-take bridge unavailable", e);
+  }
 }
+subscribeToScreenVoiceTake();
 
 /**
  * The screen marks of a recording already in the archive, from its
@@ -11159,8 +11189,9 @@ async function startLive(
   // Set the in-flight flag synchronously BEFORE any await.
   if (isBusy || stopTransitionInFlight || startLiveInFlight) return;
   startLiveInFlight = true;
-  liveRecordingMode = request.mode === "screen" && request.screenSessionId ? "screen" : "voice";
-  liveScreenSessionId = liveRecordingMode === "screen" ? String(request.screenSessionId) : "";
+  const take = liveTakeFromRequest(request);
+  liveRecordingMode = take.mode;
+  liveScreenSessionId = take.screenSessionId;
   // The request clock (§4.9). Set before anything can await, so it is
   // the moment the renderer received the toggle, not the moment the
   // microphone answered.
@@ -11302,6 +11333,9 @@ async function startLive(
       // with ``activeLiveSessionSnapshot.diarize`` too (FL-05 / F-006).
       diarize: activeLiveSessionSnapshot.diarize ? "true" : "false",
     });
+    // A screen take's recovery sidecar names its screen session, so a
+    // crash-time promotion adopts the staged screenshots (S-01 / H-01).
+    if (liveScreenSessionId) wsQuery.set("screen_session_id", liveScreenSessionId);
     if (sessionWsMode === "deepgram-stream") {
       wsQuery.set("model", activeLiveSessionSnapshot.model || getRemoteModelValue("deepgram"));
     } else {

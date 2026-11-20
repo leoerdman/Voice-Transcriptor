@@ -1,0 +1,80 @@
+# Fix journal — cross-domain lane "screen-seams" (2026-11-20)
+
+Branch `worktree-agent-ad996ef2a89b4d235`, cut from `main` at 3cc7666. Screen mode's
+cross-process seams (review D1–D3, S-02/S-04, M3, FL-12/S-01) and the coordinator's
+"screen surfaces appear at once" requirement.
+
+Before-evidence method (desktop): a copy of `desktop/` with the HEAD versions of
+`screen-mode-controller.js`, `screen-session-start.js`, `main.js`, `preload.js` and the old
+`SCREEN_MODE_WARNINGS` table (as a stand-in `screen-mode-warnings.js`), running the NEW tests.
+
+## Step 1 · D1, D2, D3, S-02 / DM-31, S-04 / DX-08, FL-12 / S-01 (renderer half)
+
+Files: `desktop/screen-mode-controller.js`, `desktop/screen-mode-warnings.js` (new),
+`desktop/screen-session-start.js`, `desktop/main.js`, `desktop/preload.js`, `desktop/package.json`
+(build.files), `frontend/src/take-collection.ts` (new), `frontend/src/main.tsx`,
+`PROJECT_STRUCTURE.md`; tests `desktop/screen-mode-controller.test.js`,
+`desktop/screen-mode-warnings.test.js` (new), `desktop/screen-session-start.test.js`,
+`desktop/ipc-contract.test.js`, `desktop/screenshot-hotkey-status.test.js`,
+`frontend/tests/take-collection.test.ts` (new).
+
+- **D1** — the controller exports `SCREEN_MODE_WARNING` (start-failed, accessibility,
+  screen-recording, helper, capture-failed) and raises only those constants. The one copy table
+  is `desktop/screen-mode-warnings.js` (keyed by the imported constants + main's own
+  `screenshot-hotkey`); main.js's `SCREEN_MODE_WARNINGS` is gone and `notifyScreenModeWarning`
+  reads `screenModeWarningCopy(kind)`. Copy added for `helper` ("Screen mode stopped drawing")
+  and `capture-failed` ("A screenshot could not be taken"). Test: every exported kind has copy,
+  AND every warning any controller test actually raised has copy (checked in each test's cleanup).
+- **D2** — one owner of the failed-start notification: the controller. Every failed start warns
+  (including `unsupported`, which used to answer silently), and `start()` never rejects (an
+  unexpected throw is a warned FAILED). `toggleRecordingFromShortcut` no longer calls
+  `notifyScreenModeWarning`.
+- **D3** — `start()` answers `{ ok, outcome }` with `SCREEN_START_OUTCOME` STARTED / ENDED /
+  FAILED. ENDED (the take's stop reached the controller first) is not a failure: no warning, no
+  renderer notice. One mechanism for "this take already ended": the controller's ended-id
+  tombstone. Main's `END_ORPHAN` re-ask of the renderer (cb31c13) is removed; the tombstone is fed
+  by every way a take ends — the renderer's `screen-mode:finish` (every stopLive of a screen take
+  calls it) and main's `endScreenModeForLostRenderer`, which now names the id.
+- **S-02 / DM-31** — `screenMode.start()` is called as soon as the renderer confirms the take,
+  before `await frontAtHotkeyPromise` and `await beginRecordingStatusSession()`; its answer is
+  read after them. `endScreenModeForLostRenderer` passes the take's id (`screenTakeId`, kept by
+  main from the start until the take's finish / a non-started outcome / renderer loss), with or
+  without a live session, so a start still on its way is refused.
+- **S-04 / DX-08** — on FAILED main sends `screen-mode:voice-take {screenSessionId}` to the main
+  window; preload `onScreenVoiceTake` (fixed channel, fresh payload, unsubscribe returned); the
+  renderer (`subscribeToScreenVoiceTake`, HMR-safe like `subscribeToSystemSuspend`) demotes the
+  take via `liveTakeAfterVoiceTakeNotice` (only the take it names). The channel is main→renderer
+  only, so there is no renderer sender for `isFromMainWindow` to check; main sends only to
+  `win.webContents`. Channel added to `ipc-contract.test.js`.
+- **FL-12 / S-01** — `buildLiveDraftPayload` sends `liveRecordingCollection(liveRecordingMode)`;
+  `recoverLiveDraftIfAny` files the draft by `recordingCollectionFromDraft(draft.recording_collection)`;
+  `recoverBackendAudioSessions` sends `recoveryPromoteBody(archiveDir)` (no collection — the sidecar
+  decides); the `/ws/transcribe` query carries `screen_session_id` for a screen take.
+  `RECORDING_COLLECTIONS` / `liveRecordingCollection` moved from main.tsx to `take-collection.ts`.
+- Backend half verified by reading: `ws_transcribe` passes `qp.get("screen_session_id")` to
+  `_open_live_recovery` (main.py ~4510), which stores only a valid id; `_promote_live_recovery`
+  adopts `meta["screen_session_id"]` and defaults the collection to the sidecar's. Covered by
+  `test_screen_sessions.py` `CrashedScreenTakeRecoveryTests` (sidecar stores the id, rejects an
+  invalid one, promotion adopts the screenshots into Screen Sessions, the route without a
+  collection lets the sidecar decide). No backend test added; backend untouched.
+
+Check: `node --test desktop/screen-mode-controller.test.js desktop/screen-mode-warnings.test.js desktop/screen-session-start.test.js desktop/ipc-contract.test.js`
+
+Before (old code, new tests): `tests 37, pass 18, fail 19`, among them
+`the controller raised "helper", which has no copy for the user`,
+`the controller raised "capture-failed", which has no copy for the user`,
+`a stop that reaches the controller before its start wins` (ENDED shape, no warning),
+`a start on a machine without the helper fails, warned` (old: silent `unsupported`),
+`a start that throws on the way resolves FAILED and warns, it never rejects` (old: rejected),
+`a take that ended before its session started is ENDED, not a failure (D3)`,
+`main does not notify a failed start itself…`, `main starts the session before the awaits…`,
+`a lost renderer retires its take by id…`, `screen-mode:voice-take is sent by main…`.
+After: all pass. Frontend before: HEAD main.tsx sent `RECORDING_COLLECTIONS.live` at three
+draft/promote sites (5185, 5870, 5976) and no `screen_session_id` — the wiring cases of
+`take-collection.test.ts` fail on it.
+
+Full suites after step 1: desktop `tests 437 pass 437`; `node --check` main/preload OK;
+frontend typecheck OK, lint OK, vitest `48 files, 609 tests passed`, build OK.
+
+Not verified live: the order change in `toggleRecordingFromShortcut` and the voice-take notice
+(need the packaged app on macOS).

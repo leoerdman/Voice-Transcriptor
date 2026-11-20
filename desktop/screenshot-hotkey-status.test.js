@@ -31,7 +31,7 @@ test("main.js probes the key at registration and reports a failed bind during a 
   assert.match(topLevelFunctionSource("probeScreenShotHotkey"), /globalShortcut\.unregister\(canonical\)/);
   const bind = topLevelFunctionSource("bindScreenShotHotkey");
   assert.match(bind, /publishScreenShotHotkeyStatus\(\)/);
-  assert.match(bind, /notifyScreenModeWarning\("screenshot-hotkey"\)/);
+  assert.match(bind, /notifyScreenModeWarning\(SCREEN_SHOT_HOTKEY_WARNING\)/);
   assert.match(mainSource, /screenShot: screenShotSlotStatus\(\{/);
   assert.doesNotMatch(mainSource, /active: "",\s*error: screenSupported \? "" : "unsupported"/, "no hard-coded slot status");
 });

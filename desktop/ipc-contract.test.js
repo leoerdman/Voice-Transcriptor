@@ -194,3 +194,18 @@ test("screen-mode:finish is invoked by the renderer bridge and handled by main",
   // Only the main window may end a session.
   assert.match(mainSource, /"screen-mode:finish", async \(event, payload\) => \{\n    if \(!win \|\| win\.isDestroyed\(\) \|\| event\.sender !== win\.webContents\)/);
 });
+
+test("screen-mode:voice-take is sent by main and subscribed to by the renderer bridge (S-04)", () => {
+  // A screen take whose session could not start is a voice take: main
+  // tells the renderer so, or the take is filed under Screen Sessions
+  // with no screenshots. Main → main window only: there is no renderer →
+  // main traffic on this channel, so no sender for main to check.
+  assert.match(mainSource, /win\.webContents\.send\("screen-mode:voice-take"/);
+  assert.match(preloadSource, /ipcRenderer\.on\("screen-mode:voice-take"/);
+  assert.match(preloadSource, /onScreenVoiceTake:/, "the bridge is what the renderer actually calls");
+  assert.match(
+    preloadSource,
+    /ipcRenderer\.removeListener\("screen-mode:voice-take"/,
+    "the bridge must hand back a way to unsubscribe",
+  );
+});

@@ -1,43 +1,62 @@
 "use strict";
 
-// DM-31 (Ultra-Audit 2026-11-20), main-side half of S-02 / DX-03: a screen
-// session that finishes starting after its take already ended is ended at
-// once, and a failed start is told to the user.
+// What main does with screenMode.start()'s answer (DM-31, S-02 / S-04,
+// review D2 / D3): a live session is kept; a take whose stop got there
+// first is a normal outcome, not a failure; a failed start makes the take
+// a voice take — and main never notifies on its own (the controller owns
+// that notification).
 
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 
+const { SCREEN_START_OUTCOME } = require("./screen-mode-controller");
 const { AFTER_SCREEN_START, decideAfterScreenStart } = require("./screen-session-start");
 const { topLevelFunctionSource } = require("./main-source");
 
-test("a take that ended while its session was starting leaves an orphan to end", () => {
+test("a started session is kept", () => {
   assert.equal(
-    decideAfterScreenStart({ started: { ok: true }, renderer: { recording: false, recordingId: 0 }, recordingId: 4 }),
-    AFTER_SCREEN_START.END_ORPHAN,
-  );
-  assert.equal(
-    decideAfterScreenStart({ started: { ok: true }, renderer: { recording: true, recordingId: 5 }, recordingId: 4 }),
-    AFTER_SCREEN_START.END_ORPHAN,
-    "a different take is recording now",
-  );
-});
-
-test("the live take keeps its session; a silent renderer is not evidence of a stop", () => {
-  assert.equal(
-    decideAfterScreenStart({ started: { ok: true }, renderer: { recording: true, recordingId: 4 }, recordingId: 4 }),
+    decideAfterScreenStart({ ok: true, outcome: SCREEN_START_OUTCOME.STARTED, id: "x" }),
     AFTER_SCREEN_START.KEEP,
   );
-  assert.equal(decideAfterScreenStart({ started: { ok: true }, renderer: null, recordingId: 4 }), AFTER_SCREEN_START.KEEP);
 });
 
-test("a failed start is reported", () => {
-  assert.equal(decideAfterScreenStart({ started: { ok: false, error: "x" }, renderer: null, recordingId: 4 }), AFTER_SCREEN_START.FAILED);
-  assert.equal(decideAfterScreenStart({ started: null, renderer: null, recordingId: 4 }), AFTER_SCREEN_START.FAILED);
+test("a take that ended before its session started is ENDED, not a failure (D3)", () => {
+  assert.equal(decideAfterScreenStart({ ok: false, outcome: SCREEN_START_OUTCOME.ENDED }), AFTER_SCREEN_START.ENDED);
 });
 
-test("main.js reconciles the session after start and surfaces a failed start", () => {
+test("a failed start makes the take a voice take (S-04)", () => {
+  assert.equal(
+    decideAfterScreenStart({ ok: false, outcome: SCREEN_START_OUTCOME.FAILED, error: "helper exited" }),
+    AFTER_SCREEN_START.VOICE_TAKE,
+  );
+});
+
+test("an answer that is not a start is never mistaken for a live session", () => {
+  for (const started of [null, undefined, {}, { ok: true }, { outcome: SCREEN_START_OUTCOME.STARTED }, "started"]) {
+    assert.equal(decideAfterScreenStart(started), AFTER_SCREEN_START.VOICE_TAKE, JSON.stringify(started));
+  }
+});
+
+// Wiring in main.js (a live Electron is needed to drive it, so the source
+// is read — only for which names are called, and in which order).
+test("main starts the session before the awaits that used to delay it, and reads the answer after (S-02)", () => {
   const fn = topLevelFunctionSource("toggleRecordingFromShortcut");
-  assert.match(fn, /decideAfterScreenStart\(\{/);
-  assert.match(fn, /AFTER_SCREEN_START\.END_ORPHAN && screenMode\.isActive\(\)/);
-  assert.match(fn, /notifyScreenModeWarning\("start-failed"\)/);
+  const startAt = fn.indexOf("screenMode.start(startDetail.screenSessionId)");
+  assert.ok(startAt > 0, "toggleRecordingFromShortcut starts the screen session");
+  assert.ok(startAt < fn.indexOf("await frontAtHotkeyPromise"), "start() waits behind the frontmost-app lookup");
+  assert.ok(startAt < fn.indexOf("await beginRecordingStatusSession()"), "start() waits behind the capsule session");
+  assert.match(fn, /decideAfterScreenStart\(started\)/);
+  assert.match(fn, /AFTER_SCREEN_START\.VOICE_TAKE\) notifyRendererVoiceTake\(/);
+});
+
+test("main does not notify a failed start itself, nor re-ask the renderer about an ended take (D2 / D3)", () => {
+  const fn = topLevelFunctionSource("toggleRecordingFromShortcut");
+  assert.doesNotMatch(fn, /notifyScreenModeWarning\(/);
+  assert.doesNotMatch(fn, /END_ORPHAN/);
+});
+
+test("a lost renderer retires its take by id, live session or not (DM-31)", () => {
+  const fn = topLevelFunctionSource("endScreenModeForLostRenderer");
+  assert.match(fn, /screenMode\.finish\(\{ id, discard: false \}\)/);
+  assert.doesNotMatch(fn, /isActive\(\)/, "a session still starting is not active yet, and must be retired too");
 });

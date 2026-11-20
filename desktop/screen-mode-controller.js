@@ -67,6 +67,43 @@ const PALETTE = Object.freeze({ dot: 18, gap: 8, padX: 10, height: 30, marginAbo
 const HELPER_READY_TIMEOUT_MS = 5000;
 const PNG_DATA_URL_PREFIX = "data:image/png;base64,";
 
+/**
+ * Every warning the controller raises through `deps.onWarning`. Main shows
+ * each one to the user from ONE copy table keyed by these values
+ * (./screen-mode-warnings.js), whose test requires copy for every kind
+ * here — a kind raised with no copy was a warning nobody saw (D1).
+ */
+const SCREEN_MODE_WARNING = Object.freeze({
+  /** A start failed for a reason other than the two below. */
+  START_FAILED: "start-failed",
+  /** The helper exited 2: no Accessibility grant, so nothing can draw. */
+  ACCESSIBILITY: "accessibility",
+  /** Screen Recording is not granted: captures would show the wallpaper. */
+  SCREEN_RECORDING: "screen-recording",
+  /** The mouse helper died mid-take: nothing draws from then on. */
+  HELPER: "helper",
+  /** A screenshot could not be taken; its strokes stay for the next one. */
+  CAPTURE_FAILED: "capture-failed",
+});
+
+/**
+ * What `start(id)` answers, as `{ ok, outcome, id?, error? }`. `ok` is
+ * true exactly for STARTED.
+ *
+ *   STARTED  the session is live (overlays up, helper tapping).
+ *   ENDED    the take already ended — its stop reached the controller
+ *            first. A normal outcome of a quick stop, not a failure: no
+ *            warning, nothing to tell the renderer (D3).
+ *   FAILED   the start failed; the controller has already warned the
+ *            user (it is the one owner of that notification — D2) and the
+ *            take goes on as a voice take.
+ */
+const SCREEN_START_OUTCOME = Object.freeze({
+  STARTED: "started",
+  ENDED: "ended",
+  FAILED: "failed",
+});
+
 function overlayHtml() {
   const border = SCREEN_MODE.borderWidth;
   return `<!doctype html>
@@ -609,21 +646,21 @@ function createScreenModeController(deps) {
       }
       if (helper === child) {
         helper = null;
-        deps.onWarning("helper");
+        deps.onWarning(SCREEN_MODE_WARNING.HELPER);
       }
     });
     child.on("exit", (code, signal) => {
       log(`[screen-mode] helper exited code=${code} signal=${signal || ""}`);
       if (helperStart && helperStart.child === child) {
         const error = new Error(`helper exited before it was ready (code=${code} signal=${signal || ""})`);
-        if (code === 2) error.warning = "accessibility";
+        if (code === 2) error.warning = SCREEN_MODE_WARNING.ACCESSIBILITY;
         helperStart.settle(error);
         return;
       }
       // stopHelper() lets go of the child before it exits: that exit is ours.
       if (helper !== child) return;
       helper = null;
-      deps.onWarning("helper");
+      deps.onWarning(SCREEN_MODE_WARNING.HELPER);
     });
     return started;
   }
@@ -757,7 +794,7 @@ function createScreenModeController(deps) {
       // No screenshot is claimed for a display that was not captured: its
       // strokes stay pending and on the screen for the next shot.
       log(`[screen-mode] capture failed (${reason}): ${failures.join("; ")}`);
-      deps.onWarning("capture-failed");
+      deps.onWarning(SCREEN_MODE_WARNING.CAPTURE_FAILED);
     }
     if (!files.length) return null;
     const taken = pending.filter((s) => captured.has(s.displayId)).map((s) => s.id);
@@ -784,15 +821,22 @@ function createScreenModeController(deps) {
   }
 
   // ── lifecycle ─────────────────────────────────────────────────────────
+  function startFailed(id, error, warning = SCREEN_MODE_WARNING.START_FAILED) {
+    log(`[screen-mode] start ${id} failed: ${error}`);
+    deps.onWarning(warning);
+    return { ok: false, outcome: SCREEN_START_OUTCOME.FAILED, error };
+  }
+
   async function startNow(id) {
     if (endedIds.has(id)) {
       // Its stop got here first (the renderer finished the take while main
       // was still on its way to start it): nobody will ever finish it.
+      // This is the one place "this take already ended" is decided.
       log(`[screen-mode] start ${id} refused: that take already ended`);
-      return { ok: false, error: "ended" };
+      return { ok: false, outcome: SCREEN_START_OUTCOME.ENDED };
     }
     if (session) {
-      if (session.id === id) return { ok: true, id };
+      if (session.id === id) return { ok: true, outcome: SCREEN_START_OUTCOME.STARTED, id };
       // A new take while an old session is still up: the old take's
       // recording is over (main starts a session only for a confirmed new
       // recording), so its session is closed — screenshots kept staged —
@@ -800,12 +844,12 @@ function createScreenModeController(deps) {
       log(`[screen-mode] start ${id} while ${session.id} is live; finishing ${session.id}`);
       await finishNow({ id: session.id });
     }
-    if (!isSupported()) return { ok: false, error: "unsupported" };
+    if (!isSupported()) return startFailed(id, "unsupported");
     const dir = path.join(deps.stagingRoot(), id);
-    fs.mkdirSync(dir, { recursive: true });
-    session = createScreenSession({ id, dir });
-    lastManifest = null;
     try {
+      fs.mkdirSync(dir, { recursive: true });
+      session = createScreenSession({ id, dir });
+      lastManifest = null;
       watchDisplays();
       await startHelper();
       const results = await Promise.allSettled(screen.getAllDisplays().map((d) => createOverlay(d)));
@@ -816,11 +860,9 @@ function createScreenModeController(deps) {
         throw new Error("no overlay could be shown");
       }
     } catch (e) {
-      log(`[screen-mode] start ${id} failed: ${e?.message || e}`);
       teardown();
-      fs.rmSync(dir, { recursive: true, force: true });
-      deps.onWarning(e?.warning || "start-failed");
-      return { ok: false, error: e?.message || String(e) };
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { }
+      return startFailed(id, e?.message || String(e), e?.warning || SCREEN_MODE_WARNING.START_FAILED);
     }
     // Without a palette the take still draws, in the default colour.
     await createPalette().catch((e) => log(`[screen-mode] palette failed: ${e?.message || e}`));
@@ -835,12 +877,12 @@ function createScreenModeController(deps) {
     const captureAccess = typeof deps.screenCaptureAccess === "function" ? deps.screenCaptureAccess() : "granted";
     if (captureAccess !== "granted") {
       log(`[screen-mode] screen recording access=${captureAccess || "unknown"}`);
-      deps.onWarning("screen-recording");
+      deps.onWarning(SCREEN_MODE_WARNING.SCREEN_RECORDING);
     }
     refreshLayout();
     writeEvents();
     log(`[screen-mode] started ${id} displays=${overlays.size}`);
-    return { ok: true, id };
+    return { ok: true, outcome: SCREEN_START_OUTCOME.STARTED, id };
   }
 
   function teardown() {
@@ -890,11 +932,27 @@ function createScreenModeController(deps) {
     return { ok: true, manifest };
   }
 
-  const start = (id) => serialize(() => startNow(id));
+  // Never rejects: whatever goes wrong on the way is a FAILED start the
+  // user has been warned about, so main has one answer to read.
+  const start = (id) => serialize(async () => {
+    try {
+      return await startNow(id);
+    } catch (e) {
+      teardown();
+      return startFailed(id, e?.message || String(e));
+    }
+  });
   const takeShot = (reason) => serialize(() => takeShotNow(reason));
   const finish = (opts) => serialize(() => finishNow(opts));
 
   return { isSupported, isActive, start, takeShot, finish, teardown, refreshLayout };
 }
 
-module.exports = { createScreenModeController, overlayHtml, paletteHtml, paletteSize };
+module.exports = {
+  SCREEN_MODE_WARNING,
+  SCREEN_START_OUTCOME,
+  createScreenModeController,
+  overlayHtml,
+  paletteHtml,
+  paletteSize,
+};
