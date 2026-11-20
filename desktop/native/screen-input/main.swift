@@ -16,6 +16,8 @@
 //
 // Protocol — one JSON object per line.
 //   stdin : {"cmd":"controls","rects":[[x,y,w,h],...]}  our controls, global points
+//           {"cmd":"front-window","id":n,"exclude":[pid,...]}  where is the front
+//                                                      window (FrontWindow.swift)?
 //           {"cmd":"quit"}
 //   stdout: {"t":"ready"}
 //           {"t":"start","x":..,"y":..} {"t":"move","x":..,"y":..} {"t":"end","x":..,"y":..}
@@ -31,6 +33,9 @@
 //                                                      off; it is back on and
 //                                                      the press it cut is
 //                                                      abandoned (see below)
+//           {"t":"front-window","id":n,"x":..,"y":..,"w":..,"h":..}  the answer to
+//                                                      that request; no x/y/w/h
+//                                                      when there is no front window
 //           {"t":"error","code":"tap-unavailable"}            then exit 2
 //
 // Output is written from a serial queue, never from the tap callback
@@ -211,7 +216,22 @@ guard let tap = CGEvent.tapCreate(
 }
 state.tap = tap
 
-// stdin reader: our controls' rectangles and quit. EOF (the app died or
+// The answer to a front-window request, from the stdin thread (the window
+// list is safe to read from any thread; the tap callback never waits on it).
+func answerFrontWindow(id: Int, exclude: [Int]) {
+  var excluded = Set(exclude)
+  excluded.insert(Int(getpid()))
+  var answer: [String: Any] = ["t": "front-window", "id": id]
+  if let r = pickFrontWindow(onScreenWindows(), excluding: excluded, minSide: 40) {
+    answer["x"] = Double(r.origin.x)
+    answer["y"] = Double(r.origin.y)
+    answer["w"] = Double(r.size.width)
+    answer["h"] = Double(r.size.height)
+  }
+  emit(answer)
+}
+
+// stdin reader: our controls' rectangles, front-window requests and quit. EOF (the app died or
 // closed the pipe) is a quit too — the tap must never outlive its owner,
 // or the user's mouse would stay captured.
 Thread.detachNewThread {
@@ -220,6 +240,12 @@ Thread.detachNewThread {
           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           let cmd = obj["cmd"] as? String else { continue }
     if cmd == "quit" { break }
+    if cmd == "front-window" {
+      let id = (obj["id"] as? NSNumber)?.intValue ?? 0
+      let exclude = (obj["exclude"] as? [NSNumber])?.map { $0.intValue } ?? []
+      answerFrontWindow(id: id, exclude: exclude)
+      continue
+    }
     if cmd == "controls", let rects = obj["rects"] as? [[Double]] {
       let parsed = rects.compactMap { r -> CGRect? in
         r.count == 4 ? CGRect(x: r[0], y: r[1], width: r[2], height: r[3]) : nil

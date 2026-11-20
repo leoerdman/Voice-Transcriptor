@@ -6,6 +6,8 @@
 //     press sequences a mouse and a trackpad produce — including the
 //     trackpad double-tap-and-drag, which must draw, and a tap macOS
 //     switches off in the middle of a press.
+//   * Which window a screenshot captures (FrontWindow.swift), run through
+//     the window lists macOS hands it.
 //   * The whole helper (main.swift: the event tap and its protocol),
 //     type-checked with the rule, so a compile error or a CoreGraphics API
 //     drift fails here instead of on a release day in build-native.sh.
@@ -28,6 +30,7 @@ const skip = swiftc.status !== 0 ? "swiftc is not available (macOS + Command Lin
 const native = path.join(__dirname, "native");
 const classifierSource = path.join(native, "screen-input", "PressClassifier.swift");
 const helperSource = path.join(native, "screen-input", "main.swift");
+const frontWindowSource = path.join(native, "screen-input", "FrontWindow.swift");
 
 // Every case the Swift suite must run, by name. A case that disappears or
 // stops printing fails here; a new case is added to this list on purpose.
@@ -78,7 +81,31 @@ test("PressClassifier: clicks pass, drags draw, double-tap-drag draws, controls 
   assert.deepEqual(ran, CASES);
 });
 
+const FRONT_WINDOW_CASES = [
+  "the frontmost ordinary window is the front window",
+  "screen mode's own overlay, palette and capsule are never it",
+  "Transcriptor's own ordinary window is skipped too",
+  "the menu bar, the Dock and panels are not windows to capture",
+  "an invisible or tiny window is passed over",
+  "no window at all is no front window",
+];
+
+test("FrontWindow: the shot's window is the frontmost ordinary window that is not ours", { skip }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "front-window-test-"));
+  const bin = path.join(dir, "front-window-tests");
+  const build = spawnSync(
+    "xcrun",
+    ["swiftc", "-o", bin, frontWindowSource, path.join(native, "tests", "front-window", "main.swift")],
+    { encoding: "utf8" },
+  );
+  assert.equal(build.status, 0, build.stderr);
+  const run = spawnSync(bin, [], { encoding: "utf8" });
+  fs.rmSync(dir, { recursive: true, force: true });
+  assert.equal(run.status, 0, run.stderr);
+  assert.deepEqual(run.stdout.trim().split("\n").map((line) => line.replace(/^ok /, "")), FRONT_WINDOW_CASES);
+});
+
 test("the helper (event tap + protocol) compiles with the rule it ships", { skip }, () => {
-  const check = spawnSync("xcrun", ["swiftc", "-typecheck", classifierSource, helperSource], { encoding: "utf8" });
+  const check = spawnSync("xcrun", ["swiftc", "-typecheck", classifierSource, frontWindowSource, helperSource], { encoding: "utf8" });
   assert.equal(check.status, 0, check.stderr);
 });

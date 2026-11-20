@@ -1,5 +1,5 @@
 {
-  "_comment": "Screen mode's cross-process contract. The desktop shell (desktop/screen-mode.js) names sessions and screenshots and writes events.json; the backend (backend/screen_sessions.py) adopts, serves, keeps and deletes them; the renderer (frontend/src/screen-annotations.ts) reads the manifest. Each side's suite checks its constants against this file, so a rename on one side fails the build instead of silently orphaning screenshots.",
+  "_comment": "Screen mode's cross-process contract. The desktop shell (desktop/screen-mode.js) names sessions and images and writes events.json; the backend (backend/screen_sessions.py) adopts, serves, keeps and deletes them; the renderer (frontend/src/screen-annotations.ts) reads the manifest. Each side's suite checks its constants against this file, so a rename on one side fails the build instead of silently orphaning screenshots.",
   "stagingDirName": "screen-sessions",
   "screensDirSuffix": ".screens",
   "eventsFileName": "events.json",
@@ -10,8 +10,16 @@
     "shot-01.png",
     "shot-12-display2.png"
   ],
+  "_derivedComment": "The agent's cheap copies, written beside the originals: a shot's downscaled JPEG (`shot-NN-preview.jpg`, of its first image) and one close-up JPEG per stroke (`shot-NN-n<number>.jpg`, the number drawn beside the stroke). They live, move and are deleted with the screens folder and are served like the originals, but are not screenshots: the history lists only names matching screenshotNamePattern.",
+  "derivedImageNamePattern": "^shot-\\d{2,}-(preview|n\\d+)\\.jpg$",
+  "exampleDerivedImageNames": [
+    "shot-01-preview.jpg",
+    "shot-01-n1.jpg",
+    "shot-12-n10.jpg"
+  ],
+  "_manifestComment": "version 2. A stroke: `n` is its number on the picture (1, 2, 3… in each shot); `tool` rect|pen; `shape` rect|loop|line|curve|dot; `box` (x, y, w, h) and the centre `xPct`/`yPct` are whole percent (0..100) of the captured area (the shot's `area`: the front window, or the display), the stroke cut to that area; `crop` is the absolute path of its close-up and is absent when none was made. A shot: `files` are the original PNGs; `preview` is the absolute path of the downscaled copy of files[0], absent when none was made; `area` is window|display. Version 1 manifests (no n/tool/shape/box/crop/preview/area; xPct/yPct of the whole display) are still read.",
   "manifest": {
-    "version": 1,
+    "version": 2,
     "id": "screen-20261120-100000-000",
     "dir": "/data/screen-sessions/screen-20261120-100000-000",
     "startedAt": 1795165500000,
@@ -22,8 +30,13 @@
         "endedAt": 1795165513000,
         "color": "#ff3b30",
         "shot": 1,
+        "n": 1,
+        "tool": "rect",
+        "shape": "rect",
+        "box": { "x": 72, "y": 8, "w": 20, "h": 12 },
         "xPct": 82,
-        "yPct": 14
+        "yPct": 14,
+        "crop": "/data/screen-sessions/screen-20261120-100000-000/shot-01-n1.jpg"
       },
       {
         "type": "shot",
@@ -32,6 +45,27 @@
         "files": [
           "/data/screen-sessions/screen-20261120-100000-000/shot-01.png"
         ],
+        "preview": "/data/screen-sessions/screen-20261120-100000-000/shot-01-preview.jpg",
+        "area": "window",
+        "strokes": 1,
+        "reason": "capsule"
+      }
+    ],
+    "endedAt": 1795165530000
+  },
+  "manifestV1": {
+    "_comment": "What 1.6.x wrote; still read everywhere a manifest is read.",
+    "version": 1,
+    "id": "screen-20261120-100000-000",
+    "dir": "/data/screen-sessions/screen-20261120-100000-000",
+    "startedAt": 1795165500000,
+    "events": [
+      { "type": "stroke", "at": 1795165512400, "endedAt": 1795165513000, "color": "#ff3b30", "shot": 1, "xPct": 82, "yPct": 14 },
+      {
+        "type": "shot",
+        "at": 1795165515000,
+        "shot": 1,
+        "files": ["/data/screen-sessions/screen-20261120-100000-000/shot-01.png"],
         "strokes": 1,
         "reason": "capsule"
       }

@@ -9,7 +9,8 @@
  *     screen and a canvas the strokes are drawn on. The overlays never
  *     receive the mouse (`setIgnoreMouseEvents(true)`): clicks, scrolls and
  *     hovers reach the apps underneath as if the overlay were not there;
- *   * the colour palette — a small floating pill above the capsule;
+ *   * the tool palette — a small floating pill above the capsule: the
+ *     rectangle (every take starts with it) and the pen, then the colours;
  *   * the native mouse helper (`runtime/bin/screen-input`, source
  *     desktop/native/screen-input/) — a CGEventTap that passes a
  *     plain click through and turns a press-and-drag into a stroke;
@@ -28,11 +29,16 @@
  * The rules — session record, stroke positions, manifest — are
  * ./screen-mode.js. This module is the I/O around them.
  *
- * Screenshots: `screencapture -x -R` of each display that has strokes (or
- * the display under the cursor when none does). The overlays, the palette
- * and the capsule are content-protected while screen mode runs, so the
- * capture is the screen itself; the strokes are then painted onto it at
- * the image's own pixel scale by the overlay that drew them. Which strokes
+ * Screenshots: `screencapture -x -R` of the front window of the front app
+ * (asked of the helper when the shot begins) when every stroke touches
+ * it — no menu bar, no Dock — or else of each display that has strokes
+ * (or the display under the cursor when none does); ./screen-mode.js
+ * (planShot) decides which. The overlays, the palette and the capsule are
+ * content-protected while screen mode runs, so the capture is the screen
+ * itself; the strokes and their numbers are then painted onto it at the
+ * image's own pixel scale by the overlay that drew them, and the agent's
+ * cheap copies (a downscaled preview, a close-up per stroke) are cut from
+ * that picture. Which strokes
  * a shot holds is decided once, when the capture begins: a stroke that
  * finishes while the images are being made is not in them, stays on the
  * screen and belongs to the next shot. A display that could not be
@@ -55,17 +61,24 @@ const {
   SCREEN_MODE,
   beginStroke,
   createScreenSession,
+  cropFileName,
   endStroke,
   extendStroke,
+  fitWithin,
+  numberBadgeCenter,
   pendingStrokes,
+  planShot,
+  previewFileName,
   recordShot,
   screenSessionManifest,
   shotFileName,
+  strokeCropRect,
+  unshotStrokes,
 } = require("./screen-mode");
 const { PRESENTER_STATE, SCREEN_SURFACE, createSurfacePresenter } = require("./screen-surfaces");
 
 const OVERLAY_PARTITION = "screen-mode-overlay";
-const PALETTE = Object.freeze({ dot: 18, gap: 8, padX: 10, height: 30, marginAboveCapsule: 8 });
+const PALETTE = Object.freeze({ dot: 18, tool: 22, divider: 1, gap: 8, padX: 10, height: 30, marginAboveCapsule: 8 });
 
 /**
  * Screen mode's stacking order, on macOS's "screen-saver" window level:
@@ -112,6 +125,10 @@ const HELPER_READY_TIMEOUT_MS = 5000;
 // or palette not ready by then is left out of the picture.
 const SURFACES_READY_TIMEOUT_MS = 3000;
 const PNG_DATA_URL_PREFIX = "data:image/png;base64,";
+const JPEG_DATA_URL_PREFIX = "data:image/jpeg;base64,";
+// The helper reads the window list in a few milliseconds; a shot does not
+// wait longer than this for it before falling back to the display.
+const FRONT_WINDOW_TIMEOUT_MS = 400;
 
 /**
  * Every warning the controller raises through `deps.onWarning`. Main shows
@@ -152,6 +169,7 @@ const SCREEN_START_OUTCOME = Object.freeze({
 
 function overlayHtml() {
   const border = SCREEN_MODE.borderWidth;
+  const badge = SCREEN_MODE.badge;
   return `<!doctype html>
 <html><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
@@ -167,6 +185,15 @@ function overlayHtml() {
   const cv = document.getElementById("cv");
   const ctx = cv.getContext("2d");
   const LINE = ${SCREEN_MODE.strokeWidth};
+  const BADGE_R = ${badge.radius};
+  // Clear of the stroke's line: the gap plus half the line's width.
+  const BADGE_GAP = ${badge.gap + SCREEN_MODE.strokeWidth / 2};
+  const BADGE_FONT_PX = ${Number(/(\d+)px/.exec(badge.font)[1])};
+  const BADGE_FONT = ${JSON.stringify(badge.font.replace(/\d+px/, "{px}px"))};
+  // One rule for where a number goes and how big a copy is, shared with
+  // desktop/screen-mode.js (embedded from there, not retyped).
+  const numberBadgeCenter = ${numberBadgeCenter.toString()};
+  const fitWithin = ${fitWithin.toString()};
   let origin = { x: 0, y: 0 };
   const strokes = new Map();
   function resize() {
@@ -176,8 +203,13 @@ function overlayHtml() {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     redraw();
   }
-  function drawStroke(c, s, scale) {
+  // Points are relative to this display; (ox, oy) is the corner of the
+  // area being painted (0, 0 on the screen, the captured area's corner in
+  // an image) and \`scale\` its pixels per point.
+  function drawStroke(c, s, scale, ox, oy) {
     if (!s.points.length) return;
+    const X = (p) => (p[0] - ox) * scale;
+    const Y = (p) => (p[1] - oy) * scale;
     c.save();
     c.strokeStyle = s.color;
     c.fillStyle = s.color;
@@ -186,34 +218,82 @@ function overlayHtml() {
     c.lineJoin = "round";
     c.beginPath();
     const p0 = s.points[0];
-    c.moveTo(p0[0] * scale, p0[1] * scale);
-    if (s.points.length === 1) {
-      c.arc(p0[0] * scale, p0[1] * scale, LINE * scale / 2, 0, Math.PI * 2);
+    const last = s.points[s.points.length - 1];
+    if (s.tool === "rect") {
+      c.moveTo(X(p0), Y(p0));
+      c.lineTo(X(last), Y(p0));
+      c.lineTo(X(last), Y(last));
+      c.lineTo(X(p0), Y(last));
+      c.closePath();
+      c.stroke();
+    } else if (s.points.length === 1) {
+      c.moveTo(X(p0), Y(p0));
+      c.arc(X(p0), Y(p0), LINE * scale / 2, 0, Math.PI * 2);
       c.fill();
     } else {
+      c.moveTo(X(p0), Y(p0));
       for (let i = 1; i < s.points.length - 1; i += 1) {
         const a = s.points[i], b = s.points[i + 1];
-        c.quadraticCurveTo(a[0] * scale, a[1] * scale, (a[0] + b[0]) / 2 * scale, (a[1] + b[1]) / 2 * scale);
+        c.quadraticCurveTo(X(a), Y(a), X([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]), Y([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]));
       }
-      const last = s.points[s.points.length - 1];
-      c.lineTo(last[0] * scale, last[1] * scale);
+      c.lineTo(X(last), Y(last));
       c.stroke();
     }
     c.restore();
   }
+  // A light colour (the white or the yellow of the palette) takes a dark
+  // digit: a white one on it could not be read.
+  function digitColor(hex) {
+    const v = parseInt(String(hex).slice(1), 16);
+    const lum = (0.2126 * ((v >> 16) & 255) + 0.7152 * ((v >> 8) & 255) + 0.0722 * (v & 255)) / 255;
+    return lum > 0.6 ? "#111111" : "#ffffff";
+  }
+  // The stroke's number in a circle of its colour, placed inside \`view\`
+  // (display points) by the shared rule.
+  function drawBadge(c, s, scale, view, ox, oy) {
+    if (!s.points.length || !s.n) return;
+    const at = numberBadgeCenter(s.tool, s.points, view, BADGE_R, BADGE_GAP);
+    const x = (at.x - ox) * scale;
+    const y = (at.y - oy) * scale;
+    c.save();
+    c.beginPath();
+    c.arc(x, y, BADGE_R * scale, 0, Math.PI * 2);
+    c.fillStyle = s.color;
+    c.fill();
+    c.lineWidth = scale;
+    c.strokeStyle = "rgba(0,0,0,0.35)";
+    c.stroke();
+    c.fillStyle = digitColor(s.color);
+    c.font = BADGE_FONT.replace("{px}", String(BADGE_FONT_PX * scale));
+    c.textAlign = "center";
+    c.textBaseline = "middle";
+    c.fillText(String(s.n), x, y + 0.5 * scale);
+    c.restore();
+  }
   function redraw() {
     ctx.clearRect(0, 0, innerWidth, innerHeight);
-    for (const s of strokes.values()) drawStroke(ctx, s, 1);
+    const view = { x: 0, y: 0, width: innerWidth, height: innerHeight };
+    for (const s of strokes.values()) drawStroke(ctx, s, 1, 0, 0);
+    for (const s of strokes.values()) drawBadge(ctx, s, 1, view, 0, 0);
   }
   window.__setOrigin = (x, y) => { origin = { x, y }; return true; };
-  // ops: ["b", id, color, gx, gy] begin, ["m", id, gx, gy] move. Points
-  // are kept relative to the display they were drawn on, as it was then.
+  // ops: ["b", id, color, gx, gy, tool, n] begin, ["m", id, gx, gy] move,
+  // ["n", id, n] the stroke's number changed. Points are kept relative to
+  // the display they were drawn on, as it was then. A rectangle is its
+  // two corners: a move replaces the second.
   window.__apply = (ops) => {
     for (const op of ops) {
-      if (op[0] === "b") strokes.set(op[1], { color: op[2], points: [[op[3] - origin.x, op[4] - origin.y]] });
-      else if (op[0] === "m") {
+      if (op[0] === "b") {
+        strokes.set(op[1], { color: op[2], tool: op[5], n: op[6], points: [[op[3] - origin.x, op[4] - origin.y]] });
+      } else if (op[0] === "m") {
         const s = strokes.get(op[1]);
-        if (s) s.points.push([op[2] - origin.x, op[3] - origin.y]);
+        if (!s) continue;
+        const p = [op[2] - origin.x, op[3] - origin.y];
+        if (s.tool === "rect") s.points = [s.points[0], p];
+        else s.points.push(p);
+      } else if (op[0] === "n") {
+        const s = strokes.get(op[1]);
+        if (s) s.n = op[2];
       }
     }
     redraw();
@@ -222,7 +302,7 @@ function overlayHtml() {
   // A shot names the strokes it holds; nothing else is touched, so a
   // stroke still being drawn keeps what it has drawn and keeps drawing.
   // A shot takes its strokes off the screen the moment it is asked for
-  // (__detach) and keeps their data for the image (__composite) until it
+  // (__detach) and keeps their data for the image (__render) until it
   // is done: dropped once the image holds them (__drop), put back on the
   // screen when the capture failed (__restore).
   const detached = new Map();
@@ -261,22 +341,47 @@ function overlayHtml() {
     );
     return true;
   };
-  // Paint the strokes \`ids\` onto a capture of this display, at the
-  // capture's own pixel scale, and hand back a PNG data URL.
-  window.__composite = (dataUrl, ids) => new Promise((resolve, reject) => {
+  function jpeg(source, sx, sy, sw, sh, size, quality) {
+    const out = document.createElement("canvas");
+    out.width = size.width;
+    out.height = size.height;
+    const c = out.getContext("2d");
+    c.imageSmoothingQuality = "high";
+    c.drawImage(source, sx, sy, sw, sh, 0, 0, size.width, size.height);
+    return out.toDataURL("image/jpeg", quality);
+  }
+  // A capture of \`region\` (display points, relative to this display) at
+  // the capture's own pixel scale: the strokes \`ids\` and their numbers
+  // are painted in (numbers kept inside the captured area), then the
+  // agent's cheap copies are cut from that picture — the downscaled
+  // preview (when \`opts.preview\`) and one close-up per \`crops\` entry
+  // ({id, x, y, width, height}: points relative to the region).
+  // Answers { image: PNG data URL (null when nothing was painted), preview, crops: {id: JPEG} }.
+  window.__render = (dataUrl, ids, region, crops, opts) => new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
-      const scale = img.naturalWidth / Math.max(1, innerWidth);
+      const scale = img.naturalWidth / Math.max(1, region.width);
       const out = document.createElement("canvas");
       out.width = img.naturalWidth;
       out.height = img.naturalHeight;
       const c = out.getContext("2d");
       c.drawImage(img, 0, 0);
-      for (const id of ids) {
-        const s = detached.get(id) || strokes.get(id);
-        if (s) drawStroke(c, s, scale);
+      const painted = ids.map((id) => detached.get(id) || strokes.get(id)).filter(Boolean);
+      for (const s of painted) drawStroke(c, s, scale, region.x, region.y);
+      for (const s of painted) drawBadge(c, s, scale, region, region.x, region.y);
+      const result = { image: painted.length ? out.toDataURL("image/png") : null, preview: null, crops: {} };
+      if (opts.preview) {
+        const size = fitWithin(out.width, out.height, opts.preview.maxSide, opts.preview.maxPixels);
+        result.preview = jpeg(out, 0, 0, out.width, out.height, size, opts.preview.quality);
       }
-      resolve(out.toDataURL("image/png"));
+      for (const crop of crops) {
+        const sx = Math.max(0, Math.round(crop.x * scale));
+        const sy = Math.max(0, Math.round(crop.y * scale));
+        const sw = Math.max(1, Math.min(out.width - sx, Math.round(crop.width * scale)));
+        const sh = Math.max(1, Math.min(out.height - sy, Math.round(crop.height * scale)));
+        result.crops[crop.id] = jpeg(out, sx, sy, sw, sh, fitWithin(sw, sh, opts.crop.maxSide, 0), opts.crop.quality);
+      }
+      resolve(result);
     };
     img.onerror = () => reject(new Error("capture image failed to load"));
     img.src = dataUrl;
@@ -286,7 +391,17 @@ function overlayHtml() {
 </script></body></html>`;
 }
 
-function paletteHtml(colors, selected) {
+const TOOL_ICONS = Object.freeze({
+  rect: '<svg viewBox="0 0 14 14" aria-hidden="true"><rect x="2" y="3" width="10" height="8" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.7"/></svg>',
+  pen: '<svg viewBox="0 0 14 14" aria-hidden="true"><path d="M2 10.5c1.6-4.2 3.2-4.6 4.4-2.2s2.6 1.8 5.6-4.8" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+});
+
+const TOOL_LABELS = Object.freeze({ rect: "Rectangle", pen: "Pen" });
+
+function paletteHtml(colors, selected, tools = SCREEN_MODE.tools, selectedTool = SCREEN_MODE.tools[0]) {
+  const toolButtons = tools
+    .map((t) => `<button class="tool${t === selectedTool ? " sel" : ""}" data-t="${t}" aria-label="${TOOL_LABELS[t] || t}">${TOOL_ICONS[t] || ""}</button>`)
+    .join("");
   const dots = colors
     .map((c) => `<button class="dot${c === selected ? " sel" : ""}" data-c="${c}" style="background:${c}" aria-label="${c}"></button>`)
     .join("");
@@ -300,22 +415,35 @@ function paletteHtml(colors, selected) {
   #pill { height: ${PALETTE.height}px; display: flex; align-items: center; gap: ${PALETTE.gap}px; padding: 0 ${PALETTE.padX}px;
     border-radius: 999px; background: #121212; border: 1px solid rgba(255,255,255,.16); box-shadow: inset 0 1px 0 rgba(255,255,255,.10); }
   .dot { width: ${PALETTE.dot}px; height: ${PALETTE.dot}px; border-radius: 50%; border: 2px solid rgba(255,255,255,.18); padding: 0; cursor: pointer; outline: none; }
-  .dot.sel { border-color: #fff; box-shadow: 0 0 0 2px rgba(255,255,255,.25); }
+  .tool { width: ${PALETTE.tool}px; height: ${PALETTE.tool}px; border-radius: 50%; border: 2px solid rgba(255,255,255,.18); padding: 0;
+    background: #262626; color: rgba(255,255,255,.72); display: flex; align-items: center; justify-content: center; cursor: pointer; outline: none; }
+  .tool svg { width: 12px; height: 12px; display: block; pointer-events: none; }
+  .sep { width: ${PALETTE.divider}px; height: 16px; background: rgba(255,255,255,.18); flex: none; }
+  .dot.sel, .tool.sel { border-color: #fff; box-shadow: 0 0 0 2px rgba(255,255,255,.25); }
+  .tool.sel { color: #fff; }
 </style></head>
-<body><div id="pill">${dots}</div>
+<body><div id="pill">${toolButtons}<span class="sep"></span>${dots}</div>
 <script>
-  // A tap on a dot reaches this page only as the helper's tap, which the
-  // controller resolves to the dot's colour itself (\`deliverTap\`).
+  // A tap on a button reaches this page only as the helper's tap, which
+  // the controller resolves to the tool or colour itself (\`deliverTap\`).
   window.__select = (c) => {
     for (const b of document.querySelectorAll(".dot")) b.classList.toggle("sel", b.dataset.c === c);
+    return true;
+  };
+  window.__selectTool = (t) => {
+    for (const b of document.querySelectorAll(".tool")) b.classList.toggle("sel", b.dataset.t === t);
     return true;
   };
 </script></body></html>`;
 }
 
-function paletteSize(colorCount) {
+/** The palette's size: the tools, a divider, the colours. */
+function paletteSize(colorCount, toolCount = SCREEN_MODE.tools.length) {
+  const items = toolCount + (toolCount ? 1 : 0) + colorCount;
   return {
-    width: PALETTE.padX * 2 + colorCount * PALETTE.dot + (colorCount - 1) * PALETTE.gap + 2,
+    width:
+      PALETTE.padX * 2 + toolCount * PALETTE.tool + (toolCount ? PALETTE.divider : 0) +
+      colorCount * PALETTE.dot + (items - 1) * PALETTE.gap + 2,
     height: PALETTE.height,
   };
 }
@@ -555,7 +683,7 @@ function createScreenModeController(deps) {
     return paletteBoundsFor({
       capsule,
       workArea: capsule ? null : screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea,
-      size: paletteSize(SCREEN_MODE.colors.length),
+      size: paletteSize(SCREEN_MODE.colors.length, SCREEN_MODE.tools.length),
       capsuleLayout: deps.capsuleLayout,
     });
   }
@@ -596,7 +724,12 @@ function createScreenModeController(deps) {
     palette = w;
     optional("palette setAlwaysOnTop", () => w.setAlwaysOnTop(true, SCREEN_MODE_LAYERS.level, SCREEN_MODE_LAYERS.palette));
     optional("palette setVisibleOnAllWorkspaces", () => w.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }));
-    const html = paletteHtml(SCREEN_MODE.colors, session ? session.color : SCREEN_MODE.colors[0]);
+    const html = paletteHtml(
+      SCREEN_MODE.colors,
+      session ? session.color : SCREEN_MODE.colors[0],
+      SCREEN_MODE.tools,
+      session ? session.tool : SCREEN_MODE.tools[0],
+    );
     await w.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
     if (w.isDestroyed()) throw new Error("palette window was destroyed while loading");
     if (presented) w.showInactive();
@@ -641,6 +774,16 @@ function createScreenModeController(deps) {
     }
   }
 
+  // The tool for the next stroke (a stroke being drawn keeps its own).
+  function setTool(tool) {
+    if (!session || !SCREEN_MODE.tools.includes(tool) || session.tool === tool) return;
+    session.tool = tool;
+    log(`[screen-mode] tool ${tool}`);
+    if (palette && !palette.isDestroyed()) {
+      palette.webContents.executeJavaScript(`window.__selectTool(${JSON.stringify(tool)})`, true).catch(() => { });
+    }
+  }
+
   // Called by main whenever it moves or resizes the capsule, and here
   // when the palette or the helper appears: the helper must always know
   // where our own controls are.
@@ -664,7 +807,7 @@ function createScreenModeController(deps) {
    * A tap the helper took on one of our controls. The window server never
    * sees it, so the app is never activated and its main window never
    * comes forward.
-   *   * On the palette: the colour of the dot under the point is read
+   *   * On the palette: the tool or the colour under the point is read
    *     back and selected here — the palette page has no channel of its
    *     own to the main process.
    *   * On the capsule: whatever is at that point inside its page is
@@ -684,12 +827,16 @@ function createScreenModeController(deps) {
       target.webContents.executeJavaScript(
         `(() => {
           const el = document.elementFromPoint(${localX}, ${localY});
-          const dot = el && el.closest(".dot");
-          return dot ? dot.dataset.c : null;
+          if (!el) return null;
+          const tool = el.closest(".tool");
+          if (tool) return { tool: tool.dataset.t };
+          const dot = el.closest(".dot");
+          return dot ? { color: dot.dataset.c } : null;
         })()`,
         true,
-      ).then((color) => {
-        if (color) setColor(color);
+      ).then((hit) => {
+        if (hit && hit.tool) setTool(hit.tool);
+        else if (hit && hit.color) setColor(hit.color);
       }, (e) => log(`[screen-mode] palette tap failed: ${e?.message || e}`));
       return;
     }
@@ -833,6 +980,10 @@ function createScreenModeController(deps) {
       logPress(`[screen-mode] press outcome=${msg.outcome} clicks=${msg.clicks} drags=${msg.drags} echoes=${msg.echoes ?? 0} by=${msg.by ?? "?"}`);
       return;
     }
+    if (t === "front-window") {
+      answerFrontWindow(msg);
+      return;
+    }
     if (t === "tap-disabled") {
       // macOS switched the tap off and the helper switched it back on; the
       // press it cut was abandoned (a stroke ended, a held press handed to
@@ -848,7 +999,7 @@ function createScreenModeController(deps) {
     } else if (t === "start") {
       const display = screen.getDisplayNearestPoint({ x: Math.round(x), y: Math.round(y) });
       const stroke = beginStroke(session, { x, y, displayId: display.id, displayBounds: display.bounds });
-      queueOp(["b", stroke.id, stroke.color, x, y]);
+      queueOp(["b", stroke.id, stroke.color, x, y, stroke.tool, stroke.n]);
     } else if (t === "move") {
       const stroke = extendStroke(session, { x, y });
       if (stroke) queueOp(["m", stroke.id, x, y]);
@@ -856,6 +1007,46 @@ function createScreenModeController(deps) {
       const stroke = endStroke(session, { x, y });
       if (stroke) queueOp(["m", stroke.id, x, y]);
     }
+  }
+
+  // ── the front window ──────────────────────────────────────────────────
+  // Asked of the helper (FrontWindow.swift: the frontmost ordinary window
+  // not owned by Transcriptor) when a shot begins. A helper that does not
+  // answer in time means "no front window": the shot is the display.
+  const frontWindowRequests = new Map(); // id -> resolve
+  let nextFrontWindowRequest = 1;
+
+  function queryFrontWindow() {
+    if (!helper) return Promise.resolve(null);
+    const id = nextFrontWindowRequest++;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        if (!frontWindowRequests.delete(id)) return;
+        log(`[screen-mode] front window: no answer within ${FRONT_WINDOW_TIMEOUT_MS} ms`);
+        resolve(null);
+      }, FRONT_WINDOW_TIMEOUT_MS);
+      timer.unref?.();
+      frontWindowRequests.set(id, (bounds) => {
+        clearTimeout(timer);
+        resolve(bounds);
+      });
+      sendHelper({ cmd: "front-window", id, exclude: [process.pid] });
+    });
+  }
+
+  function answerFrontWindow(msg) {
+    const id = Number(msg.id);
+    const resolve = frontWindowRequests.get(id);
+    if (!resolve) return;
+    frontWindowRequests.delete(id);
+    const [x, y, width, height] = [msg.x, msg.y, msg.w, msg.h].map(Number);
+    const found = [x, y, width, height].every(Number.isFinite) && width > 0 && height > 0;
+    resolve(found ? { x, y, width, height } : null);
+  }
+
+  function dropFrontWindowRequests() {
+    for (const resolve of frontWindowRequests.values()) resolve(null);
+    frontWindowRequests.clear();
   }
 
   // ── capture ───────────────────────────────────────────────────────────
@@ -876,6 +1067,11 @@ function createScreenModeController(deps) {
     });
   }
 
+  function decodeDataUrl(value, prefix, what) {
+    if (typeof value !== "string" || !value.startsWith(prefix)) throw new Error(`the overlay returned no ${what}`);
+    return Buffer.from(value.slice(prefix.length), "base64");
+  }
+
   async function takeShotNow(reason) {
     if (!session) return null;
     flushOps();
@@ -883,13 +1079,19 @@ function createScreenModeController(deps) {
     // arriving while the images are made, and a stroke that finishes
     // during the awaits below is in none of them.
     const pending = pendingStrokes(session);
-    const ids = pending.map((s) => s.id);
-    const displayIds = [...new Set(pending.map((s) => s.displayId))];
-    if (!displayIds.length) {
-      displayIds.push(screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).id);
-    }
-    const allDisplays = screen.getAllDisplays();
     const at = Date.now();
+    // What the shot captures — the front window, or whole displays — is
+    // decided once too (./screen-mode.js, planShot).
+    const frontWindow = await queryFrontWindow();
+    if (!session) return null;
+    const allDisplays = screen.getAllDisplays();
+    const plan = planShot({
+      strokes: pending,
+      frontWindow,
+      displays: allDisplays,
+      cursorDisplayId: screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).id,
+    });
+    const index = session.shots.length + 1;
     // The order the user sees (2026-11-20, after trying the reverse): the
     // shot is taken FIRST, with the strokes still on the screen, and the
     // moment the capture is done they vanish with the flash. Taking them
@@ -899,18 +1101,13 @@ function createScreenModeController(deps) {
     // content-protected); they are painted into the image from their
     // data, which the overlay keeps aside after `__detach`.
     //
-    // 1. capture every display at once;
+    // 1. capture every area at once;
     const captureStarted = Date.now();
-    const targets = displayIds.map((displayId) => {
-      const display = allDisplays.find((d) => d.id === displayId);
-      if (!display) return { displayId, display: null, file: "", onDisplay: [] };
+    const targets = plan.map((target) => {
+      const display = allDisplays.find((d) => d.id === target.displayId) || null;
+      if (!display || !target.region) return { ...target, display: null, file: "" };
       const ordinal = allDisplays.indexOf(display) + 1;
-      return {
-        displayId,
-        display,
-        file: path.join(session.dir, shotFileName(session.shots.length + 1, ordinal, displayIds.length)),
-        onDisplay: pending.filter((s) => s.displayId === displayId).map((s) => s.id),
-      };
+      return { ...target, display, file: path.join(session.dir, shotFileName(index, ordinal, plan.length)) };
     });
     const failures = [];
     const raw = await Promise.all(targets.map(async (target) => {
@@ -919,7 +1116,7 @@ function createScreenModeController(deps) {
         return false;
       }
       try {
-        await captureRegion(target.display.bounds, target.file);
+        await captureRegion(target.region, target.file);
         return true;
       } catch (e) {
         failures.push(`display ${target.displayId}: ${e?.message || e}`);
@@ -930,54 +1127,105 @@ function createScreenModeController(deps) {
     const captureMs = Date.now() - captureStarted;
     const grabbed = targets.filter((_, i) => raw[i]);
     // 2. the captured strokes leave the screen, now;
-    const grabbedIds = grabbed.flatMap((target) => target.onDisplay);
+    const grabbedIds = grabbed.flatMap((target) => target.strokeIds);
     if (grabbedIds.length) {
       await Promise.all([...overlays.values()].map((entry) => overlayCall(entry, `window.__detach(${JSON.stringify(grabbedIds)})`)));
     }
     if (grabbed.length) {
       for (const entry of overlays.values()) overlayCall(entry, "window.__flash()");
     }
-    // 3. and are painted into the images that hold them.
+    // 3. and are painted, with their numbers, into the images that hold
+    //    them; the agent's cheap copies are cut from those images: the
+    //    preview of the first image, a close-up per stroke.
     const composeStarted = Date.now();
     const files = [];
-    const captured = new Set();
+    const regions = {};
+    const crops = {};
+    let preview = "";
     for (const target of grabbed) {
+      const wantPreview = target === targets[0];
+      const entry = overlays.get(target.displayId);
+      const strokesHere = pending.filter((s) => target.strokeIds.includes(s.id));
       try {
-        if (target.onDisplay.length) {
-          // The strokes are part of the image: without them painted in,
-          // this file is not the shot the strokes are said to be in.
+        if (strokesHere.length || (wantPreview && entry)) {
+          const origin = entry ? entry.bounds : target.display.bounds;
+          const region = {
+            x: target.region.x - origin.x,
+            y: target.region.y - origin.y,
+            width: target.region.width,
+            height: target.region.height,
+          };
+          const cropRects = strokesHere
+            .map((s) => ({ id: s.id, rect: strokeCropRect(s, target.region) }))
+            .filter((c) => c.rect)
+            .map((c) => ({ id: c.id, ...c.rect }));
           const png = fs.readFileSync(target.file).toString("base64");
-          const composed = await overlayEval(
-            overlays.get(target.displayId),
-            `window.__composite(${JSON.stringify(`${PNG_DATA_URL_PREFIX}${png}`)}, ${JSON.stringify(target.onDisplay)})`,
-          );
-          if (typeof composed !== "string" || !composed.startsWith(PNG_DATA_URL_PREFIX)) {
-            throw new Error("the overlay returned no image");
+          let rendered;
+          try {
+            rendered = await overlayEval(
+              entry,
+              `window.__render(${JSON.stringify(`${PNG_DATA_URL_PREFIX}${png}`)}, ${JSON.stringify(target.strokeIds)}, ` +
+              `${JSON.stringify(region)}, ${JSON.stringify(cropRects)}, ` +
+              `${JSON.stringify({ preview: wantPreview ? SCREEN_MODE.preview : null, crop: SCREEN_MODE.crop })})`,
+            );
+          } catch (e) {
+            // The strokes are part of the image: without them painted in,
+            // this file is not the shot the strokes are said to be in. A
+            // shot with nothing drawn keeps its capture, without a preview.
+            if (strokesHere.length) throw e;
+            log(`[screen-mode] preview of shot ${index} failed: ${e?.message || e}`);
+            rendered = null;
           }
-          fs.writeFileSync(target.file, Buffer.from(composed.slice(PNG_DATA_URL_PREFIX.length), "base64"));
+          if (rendered) {
+            if (strokesHere.length) fs.writeFileSync(target.file, decodeDataUrl(rendered.image, PNG_DATA_URL_PREFIX, "image"));
+            if (wantPreview) {
+              try {
+                const file = path.join(session.dir, previewFileName(index));
+                fs.writeFileSync(file, decodeDataUrl(rendered.preview, JPEG_DATA_URL_PREFIX, "preview"));
+                preview = file;
+              } catch (e) {
+                log(`[screen-mode] preview of shot ${index} not written: ${e?.message || e}`);
+              }
+            }
+            for (const s of strokesHere) {
+              if (!rendered.crops || !rendered.crops[s.id]) continue;
+              try {
+                const file = path.join(session.dir, cropFileName(index, s.n));
+                fs.writeFileSync(file, decodeDataUrl(rendered.crops[s.id], JPEG_DATA_URL_PREFIX, "close-up"));
+                crops[s.id] = file;
+              } catch (e) {
+                log(`[screen-mode] close-up ${s.n} of shot ${index} not written: ${e?.message || e}`);
+              }
+            }
+          }
         }
+        for (const s of strokesHere) regions[s.id] = target.region;
         files.push(target.file);
-        captured.add(target.displayId);
       } catch (e) {
         failures.push(`display ${target.displayId}: ${e?.message || e}`);
         fs.rmSync(target.file, { force: true });
+        for (const s of strokesHere) {
+          if (crops[s.id]) fs.rmSync(crops[s.id], { force: true });
+          delete crops[s.id];
+        }
       }
     }
+    const area = plan[0] ? plan[0].area : "display";
     if (grabbed.length) {
       log(
-        `[screen-mode] shot captured (${reason}) displays=${grabbed.length} capture_ms=${captureMs} ` +
+        `[screen-mode] shot captured (${reason}) displays=${grabbed.length} area=${area} capture_ms=${captureMs} ` +
         `strokes_off=${grabbedIds.length} compose_ms=${Date.now() - composeStarted}`,
       );
     }
     if (failures.length) {
-      // No screenshot is claimed for a display that was not captured: its
+      // No screenshot is claimed for an area that was not captured: its
       // strokes stay pending and on the screen for the next shot.
       log(`[screen-mode] capture failed (${reason}): ${failures.join("; ")}`);
       deps.onWarning(SCREEN_MODE_WARNING.CAPTURE_FAILED);
     }
-    const taken = pending.filter((s) => captured.has(s.displayId)).map((s) => s.id);
-    const kept = pending.filter((s) => !captured.has(s.displayId)).map((s) => s.id);
-    // Only the strokes the shot took are gone for good; those of a display
+    const taken = pending.filter((s) => regions[s.id]).map((s) => s.id);
+    const kept = pending.filter((s) => !taken.includes(s.id)).map((s) => s.id);
+    // Only the strokes the shot took are gone for good; those of an area
     // that was not captured come back on the screen, pending for the next
     // shot. Queued ops are kept: they belong to strokes still being drawn
     // or begun since.
@@ -985,10 +1233,18 @@ function createScreenModeController(deps) {
       if (taken.length) overlayCall(entry, `window.__drop(${JSON.stringify(taken)})`);
       if (kept.length) overlayCall(entry, `window.__restore(${JSON.stringify(kept)})`);
     }
-    if (!files.length) return null;
-    const shot = recordShot(session, { at, files, strokeIds: taken, reason });
+    if (!files.length) {
+      if (preview) fs.rmSync(preview, { force: true });
+      return null;
+    }
+    const shot = recordShot(session, { at, files, strokeIds: taken, reason, area, preview, regions, crops });
+    // The screen is clean: what is still on it is numbered from 1 again.
+    for (const s of unshotStrokes(session)) queueOp(["n", s.id, s.n]);
     writeEvents();
-    log(`[screen-mode] shot ${shot.index} reason=${reason} files=${files.length} strokes=${shot.strokeIds.length}`);
+    log(
+      `[screen-mode] shot ${shot.index} reason=${reason} area=${area} files=${files.length} ` +
+      `strokes=${shot.strokeIds.length} preview=${preview ? 1 : 0} closeups=${Object.keys(crops).length}`,
+    );
     return { index: shot.index, files };
   }
 
@@ -1103,6 +1359,7 @@ function createScreenModeController(deps) {
   }
 
   function teardown() {
+    dropFrontWindowRequests();
     unwatchDisplays();
     stopHelper();
     flushPressRepeats();

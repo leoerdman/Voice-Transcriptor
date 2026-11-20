@@ -64,6 +64,11 @@ class ContractTests(unittest.TestCase):
         self.assertTrue(screen_sessions.is_session_id(CONTRACT["exampleSessionId"]))
         for name in CONTRACT["exampleScreenshotNames"]:
             self.assertRegex(name, screen_sessions.SCREENSHOT_NAME_RE)
+        self.assertEqual(screen_sessions.DERIVED_IMAGE_NAME_RE.pattern, CONTRACT["derivedImageNamePattern"])
+        for name in CONTRACT["exampleDerivedImageNames"]:
+            self.assertRegex(name, screen_sessions.DERIVED_IMAGE_NAME_RE)
+            # A cheap copy is never taken for a screenshot of the history.
+            self.assertIsNone(screen_sessions.SCREENSHOT_NAME_RE.fullmatch(name))
 
     def test_adoption_writes_the_contracts_archived_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -83,7 +88,34 @@ class ContractTests(unittest.TestCase):
         out = screen_sessions._rehome_manifest(CONTRACT["manifest"], folder)
         self.assertEqual(out["dir"], str(folder))
         self.assertEqual(out["events"][1]["files"], [str(folder / "shot-01.png")])
-        self.assertEqual(out["events"][0], CONTRACT["manifest"]["events"][0])
+        self.assertEqual(out["events"][1]["preview"], str(folder / "shot-01-preview.jpg"))
+        self.assertEqual(out["events"][0]["crop"], str(folder / "shot-01-n1.jpg"))
+        self.assertEqual(
+            {k: v for k, v in out["events"][0].items() if k != "crop"},
+            {k: v for k, v in CONTRACT["manifest"]["events"][0].items() if k != "crop"},
+        )
+        self.assertEqual(
+            {k: v for k, v in out["events"][1].items() if k not in ("files", "preview")},
+            {k: v for k, v in CONTRACT["manifest"]["events"][1].items() if k not in ("files", "preview")},
+        )
+
+    def test_a_version_1_manifest_is_still_rehomed_as_it_was(self) -> None:
+        folder = Path("/archive/take.screens")
+        v1 = {k: v for k, v in CONTRACT["manifestV1"].items() if not k.startswith("_")}
+        out = screen_sessions._rehome_manifest(v1, folder)
+        self.assertEqual(out["version"], 1)
+        self.assertEqual(out["events"][0], v1["events"][0])
+        self.assertEqual(out["events"][1]["files"], [str(folder / "shot-01.png")])
+        self.assertNotIn("preview", out["events"][1])
+
+    def test_a_copy_path_that_is_not_a_shell_name_is_dropped(self) -> None:
+        folder = Path("/archive/take.screens")
+        out = screen_sessions._rehome_manifest({"events": [
+            {"type": "stroke", "crop": "/etc/passwd"},
+            {"type": "shot", "files": [], "preview": 7},
+        ]}, folder)
+        self.assertNotIn("crop", out["events"][0])
+        self.assertNotIn("preview", out["events"][1])
 
 
 class AdoptionTests(unittest.TestCase):
@@ -141,6 +173,21 @@ class AdoptionTests(unittest.TestCase):
         self.assertIsNone(screen_sessions.adopt_session(self.data, SESSION, self.archive, "x"))
         self.assertIsNone(screen_sessions.adopt_session(self.data, "../etc", self.archive, "x"))
         self.assertIsNone(screen_sessions.adopt_session(self.data, "", self.archive, "x"))
+
+    def test_the_cheap_copies_move_with_the_screenshots_but_are_not_listed(self) -> None:
+        staged = _stage(self.data)
+        (staged / "shot-01-preview.jpg").write_bytes(b"\xff\xd8 preview")
+        (staged / "shot-01-n1.jpg").write_bytes(b"\xff\xd8 close-up")
+        screen_sessions.adopt_session(self.data, SESSION, self.archive, "r")
+        dest = self.archive / "r.screens"
+        self.assertTrue((dest / "shot-01-preview.jpg").is_file())
+        self.assertTrue((dest / "shot-01-n1.jpg").is_file())
+        self.assertEqual(screen_sessions.list_screenshots(self.archive, "r"), ["shot-01.png", "shot-02.png"])
+        served = screen_sessions.screenshot_path(self.archive, "r", "shot-01-n1.jpg")
+        self.assertEqual(served, dest / "shot-01-n1.jpg")
+        self.assertEqual(screen_sessions.image_media_type(served.name), "image/jpeg")
+        self.assertEqual(screen_sessions.image_media_type("shot-01.png"), "image/png")
+        self.assertIsNone(screen_sessions.screenshot_path(self.archive, "r", "shot-01-n1.png"))
 
     def test_only_shell_written_names_are_served(self) -> None:
         _stage(self.data)

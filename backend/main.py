@@ -8591,7 +8591,7 @@ def get_recording_screenshot(
     shot = screen_sessions.screenshot_path(target_dir or p.parent, p.stem, file_name)
     if shot is None:
         raise HTTPException(status_code=404, detail="screenshot not found")
-    return FileResponse(str(shot), media_type="image/png", filename=shot.name)
+    return FileResponse(str(shot), media_type=screen_sessions.image_media_type(shot.name), filename=shot.name)
 
 
 _stats_cache: Optional[dict] = None

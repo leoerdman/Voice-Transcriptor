@@ -18,16 +18,17 @@ const vm = require("node:vm");
 const { SCREEN_START_OUTCOME, createScreenModeController } = require("./screen-mode-controller");
 const { screenModeWarningCopy } = require("./screen-mode-warnings");
 
-const PNG = "data:image/png;base64,";
 const tick = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ── a DOM just large enough for the overlay and palette pages ──────────
 function recordingContext2d() {
   const calls = [];
   const ctx = { calls };
-  for (const name of ["save", "restore", "beginPath", "moveTo", "lineTo", "quadraticCurveTo", "arc", "fill", "stroke", "clearRect", "setTransform", "drawImage"]) {
+  for (const name of ["save", "restore", "beginPath", "moveTo", "lineTo", "quadraticCurveTo", "arc", "fill", "stroke", "clearRect", "setTransform", "drawImage", "closePath"]) {
     ctx[name] = (...args) => { calls.push([name, ...args.filter((a) => typeof a === "number")]); };
   }
+  // The number beside a stroke: its text, where, and in what colour.
+  ctx.fillText = (text, x, y) => { calls.push(["fillText", String(text), x, y, ctx.fillStyle]); };
   return ctx;
 }
 
@@ -38,9 +39,12 @@ function fakeCanvas() {
     height: 0,
     ctx,
     getContext: () => ctx,
-    // The "PNG" a composite produces: the draw calls, so a test can read
-    // which strokes were painted into a screenshot.
-    toDataURL: () => `${PNG}${Buffer.from(JSON.stringify(ctx.calls)).toString("base64")}`,
+    // The "PNG" (or JPEG) a render produces: the draw calls, so a test can
+    // read which strokes were painted into a screenshot, and its size.
+    toDataURL(type = "image/png") {
+      const body = { w: this.width, h: this.height, calls: ctx.calls };
+      return `data:${type};base64,${Buffer.from(JSON.stringify(body)).toString("base64")}`;
+    },
   };
 }
 
@@ -77,10 +81,14 @@ function pageContext(html, { width, height, hit }) {
       querySelectorAll: () => [],
       elementFromPoint: (x, y) => hit(x, y),
     },
+    // A capture's size is in the fake file the capture wrote (the region
+    // at 2x); anything else is the whole window at 2x.
     Image: class {
       set src(url) {
-        this.naturalWidth = width * 2;
-        this.naturalHeight = height * 2;
+        let size = null;
+        try { size = JSON.parse(Buffer.from(url.slice(url.indexOf(",") + 1), "base64").toString("utf8")); } catch { }
+        this.naturalWidth = size && size.w ? size.w : width * 2;
+        this.naturalHeight = size && size.h ? size.h : height * 2;
         this.url = url;
         setImmediate(() => this.onload());
       }
@@ -161,7 +169,24 @@ function createWorld({ displays, helperReady = true, failLoad = () => false, hit
   const childProcess = {
     spawn() {
       const child = new EventEmitter();
-      child.stdin = { written: [], destroyed: false, write(s) { this.written.push(s); }, end() { this.destroyed = true; } };
+      child.stdin = {
+        written: [],
+        destroyed: false,
+        write(s) {
+          this.written.push(s);
+          // The helper answers a front-window request from the window list
+          // (`world.frontWindow`: null — no front window — unless a test
+          // sets one; `world.frontWindowSilent`: no answer at all).
+          let cmd = null;
+          try { cmd = JSON.parse(s); } catch { }
+          if (cmd && cmd.cmd === "front-window" && !world.frontWindowSilent) {
+            const w = world.frontWindow;
+            const answer = w ? { t: "front-window", id: cmd.id, x: w.x, y: w.y, w: w.width, h: w.height } : { t: "front-window", id: cmd.id };
+            setImmediate(() => child.stdout.emit("data", `${JSON.stringify(answer)}\n`));
+          }
+        },
+        end() { this.destroyed = true; },
+      };
       child.stdout = Object.assign(new EventEmitter(), { setEncoding() { } });
       child.stderr = Object.assign(new EventEmitter(), { setEncoding() { } });
       child.exitCode = null;
@@ -205,7 +230,8 @@ function createWorld({ displays, helperReady = true, failLoad = () => false, hit
       world.captures.push({ bounds, outFile });
       if (world.captureGate) await world.captureGate;
       if (world.captureFails && world.captureFails(bounds)) throw new Error("display asleep");
-      fs.writeFileSync(outFile, "raw-capture");
+      // The capture, as the fake Image reads it: the region at 2x.
+      fs.writeFileSync(outFile, JSON.stringify({ w: bounds.width * 2, h: bounds.height * 2, raw: true }));
     },
   });
   world.screen = screen;
@@ -234,8 +260,12 @@ function drawStroke(world, points) {
   world.say({ t: "end", x: last[0], y: last[1] });
 }
 
+function painted(file) {
+  return JSON.parse(fs.readFileSync(file, "utf8"));
+}
+
 function paintedMoveTos(file) {
-  return JSON.parse(fs.readFileSync(file, "utf8")).filter((c) => c[0] === "moveTo");
+  return painted(file).calls.filter((c) => c[0] === "moveTo");
 }
 
 const ID = "screen-20261120-100000-000";
@@ -310,7 +340,7 @@ test("a shot is captured with its strokes still on the screen; they leave the mo
     const result = await shot;
     assert.equal(await overlay.webContents.executeJavaScript("window.__hasStrokes([1])"), false, "gone once it is taken");
     assert.equal(paintedMoveTos(result.files[0]).length, 1, "the image holds the stroke");
-    assert.ok(world.logs.some((l) => /shot captured \(capsule\) displays=1 capture_ms=\d+ strokes_off=1 compose_ms=\d+/.test(l)));
+    assert.ok(world.logs.some((l) => /shot captured \(capsule\) displays=1 area=display capture_ms=\d+ strokes_off=1 compose_ms=\d+/.test(l)));
   } finally {
     world.cleanup();
   }
@@ -712,6 +742,9 @@ test("every stdout line main.swift documents is understood by the controller", a
     tap: { line: { t: "tap", x: 5, y: 5 }, seen: (w) => w.capsule.webContents.scripts.length === 1 },
     press: { line: { t: "press", outcome: "stroke", clicks: 1, drags: 9 }, seen: (w) => w.logs.some((l) => l.includes("press outcome=stroke clicks=1 drags=9")) },
     "tap-disabled": { line: { t: "tap-disabled", reason: "timeout", abandoned: "stroke" }, seen: (w) => w.logs.some((l) => l.includes("tap disabled reason=timeout abandoned=stroke")) },
+    // An answer nobody asked for (a request that already timed out) is
+    // dropped; the request/answer pair itself is driven by the window tests.
+    "front-window": { line: { t: "front-window", id: 999 }, seen: () => true },
     error: { line: { t: "error", code: "tap-unavailable" }, seen: (w) => w.logs.some((l) => l.includes("helper error tap-unavailable")) },
   };
   assert.deepEqual(documented, Object.keys(samples).sort());
@@ -725,7 +758,7 @@ test("every stdout line main.swift documents is understood by the controller", a
   };
   try {
     await world.controller.start(ID);
-    for (const kind of ["ready", "start", "move", "end", "tap", "press", "tap-disabled", "error"]) {
+    for (const kind of ["ready", "start", "move", "end", "tap", "press", "tap-disabled", "front-window", "error"]) {
       world.say(samples[kind].line);
       assert.ok(samples[kind].seen(world), `line ${kind} had no effect`);
     }
@@ -764,4 +797,224 @@ test("the overlay, palette and capsule layers are one ordered fact", () => {
   const { SCREEN_MODE_LAYERS } = require("./screen-mode-controller");
   assert.ok(SCREEN_MODE_LAYERS.overlay < SCREEN_MODE_LAYERS.palette);
   assert.ok(SCREEN_MODE_LAYERS.palette < SCREEN_MODE_LAYERS.capsule);
+});
+
+// ── tools, numbers, the front window, the cheap copies ─────────────────
+async function screenNumbers(world) {
+  // What the live canvas last drew: the numbers' text, in order.
+  await tick(30);
+  const calls = world.overlays()[0].page.screenCanvas.ctx.calls;
+  const lastClear = calls.map((c) => c[0]).lastIndexOf("clearRect");
+  return calls.slice(lastClear).filter((c) => c[0] === "fillText").map((c) => c[1]);
+}
+
+test("every take starts with the rectangle; a tap on the pen switches the next stroke to it", async () => {
+  let hitTool = null;
+  const world = createWorld({
+    hit: () => ({ closest: (sel) => (sel === ".tool" && hitTool ? { dataset: { t: hitTool } } : null) }),
+  });
+  try {
+    await world.controller.start(ID);
+    drawStroke(world, [[100, 100], [140, 150], [300, 250]]); // a rectangle: two corners
+    hitTool = "pen";
+    const b = world.palette().getBounds();
+    world.say({ t: "tap", x: b.x + 15, y: b.y + 15 });
+    await tick(5);
+    assert.ok(world.palette().webContents.scripts.some((js) => js.includes('__selectTool("pen")')), "the pen is shown selected");
+    assert.ok(world.logs.includes("[screen-mode] tool pen"));
+    drawStroke(world, [[400, 400], [450, 420], [500, 400]]);
+    await world.controller.takeShot("hotkey");
+    const strokes = (await world.controller.finish({ id: ID })).manifest.events.filter((e) => e.type === "stroke");
+    assert.deepEqual(strokes.map((e) => [e.n, e.tool, e.shape]), [[1, "rect", "rect"], [2, "pen", "curve"]]);
+  } finally {
+    world.cleanup();
+  }
+  // The next take starts with the rectangle again.
+  const next = createWorld();
+  try {
+    await next.controller.start(ID);
+    drawStroke(next, [[100, 100], [300, 300]]);
+    await next.controller.takeShot("hotkey");
+    const stroke = (await next.controller.finish({ id: ID })).manifest.events.find((e) => e.type === "stroke");
+    assert.equal(stroke.tool, "rect");
+  } finally {
+    next.cleanup();
+  }
+});
+
+test("the palette shows the two tools, a divider, then the colours, the selected ones lit alike", () => {
+  const { SCREEN_MODE } = require("./screen-mode");
+  const { paletteHtml, paletteSize } = require("./screen-mode-controller");
+  const html = paletteHtml(SCREEN_MODE.colors, SCREEN_MODE.colors[0], SCREEN_MODE.tools, "rect");
+  const order = [...html.matchAll(/class="(tool|sep|dot)[^"]*"/g)].map((m) => m[1]);
+  assert.deepEqual(order, ["tool", "tool", "sep", ...SCREEN_MODE.colors.map(() => "dot")]);
+  assert.match(html, /class="tool sel" data-t="rect"/);
+  assert.match(html, /class="tool" data-t="pen"/);
+  assert.match(html, /\.dot\.sel, \.tool\.sel \{/, "one highlight for a selected tool and a selected colour");
+  assert.ok(paletteSize(6, 2).width > paletteSize(6, 0).width + 2 * 22, "the pill is wide enough for the tools");
+});
+
+test("a rectangle is drawn live from the press to the pointer, in any direction", async () => {
+  const world = createWorld();
+  try {
+    await world.controller.start(ID);
+    world.say({ t: "start", x: 500, y: 400 });
+    world.say({ t: "move", x: 300, y: 250 }); // up and to the left of the press
+    await tick(30);
+    const calls = world.overlays()[0].page.screenCanvas.ctx.calls;
+    const last = calls.slice(calls.map((c) => c[0]).lastIndexOf("clearRect"));
+    const path = last.filter((c) => c[0] === "moveTo" || c[0] === "lineTo").map((c) => c.slice(1));
+    assert.deepEqual(path, [[500, 400], [300, 400], [300, 250], [500, 250]]);
+    assert.ok(last.some((c) => c[0] === "closePath"));
+  } finally {
+    world.cleanup();
+  }
+});
+
+test("each stroke shows its number live; after a shot the next one is 1 again", async () => {
+  const world = createWorld();
+  try {
+    await world.controller.start(ID);
+    drawStroke(world, [[100, 100], [200, 200]]);
+    drawStroke(world, [[300, 100], [400, 200]]);
+    world.say({ t: "start", x: 500, y: 100 }); // still being drawn: numbered already
+    world.say({ t: "move", x: 600, y: 200 });
+    assert.deepEqual(await screenNumbers(world), ["1", "2", "3"]);
+    await world.controller.takeShot("capsule");
+    // Strokes 1 and 2 left with the shot; the one still being drawn is now 1.
+    assert.deepEqual(await screenNumbers(world), ["1"]);
+    world.say({ t: "end", x: 600, y: 200 });
+    drawStroke(world, [[100, 500], [200, 600]]);
+    assert.deepEqual(await screenNumbers(world), ["1", "2"]);
+    await world.controller.takeShot("capsule");
+    const strokes = (await world.controller.finish({ id: ID })).manifest.events.filter((e) => e.type === "stroke");
+    assert.deepEqual(strokes.map((e) => [e.shot, e.n]), [[1, 1], [1, 2], [2, 1], [2, 2]]);
+  } finally {
+    world.cleanup();
+  }
+});
+
+test("a shot is the front window when every stroke touches it: placed, numbered and copied from the window", async () => {
+  const world = createWorld();
+  world.frontWindow = { x: 100, y: 50, width: 600, height: 400 };
+  try {
+    await world.controller.start(ID);
+    drawStroke(world, [[250, 150], [400, 250]]); // inside the window
+    drawStroke(world, [[600, 300], [900, 700]]); // runs past its corner
+    const shot = await world.controller.takeShot("capsule");
+    assert.deepEqual(world.captures.map((c) => c.bounds), [world.frontWindow], "only the window is captured");
+    const manifest = (await world.controller.finish({ id: ID })).manifest;
+    assert.equal(manifest.version, 2);
+    const shotEvent = manifest.events.find((e) => e.type === "shot");
+    const strokes = manifest.events.filter((e) => e.type === "stroke");
+    assert.equal(shotEvent.area, "window");
+    assert.deepEqual(shotEvent.files, shot.files);
+    // Places are percent of the window, the second stroke cut at its edge.
+    assert.deepEqual(strokes[0].box, { x: 25, y: 25, w: 25, h: 25 });
+    assert.deepEqual(strokes[1].box, { x: 83, y: 63, w: 17, h: 37 });
+    // The image is the window at its own pixels, with both strokes and both numbers.
+    const image = painted(shotEvent.files[0]);
+    assert.deepEqual([image.w, image.h], [1200, 800]);
+    assert.equal(image.calls.filter((c) => c[0] === "closePath").length, 2);
+    const numbers = image.calls.filter((c) => c[0] === "fillText");
+    assert.deepEqual(numbers.map((c) => c[1]), ["1", "2"]);
+    for (const [, , x, y] of numbers) assert.ok(x >= 0 && y >= 0 && x <= 1200 && y <= 800, "every number is inside the picture");
+    // The preview: a JPEG beside the original, named by the contract.
+    assert.equal(shotEvent.preview, path.join(world.staging, ID, "shot-01-preview.jpg"));
+    assert.ok(fs.existsSync(shotEvent.preview));
+    // A close-up per stroke that fits one, at the stroke's own number.
+    assert.equal(strokes[0].crop, path.join(world.staging, ID, "shot-01-n1.jpg"));
+    assert.ok(fs.existsSync(strokes[0].crop));
+    const crop = painted(strokes[0].crop);
+    assert.ok(crop.w <= 1024 && crop.h <= 1024);
+    // (150+2·40)·2 × (100+2·40)·2: the box plus its 40 pt margin, at 2x.
+    assert.deepEqual([crop.w, crop.h], [460, 360]);
+  } finally {
+    world.cleanup();
+  }
+});
+
+test("a stroke wholly outside the front window makes the shot the whole display", async () => {
+  const world = createWorld();
+  world.frontWindow = { x: 100, y: 50, width: 400, height: 300 };
+  try {
+    await world.controller.start(ID);
+    drawStroke(world, [[150, 100], [250, 200]]);
+    drawStroke(world, [[700, 600], [800, 700]]); // nowhere near the window
+    await world.controller.takeShot("hotkey");
+    assert.deepEqual(world.captures.map((c) => c.bounds), [world.displays[0].bounds]);
+    const manifest = (await world.controller.finish({ id: ID })).manifest;
+    assert.equal(manifest.events.find((e) => e.type === "shot").area, "display");
+    assert.deepEqual(manifest.events.find((e) => e.type === "stroke").box, { x: 15, y: 13, w: 10, h: 13 });
+  } finally {
+    world.cleanup();
+  }
+});
+
+test("a helper that does not say where the front window is: the shot is the display, not a hang", async () => {
+  const world = createWorld();
+  world.frontWindowSilent = true;
+  try {
+    await world.controller.start(ID);
+    drawStroke(world, [[150, 100], [250, 200]]);
+    const started = Date.now();
+    await world.controller.takeShot("hotkey");
+    assert.ok(Date.now() - started < 2000);
+    assert.deepEqual(world.captures.map((c) => c.bounds), [world.displays[0].bounds]);
+    assert.ok(world.logs.some((l) => /front window: no answer within \d+ ms/.test(l)));
+    const manifest = (await world.controller.finish({ id: ID })).manifest;
+    assert.equal(manifest.events.find((e) => e.type === "shot").area, "display");
+  } finally {
+    world.cleanup();
+  }
+});
+
+test("a shot with nothing drawn keeps its capture as taken and still gets a preview", async () => {
+  const world = createWorld();
+  world.frontWindow = { x: 100, y: 50, width: 600, height: 400 };
+  try {
+    await world.controller.start(ID);
+    const shot = await world.controller.takeShot("hotkey");
+    assert.equal(painted(shot.files[0]).raw, true, "the original is the capture itself");
+    const manifest = (await world.controller.finish({ id: ID })).manifest;
+    const shotEvent = manifest.events.find((e) => e.type === "shot");
+    assert.equal(shotEvent.area, "window");
+    assert.equal(shotEvent.strokes, 0);
+    assert.ok(fs.existsSync(shotEvent.preview));
+  } finally {
+    world.cleanup();
+  }
+});
+
+test("a stroke covering most of the area gets no close-up: the preview already shows it", async () => {
+  const world = createWorld();
+  try {
+    await world.controller.start(ID);
+    drawStroke(world, [[50, 50], [950, 750]]);
+    await world.controller.takeShot("hotkey");
+    const manifest = (await world.controller.finish({ id: ID })).manifest;
+    const stroke = manifest.events.find((e) => e.type === "stroke");
+    assert.equal("crop" in stroke, false);
+    assert.deepEqual(fs.readdirSync(path.join(world.staging, ID)).filter((f) => /-n\d+\.jpg$/.test(f)), []);
+  } finally {
+    world.cleanup();
+  }
+});
+
+test("a white stroke's number is a dark digit; every other colour's is white", async () => {
+  const { SCREEN_MODE } = require("./screen-mode");
+  const world = createWorld();
+  try {
+    await world.controller.start(ID);
+    drawStroke(world, [[100, 100], [200, 200]]); // red, the default
+    await tick(30);
+    const red = world.overlays()[0].page.screenCanvas.ctx.calls.filter((c) => c[0] === "fillText").pop();
+    assert.equal(red[4], "#ffffff");
+    const overlay = world.overlays()[0];
+    await overlay.webContents.executeJavaScript(`window.__apply([["b", 99, ${JSON.stringify(SCREEN_MODE.colors[5])}, 300, 300, "rect", 2], ["m", 99, 400, 400]])`);
+    const white = overlay.page.screenCanvas.ctx.calls.filter((c) => c[0] === "fillText").pop();
+    assert.equal(white[4], "#111111");
+  } finally {
+    world.cleanup();
+  }
 });

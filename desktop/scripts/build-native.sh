@@ -3,7 +3,8 @@
 # runtime. Today that is one: `screen-input`, the CGEventTap that lets
 # screen mode tell a click (passed through to the app underneath) from a
 # press-and-drag (a stroke drawn on the overlay). Source:
-# desktop/native/screen-input/ (main.swift: the tap; PressClassifier.swift: the rule).
+# desktop/native/screen-input/ (main.swift: the tap; PressClassifier.swift: the rule;
+# FrontWindow.swift: the window a screenshot captures).
 #
 # Output: desktop/native/build/<target>/ — copied by electron-builder to
 # Contents/Resources/runtime/bin, inside the runtime root, so afterPack's
@@ -44,6 +45,7 @@ fi
 xcrun swiftc -O \
   -target "${ARCH}-apple-macos12" \
   "$DESKTOP_DIR/native/screen-input/PressClassifier.swift" \
+  "$DESKTOP_DIR/native/screen-input/FrontWindow.swift" \
   "$DESKTOP_DIR/native/screen-input/main.swift" \
   -o "$OUT_DIR/screen-input"
 chmod 755 "$OUT_DIR/screen-input"

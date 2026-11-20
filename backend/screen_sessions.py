@@ -65,6 +65,12 @@ SCREENS_DIR_SUFFIX = ".screens"
 EVENTS_FILE_NAME = "events.json"
 SCREEN_SESSION_ID_RE = re.compile(r"^screen-\d{8}-\d{6}-\d{3}$")
 SCREENSHOT_NAME_RE = re.compile(r"^shot-\d{2,}(-display\d+)?\.png$")
+# The agent's cheap copies the shell writes beside the screenshots: a
+# shot's downscaled preview (``shot-NN-preview.jpg``) and one close-up per
+# stroke (``shot-NN-n<number>.jpg``). They live, move and are deleted with
+# the folder and are served like the screenshots, but they are not
+# screenshots: ``screenshots_in`` (the history's list) never names them.
+DERIVED_IMAGE_NAME_RE = re.compile(r"^shot-\d{2,}-(preview|n\d+)\.jpg$")
 
 
 def staging_root(data_dir: Path) -> Path:
@@ -115,11 +121,23 @@ def list_screenshots(target_dir: Path, stem: str) -> list[str]:
     return screenshots_in(d) if d is not None else []
 
 
-def screenshot_path(target_dir: Path, stem: str, file_name: str) -> Optional[Path]:
-    """The path of one screenshot, or None. Only a name the desktop shell
-    writes is accepted — never a path, never anything else in the folder."""
+def is_served_image_name(file_name: object) -> bool:
+    """A screenshot or one of its cheap copies — the image names the shell
+    writes into a screens folder, and the only ones ever served."""
     leaf = str(file_name or "")
-    if not SCREENSHOT_NAME_RE.fullmatch(leaf):
+    return bool(SCREENSHOT_NAME_RE.fullmatch(leaf) or DERIVED_IMAGE_NAME_RE.fullmatch(leaf))
+
+
+def image_media_type(file_name: str) -> str:
+    return "image/jpeg" if str(file_name).lower().endswith(".jpg") else "image/png"
+
+
+def screenshot_path(target_dir: Path, stem: str, file_name: str) -> Optional[Path]:
+    """The path of one screenshot (or one of its cheap copies), or None.
+    Only a name the desktop shell writes is accepted — never a path, never
+    anything else in the folder."""
+    leaf = str(file_name or "")
+    if not is_served_image_name(leaf):
         return None
     d = recording_screens_dir(target_dir, stem)
     if d is None:
@@ -160,10 +178,22 @@ def is_screens_work_dir(path: Path) -> bool:
     return bool(SCREENS_WORK_DIR_RE.search(path.name)) and path.is_dir() and not path.is_symlink()
 
 
+def _rehome_image(value: object, folder: Path) -> Optional[str]:
+    """One cheap copy's path (a shot's ``preview``, a stroke's ``crop``)
+    pointed at ``folder``; None for anything that is not a name the shell
+    writes for one."""
+    if not isinstance(value, str):
+        return None
+    leaf = Path(value).name
+    return str(folder / leaf) if DERIVED_IMAGE_NAME_RE.fullmatch(leaf) else None
+
+
 def _rehome_manifest(manifest: dict[str, Any], folder: Path) -> dict[str, Any]:
-    """Point every screenshot path in the manifest at ``folder``. Fields of
-    the wrong shape (the shell wrote ``events`` as something other than a
-    list) are dropped, never trusted."""
+    """Point every image path in the manifest — a shot's ``files`` and
+    ``preview``, a stroke's ``crop`` (manifest v2; v1 has only ``files``)
+    — at ``folder``. Fields of the wrong shape (the shell wrote ``events``
+    as something other than a list, a ``crop`` that is not one of its
+    names) are dropped, never trusted."""
     out = dict(manifest)
     out["dir"] = str(folder)
     events = []
@@ -175,6 +205,13 @@ def _rehome_manifest(manifest: dict[str, Any], folder: Path) -> dict[str, Any]:
         files = e.get("files")
         if isinstance(files, list):
             e["files"] = [str(folder / Path(str(f)).name) for f in files if isinstance(f, str)]
+        for key in ("preview", "crop"):
+            if key in e:
+                rehomed = _rehome_image(e[key], folder)
+                if rehomed is None:
+                    del e[key]
+                else:
+                    e[key] = rehomed
         events.append(e)
     out["events"] = events
     return out
