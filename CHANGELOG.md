@@ -3,6 +3,17 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.9] - 2026-11-20
+
+### Changed
+
+- **A thin line runs in the capsule from the moment you press**, in the take's colour (red while recording), even before you say anything; the level bars rise above it. Silence used to leave the waveform empty.
+- **The start tone sounds at the press on every start.** It used to wait for the first audio frame unless the microphone had been kept warm, and a Bluetooth headset is never kept warm: that frame arrives while the headset switches to its call profile with its output muted, so the tone was never heard. The log now records each tone (`[cue] start played`).
+
+### Fixed
+
+- **Screen mode: double-tap-and-drag through BetterTouchTool draws.** BetterTouchTool posts the press itself; the helper holds it back, so macOS never sees the button go down and the movement arrives as plain cursor motion, which the helper ignored — the cursor moved and nothing was drawn. Cursor motion during a held press is now a stroke; it still reaches the screen, so the cursor never stalls.
+
 ## [1.6.8] - 2026-11-20
 
 What the first live day of 1.6.7 turned up.
