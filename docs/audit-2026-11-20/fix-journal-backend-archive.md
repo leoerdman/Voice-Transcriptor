@@ -22,3 +22,23 @@ Proof method: SKILL §7.1 — the fixed file is put aside, `git show HEAD:<path>
   FAILED (failures=3)
   ```
 - After: `Ran 3 tests ... OK`; full suite `Ran 885 tests ... OK (skipped=2)`.
+
+### C2 · BL-01 (P1), BL-17 (P2, cause removed) · the recovery spool has one owner of its deletion
+- Files: `backend/main.py` (`_safe_delete_live_recovery` defers while the handler owns the session, `_mark_live_recovery_discarded`, `LIVE_RECOVERY_STATUS_DISCARDED`, `_live_recovery_discard_pending`, `_unregister_live_session` returns the pending request, new `_end_live_session_ownership` = the handler's `finally` (finalize first, then release, then carry out the deferred delete), `_finalize_live_recovery` writes `status: "discarded"` when a request is pending, `_list_live_recoveries`/`_promote_live_recovery` skip/404 a discarded take, `_recovery_spool_bytes` docstring), `backend/tests/test_live_recovery_liveness.py` (new `SpoolHasOneOwnerTests`).
+- Note for the merge: the `ws_transcribe` `finally` (3 lines) now calls `_end_live_session_ownership`; nothing else in the handler changed.
+- Check: `python -m unittest backend.tests.test_live_recovery_liveness.SpoolHasOneOwnerTests`
+- Before (main.py at HEAD):
+  ```
+  ERROR: test_a_save_during_the_session_leaves_the_spool_readable (...)
+  AssertionError: 0 not greater than 0
+  AttributeError: module 'backend.main' has no attribute '_end_live_session_ownership'
+  ERROR: test_the_deferred_discard_runs_after_finalize_and_leaves_nothing (...)
+  AttributeError: module 'backend.main' has no attribute '_end_live_session_ownership'
+  ERROR: test_without_a_request_finalize_keeps_the_recovery (...)
+  AttributeError: module 'backend.main' has no attribute '_end_live_session_ownership'
+  Ran 4 tests in 1.775s
+  FAILED (errors=3)
+  ```
+  (the behavioural failure is the first: the save emptied the spool the finalize recovery reads.)
+- After: `Ran 4 tests ... OK`; full suite `Ran 889 tests ... OK (skipped=2)`.
+- BL-17: the "spool not readable at finalize" WARNING was the symptom of this race; with the race gone the line stays at WARNING because it now reports a genuinely abnormal state.

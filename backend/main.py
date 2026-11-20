@@ -1124,11 +1124,74 @@ def _delete_live_recovery(session_id: str) -> bool:
 
 
 def _safe_delete_live_recovery(session_id: str) -> bool:
+    """Delete a session's recovery files — or, while its WebSocket handler
+    still owns them, ask the handler to.
+
+    ONE owner of the spool's deletion (BL-01): from the moment the handler
+    registers the session until it has sent the ``final`` envelope and
+    finalized the sidecar, the spool is the handler's. The finalize-time
+    recovery reads it back (``_recovery_spool_bytes``) to repair holes in
+    the envelope. The renderer's save / discard used to unlink it from
+    under that read whenever it landed first — 400 of 1 591 sessions in
+    November logged "spool not readable at finalize" and shipped holes
+    unrepaired — and the finalize then rewrote a "recoverable" sidecar
+    that no spool backed (the orphan sidecars ``_delete_live_recovery``
+    documents).
+
+    A request that arrives while the handler owns the files is recorded
+    and marked on disk (``status: "discarded"``, so a crash before the
+    handler finishes never offers the take for promotion again); the
+    handler executes it as its last step (``_unregister_live_session``).
+    Returns True when the files are gone or their deletion is scheduled.
+    """
+    with _live_sessions_lock:
+        deferred = session_id in _live_sessions_in_flight
+        if deferred:
+            _live_recovery_discard_pending.add(session_id)
+    if deferred:
+        _mark_live_recovery_discarded(session_id)
+        return True
     try:
         return _delete_live_recovery(session_id)
     except OSError as exc:
         logger.warning("live recovery delete failed for %s: %s", session_id, exc)
         return False
+
+
+LIVE_RECOVERY_STATUS_DISCARDED = "discarded"
+
+
+def _mark_live_recovery_discarded(session_id: str) -> None:
+    """Persist a deferred discard in the sidecar (see
+    ``_safe_delete_live_recovery``). Best effort: the in-memory request is
+    what the handler acts on; the mark only covers a crash in between."""
+    _pcm_path, meta_path = _live_recovery_paths(session_id)
+    if meta_path is None:
+        return
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if not isinstance(meta, dict):
+            return
+        meta["status"] = LIVE_RECOVERY_STATUS_DISCARDED
+        atomic_write_json(meta_path, meta)
+    except (OSError, ValueError) as exc:
+        logger.warning("live recovery %s: could not mark discarded: %s", session_id, exc)
+
+
+def _end_live_session_ownership(session_id: str, recovery: Optional[dict]) -> None:
+    """The WebSocket handler's last step. Finalize the spool while still
+    its owner, THEN release ownership and carry out a save/discard that
+    arrived meanwhile — never the other way round, or that request would
+    unlink the spool under the finalize-time recovery read (BL-01)."""
+    if recovery is not None:
+        _finalize_live_recovery(recovery)
+    if _unregister_live_session(session_id):
+        _safe_delete_live_recovery(session_id)
+
+
+def _live_recovery_discard_is_pending(session_id: str) -> bool:
+    with _live_sessions_lock:
+        return session_id in _live_recovery_discard_pending
 
 
 def _session_id_from_recovery_stem(stem: str) -> str:
@@ -1174,6 +1237,9 @@ def _session_id_from_recovery_stem(stem: str) -> str:
 # Both endpoints consult this, so the list can no longer offer something
 # the promote will reject.
 _live_sessions_in_flight: set[str] = set()
+# Sessions whose recovery files were asked to be deleted while their
+# handler still owned them (``_safe_delete_live_recovery``). Same lock.
+_live_recovery_discard_pending: set[str] = set()
 _live_sessions_lock = threading.Lock()
 
 
@@ -1184,11 +1250,18 @@ def _register_live_session(session_id: str) -> None:
         _live_sessions_in_flight.add(session_id)
 
 
-def _unregister_live_session(session_id: str) -> None:
+def _unregister_live_session(session_id: str) -> bool:
+    """End the handler's ownership. Returns True when a discard of the
+    session's recovery files was requested meanwhile — the caller then
+    deletes them (``_safe_delete_live_recovery`` now acts directly)."""
     if not session_id:
-        return
+        return False
     with _live_sessions_lock:
         _live_sessions_in_flight.discard(session_id)
+        if session_id in _live_recovery_discard_pending:
+            _live_recovery_discard_pending.discard(session_id)
+            return True
+        return False
 
 
 def _live_session_is_streaming(session_id: str) -> bool:
@@ -1207,6 +1280,11 @@ def _list_live_recoveries() -> list[dict[str, Any]]:
                 or _session_id_from_recovery_stem(pcm_path.stem)
             )
             if not LIVE_SESSION_ID_RE.fullmatch(session_id):
+                continue
+            # A take whose save already landed (its discard was deferred
+            # and the process died before the handler executed it) is not
+            # a recovery: promoting it would duplicate the saved recording.
+            if str(raw.get("status") or "") == LIVE_RECOVERY_STATUS_DISCARDED:
                 continue
             # Never offer a session that is streaming right now: promoting
             # it would truncate the WAV and unlink the spool from under the
@@ -1395,6 +1473,10 @@ def _promote_live_recovery(
                     status_code=409,
                     detail="session is still recording; stop it before promoting",
                 )
+            # Same rule as the list: a discarded take is not offered and
+            # cannot be promoted.
+            if str(meta.get("status") or "") == LIVE_RECOVERY_STATUS_DISCARDED:
+                raise HTTPException(status_code=404, detail="live recovery not found")
             # Refuse an oversized spool BEFORE touching it. The
             # conversion below streams (``write_wav_from_pcm16_stream``,
             # ~2 MB per chunk), so this is a bound on how much of the
@@ -4243,9 +4325,7 @@ async def ws_transcribe(websocket: WebSocket):
         else:
             logger.warning("ws/transcribe transient broken pipe: %s", e)
     finally:
-        _unregister_live_session(session_id)
-        if recovery_ctx is not None:
-            _finalize_live_recovery(recovery_ctx)
+        _end_live_session_ownership(session_id, recovery_ctx)
 
 
 def _normalize_live_provider(raw: Optional[str]) -> str:
@@ -4459,7 +4539,11 @@ def _finalize_live_recovery(recovery: dict) -> None:
                 "finished_at": datetime.now().isoformat(),
                 "bytes": recovery["bytes"],
                 "chunks": recovery["chunks"],
-                "status": "error" if recovery["had_error"] else "recoverable",
+                "status": (
+                    LIVE_RECOVERY_STATUS_DISCARDED
+                    if _live_recovery_discard_is_pending(str(recovery.get("session_id") or ""))
+                    else "error" if recovery["had_error"] else "recoverable"
+                ),
                 "write_error": str(recovery.get("write_error") or ""),
             }
         )
@@ -4496,9 +4580,10 @@ def _recovery_spool_bytes(recovery: Optional[dict]) -> bytes:
     * the file is opened UNBUFFERED (``_open_live_recovery``), so
       everything ``_record_recovery_chunk`` accepted is already visible
       to this read even though the writer still holds the handle;
-    * it is deleted only by ``_finalize_live_recovery``, which the
-      WebSocket handler runs in its ``finally`` — strictly after the
-      envelope has been sent.
+    * nothing deletes it while the WebSocket handler owns it: a save or
+      discard that arrives meanwhile is deferred until the handler's
+      ``finally`` has finalized it (``_safe_delete_live_recovery``) —
+      strictly after the envelope has been sent.
 
     Returns ``b""`` — never raises — when there is no spool, when it is
     unreadable, or when it is larger than this process will read at

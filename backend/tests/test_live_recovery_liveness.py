@@ -159,5 +159,69 @@ class LiveRecoveryLivenessTests(unittest.TestCase):
         self.assertAlmostEqual(record["duration_sec"], 43.0, delta=0.5)
 
 
+class SpoolHasOneOwnerTests(unittest.TestCase):
+    """BL-01: while the WebSocket handler owns a session, a save/discard
+    must not unlink the spool the finalize-time recovery still reads."""
+
+    setUp = LiveRecoveryLivenessTests.setUp
+    tearDown = LiveRecoveryLivenessTests.tearDown
+
+    def _open(self) -> dict:
+        recovery = self.main._open_live_recovery(
+            session_id=SESSION,
+            started_at=datetime.now(),
+            provider="deepgram",
+            model="nova-3",
+            language="auto",
+            archive_dir="",
+            recording_collection="live",
+        )
+        self.main._record_recovery_chunk(
+            recovery, b"\x00\x01" * (2 * self.main.LIVE_SAMPLE_RATE_HZ)
+        )
+        return recovery
+
+    def _files(self) -> list[str]:
+        return sorted(p.suffix for p in self.main.LIVE_RECOVERY_DIR.iterdir())
+
+    def test_a_save_during_the_session_leaves_the_spool_readable(self) -> None:
+        self.main._register_live_session(SESSION)
+        recovery = self._open()
+        try:
+            self.assertTrue(self.main._safe_delete_live_recovery(SESSION))
+            self.assertGreater(len(self.main._recovery_spool_bytes(recovery)), 0)
+        finally:
+            self.main._end_live_session_ownership(SESSION, recovery)
+
+    def test_the_deferred_discard_runs_after_finalize_and_leaves_nothing(self) -> None:
+        self.main._register_live_session(SESSION)
+        recovery = self._open()
+        self.main._safe_delete_live_recovery(SESSION)
+        self.main._end_live_session_ownership(SESSION, recovery)
+        # No spool AND no orphan "recoverable" sidecar rewritten by finalize.
+        self.assertEqual(self._files(), [])
+
+    def test_a_crash_after_the_save_does_not_offer_the_take_again(self) -> None:
+        self.main._register_live_session(SESSION)
+        recovery = self._open()
+        self.main._safe_delete_live_recovery(SESSION)
+        recovery["pcm_file"].close()
+        # The process dies here: the handler never runs its last step.
+        self.main._live_sessions_in_flight.clear()
+        listed = [r["session_id"] for r in self.main._list_live_recoveries()]
+        self.assertNotIn(SESSION, listed)
+        with self.assertRaises(self.main.HTTPException) as ctx:
+            self.main._promote_live_recovery(SESSION)
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_without_a_request_finalize_keeps_the_recovery(self) -> None:
+        self.main._register_live_session(SESSION)
+        recovery = self._open()
+        self.main._end_live_session_ownership(SESSION, recovery)
+        self.assertEqual(self._files(), [".json", ".pcm16"])
+        listed = [r["session_id"] for r in self.main._list_live_recoveries()]
+        self.assertIn(SESSION, listed)
+
+
 if __name__ == "__main__":
     unittest.main()
