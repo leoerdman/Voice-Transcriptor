@@ -9,7 +9,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const {
-  MAX_SOURCE_LEN,
+  RECORDING_SIGNAL_KINDS,
   validateRecordingFinalPayload,
   createRecordingFinalSlot,
 } = require("./recording-final-slot");
@@ -22,20 +22,20 @@ test("validator accepts the contract shape and drops unknown keys", () => {
       recordingId: 7,
       text: "hello world",
       final: true,
-      source: "live-stop",
+      kind: "transcript",
       // Anything else the renderer happens to attach is not part of the
       // contract and must not reach the paste path.
       pasteNow: true,
       nested: { evil: 1 },
     }),
-    { recordingId: 7, text: "hello world", final: true, source: "live-stop" },
+    { recordingId: 7, text: "hello world", final: true, kind: "transcript", phase: "" },
   );
 });
 
 test("validator accepts a provisional payload and an empty text", () => {
   assert.deepEqual(
-    validateRecordingFinalPayload({ recordingId: 1, text: "", final: false, source: "" }),
-    { recordingId: 1, text: "", final: false, source: "" },
+    validateRecordingFinalPayload({ recordingId: 1, text: "", final: false, kind: "status", phase: "no-speech" }),
+    { recordingId: 1, text: "", final: false, kind: "status", phase: "no-speech" },
   );
 });
 
@@ -65,28 +65,21 @@ test("validator rejects non-objects", () => {
   }
 });
 
-test("validator normalizes source but never rejects a payload over it", () => {
-  assert.equal(
-    validateRecordingFinalPayload({ recordingId: 1, text: "x", final: true, source: "  live\n stop " })
-      .source,
-    "live stop",
-  );
-  // Missing or wrong-typed source is telemetry only — the transcript
-  // still gets through.
-  assert.equal(validateRecordingFinalPayload({ recordingId: 1, text: "x", final: true }).source, "");
-  assert.equal(
-    validateRecordingFinalPayload({ recordingId: 1, text: "x", final: true, source: 42 }).source,
-    "",
-  );
-  assert.equal(
-    validateRecordingFinalPayload({
-      recordingId: 1,
-      text: "x",
-      final: true,
-      source: "s".repeat(MAX_SOURCE_LEN + 50),
-    }).source.length,
-    MAX_SOURCE_LEN,
-  );
+test("validator requires an explicit kind and a well-formed phase (no label parsing)", () => {
+  const base = { recordingId: 1, text: "x", final: true };
+  for (const kind of RECORDING_SIGNAL_KINDS) {
+    assert.equal(validateRecordingFinalPayload({ ...base, kind }).kind, kind);
+  }
+  // The old free-form label is not a kind: a payload carrying only it is
+  // not a hand-off.
+  assert.equal(validateRecordingFinalPayload({ ...base, source: "transcript" }), null);
+  assert.equal(validateRecordingFinalPayload({ ...base, kind: "Transcript" }), null);
+  assert.equal(validateRecordingFinalPayload({ ...base, kind: "status:upscaling" }), null);
+  assert.equal(validateRecordingFinalPayload({ ...base, kind: "status", phase: "upscaling" }).phase, "upscaling");
+  assert.equal(validateRecordingFinalPayload({ ...base, kind: "status" }).phase, "");
+  for (const phase of [42, "Upscaling", "up scaling", "x".repeat(40), null]) {
+    assert.equal(validateRecordingFinalPayload({ ...base, kind: "status", phase }), null, String(phase));
+  }
 });
 
 // --------------------------------------------------------------------- slot
@@ -101,7 +94,7 @@ test("slot ignores an invalid payload entirely", () => {
 
 test("set-before-wait: a signal published before anyone waits is not lost", async () => {
   const slot = createRecordingFinalSlot();
-  slot.set({ recordingId: 5, text: "paste me", final: true, source: "live" });
+  slot.set({ recordingId: 5, text: "paste me", final: true, kind: "transcript" });
   // The post-stop task starts waiting only after the queue reaches it —
   // by then the renderer may already have published. The wait must
   // resolve immediately from the stored value, not hang for its timeout.
@@ -116,7 +109,7 @@ test("set-before-wait: a signal published before anyone waits is not lost", asyn
 test("wait-before-set: a waiter is woken by the signal that arrives later", async () => {
   const slot = createRecordingFinalSlot();
   const pending = slot.waitForSignal(9, { timeoutMs: 5000 });
-  setTimeout(() => slot.set({ recordingId: 9, text: "late", final: true }), 20);
+  setTimeout(() => slot.set({ recordingId: 9, text: "late", final: true, kind: "transcript" }), 20);
   const signal = await pending;
   assert.equal(signal.text, "late");
   assert.equal(signal.final, true);
@@ -125,7 +118,7 @@ test("wait-before-set: a waiter is woken by the signal that arrives later", asyn
 test("a provisional wakes the waiter, and the following final wakes the next one", async () => {
   const slot = createRecordingFinalSlot();
   const first = slot.waitForSignal(3, { timeoutMs: 5000 });
-  slot.set({ recordingId: 3, text: "before upscale", final: false, source: "status" });
+  slot.set({ recordingId: 3, text: "before upscale", final: false, kind: "status", phase: "upscaling" });
   const provisional = await first;
   assert.equal(provisional.final, false);
   assert.equal(provisional.text, "before upscale");
@@ -133,7 +126,7 @@ test("a provisional wakes the waiter, and the following final wakes the next one
   // The caller resumes waiting from the sequence it has already seen, so
   // the provisional it just handled cannot wake it a second time.
   const second = slot.waitForSignal(3, { sinceSeq: provisional.seq, timeoutMs: 5000 });
-  slot.set({ recordingId: 3, text: "after upscale", final: true, source: "paste-ready" });
+  slot.set({ recordingId: 3, text: "after upscale", final: true, kind: "transcript" });
   const final = await second;
   assert.equal(final.final, true);
   assert.equal(final.text, "after upscale");
@@ -147,7 +140,7 @@ test("a provisional wakes the waiter, and the following final wakes the next one
 
 test("sinceSeq is honoured on a set-before-wait read", async () => {
   const slot = createRecordingFinalSlot();
-  const stored = slot.set({ recordingId: 4, text: "seen already", final: false });
+  const stored = slot.set({ recordingId: 4, text: "seen already", final: false, kind: "status" });
   // Already handled — waiting from its own seq must not return it again.
   const started = Date.now();
   assert.equal(await slot.waitForSignal(4, { sinceSeq: stored.seq, timeoutMs: 60 }), null);
@@ -156,8 +149,8 @@ test("sinceSeq is honoured on a set-before-wait read", async () => {
 
 test("last write wins per kind", () => {
   const slot = createRecordingFinalSlot();
-  slot.set({ recordingId: 2, text: "first", final: true });
-  slot.set({ recordingId: 2, text: "corrected", final: true });
+  slot.set({ recordingId: 2, text: "first", final: true, kind: "transcript" });
+  slot.set({ recordingId: 2, text: "corrected", final: true, kind: "transcript" });
   assert.equal(slot.peek(2).final.text, "corrected");
 });
 
@@ -167,7 +160,7 @@ test("another recording's signal never resolves this recording's waiter", async 
   // A recording that started after this one finished publishing its own
   // text: strict id matching is what keeps one recording's transcript
   // from being pasted for another.
-  slot.set({ recordingId: 12, text: "next recording", final: true });
+  slot.set({ recordingId: 12, text: "next recording", final: true, kind: "transcript" });
   assert.equal(await pending, null);
   assert.equal(slot.peek(11), null);
   assert.equal(slot.peek(12).final.text, "next recording");
@@ -175,11 +168,11 @@ test("another recording's signal never resolves this recording's waiter", async 
 
 test("superseded id: the oldest slot is dropped and its waiter released", async () => {
   const slot = createRecordingFinalSlot({ maxRecordings: 2 });
-  const oldest = slot.set({ recordingId: 100, text: "oldest", final: false });
+  const oldest = slot.set({ recordingId: 100, text: "oldest", final: false, kind: "status" });
   // Still waiting for its final, having already handled the provisional.
   const stale = slot.waitForSignal(100, { sinceSeq: oldest.seq, timeoutMs: 5000 });
-  slot.set({ recordingId: 101, text: "middle", final: false });
-  slot.set({ recordingId: 102, text: "newest", final: false });
+  slot.set({ recordingId: 101, text: "middle", final: false, kind: "status" });
+  slot.set({ recordingId: 102, text: "newest", final: false, kind: "status" });
   // Released with null rather than left hanging on its own timeout: the
   // caller falls back instead of blocking to its deadline.
   assert.equal(await stale, null);
@@ -200,7 +193,7 @@ test("timeout: a zero or missing timeout is a non-blocking read", async () => {
   const slot = createRecordingFinalSlot();
   assert.equal(await slot.waitForSignal(77, { timeoutMs: 0 }), null);
   assert.equal(await slot.waitForSignal(77), null);
-  slot.set({ recordingId: 77, text: "here", final: true });
+  slot.set({ recordingId: 77, text: "here", final: true, kind: "transcript" });
   assert.equal((await slot.waitForSignal(77)).text, "here");
 });
 
@@ -217,10 +210,10 @@ test("an unusable recordingId degrades to a plain timer", async () => {
 test("a settled waiter is not disturbed by later signals", async () => {
   const slot = createRecordingFinalSlot();
   const pending = slot.waitForSignal(21, { timeoutMs: 5000 });
-  slot.set({ recordingId: 21, text: "one", final: false });
+  slot.set({ recordingId: 21, text: "one", final: false, kind: "status" });
   assert.equal((await pending).text, "one");
   // No waiters left: a second signal must not throw or double-resolve.
-  slot.set({ recordingId: 21, text: "two", final: true });
+  slot.set({ recordingId: 21, text: "two", final: true, kind: "transcript" });
   assert.equal(slot.peek(21).final.text, "two");
 });
 
@@ -243,7 +236,7 @@ function matchAll(source, pattern) {
 
 test("preload sends, and main listens on, the same one channel", () => {
   const sent = matchAll(PRELOAD_SRC, /ipcRenderer\.send\(\s*"([^"]+)"/g);
-  assert.deepEqual(sent, ["recording-final"], "preload's send surface is this one channel");
+  assert.equal(sent.filter((c) => c === "recording-final").length, 1, "the hand-off is sent on one channel, once");
   const listened = matchAll(MAIN_SRC, /ipcMain\.on\(\s*"([^"]+)"/g);
   assert.ok(
     listened.includes("recording-final"),

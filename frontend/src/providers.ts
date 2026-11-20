@@ -11,7 +11,7 @@
  */
 import type { WireProvider } from "./transcription-catalog";
 
-export type ProviderId = Exclude<WireProvider, "">;
+export type ProviderId = WireProvider;
 export type RemoteProviderId = Exclude<ProviderId, "local">;
 
 interface ProviderInfo {
@@ -30,7 +30,7 @@ export const PROVIDERS: Readonly<Record<ProviderId, ProviderInfo>> = {
 /** Typed as strings: it orders names read from the archive, which may be anything. */
 export const PROVIDER_DISPLAY_ORDER: readonly string[] = Object.keys(PROVIDERS);
 
-function isProviderId(value: string): value is ProviderId {
+export function isProviderId(value: string): value is ProviderId {
   return Object.prototype.hasOwnProperty.call(PROVIDERS, value);
 }
 
@@ -46,14 +46,21 @@ export function providerLabel(provider: string): string {
 }
 
 export function isRemoteProvider(provider: WireProvider): provider is RemoteProviderId {
-  return provider !== "" && PROVIDERS[provider].remote;
+  return PROVIDERS[provider].remote;
 }
 
-/** A stored selection read back: a provider of this build, "" (None), or the fallback. */
+/**
+ * A stored selection read back: a provider of this build, or the fallback.
+ *
+ * FU-15 (user decision 2026-11-20: remove None). The Live toolbar used to
+ * offer "None" and persisted it as ``provider: ""``; it is gone, so a
+ * stored "" — from a build that still had it, or anything unrecognised —
+ * migrates to the fallback (the default provider) here, at the one place
+ * a stored provider is read. The next autosave writes the migrated value.
+ */
 export function normalizeProviderSelection(value: unknown, fallback: WireProvider = "local"): WireProvider {
   const provider = String(value ?? "").trim();
-  if (provider === "" || isProviderId(provider)) return provider;
-  return fallback;
+  return isProviderId(provider) ? provider : fallback;
 }
 
 export function providerKeyErrorMessage(provider: WireProvider): string {
@@ -63,13 +70,13 @@ export function providerKeyErrorMessage(provider: WireProvider): string {
 
 /**
  * The provider a remote request is billed to. Three request builders used
- * `provider || "openrouter"`: a None ("") selection that reached them was
- * silently sent to a paid provider, without a model and past the guards
- * that skip "". Anything that is not a remote provider is refused.
+ * `provider || "openrouter"`: a selection that was not remote was
+ * silently sent to a paid provider. Anything that is not a remote
+ * provider is refused.
  */
 export function requireRemoteProvider(provider: WireProvider): RemoteProviderId {
   if (!isRemoteProvider(provider)) {
-    throw new Error(`A remote transcription needs a remote provider, got "${provider || "none"}".`);
+    throw new Error(`A remote transcription needs a remote provider, got "${provider}".`);
   }
   return provider;
 }

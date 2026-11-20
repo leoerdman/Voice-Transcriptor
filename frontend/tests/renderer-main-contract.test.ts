@@ -50,32 +50,25 @@ describe("renderer globals the main process reads", () => {
 });
 
 /**
- * The document.title bridge. Three messages, two processes, and until
- * now four independent string literals on the renderer side alone.
+ * DM-10 / FU-10 / K-1: the main window talks to main over preload sends
+ * (desktop/renderer-requests.js), not by writing sentinels into
+ * ``document.title``. The channel must not come back on either side.
  */
-describe("the title bridge prefixes match desktop/main.js", () => {
+describe("no document.title channel between the renderer and main", () => {
   const desktopMain = readFileSync(resolve(process.cwd(), "../desktop/main.js"), "utf8");
 
-  it("declares each prefix once in the renderer", () => {
-    const block = /TITLE_BRIDGE_PREFIX = \{([\s\S]*?)\} as const;/.exec(mainTsx)?.[1];
-    expect(block, "TITLE_BRIDGE_PREFIX not found").toBeTruthy();
-    const prefixes = Array.from(String(block).matchAll(/"(__app_[a-z_]+__)"/g)).map((m) => m[1]);
-    expect(prefixes.sort()).toEqual([
-      "__app_record_toggle__",
-      "__app_reveal_recording__",
-      "__app_shortcuts__",
-    ]);
-    for (const prefix of prefixes) {
-      // Once in the declaration, nowhere else: the three call sites go
-      // through postTitleBridgeMessage.
-      expect(mainTsx.split(`"${prefix}"`).length - 1, prefix).toBe(1);
-    }
+  it("the renderer never writes a sentinel title and main never listens for one", () => {
+    expect(mainTsx).not.toMatch(/__app_[a-z_]+__/);
+    expect(mainTsx).not.toMatch(/document\.title\s*=/);
+    expect(desktopMain).not.toContain("page-title-updated");
   });
 
-  it("is the same set the main process listens for", () => {
-    for (const prefix of ["__app_shortcuts__", "__app_record_toggle__", "__app_reveal_recording__"]) {
-      expect(desktopMain, prefix).toContain(prefix);
-    }
+  it("the renderer uses the preload sends and the pushed shortcut status", () => {
+    expect(mainTsx).toContain("window.transcriptor?.shortcuts?.(");
+    expect(mainTsx).toContain("window.transcriptor?.recordToggle?.()");
+    expect(mainTsx).toContain("window.transcriptor?.revealRecording");
+    expect(mainTsx).toContain("window.transcriptor?.onShortcutStatus?.(");
+    expect(mainTsx).not.toContain("__transcriptorShortcutStatus");
   });
 });
 
@@ -204,11 +197,13 @@ describe("stopLive has exactly one transcript delivery site (F/7 / U-022)", () =
     expect(stopLiveBody).not.toMatch(/\(!!provider && micHealthBad\)/);
   });
 
-  it("the six no-transcript exits end through one epilogue, not a copy each (D-13)", () => {
+  it("the five no-transcript exits end through one epilogue, not a copy each (D-13)", () => {
     // Each early return states its plan; runStopEpilogue (./stop-epilogue,
     // behaviour-tested in stop-epilogue.test.ts) does the ending.
+    // Five, not six: the "no provider selected" exit went with the "None"
+    // option (FU-15, user decision 2026-11-20).
     const exits = stopLiveBody.match(/await endWithoutTranscript\(\{/g) || [];
-    expect(exits.length).toBe(6);
+    expect(exits.length).toBe(5);
     expect(stopLiveBody).toContain("runStopEpilogue(plan, {");
     // The bookkeeping is handed to the epilogue, never called inline by an exit.
     expect(stopLiveBody).toContain("release: releaseStopEpilogueBookkeeping,");
@@ -488,7 +483,7 @@ describe("live half: one rule per fact, no dead state (FL-05/06/09/14/15/16/17/1
   });
 
   it("FL-05: the final envelope is the parsed message minus its type, and the WS diarize comes from the snapshot", () => {
-    const handler = /case "final": \{([\s\S]*?)\n {8}\}/.exec(mainTsx)?.[1] || "";
+    const handler = /case "final": \{([\s\S]*?)\n {6}\}/.exec(mainTsx)?.[1] || "";
     expect(handler).toContain("const { type: _type, ...fields } = msg;");
     expect(handler).toContain("...fields,");
     expect(mainTsx).toContain('diarize: activeLiveSessionSnapshot.diarize ? "true" : "false",');
@@ -561,7 +556,7 @@ function mainTsxSlice(header: string, next: string): string {
 describe("upload queue wiring for a failed History save (FQ-01/FQ-05/FQ-18)", () => {
   it("both the queue row and the result pane render the error state through uploadErrorView", () => {
     const row = mainTsxSlice("function renderUploadQueue(): void {", "\nfunction renderUploadResultPane(");
-    const pane = mainTsxSlice("function renderUploadResultPane(): void {", "\ninstallRevealRecordingBridge();");
+    const pane = mainTsxSlice("function renderUploadResultPane(): void {", "\nsetupUploadView();");
     expect(row).toContain("uploadErrorView(item)");
     expect(pane).toContain("uploadErrorView(item)");
   });

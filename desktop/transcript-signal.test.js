@@ -16,7 +16,6 @@ const {
   SIGNAL_OUTCOME,
   isPasteableTranscript,
   isNoSpeechPlaceholder,
-  parseSignalSource,
   classifyRecordingSignal,
 } = require("./transcript-signal");
 
@@ -33,7 +32,7 @@ const DICTATIONS_THAT_LOOK_LIKE_STATUSES = [
 
 test("a final transcript is pasted whatever words it contains", () => {
   for (const text of DICTATIONS_THAT_LOOK_LIKE_STATUSES) {
-    const verdict = classifyRecordingSignal({ final: true, text, source: "transcript" });
+    const verdict = classifyRecordingSignal({ final: true, text, kind: "transcript" });
     assert.equal(verdict.outcome, SIGNAL_OUTCOME.FINAL, text);
     assert.equal(verdict.text, text);
     assert.equal(isPasteableTranscript(text), true, text);
@@ -42,7 +41,7 @@ test("a final transcript is pasted whatever words it contains", () => {
 
 test("the pre-upscale publish is best-known text, whatever words it contains", () => {
   for (const text of DICTATIONS_THAT_LOOK_LIKE_STATUSES) {
-    const verdict = classifyRecordingSignal({ final: false, text, source: "status:upscaling" });
+    const verdict = classifyRecordingSignal({ final: false, text, kind: "status", phase: "upscaling" });
     assert.equal(verdict.outcome, SIGNAL_OUTCOME.PROVISIONAL, text);
     assert.equal(verdict.text, text);
   }
@@ -50,11 +49,11 @@ test("the pre-upscale publish is best-known text, whatever words it contains", (
 
 test("no-speech is read from the phase or an exact placeholder, never from a substring", () => {
   assert.deepEqual(
-    classifyRecordingSignal({ final: false, text: NO_SPEECH_STATUS, source: "status:no-speech" }),
+    classifyRecordingSignal({ final: false, text: NO_SPEECH_STATUS, kind: "status", phase: "no-speech" }),
     { outcome: SIGNAL_OUTCOME.TERMINAL, text: "", status: NO_SPEECH_STATUS, upscaling: false },
   );
   assert.deepEqual(
-    classifyRecordingSignal({ final: false, text: "[ Silence ]", source: "status" }),
+    classifyRecordingSignal({ final: false, text: "[ Silence ]", kind: "status" }),
     { outcome: SIGNAL_OUTCOME.TERMINAL, text: "", status: NO_SPEECH_STATUS, upscaling: false },
   );
   assert.equal(isNoSpeechPlaceholder("[silence]"), true);
@@ -62,37 +61,37 @@ test("no-speech is read from the phase or an exact placeholder, never from a sub
   assert.equal(isNoSpeechPlaceholder("the room was silent, silence detected twice"), false);
   // A final carrying only a placeholder is not something to paste.
   assert.equal(
-    classifyRecordingSignal({ final: true, text: "[ silence ]", source: "transcript" }).outcome,
+    classifyRecordingSignal({ final: true, text: "[ silence ]", kind: "transcript" }).outcome,
     SIGNAL_OUTCOME.TERMINAL,
   );
-  assert.equal(classifyRecordingSignal({ final: true, text: "  ", source: "transcript" }).outcome, SIGNAL_OUTCOME.TERMINAL);
+  assert.equal(classifyRecordingSignal({ final: true, text: "  ", kind: "transcript" }).outcome, SIGNAL_OUTCOME.TERMINAL);
 });
 
 test("a status or error publish ends the recording and its text is the status", () => {
   const off = "Auto transcribe is off. Audio was saved locally and is ready to review.";
   assert.deepEqual(
-    classifyRecordingSignal({ final: false, text: off, source: "status" }),
+    classifyRecordingSignal({ final: false, text: off, kind: "status" }),
     { outcome: SIGNAL_OUTCOME.TERMINAL, text: "", status: off, upscaling: false },
   );
   assert.deepEqual(
-    classifyRecordingSignal({ final: false, text: "Transcription failed.", source: "error" }),
+    classifyRecordingSignal({ final: false, text: "Transcription failed.", kind: "error" }),
     { outcome: SIGNAL_OUTCOME.TERMINAL, text: "", status: "Transcription failed.", upscaling: false },
   );
 });
 
 test("a transcript-kind publish the renderer did not mark final is waited past, not dropped", () => {
-  const verdict = classifyRecordingSignal({ final: false, text: "HTTP 500 again", source: "transcript" });
+  const verdict = classifyRecordingSignal({ final: false, text: "HTTP 500 again", kind: "transcript" });
   assert.equal(verdict.outcome, SIGNAL_OUTCOME.PROVISIONAL);
   // Not the upscale phase: the capsule is not told it is upscaling.
   assert.equal(verdict.upscaling, false);
 });
 
 test("the pre-upscale publish puts the capsule in Upscaling; nothing else does", () => {
-  assert.equal(classifyRecordingSignal({ final: false, text: "hello there", source: "status:upscaling" }).upscaling, true);
+  assert.equal(classifyRecordingSignal({ final: false, text: "hello there", kind: "status", phase: "upscaling" }).upscaling, true);
   // An upscale phase with nothing to paste is an ending, not an upscale.
-  assert.equal(classifyRecordingSignal({ final: false, text: "  ", source: "status:upscaling" }).upscaling, false);
-  assert.equal(classifyRecordingSignal({ final: true, text: "hello there", source: "transcript:upscaling" }).upscaling, false);
-  assert.equal(classifyRecordingSignal({ final: false, text: "Transcription failed.", source: "error" }).upscaling, false);
+  assert.equal(classifyRecordingSignal({ final: false, text: "  ", kind: "status", phase: "upscaling" }).upscaling, false);
+  assert.equal(classifyRecordingSignal({ final: true, text: "hello there", kind: "transcript", phase: "upscaling" }).upscaling, false);
+  assert.equal(classifyRecordingSignal({ final: false, text: "Transcription failed.", kind: "error" }).upscaling, false);
 });
 
 test("main.js moves the capsule to Upscaling on the verdict that says so (wiring)", () => {
@@ -104,10 +103,10 @@ test("main.js moves the capsule to Upscaling on the verdict that says so (wiring
   );
 });
 
-test("the source label splits into kind and phase", () => {
-  assert.deepEqual(parseSignalSource("status:upscaling"), { kind: "status", phase: "upscaling" });
-  assert.deepEqual(parseSignalSource("Transcript"), { kind: "transcript", phase: "" });
-  assert.deepEqual(parseSignalSource(undefined), { kind: "", phase: "" });
+test("kind and phase are read from their own fields, not from a label", () => {
+  // A label that merely looks like "status:upscaling" is not the phase.
+  assert.equal(classifyRecordingSignal({ final: false, text: "hello there", source: "status:upscaling" }).upscaling, false);
+  assert.equal(classifyRecordingSignal({ final: false, text: "hello there", kind: "status", phase: "upscaling" }).upscaling, true);
 });
 
 test("main.js classifies hand-off signals through ./transcript-signal and sniffs no text", () => {

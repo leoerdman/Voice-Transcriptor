@@ -25,7 +25,12 @@ export type TranscriptionGroupId =
   | "deepgram"
   | "openrouter";
 
-export type WireProvider = "local" | "deepgram" | "openrouter" | "";
+/**
+ * A provider is always selected (FU-15, user decision 2026-11-20): the
+ * Live toolbar no longer offers "None", so transcription cannot be
+ * switched off by accident and there is no empty provider on the wire.
+ */
+export type WireProvider = "local" | "deepgram" | "openrouter";
 
 export interface TranscriptionModelOption {
   id: string;
@@ -115,11 +120,10 @@ export function buildTranscriptionCatalog(
 }
 
 /** Wire provider a UI group transcribes through. */
-export function wireProviderForGroup(group: TranscriptionGroupId | ""): WireProvider {
+export function wireProviderForGroup(group: TranscriptionGroupId): WireProvider {
   if (group === "deepgram") return "deepgram";
   if (group === "openrouter") return "openrouter";
-  if (group === "local-whisper" || group === "gigaam") return "local";
-  return "";
+  return "local";
 }
 
 /** Map a persisted wire selection back to its UI group. */
@@ -136,7 +140,7 @@ export function groupFromWire(
   return "local-whisper";
 }
 
-export function isLocalGroup(group: TranscriptionGroupId | ""): boolean {
+export function isLocalGroup(group: TranscriptionGroupId): boolean {
   return group === "local-whisper" || group === "gigaam";
 }
 
@@ -155,9 +159,8 @@ export function isLocalGroup(group: TranscriptionGroupId | ""): boolean {
  */
 export function defaultModelForGroup(
   groups: ReadonlyArray<TranscriptionGroup>,
-  group: TranscriptionGroupId | "",
+  group: TranscriptionGroupId,
 ): string {
-  if (!group) return "";
   const models = groups.find((g) => g.id === group)?.models || [];
   return (models.find((m) => m.available) || models[0])?.id || "";
 }

@@ -62,7 +62,7 @@ import {
 } from "./deepgram-dual";
 import { UI_COPY, applyStaticUiCopy, renderAcceptedFormatsHint, resultPaneTitle } from "./ui-copy";
 import { flashButtonFeedback, flashCopyOutcome } from "./button-feedback";
-import { acceleratorToDisplayTokens, shortcutBadge } from "./shortcut-display";
+import { acceleratorToDisplayTokens, shortcutBadge, type ShortcutSlotStatus } from "./shortcut-display";
 // D-015: the ONE retired-shortcut-pair rule, shared with desktop/main.js
 // rather than re-derived here. See the module's own docstring for why —
 // two hand-written copies of "this stored pair is retired" drifted when
@@ -135,6 +135,7 @@ import {
   PROVIDER_DISPLAY_ORDER,
   isRemoteProvider,
   normalizeProviderSelection,
+  isProviderId,
   providerKeyErrorMessage,
   providerLabel,
   requireRemoteProvider,
@@ -487,7 +488,7 @@ interface LiveSessionSnapshot {
   finalLocalModel: string;
 }
 
-type LiveWsMode = "none" | "local-assist" | "deepgram-stream";
+type LiveWsMode = "local-assist" | "deepgram-stream";
 
 /**
  * The stop envelope's fields, owned by ``./live-envelope`` — the
@@ -592,17 +593,29 @@ function parseLiveWsMessage(raw: string): LiveWsMessage | null {
 
 type RecordingFinalSignalKind = "" | "transcript" | "status" | "error";
 type AutoStopSilenceConfig = { enabled: boolean; seconds: number; thresholdDb: number };
+/**
+ * What desktop/main.js reads from ``window.__transcriptorLiveStatusSnapshot()``
+ * (the stop query, renderer-toggle.js, the auto-stop config). Only fields
+ * with a reader: ``status``/``statusKind``/``busy`` lost theirs when main
+ * stopped polling the renderer after a stop (DM-15), and ``recording`` /
+ * ``recordingId`` are read from their own globals, never from here.
+ */
 type LiveStatusSnapshot = {
-  status: string;
-  statusKind: StatusKind;
   timerText: string;
-  busy: boolean;
-  recording: boolean;
-  recordingId: number;
   autoSendEnter: boolean;
   autoStopSilence: AutoStopSilenceConfig;
 };
 type ShortcutBridgeAction = "capture-start" | "capture-cancel" | "update";
+/** What desktop/main.js pushes on "shortcut-status" (registration outcome per slot). */
+type ShortcutStatusPayload = {
+  record?: ShortcutSlotStatus;
+  paste?: ShortcutSlotStatus;
+  screen?: ShortcutSlotStatus;
+  screenShot?: ShortcutSlotStatus;
+  screenModeSupported?: boolean;
+  macFnState?: boolean | null;
+  platform?: string;
+};
 type ShortcutPair = { record: string; paste: string };
 // Every hotkey slot. ``screen`` / ``screenShot`` are screen mode's
 // (macOS only) and are empty where the platform has no default.
@@ -702,25 +715,8 @@ declare global {
     __transcriptorLiveStatusSnapshot?: () => LiveStatusSnapshot;
     __transcriptorRecordingTooShort?: () => boolean;
     __transcriptorSetMainStatus?: (status: string, kind?: StatusKind) => boolean;
-    __transcriptorShortcutStatus?: {
-      record?: { active?: string; desired?: string; error?: string };
-      paste?: { active?: string; desired?: string; error?: string };
-      screen?: { active?: string; desired?: string; error?: string };
-      screenShot?: { active?: string; desired?: string; error?: string };
-      screenModeSupported?: boolean;
-      macFnState?: boolean | null;
-      platform?: string;
-    };
     __setBackendBootStatus?: (msg: string) => void;
     __setBackendBootError?: (msg: string) => void;
-    /**
-     * Open the OS file manager (Finder / Explorer / Files) at the
-     * transcript file matching the given recording. Implemented by setting
-     * ``document.title`` to a known prefix; the Electron main process
-     * intercepts via ``page-title-updated`` and calls
-     * ``shell.showItemInFolder``. No-op in plain-browser dev preview.
-     */
-    __transcriptorRevealRecording?: (name: string, archiveDir: string) => void;
     /**
      * Electron preload bridge. Returns an absolute filesystem path for
      * a File obtained from the OS picker/drag-drop, or "" in browser dev
@@ -773,15 +769,19 @@ declare global {
      * Only the latter carries ``final: true``. Without the flag the
      * main process could not tell them apart and pasted whichever
      * arrived before its deadline — one recording, two possible
-     * results. ``source`` is a free-form label for the main process's
-     * trace log and carries the publishing phase.
+     * results. ``kind`` and ``phase`` say what the publish is (a status
+     * line, an error, a transcript; "upscaling", "no-speech") so main
+     * never reads the text to find out (DM-01).
      */
     transcriptor?: {
       recordingFinal?: (payload: {
         recordingId: number;
         text: string;
         final: boolean;
-        source: string;
+        /** What this publish is — validated by desktop/recording-final-slot.js. */
+        kind: Exclude<RecordingFinalSignalKind, "">;
+        /** "" or what the renderer is doing ("upscaling", "no-speech"). */
+        phase: string;
       }) => boolean;
       /**
        * Screen mode: end the main-process side of a stopping take and
@@ -810,6 +810,28 @@ declare global {
       onSystemSuspend?: (
         callback: (payload: { reason: string }) => void,
       ) => (() => void);
+      /**
+       * Shortcut registration status, pushed by main whenever it changes
+       * and when the page loads (DM-14 / S-10). Returns an unsubscribe.
+       */
+      onShortcutStatus?: (
+        callback: (status: ShortcutStatusPayload) => void,
+      ) => (() => void);
+      /**
+       * The main window's requests to main (DM-10), validated there by
+       * desktop/renderer-requests.js: a Settings → Shortcuts message, the
+       * in-window Record/Stop button, and "Reveal in folder" for a saved
+       * transcript (shell.showItemInFolder).
+       */
+      shortcuts?: (message: {
+        action: ShortcutBridgeAction;
+        record: string;
+        paste: string;
+        screen: string;
+        screenShot: string;
+      }) => boolean;
+      recordToggle?: () => boolean;
+      revealRecording?: (payload: { name: string; archiveDir: string }) => boolean;
     };
   }
 }
@@ -947,47 +969,6 @@ function installAppearanceStateClasses(): void {
 }
 
 installAppearanceStateClasses();
-
-/**
- * The renderer → main-process bridge that rides on ``document.title``.
- *
- * Electron's ``page-title-updated`` is the one channel available to a
- * renderer that has no preload IPC for these three messages: the main
- * process reads the sentinel and ``preventDefault()``s the real title
- * change. The idiom — save the title, write the sentinel, restore on the
- * next tick — was copied three times with four literals spread over two
- * processes, and two messages posted in one tick made the second capture
- * the FIRST one's sentinel as the title to restore, leaving it on the
- * document for main.js to read a second time.
- *
- * ``desktop/main.js`` holds the same three prefixes; the two sides are
- * pinned by ``tests/renderer-main-contract.test.ts``.
- */
-const TITLE_BRIDGE_PREFIX = {
-  shortcuts: "__app_shortcuts__",
-  recordToggle: "__app_record_toggle__",
-  revealRecording: "__app_reveal_recording__",
-} as const;
-
-/** The real document title, saved before the first sentinel of a burst. */
-let titleBridgeRestore = "";
-let titleBridgeRestoreTimer = 0;
-
-function postTitleBridgeMessage(prefix: string, payload = ""): void {
-  if (!titleBridgeRestoreTimer) {
-    titleBridgeRestore = document.title;
-  }
-  document.title = prefix + payload;
-  // main.js consumes the sentinel through page-title-updated and
-  // preventDefault()s the real title change. Restored defensively for
-  // browser dev preview and any future non-Electron surface — and once
-  // per burst, from the title that was there before the burst began.
-  window.clearTimeout(titleBridgeRestoreTimer);
-  titleBridgeRestoreTimer = window.setTimeout(() => {
-    titleBridgeRestoreTimer = 0;
-    document.title = titleBridgeRestore || "Transcriptor";
-  }, 0);
-}
 
 const wsBase = (): string => (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host;
 // Backend-owned; injected in window.__TRANSCRIPTOR_BOOTSTRAP and refreshed
@@ -1452,7 +1433,7 @@ function normalizeUpscaleModelOptions(value: unknown, fallback: UpscaleModelOpti
 // these selects are VIEWS — never re-derive provider groups or model
 // lists from the DOM.
 
-let uiProviderGroup: TranscriptionGroupId | "" = "local-whisper";
+let uiProviderGroup: TranscriptionGroupId = "local-whisper";
 const uiModelByGroup: Record<string, string> = {};
 let transcriptionCatalogCache: TranscriptionGroup[] | null = null;
 
@@ -1492,19 +1473,14 @@ function renderTranscriptionSelectors(): void {
   for (const id of ["providerSelect", "uploadProviderMirror"]) {
     const sel = document.getElementById(id) as HTMLSelectElement | null;
     if (!sel) continue;
-    // "None" (no transcription) is a Transcribe-toolbar concept; the
-    // Upload mirror always transcribes. It is part of the signature
-    // because it is part of what gets rendered: without it the signature
-    // described four options while the select held five, never matched
-    // again after the first build, and the idempotence guard this
-    // function is built around silently inverted into "rebuild every
-    // time" — closing the dropdown under the user on every 10 s health
-    // poll, which is the exact regression it was written to prevent.
-    const wantsNone = id === "providerSelect";
-    const signature = [
-      ...groups.map((g) => `${g.id}:${g.models.some((m) => m.available) ? "1" : "0"}`),
-      ...(wantsNone ? [":1"] : []),
-    ].join("|");
+    // Both selects list exactly the groups: there is no "None" (FU-15,
+    // user decision 2026-11-20 — a provider is always selected, so
+    // transcription cannot be switched off by accident). The signature
+    // is what gets rendered, so the idempotence guard matches after the
+    // first build and the 10 s health poll never closes an open dropdown.
+    const signature = groups
+      .map((g) => `${g.id}:${g.models.some((m) => m.available) ? "1" : "0"}`)
+      .join("|");
     const current = Array.from(sel.options)
       .map((o) => `${o.value}:${o.disabled ? "0" : "1"}`)
       .join("|");
@@ -1517,21 +1493,8 @@ function renderTranscriptionSelectors(): void {
         opt.disabled = !g.models.some((m) => m.available);
         sel.appendChild(opt);
       }
-      if (wantsNone) {
-        const none = document.createElement("option");
-        none.value = "";
-        none.textContent = "None";
-        sel.appendChild(none);
-      }
     }
-    // The empty string is assigned too, on the select that has a "None"
-    // option: skipping it let the browser fall back to the first option,
-    // so the toolbar read "Local Whisper" while the SSOT said "None".
-    // These selects are views, and a view that declines to show one of
-    // its states is not one. The Upload mirror is the exception on
-    // purpose — it has no "None" to show, so it keeps its selection
-    // rather than blanking out.
-    if (wantsNone || uiProviderGroup) sel.value = uiProviderGroup;
+    sel.value = uiProviderGroup;
   }
   const group = groups.find((g) => g.id === uiProviderGroup) || null;
   for (const id of ["remoteModelSelect", "uploadModelMirror"]) {
@@ -1563,7 +1526,7 @@ function renderTranscriptionSelectors(): void {
 }
 
 /** Single writer for the unified selection. */
-function setTranscriptionSelection(group: TranscriptionGroupId | "", model?: string): void {
+function setTranscriptionSelection(group: TranscriptionGroupId, model?: string): void {
   uiProviderGroup = group;
   if (group) {
     // Selecting a GROUP selects a model in it. The group's change
@@ -1591,7 +1554,7 @@ function setTranscriptionSelection(group: TranscriptionGroupId | "", model?: str
   scheduleLocalWarmup();
 }
 
-function readProviderGroup(): TranscriptionGroupId | "" {
+function readProviderGroup(): TranscriptionGroupId {
   return uiProviderGroup;
 }
 
@@ -4708,7 +4671,6 @@ async function stopMediaRecorderAndFlush(): Promise<void> {
 }
 
 function getRemoteModelValue(provider: Provider): string {
-  if (!provider) return "";
   if (provider === "openrouter") {
     const v = (uiModelByGroup.openrouter || remoteModelByProvider.openrouter || "").trim();
     return v || DEFAULT_OPENROUTER_AUDIO_MODEL;
@@ -5250,15 +5212,13 @@ function resolveSessionLocalModels(selectedProvider: Provider): { assistLocalMod
  * SSOT routing rules:
  *   - deepgram (online)  → dedicated Deepgram streaming WebSocket
  *   - local / remote fallback → local faster-whisper assist pipeline
- *   - no provider        → no live transcription transport
+ *
+ * There is no "no provider" route: a provider is always selected (FU-15).
  */
 function resolveLiveWsMode(snapshot: LiveSessionSnapshot | null): LiveWsMode {
   const provider = snapshot
     ? snapshot.effectiveProvider
     : resolveEffectiveProvider(readProviderSelection());
-  if (!provider) {
-    return "none";
-  }
   if (provider === "deepgram" && isProviderKeyConfigured("deepgram")) {
     return "deepgram-stream";
   }
@@ -5357,10 +5317,8 @@ function parseViewName(value: string): ViewName {
 function switchView(view: ViewName): void {
   if (view === "settings") {
     void refreshLocalModels();
-    // Read the shortcut status now rather than on the gated poll's first
-    // tick 2 s later: the screen-mode rows are un-hidden by it, and they
-    // popped in after the form had already been laid out.
-    refreshShortcutConflictState();
+    // The shortcut badges and screen-mode rows need no refresh here:
+    // main pushes the status on change and on load (onShortcutStatus).
     // Cheap, and the answer moves without the renderer touching it:
     // the backend rewrites the connection file when its port changes,
     // and the defaults line follows the Upload tab. Re-read on every
@@ -5410,7 +5368,6 @@ function switchView(view: ViewName): void {
 }
 
 function resolveEffectiveProvider(preferred: Provider): Provider {
-  if (!preferred) return "";
   if (preferred === "local") return "local";
   if (!isRemoteProvider(preferred)) return "local";
   if (!isProviderKeyConfigured(preferred)) return "local";
@@ -6118,15 +6075,15 @@ const DEFAULT_SHORTCUTS: ShortcutSet = {
 let currentShortcuts: ShortcutSet = { ...DEFAULT_SHORTCUTS };
 let activeShortcutBtn: HTMLButtonElement | null = null;
 function postShortcutBridgeMessage(action: ShortcutBridgeAction, shortcuts: ShortcutSet = currentShortcuts): void {
-  const payload = encodeURIComponent(JSON.stringify({
+  // Preload send; main validates it (desktop/renderer-requests.js). Absent
+  // in a plain-browser preview, where there are no global shortcuts.
+  window.transcriptor?.shortcuts?.({
     action,
     record: shortcuts.record,
     paste: shortcuts.paste,
     screen: shortcuts.screen,
     screenShot: shortcuts.screenShot,
-    nonce: `${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
-  }));
-  postTitleBridgeMessage(TITLE_BRIDGE_PREFIX.shortcuts, payload);
+  });
 }
 
 function publishShortcutUpdateToMain(): void {
@@ -6184,15 +6141,13 @@ function updateShortcutDisplay(btnId: string, accelerator: string): void {
 updateAllShortcutDisplays();
 
 /**
- * Poll `window.__transcriptorShortcutStatus` (published by Electron main
- * after every globalShortcut.register) and toggle a conflict class on
- * the shortcut buttons. Without this, a shortcut that the OS refused
- * (already bound by another app) looks "saved" in Settings but does
- * nothing at all — the user has no way to know.
+ * Toggle a conflict class on the shortcut buttons from the registration
+ * status main pushes after every globalShortcut.register. Without this, a
+ * shortcut that the OS refused (already bound by another app) looks
+ * "saved" in Settings but does nothing at all — the user has no way to
+ * know.
  */
-function refreshShortcutConflictState(): void {
-  const status = window.__transcriptorShortcutStatus;
-  if (!status) return;
+function refreshShortcutConflictState(status: ShortcutStatusPayload): void {
   // The screen-mode rows exist only where the desktop shell supports it.
   const screenSupported = status.screenModeSupported === true;
   for (const fieldId of ["shortcutScreenField", "shortcutScreenShotField"]) {
@@ -6210,23 +6165,17 @@ function refreshShortcutConflictState(): void {
     if (!entry) continue;
     const btn = document.getElementById(slot.buttonId) as HTMLButtonElement | null;
     if (!btn) continue;
-    const badge = shortcutBadge(slot.id, entry, isMacFnCollision);
+    const badge = shortcutBadge(entry, isMacFnCollision);
     btn.classList.toggle("shortcut-conflict", badge.conflict);
     btn.title = badge.title;
   }
 }
-// Conflict-state badge on Settings → Shortcuts. The badge only exists
-// on that pane, so the poll only exists while that pane is on screen —
-// previously it woke every 2 s for the entire life of the app and
-// returned early, which with `backgroundThrottling: false` is a real
-// timer firing forever to decide to do nothing.
-const _shortcutConflictPoll = createGatedPoll({
-  name: "shortcut-conflict",
-  intervalMs: 2000,
-  shouldRun: () => rendererIsVisible() && isViewVisible("settings"),
-  tick: () => { refreshShortcutConflictState(); },
-});
-gatedPolls.push(_shortcutConflictPoll);
+// Conflict-state badge on Settings → Shortcuts, painted when main says
+// the status changed (DM-14 / S-10) — no poll, no window global. The
+// badges are plain DOM state, so painting them while the pane is hidden
+// is what keeps them right when it is opened. Subscribed once: the
+// preload world (and this listener) is torn down with the page.
+window.transcriptor?.onShortcutStatus?.(refreshShortcutConflictState);
 // Symmetric cleanup: a ``pagehide`` event fires before any teardown
 // (Electron renderer reload, dev hot-reload, real navigation away),
 // so clearing here prevents a stale handle from leaking across hot
@@ -6980,9 +6929,8 @@ async function loadCfg(): Promise<void> {
       }
       uiModelByGroup.deepgram = remoteModelByProvider.deepgram;
       uiModelByGroup.openrouter = remoteModelByProvider.openrouter;
-      // A stored "" (the Live toolbar's "None") is read back as Whisper
-      // by ``groupFromWire``, so a None chosen in the toolbar does not
-      // survive a restart.
+      // A stored "" (the removed "None" option) was migrated to the
+      // default provider by ``normalizeProviderSelection`` above (FU-15).
       uiProviderGroup = group;
     }
     const auto = $("autoTranscribeToggle") as HTMLInputElement;
@@ -8606,16 +8554,13 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
       setRecordingViewerAudioRowVisible(false);
     }
     // Reveal-in-folder button — surfaced when running inside Electron
-    // (``__transcriptorRevealRecording`` injected by main.tsx and
-    // dispatched by main.js via the page-title-updated channel).
-    // Hidden in plain-browser dev preview where the helper is undefined.
+    // (the preload's revealRecording send). Hidden in plain-browser dev
+    // preview, where there is no host to ask.
     const revealBtn = document.getElementById("recordingRevealBtn") as HTMLButtonElement | null;
     if (revealBtn) {
-      const hasReveal = hostCanRevealFiles();
-      revealBtn.hidden = !hasReveal;
+      revealBtn.hidden = !hostCanRevealFiles();
       revealBtn.onclick = () => {
-        const fn = window.__transcriptorRevealRecording;
-        if (fn) fn(name, String(r.archive_dir || effectiveArchiveDir).trim());
+        revealRecordingInFolder(name, String(r.archive_dir || effectiveArchiveDir).trim());
       };
     }
     updateRecordingCopyState();
@@ -9254,7 +9199,7 @@ function shouldLivePreview(): boolean {
 
 ($("providerSelect") as HTMLSelectElement).addEventListener("change", () => {
   setTranscriptionSelection(
-    ($("providerSelect") as HTMLSelectElement).value as TranscriptionGroupId | "",
+    ($("providerSelect") as HTMLSelectElement).value as TranscriptionGroupId,
   );
 });
 ($("remoteModelSelect") as HTMLSelectElement).addEventListener("change", () => {
@@ -9631,12 +9576,7 @@ const pendingWorkletFlushes = new Map<string, () => void>();
 
 function liveStatusSnapshot(): LiveStatusSnapshot {
   return {
-    status: liveStatusText,
-    statusKind: liveStatusKind,
     timerText: liveTimerText,
-    busy: isBusy,
-    recording: isRecording,
-    recordingId: currentRecordingId,
     autoSendEnter: readAutoSendEnterEnabled(),
     autoStopSilence: getAutoStopSilenceConfig(),
   };
@@ -10595,8 +10535,8 @@ interface RecordingOutputSignal {
   kind?: RecordingFinalSignalKind;
   /**
    * What the renderer is doing at this publish ("upscaling",
-   * "no-speech", …). Rides along in the IPC signal's ``source`` label
-   * so the desktop side can show a phase it used to derive by polling.
+   * "no-speech", …). Sent as the IPC signal's ``phase`` field so the
+   * desktop side can show a phase it used to derive by polling.
    */
   phase?: string;
   sessionToken?: string;
@@ -10623,7 +10563,7 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
   // every publish for a real recording emits one signal — a recording
   // that ends without a transcript at all still says so, which is how
   // main learns it is terminal without waiting out its deadline. Main
-  // decides from ``final`` and the kind/phase label, not by reading the
+  // decides from ``final`` and the kind/phase fields, not by reading the
   // text (only whole-string equality with the renderer's own no-speech
   // placeholders); the text rides along to be pasted when ``final``.
   if (rid > 0) {
@@ -10631,7 +10571,8 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
       recordingId: rid,
       text: isPasteReady ? pasteText : domText,
       final: isPasteReady,
-      source: signal.phase ? `${kind || "status"}:${signal.phase}` : (kind || "status"),
+      kind: kind || "status",
+      phase: signal.phase || "",
     });
   }
 
@@ -11285,192 +11226,185 @@ async function startLive(
     syncLiveOutputFromState();
   }, UI_TOKENS.timer.tickMs);
 
-  const enableVisibleLivePreview = sessionWsMode !== "none" && shouldLivePreview();
-  if (sessionWsMode === "none") {
-    patchCurrentRecordingSummary({
-      status: "Recording audio only. No transcription provider is selected.",
-      tone: "info",
-    }, sessionUiToken);
+  const enableVisibleLivePreview = shouldLivePreview();
+  const wsQuery = new URLSearchParams({
+    provider: sessionWsMode === "deepgram-stream" ? "deepgram" : "local",
+    language: activeLiveSessionSnapshot.language,
+    session_id: activeLiveSessionId,
+    archive_dir: activeLiveArchiveDir,
+    recording_collection: liveRecordingCollection(liveRecordingMode),
+    // The session snapshot, not a second DOM read: the stop path decodes
+    // with ``activeLiveSessionSnapshot.diarize`` too (FL-05 / F-006).
+    diarize: activeLiveSessionSnapshot.diarize ? "true" : "false",
+  });
+  if (sessionWsMode === "deepgram-stream") {
+    wsQuery.set("model", activeLiveSessionSnapshot.model || getRemoteModelValue("deepgram"));
   } else {
-    const wsQuery = new URLSearchParams({
-      provider: sessionWsMode === "deepgram-stream" ? "deepgram" : "local",
-      language: activeLiveSessionSnapshot.language,
-      session_id: activeLiveSessionId,
-      archive_dir: activeLiveArchiveDir,
-      recording_collection: liveRecordingCollection(liveRecordingMode),
-      // The session snapshot, not a second DOM read: the stop path decodes
-      // with ``activeLiveSessionSnapshot.diarize`` too (FL-05 / F-006).
-      diarize: activeLiveSessionSnapshot.diarize ? "true" : "false",
-    });
-    if (sessionWsMode === "deepgram-stream") {
-      wsQuery.set("model", activeLiveSessionSnapshot.model || getRemoteModelValue("deepgram"));
-    } else {
-      wsQuery.set("model", activeLiveSessionSnapshot.assistLocalModel);
-    }
-    const sessionSocket = new WebSocket(wsBase() + "/ws/transcribe?" + wsQuery.toString(), websocketAuthProtocols());
-    markStartPhase("wsRequested");
-    ws = sessionSocket;
-    ws.binaryType = "arraybuffer";
-    ws.onopen = () => {
-      // Drain whatever was captured during the handshake. Without this
-      // the flush depended on another frame arriving afterwards, so a
-      // recording that ended inside the handshake window streamed a
-      // transcript missing its opening words.
-      //
-      // Bound to ``sessionSocket`` rather than the module-level ``ws``:
-      // a late ``open`` from a superseded socket must not push this
-      // session's buffered audio into the socket of the next one.
-      if (activeUiSessionToken === sessionUiToken) {
-        flushPendingWsFrames(sessionSocket);
-      }
-      const statusMsg =
-        sessionWsMode === "deepgram-stream"
-          ? enableVisibleLivePreview
-            ? "Recording. Deepgram live streaming is active."
-            : "Recording. Deepgram live stream is committing segments in the background."
-          : enableVisibleLivePreview
-            ? selectedEffectiveProvider === "local"
-              ? "Recording with live preview enabled."
-              : "Recording with live preview enabled. Local assist is canonical for fast stop."
-            : "Recording. Background local assist is active for fast stop finalization.";
-      patchCurrentRecordingSummary({ status: statusMsg, tone: "info" }, sessionUiToken);
-    };
-    ws.onerror = (ev) => {
-      // Scope the log to this session token so a stale socket from a
-      // prior recording can't confuse the developer into thinking the
-      // current session is broken. No state mutation — actual error
-      // surfacing happens through the higher-level 'error' message
-      // path from the backend or the onclose handler below.
-      console.warn(`live ws transport error [session=${sessionUiToken.slice(0, 8)}]`, ev);
-    };
-    ws.onclose = (ev) => {
-      // A clean close (1000/1005) after finalize is expected. An unclean
-      // close before finalize means the stream died; release any pending
-      // waiters for THIS session with a synthetic error envelope so
-      // stopLive doesn't hang on waitForLiveFinalEnvelope.
-      //
-      // stopLive arms its waiter lazily, so at the moment of an unclean
-      // close there is usually no slot and nobody waiting yet. The
-      // envelope is recorded regardless (``resolveLiveFinal`` creates the
-      // slot): bailing out on a missing slot meant the later waiter had
-      // nothing to resolve against and burned its whole budget (FL-03).
-      // The real ``final`` message always arrives before ``onclose``.
-      const slot = liveFinalSlots.get(sessionUiToken);
-      console.log(`[trace ws-close] code=${ev.code} reason="${ev.reason || ""}" wasClean=${ev.wasClean} hadEnvelope=${!!slot?.envelope} waiters=${slot?.waiters.length ?? 0}`);
-      if (!liveCloseOwesErrorEnvelope({ hadEnvelope: !!slot?.envelope, wasClean: ev.wasClean, code: ev.code })) return;
-      console.warn(`live ws unexpectedly closed (code=${ev.code}, reason=${ev.reason || "?"})`);
-      if (activeUiSessionToken === sessionUiToken && isRecording) {
-        patchCurrentRecordingSummary({
-          status: "Live stream lost. The recording continues and will be transcribed from the saved audio.",
-          tone: "warning",
-        }, sessionUiToken);
-      }
-      resolveLiveFinal(sessionUiToken, {
-        text: "",
-        segments: [],
-        durationSec: 0,
-        source: sessionWsMode,
-        error: `live stream closed unexpectedly (code=${ev.code})`,
-      });
-    };
-    ws.onmessage = (ev: MessageEvent<string>) => {
-      const msg = parseLiveWsMessage(ev.data);
-      if (!msg) return;
-      const isActiveSession = activeUiSessionToken === sessionUiToken;
-      const sessionBuffer = ensureLiveTranscriptBuffer(sessionUiToken, sessionWsMode);
-      switch (msg.type) {
-        case "error": {
-          setLiveStreamError(sessionUiToken, msg.error);
-          console.warn(`live ws error event (fatal=${msg.fatal}):`, msg.error);
-          // Only surface truly fatal errors to the user. Non-fatal
-          // stream drops (when we already have committed segments) are
-          // logged to the console but invisible in the pill — the
-          // recording keeps going, just not streaming to Deepgram
-          // anymore. stopLive picks up the committed text as the
-          // transcript so the user experience is seamless.
-          if (isActiveSession && msg.fatal) {
-            patchCurrentRecordingSummary(
-              {
-                status: `Live stream error: ${explainNetworkError(new Error(msg.error))}`,
-                tone: "error",
-              },
-              sessionUiToken
-            );
-            // DO NOT pipe the error message through setLiveInterimText:
-            // that path feeds into `sourceLiveText` at stopLive time,
-            // which then becomes the saved transcript + the clipboard-
-            // paste content. A user in a region that blocks Deepgram
-            // would otherwise see a raw "[Deepgram connect failed: did
-            // not receive a valid HTTP response]" pasted into Slack /
-            // Telegram / wherever. The status pill carries the error;
-            // transcript stays empty so the paste code path treats it
-            // as "nothing to paste".
-          }
-          return;
-        }
-        case "segments": {
-          const lastNew = msg.segments.length > 0 ? msg.segments[msg.segments.length - 1] : null;
-          console.log(`[trace ws-segments] session=${sessionUiToken.slice(0, 8)} active=${isActiveSession} count=${msg.segments.length} ${lastNew ? `lastEnd=${lastNew.end.toFixed(2)} ${traceTextStats("lastText", lastNew.text)}` : "(empty)"}`);
-          appendSegmentsToBuffer(sessionBuffer, msg.segments);
-          if (isActiveSession) {
-            // No draft write here. Deepgram commits segments several
-            // times a second and this handler runs on the main thread —
-            // the same thread the ScriptProcessor fallback captures on,
-            // where a full text composition plus an IPC write per commit
-            // is exactly what drops audio (BUGS_AUDIT_2026-09-03 §4.5).
-            // The 1.2 s autosave interval started in startLive already
-            // persists the same text from the same buffer.
-            projectLiveTranscriptBufferToActiveState(sessionBuffer);
-          }
-          return;
-        }
-        case "finalizing": {
-          // C3: resolves the per-session slot (value + waiters) so an
-          // envelope wait already in progress can recompute its deadline
-          // instead of only being readable by a wait that starts later.
-          announceFinalizeBudget(sessionUiToken, {
-            budgetMs: msg.budgetMs,
-            expectsMore: msg.expectsMore,
-          });
-          console.log(
-            `[trace stopLive] backend announced finalize budget=${msg.budgetMs}ms expectsMore=${msg.expectsMore ? 1 : 0}`,
-          );
-          return;
-        }
-        case "interim": {
-          sessionBuffer.interimText = normalizeTranscriptWhitespace(msg.segment.text);
-          sessionBuffer.interimSegment = msg.segment;
-          if (isActiveSession) {
-            projectLiveTranscriptBufferToActiveState(sessionBuffer);
-          }
-          return;
-        }
-        case "final": {
-          const lastSeg = msg.segments.length > 0 ? msg.segments[msg.segments.length - 1] : null;
-          console.log(`[trace ws-final] session=${sessionUiToken.slice(0, 8)} active=${isActiveSession} textLen=${msg.text.length} segCount=${msg.segments.length} ${lastSeg ? `lastEnd=${lastSeg.end.toFixed(2)} ${traceTextStats("lastText", lastSeg.text)}` : "(empty)"} durationSec=${msg.durationSec.toFixed(2)} error="${msg.error || ""}"`);
-          appendSegmentsToBuffer(sessionBuffer, msg.segments);
-          if (isActiveSession) {
-            projectLiveTranscriptBufferToActiveState(sessionBuffer);
-          }
-          // The parsed message minus its ``type`` IS the envelope — one
-          // contract (./live-envelope). It used to be copied field by
-          // field, so a field added to the contract was silently dropped
-          // here (FL-05). Coverage diagnostics (BUG-20 / C5:
-          // ``uncoveredSpeechSec``, ``streamedSec``, ``coveredEndSec``,
-          // ``stats``) ride along to explain a stop in the log; the
-          // backend has already closed its own gaps before sending.
-          const { type: _type, ...fields } = msg;
-          const envelope: LiveFinalEnvelope = {
-            ...fields,
-            text: normalizeTranscriptWhitespace(fields.text),
-            source: fields.source || sessionWsMode,
-          };
-          resolveLiveFinal(sessionUiToken, envelope);
-          return;
-        }
-      }
-    };
+    wsQuery.set("model", activeLiveSessionSnapshot.assistLocalModel);
   }
+  const sessionSocket = new WebSocket(wsBase() + "/ws/transcribe?" + wsQuery.toString(), websocketAuthProtocols());
+  markStartPhase("wsRequested");
+  ws = sessionSocket;
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => {
+    // Drain whatever was captured during the handshake. Without this
+    // the flush depended on another frame arriving afterwards, so a
+    // recording that ended inside the handshake window streamed a
+    // transcript missing its opening words.
+    //
+    // Bound to ``sessionSocket`` rather than the module-level ``ws``:
+    // a late ``open`` from a superseded socket must not push this
+    // session's buffered audio into the socket of the next one.
+    if (activeUiSessionToken === sessionUiToken) {
+      flushPendingWsFrames(sessionSocket);
+    }
+    const statusMsg =
+      sessionWsMode === "deepgram-stream"
+        ? enableVisibleLivePreview
+          ? "Recording. Deepgram live streaming is active."
+          : "Recording. Deepgram live stream is committing segments in the background."
+        : enableVisibleLivePreview
+          ? selectedEffectiveProvider === "local"
+            ? "Recording with live preview enabled."
+            : "Recording with live preview enabled. Local assist is canonical for fast stop."
+          : "Recording. Background local assist is active for fast stop finalization.";
+    patchCurrentRecordingSummary({ status: statusMsg, tone: "info" }, sessionUiToken);
+  };
+  ws.onerror = (ev) => {
+    // Scope the log to this session token so a stale socket from a
+    // prior recording can't confuse the developer into thinking the
+    // current session is broken. No state mutation — actual error
+    // surfacing happens through the higher-level 'error' message
+    // path from the backend or the onclose handler below.
+    console.warn(`live ws transport error [session=${sessionUiToken.slice(0, 8)}]`, ev);
+  };
+  ws.onclose = (ev) => {
+    // A clean close (1000/1005) after finalize is expected. An unclean
+    // close before finalize means the stream died; release any pending
+    // waiters for THIS session with a synthetic error envelope so
+    // stopLive doesn't hang on waitForLiveFinalEnvelope.
+    //
+    // stopLive arms its waiter lazily, so at the moment of an unclean
+    // close there is usually no slot and nobody waiting yet. The
+    // envelope is recorded regardless (``resolveLiveFinal`` creates the
+    // slot): bailing out on a missing slot meant the later waiter had
+    // nothing to resolve against and burned its whole budget (FL-03).
+    // The real ``final`` message always arrives before ``onclose``.
+    const slot = liveFinalSlots.get(sessionUiToken);
+    console.log(`[trace ws-close] code=${ev.code} reason="${ev.reason || ""}" wasClean=${ev.wasClean} hadEnvelope=${!!slot?.envelope} waiters=${slot?.waiters.length ?? 0}`);
+    if (!liveCloseOwesErrorEnvelope({ hadEnvelope: !!slot?.envelope, wasClean: ev.wasClean, code: ev.code })) return;
+    console.warn(`live ws unexpectedly closed (code=${ev.code}, reason=${ev.reason || "?"})`);
+    if (activeUiSessionToken === sessionUiToken && isRecording) {
+      patchCurrentRecordingSummary({
+        status: "Live stream lost. The recording continues and will be transcribed from the saved audio.",
+        tone: "warning",
+      }, sessionUiToken);
+    }
+    resolveLiveFinal(sessionUiToken, {
+      text: "",
+      segments: [],
+      durationSec: 0,
+      source: sessionWsMode,
+      error: `live stream closed unexpectedly (code=${ev.code})`,
+    });
+  };
+  ws.onmessage = (ev: MessageEvent<string>) => {
+    const msg = parseLiveWsMessage(ev.data);
+    if (!msg) return;
+    const isActiveSession = activeUiSessionToken === sessionUiToken;
+    const sessionBuffer = ensureLiveTranscriptBuffer(sessionUiToken, sessionWsMode);
+    switch (msg.type) {
+      case "error": {
+        setLiveStreamError(sessionUiToken, msg.error);
+        console.warn(`live ws error event (fatal=${msg.fatal}):`, msg.error);
+        // Only surface truly fatal errors to the user. Non-fatal
+        // stream drops (when we already have committed segments) are
+        // logged to the console but invisible in the pill — the
+        // recording keeps going, just not streaming to Deepgram
+        // anymore. stopLive picks up the committed text as the
+        // transcript so the user experience is seamless.
+        if (isActiveSession && msg.fatal) {
+          patchCurrentRecordingSummary(
+            {
+              status: `Live stream error: ${explainNetworkError(new Error(msg.error))}`,
+              tone: "error",
+            },
+            sessionUiToken
+          );
+          // DO NOT pipe the error message through setLiveInterimText:
+          // that path feeds into `sourceLiveText` at stopLive time,
+          // which then becomes the saved transcript + the clipboard-
+          // paste content. A user in a region that blocks Deepgram
+          // would otherwise see a raw "[Deepgram connect failed: did
+          // not receive a valid HTTP response]" pasted into Slack /
+          // Telegram / wherever. The status pill carries the error;
+          // transcript stays empty so the paste code path treats it
+          // as "nothing to paste".
+        }
+        return;
+      }
+      case "segments": {
+        const lastNew = msg.segments.length > 0 ? msg.segments[msg.segments.length - 1] : null;
+        console.log(`[trace ws-segments] session=${sessionUiToken.slice(0, 8)} active=${isActiveSession} count=${msg.segments.length} ${lastNew ? `lastEnd=${lastNew.end.toFixed(2)} ${traceTextStats("lastText", lastNew.text)}` : "(empty)"}`);
+        appendSegmentsToBuffer(sessionBuffer, msg.segments);
+        if (isActiveSession) {
+          // No draft write here. Deepgram commits segments several
+          // times a second and this handler runs on the main thread —
+          // the same thread the ScriptProcessor fallback captures on,
+          // where a full text composition plus an IPC write per commit
+          // is exactly what drops audio (BUGS_AUDIT_2026-09-03 §4.5).
+          // The 1.2 s autosave interval started in startLive already
+          // persists the same text from the same buffer.
+          projectLiveTranscriptBufferToActiveState(sessionBuffer);
+        }
+        return;
+      }
+      case "finalizing": {
+        // C3: resolves the per-session slot (value + waiters) so an
+        // envelope wait already in progress can recompute its deadline
+        // instead of only being readable by a wait that starts later.
+        announceFinalizeBudget(sessionUiToken, {
+          budgetMs: msg.budgetMs,
+          expectsMore: msg.expectsMore,
+        });
+        console.log(
+          `[trace stopLive] backend announced finalize budget=${msg.budgetMs}ms expectsMore=${msg.expectsMore ? 1 : 0}`,
+        );
+        return;
+      }
+      case "interim": {
+        sessionBuffer.interimText = normalizeTranscriptWhitespace(msg.segment.text);
+        sessionBuffer.interimSegment = msg.segment;
+        if (isActiveSession) {
+          projectLiveTranscriptBufferToActiveState(sessionBuffer);
+        }
+        return;
+      }
+      case "final": {
+        const lastSeg = msg.segments.length > 0 ? msg.segments[msg.segments.length - 1] : null;
+        console.log(`[trace ws-final] session=${sessionUiToken.slice(0, 8)} active=${isActiveSession} textLen=${msg.text.length} segCount=${msg.segments.length} ${lastSeg ? `lastEnd=${lastSeg.end.toFixed(2)} ${traceTextStats("lastText", lastSeg.text)}` : "(empty)"} durationSec=${msg.durationSec.toFixed(2)} error="${msg.error || ""}"`);
+        appendSegmentsToBuffer(sessionBuffer, msg.segments);
+        if (isActiveSession) {
+          projectLiveTranscriptBufferToActiveState(sessionBuffer);
+        }
+        // The parsed message minus its ``type`` IS the envelope — one
+        // contract (./live-envelope). It used to be copied field by
+        // field, so a field added to the contract was silently dropped
+        // here (FL-05). Coverage diagnostics (BUG-20 / C5:
+        // ``uncoveredSpeechSec``, ``streamedSec``, ``coveredEndSec``,
+        // ``stats``) ride along to explain a stop in the log; the
+        // backend has already closed its own gaps before sending.
+        const { type: _type, ...fields } = msg;
+        const envelope: LiveFinalEnvelope = {
+          ...fields,
+          text: normalizeTranscriptWhitespace(fields.text),
+          source: fields.source || sessionWsMode,
+        };
+        resolveLiveFinal(sessionUiToken, envelope);
+        return;
+      }
+    }
+  };
 
   try {
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -12006,7 +11940,7 @@ async function stopLive(
     return { status: "", tone: "info", notice: null };
   };
   const provider = effectiveProvider;
-  const metadataProvider = provider || (providerValue ? providerValue : "none");
+  const metadataProvider: string = provider;
   let savedAudioFile: File | null = null;
   let transcribeInputFile: File | null = null;
   const sessionArchiveDir = String(activeLiveArchiveDir || currentArchiveDirSnapshot()).trim();
@@ -12659,17 +12593,6 @@ async function stopLive(
         ? { status: "Audio saved. Final transcription was skipped for this session.", tone: "success" }
         : { status: "Audio saved, but the canonical transcription input is unavailable for this session.", tone: "warning" },
       conflictStatus: "Audio is available, but the original archive changed before the session metadata could be finalized.",
-    });
-    return;
-  }
-
-  if (!provider) {
-    await endWithoutTranscript({
-      signal: { domText: "No transcription provider is selected. Audio was saved locally.", kind: "status" },
-      statusLabel: "Idle",
-      save: true,
-      summary: { status: "Audio saved. No transcription provider is selected.", tone: "warning" },
-      conflictStatus: "No provider is selected, and the original archive changed before the session metadata could be finalized.",
     });
     return;
   }
@@ -13385,7 +13308,7 @@ async function stopLive(
 // event directly from the button would skip all of that and create a
 // second, weaker recording path.
 document.getElementById("recordToggleBtn")?.addEventListener("click", () => {
-  postTitleBridgeMessage(TITLE_BRIDGE_PREFIX.recordToggle, String(Date.now()));
+  window.transcriptor?.recordToggle?.();
 });
 
 window.addEventListener("transcriptor-hotkey-toggle", (ev) => {
@@ -14016,27 +13939,26 @@ function normalizeTranscriptRecordingName(name: string): string {
 }
 
 /**
- * Whether the shell can actually reveal a file in the OS file manager.
- *
- * NOT ``typeof window.__transcriptorRevealRecording === "function"``:
- * the renderer installs that itself, unconditionally, at module scope,
- * so the check was always true and the "Reveal in folder" button showed
- * in a plain browser preview and silently did nothing. The preload
- * script is what proves a host is there.
+ * Whether the shell can actually reveal a file in the OS file manager:
+ * the preload's ``revealRecording`` send is what proves a host is there.
+ * Absent in a plain browser preview, where the "Reveal in folder" button
+ * stays hidden instead of silently doing nothing.
  */
 function hostCanRevealFiles(): boolean {
-  return typeof window.__transcriptorFilePathForFile === "function";
+  return typeof window.transcriptor?.revealRecording === "function";
 }
 
-function installRevealRecordingBridge(): void {
-  window.__transcriptorRevealRecording = (name: string, archiveDir: string) => {
-    const safe = normalizeTranscriptRecordingName(name);
-    if (!safe) return;
-    const payload = encodeURIComponent(
-      JSON.stringify({ name: safe, archiveDir: String(archiveDir || "") }),
-    );
-    postTitleBridgeMessage(TITLE_BRIDGE_PREFIX.revealRecording, payload);
-  };
+/**
+ * Ask the desktop shell to show a saved transcript in the OS file
+ * manager. Main re-validates the name and the folder
+ * (desktop/renderer-requests.js ``resolveRevealTarget``); this only
+ * refuses what can never be a transcript name.
+ */
+function revealRecordingInFolder(name: string, archiveDir: string): boolean {
+  const safe = normalizeTranscriptRecordingName(name);
+  const reveal = window.transcriptor?.revealRecording;
+  if (!safe || typeof reveal !== "function") return false;
+  return reveal({ name: safe, archiveDir: String(archiveDir || "") });
 }
 
 function uploadRevealTarget(item: UploadQueueItem | null | undefined): UploadRevealTarget | null {
@@ -14050,10 +13972,8 @@ function uploadRevealTarget(item: UploadQueueItem | null | undefined): UploadRev
 
 function revealUploadItem(item: UploadQueueItem | null | undefined): boolean {
   const target = uploadRevealTarget(item);
-  const reveal = window.__transcriptorRevealRecording;
-  if (!target || !reveal || !hostCanRevealFiles()) return false;
-  reveal(target.name, target.archiveDir);
-  return true;
+  if (!target) return false;
+  return revealRecordingInFolder(target.name, target.archiveDir);
 }
 
 function createUploadRevealButton(item: UploadQueueItem): HTMLButtonElement | null {
@@ -14164,11 +14084,11 @@ function uploadQueueSnapshotItem(item: UploadQueueItem): UploadQueueSnapshotItem
     startedAt: item.startedAt,
     endedAt: item.endedAt,
     completedAt: item.completedAt,
-    provider: item.provider || "",
+    provider: item.provider,
     model: item.model || "",
     language: item.language || "",
     audioDurationSec: Math.max(0, Number(item.audioDurationSec || 0) || 0),
-    requestedProvider: item.requestedProvider || "",
+    requestedProvider: item.requestedProvider,
     requestedModel: item.requestedModel || "",
     requestedLanguage: item.requestedLanguage || "",
     requestedDiarize: item.requestedDiarize === true,
@@ -14227,7 +14147,8 @@ function applyUploadQueueSnapshot(payload: Partial<UploadQueueStoragePayload>): 
       // A restored snapshot is untrusted input: normalize it through the
       // same predicate as the requested provider rather than asserting
       // the type is whatever the file said.
-      provider: normalizeProviderSelection(src.provider, ""),
+      // "" / absent = not known yet (the job never reported one).
+      provider: isProviderId(String(src.provider || "")) ? src.provider as Provider : undefined,
       model: String(src.model || ""),
       language: String(src.language || ""),
       audioDurationSec: Math.max(0, Number(src.audioDurationSec || 0) || 0),
@@ -14491,7 +14412,7 @@ function setupUploadView(): void {
       const el = document.getElementById(mirrorId) as HTMLSelectElement | null;
       setTranscriptionSelection(
         mirrorId === "uploadProviderMirror"
-          ? ((el?.value || "local-whisper") as TranscriptionGroupId | "")
+          ? ((el?.value || "local-whisper") as TranscriptionGroupId)
           : readProviderGroup(),
         mirrorId === "uploadModelMirror" ? el?.value || undefined : undefined,
       );
@@ -15490,7 +15411,4 @@ function renderUploadResultPane(): void {
   }
 }
 
-// Renderer-side bridge must be installed before setupUploadView(), because
-// setupUploadView() immediately restores and renders persisted queue items.
-installRevealRecordingBridge();
 setupUploadView();

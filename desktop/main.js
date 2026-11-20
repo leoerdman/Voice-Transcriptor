@@ -135,6 +135,11 @@ const { recordingKey, createBoundedKeySet } = require("./renderer-epoch");
 // The runtime accelerator set and how a Settings update changes it
 // (S-11, DM-23).
 const { normalizeShortcutSet, applyShortcutUpdate, screenShotSlotStatus } = require("./shortcut-runtime");
+const {
+  RENDERER_REQUEST_CHANNELS,
+  parseShortcutMessage,
+  resolveRevealTarget,
+} = require("./renderer-requests");
 // The capsule window's size (one flag) and when it is placed (DM-13, DM-25).
 const { capsuleWindowSize, capsuleBoundsIn, capsuleNeedsPlacement } = require("./capsule-geometry");
 // What to do once screenMode.start() answered for a take (DM-31).
@@ -2282,15 +2287,19 @@ function publishScreenShotHotkeyStatus() {
   publishShortcutStatusToRenderer();
 }
 
-/** Hand the current shortcut status to the main window (Settings badges). */
+/**
+ * Hand the current shortcut status to the main window (Settings badges).
+ * Pushed on the fixed "shortcut-status" channel whenever it changes and
+ * on did-finish-load; the renderer subscribes through the preload
+ * (onShortcutStatus) instead of polling a window global (DM-14 / S-10).
+ */
 function publishShortcutStatusToRenderer() {
   if (!lastShortcutStatus || !win || win.isDestroyed() || !win.webContents) return;
-  win.webContents
-    .executeJavaScript(
-      `window.__transcriptorShortcutStatus = ${JSON.stringify(lastShortcutStatus)};`,
-      true,
-    )
-    .catch(() => { });
+  try {
+    win.webContents.send("shortcut-status", lastShortcutStatus);
+  } catch (e) {
+    appendMainLog(`[shortcuts] status push failed: ${e?.message || e}`);
+  }
 }
 
 // The capsule stays the user's control surface in screen mode, so it is
@@ -8192,152 +8201,6 @@ async function createWindow(options = {}) {
     }
     return { action: "deny" };
   });
-  // Renderer → main IPC over the document-title channel. The renderer
-  // (sandbox: true, contextIsolation: true) cannot use ipcRenderer;
-  // the canonical workaround used elsewhere in this file
-  // is to set ``document.title = "__app_<verb>__<payload>"`` and have
-  // the main process intercept the page-title-updated event. We
-  // restrict accepted verbs to a closed list and decode the payload
-  // back to a known recordings dir + filename, so a malicious
-  // transcript cannot smuggle arbitrary paths into shell.showItemInFolder.
-  win.webContents.on("page-title-updated", (event, title) => {
-    const raw = String(title || "");
-    if (!raw.startsWith("__app_")) return;
-    event.preventDefault();
-    if (raw.startsWith("__app_shortcuts__")) {
-      let payload;
-      try {
-        payload = JSON.parse(decodeURIComponent(raw.slice("__app_shortcuts__".length)));
-      } catch (e) {
-        appendMainLog(`[shortcuts-bridge] bad payload: ${e?.message || e}`);
-        return;
-      }
-      const action = String(payload?.action || "").trim();
-      if (!["capture-start", "capture-cancel", "update"].includes(action)) {
-        appendMainLog(`[shortcuts-bridge] rejected action=${compactLogText(action, 40)}`);
-        return;
-      }
-      const message = {
-        action,
-        record: String(payload?.record || "").trim().slice(0, 96),
-        paste: String(payload?.paste || "").trim().slice(0, 96),
-        screen: String(payload?.screen || "").trim().slice(0, 96),
-        screenShot: String(payload?.screenShot || "").trim().slice(0, 96),
-      };
-      if (shortcutBridgeHandler) {
-        shortcutBridgeHandler(message);
-      } else {
-        pendingShortcutBridgeMessages.push(message);
-        pendingShortcutBridgeMessages = pendingShortcutBridgeMessages.slice(-8);
-      }
-      return;
-    }
-    if (raw.startsWith("__app_record_toggle__")) {
-      // The in-window Record/Stop button. Routed to the very same
-      // function the global hotkey calls so there is one recording
-      // toggle, not two: same microphone-permission prompt, same
-      // frontmost-window capture for auto-paste, same capsule, same
-      // single-capsule busy guard, same trace. The renderer deliberately
-      // does NOT dispatch its own toggle event for this.
-      appendMainLog("[record-toggle] requested from the in-window button");
-      toggleRecordingFromShortcut().catch((e) => {
-        appendMainLog(`[record-toggle] failed: ${e?.message || e}`);
-      });
-      return;
-    }
-    if (raw.startsWith("__app_reveal_recording__")) {
-      let payload;
-      try {
-        payload = JSON.parse(decodeURIComponent(raw.slice("__app_reveal_recording__".length)));
-      } catch (e) {
-        appendMainLog(`[reveal-recording] bad payload: ${e?.message || e}`);
-        return;
-      }
-      // 1.1.25: path-traversal defense. Previous form stripped only
-      // path separators, leaving ``..`` intact. Combined with
-      // shell.showItemInFolder, a renderer compromise could enumerate
-      // the user's home parent (e.g. /Users) by repeatedly revealing
-      // dotted names. Reject any name containing ``..`` OR a path
-      // separator outright — recording filenames produced by the
-      // backend never need either character.
-      const rawName = String(payload?.name || "");
-      if (!rawName || rawName.includes("..") || /[\\/]/.test(rawName)) return;
-      const safeName = rawName;
-      if (!safeName.toLowerCase().endsWith(".txt")) {
-        appendMainLog(`[reveal-recording] rejected non-transcript name: ${safeName}`);
-        return;
-      }
-      const archiveDirRaw = String(payload?.archiveDir || "").trim();
-      // Resolve the transcript path under the SAME archive dir we wrote to.
-      // archiveDir comes back from saveRecordingText which already
-      // sanitises it via _resolve_recordings_target_dir on the backend
-      // side, but defence-in-depth: only accept absolute paths under
-      // the data directory's recordings/ or the configured recordings root.
-      const pathContains = (root, candidate) => {
-        const rel = path.relative(root, candidate);
-        return rel === "" || (!!rel && !rel.startsWith("..") && !path.isAbsolute(rel));
-      };
-      const appDataDir = dataDir();
-      const recordingsRoot = path.resolve(appDataDir, "recordings");
-      const allowedRecordingRoots = [recordingsRoot];
-      try {
-        const cfgPath = path.join(appDataDir, "config.json");
-        if (fs.existsSync(cfgPath)) {
-          const rawCfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
-          const configuredRoot = String(rawCfg?.preferences?.recordings_dir || "").trim();
-          if (configuredRoot) {
-            allowedRecordingRoots.push(
-              path.isAbsolute(configuredRoot)
-                ? path.resolve(configuredRoot)
-                : path.resolve(appDataDir, configuredRoot)
-            );
-          }
-        }
-      } catch (e) {
-        appendMainLog(`[reveal-recording] config allowlist read failed: ${e?.message || e}`);
-      }
-      const archiveDir = archiveDirRaw && path.isAbsolute(archiveDirRaw)
-        ? path.resolve(archiveDirRaw)
-        : recordingsRoot;
-      // Walk up to make sure the resolved path is still under the
-      // user's home — block any symlink-shenanigans that would point
-      // at /etc/shadow or similar.
-      //
-      // Plain ``startsWith(home)`` has the classic prefix-bypass bug:
-      // when home = "/Users/foo", any sibling like "/Users/foobar/x"
-      // also matches because "/Users/foobar" starts with "/Users/foo".
-      // A compromised renderer could pass an archive_dir like
-      // "<home>~unrelated/whatever" and reveal arbitrary files via
-      // shell.showItemInFolder. Anchor the check on a path-separator
-      // boundary (or exact equality) so only descendants of home pass.
-      const home = path.resolve(app.getPath("home"));
-      const isInsideHome =
-        archiveDir === home || archiveDir.startsWith(home + path.sep);
-      if (!isInsideHome) {
-        appendMainLog(`[reveal-recording] archive_dir outside home: ${archiveDir}`);
-        return;
-      }
-      // Reveal means "show the transcript file". Never substitute the
-      // adjacent audio/video recording: the History and Upload panes
-      // already have dedicated playback, and selecting the media file
-      // made the user think the transcription had been saved under the
-      // wrong name.
-      const target = path.resolve(archiveDir, safeName);
-      const isAllowedRecordingPath = allowedRecordingRoots.some((root) =>
-        pathContains(root, archiveDir) && pathContains(root, target)
-      );
-      if (!isAllowedRecordingPath) {
-        appendMainLog(`[reveal-recording] archive_dir outside recording roots: ${archiveDir}`);
-        return;
-      }
-      try {
-        shell.showItemInFolder(target);
-      } catch (e) {
-        appendMainLog(`[reveal-recording] shell.showItemInFolder failed: ${e?.message || e}`);
-      }
-      return;
-    }
-  });
 
   win.webContents.on("will-navigate", (e, url) => {
     if (_isBackendOrigin(url)) return;
@@ -9128,9 +8991,9 @@ app.whenReady().then(async () => {
   // raw ipcRenderer and cannot initiate arbitrary channels.
   // Every channel the preload exposes answers only the main window's own
   // webContents (DM-28). Only that window has the preload today, so
-  // nothing else can reach these channels — but the rule was enforced by
-  // two handlers (screen-mode:finish, recording-final, which spell the
-  // same condition inline) and missing from the other four.
+  // nothing else can reach these channels — but the rule once lived in
+  // two handlers only, spelled inline; every handler now asks this one
+  // predicate.
   const isFromMainWindow = (event) =>
     !!win && !win.isDestroyed() && event?.sender === win.webContents;
   const refusedSender = (channel) => {
@@ -9239,7 +9102,7 @@ app.whenReady().then(async () => {
   // dead-pipeline fail-safe). Main owns the session; the renderer asks
   // for it back and writes it into the transcript.
   ipcMain.handle("screen-mode:finish", async (event, payload) => {
-    if (!win || win.isDestroyed() || event.sender !== win.webContents) return { ok: false, error: "sender" };
+    if (!isFromMainWindow(event)) return refusedSender("screen-mode:finish");
     const p = payload && typeof payload === "object" ? payload : {};
     try {
       const id = String(p.id || "");
@@ -9252,7 +9115,7 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.on("recording-final", (event, payload) => {
-    if (!win || win.isDestroyed() || event.sender !== win.webContents) return;
+    if (!isFromMainWindow(event)) { refusedSender("recording-final"); return; }
     const signal = recordingFinalSlot.set(payload);
     if (!signal) {
       appendMainLog(
@@ -9265,8 +9128,76 @@ app.whenReady().then(async () => {
     }
     appendMainLog(
       `[recording-final] rec=${signal.recordingId} final=${signal.final ? "1" : "0"} ` +
-      `len=${signal.text.length} source="${signal.source}" seq=${signal.seq}`,
+      `len=${signal.text.length} kind=${signal.kind} phase=${signal.phase || "-"} seq=${signal.seq}`,
     );
+  });
+
+  // The main window's own requests (DM-10): Settings → Shortcuts, the
+  // in-window Record/Stop button, "Reveal in folder". Fixed preload
+  // channels with the same sender rule as every channel above; what each
+  // request may do is decided in ./renderer-requests from the payload
+  // alone, so a renderer cannot name a verb or a path main did not allow.
+  ipcMain.on(RENDERER_REQUEST_CHANNELS.SHORTCUTS, (event, payload) => {
+    if (!isFromMainWindow(event)) { refusedSender(RENDERER_REQUEST_CHANNELS.SHORTCUTS); return; }
+    const parsed = parseShortcutMessage(payload);
+    if (!parsed.message) {
+      appendMainLog(`[shortcuts-bridge] ${compactLogText(parsed.error, 60)}`);
+      return;
+    }
+    if (shortcutBridgeHandler) {
+      shortcutBridgeHandler(parsed.message);
+    } else {
+      pendingShortcutBridgeMessages.push(parsed.message);
+      pendingShortcutBridgeMessages = pendingShortcutBridgeMessages.slice(-8);
+    }
+  });
+  ipcMain.on(RENDERER_REQUEST_CHANNELS.RECORD_TOGGLE, (event) => {
+    if (!isFromMainWindow(event)) { refusedSender(RENDERER_REQUEST_CHANNELS.RECORD_TOGGLE); return; }
+    // Routed to the very same function the global hotkey calls so there
+    // is one recording toggle, not two: same microphone-permission
+    // prompt, same frontmost-window capture for auto-paste, same capsule,
+    // same single-capsule busy guard, same trace. The renderer
+    // deliberately does NOT dispatch its own toggle event for this.
+    appendMainLog("[record-toggle] requested from the in-window button");
+    toggleRecordingFromShortcut().catch((e) => {
+      appendMainLog(`[record-toggle] failed: ${e?.message || e}`);
+    });
+  });
+  ipcMain.on(RENDERER_REQUEST_CHANNELS.REVEAL_RECORDING, (event, payload) => {
+    if (!isFromMainWindow(event)) { refusedSender(RENDERER_REQUEST_CHANNELS.REVEAL_RECORDING); return; }
+    const appDataDir = dataDir();
+    const recordingsRoot = path.resolve(appDataDir, "recordings");
+    const allowedRoots = [recordingsRoot];
+    try {
+      const cfgPath = path.join(appDataDir, "config.json");
+      if (fs.existsSync(cfgPath)) {
+        const rawCfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+        const configuredRoot = String(rawCfg?.preferences?.recordings_dir || "").trim();
+        if (configuredRoot) {
+          allowedRoots.push(
+            path.isAbsolute(configuredRoot)
+              ? path.resolve(configuredRoot)
+              : path.resolve(appDataDir, configuredRoot),
+          );
+        }
+      }
+    } catch (e) {
+      appendMainLog(`[reveal-recording] config allowlist read failed: ${e?.message || e}`);
+    }
+    const reveal = resolveRevealTarget(payload, {
+      home: app.getPath("home"),
+      recordingsRoot,
+      allowedRoots,
+    });
+    if (!reveal.ok) {
+      appendMainLog(`[reveal-recording] rejected ${reveal.reason}${reveal.detail ? `: ${reveal.detail}` : ""}`);
+      return;
+    }
+    try {
+      shell.showItemInFolder(reveal.target);
+    } catch (e) {
+      appendMainLog(`[reveal-recording] shell.showItemInFolder failed: ${e?.message || e}`);
+    }
   });
 
   lastTranscriptText = loadLastTranscriptFromDisk();

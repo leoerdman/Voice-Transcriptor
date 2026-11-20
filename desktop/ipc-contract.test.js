@@ -191,6 +191,24 @@ test("screen-mode:finish is invoked by the renderer bridge and handled by main",
   // the renderer's stopLive asks for it back on every stop path.
   assert.match(preloadSource, /ipcRenderer\.invoke\("screen-mode:finish"/);
   assert.match(mainSource, /ipcMain\.handle\("screen-mode:finish"/);
-  // Only the main window may end a session.
-  assert.match(mainSource, /"screen-mode:finish", async \(event, payload\) => \{\n    if \(!win \|\| win\.isDestroyed\(\) \|\| event\.sender !== win\.webContents\)/);
+});
+
+test("the main window's requests ride preload sends, not document.title (DM-10)", () => {
+  const { RENDERER_REQUEST_CHANNELS } = require("./renderer-requests");
+  for (const channel of Object.values(RENDERER_REQUEST_CHANNELS)) {
+    assert.match(preloadSource, new RegExp(`ipcRenderer\\.send\\("${channel}"`), `preload must send ${channel}`);
+  }
+  for (const key of Object.keys(RENDERER_REQUEST_CHANNELS)) {
+    assert.match(mainSource, new RegExp(`ipcMain\\.on\\(RENDERER_REQUEST_CHANNELS\\.${key},`), `main must receive ${key}`);
+  }
+  // The title channel is gone from both sides of the main window.
+  assert.doesNotMatch(mainSource, /page-title-updated/);
+  assert.doesNotMatch(mainSource, /__app_/);
+});
+
+test("shortcut-status is pushed by main and subscribed to by the renderer bridge (DM-14 / S-10)", () => {
+  assert.match(mainSource, /webContents\.send\("shortcut-status"/);
+  assert.match(preloadSource, /ipcRenderer\.on\("shortcut-status"/);
+  assert.match(preloadSource, /ipcRenderer\.removeListener\("shortcut-status"/);
+  assert.doesNotMatch(mainSource, /__transcriptorShortcutStatus/, "no window global written with executeJavaScript");
 });

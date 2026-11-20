@@ -68,17 +68,10 @@ function isPasteableTranscript(value) {
   return !!text && !isNoSpeechPlaceholder(text);
 }
 
-/** ``"status:upscaling"`` → ``{ kind: "status", phase: "upscaling" }``. */
-function parseSignalSource(source) {
-  const raw = String(source || "").trim().toLowerCase();
-  const colon = raw.indexOf(":");
-  const kind = colon < 0 ? raw : raw.slice(0, colon);
-  const phase = colon < 0 ? "" : raw.slice(colon + 1);
-  return { kind, phase };
-}
-
 /**
- * Classify one validated hand-off signal ({ final, text, source }).
+ * Classify one validated hand-off signal ({ final, text, kind, phase } —
+ * the fields desktop/recording-final-slot.js validated; they used to be
+ * parsed out of a free-form ``source`` label).
  *
  * Returns ``{ outcome, text, status, upscaling }``:
  *   - FINAL: ``text`` is what to paste.
@@ -93,7 +86,8 @@ function parseSignalSource(source) {
 function classifyRecordingSignal(signal) {
   const s = signal && typeof signal === "object" ? signal : {};
   const text = normalizeTranscriptText(s.text);
-  const { kind, phase } = parseSignalSource(s.source);
+  const kind = String(s.kind || "");
+  const phase = String(s.phase || "");
   const noSpeech = !text || phase === "no-speech" || isNoSpeechPlaceholder(text);
   if (s.final === true) {
     if (!noSpeech) return { outcome: SIGNAL_OUTCOME.FINAL, text, status: "", upscaling: false };
@@ -121,6 +115,5 @@ module.exports = {
   normalizeTranscriptText,
   isNoSpeechPlaceholder,
   isPasteableTranscript,
-  parseSignalSource,
   classifyRecordingSignal,
 };

@@ -164,6 +164,7 @@ desktop/
 ├── recording-stop.js               # what a main-process stop does once the renderer has or has not answered (pure, node --test)
 ├── windows-paste-fallback.js       # the Windows PowerShell paste fallback script; sends keys only after a confirmed foreground switch (pure, node --test)
 ├── renderer-toggle.js              # the record hotkey's one renderer round trip and its deadline (pure, node --test)
+├── renderer-requests.js            # the main window's requests (shortcuts, record toggle, reveal) — what main accepts from each (pure, node --test); replaces the document.title channel
 ├── data-dir.js                     # the one rule for where the desktop shell keeps its data (pure, node --test)
 ├── backend-exit.js                 # what the shell does when the backend child exits: restart, report, or let it go on quit (pure, node --test)
 ├── single-flight.js                # at most one run of an operation at a time; check and claim in one step (engine install) (pure, node --test)
@@ -173,7 +174,7 @@ desktop/
 ├── screen-session-start.js         # what main does once screenMode.start() has answered for a take already recording (pure, node --test)
 ├── capsule-preload.js              # the recording capsule's preload bridge to main (stop, screenshot, geometry) — replaces the document.title channel
 ├── ipc-contract.test.js            # main.js/preload.js IPC channel-name contract test (node --test)
-├── preload.js                      # safe renderer bridge (path-for-file, engine lifecycle invoke-only, recordingFinal send-only, system-suspend receive-only)
+├── preload.js                      # safe renderer bridge (path-for-file, engine lifecycle invoke-only, recordingFinal / shortcuts / record-toggle / reveal send-only, system-suspend / shortcut-status receive-only)
 ├── package.json                    # electron-builder config and desktop scripts
 ├── shortcut-defaults.json          # per-platform default hotkey manifest
 ├── afterPack.js                    # macOS bundle signing/runtime fixups

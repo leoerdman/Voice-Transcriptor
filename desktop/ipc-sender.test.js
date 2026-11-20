@@ -10,13 +10,15 @@ const assert = require("node:assert/strict");
 const { mainSource } = require("./main-source");
 
 function handlerHead(channel) {
-  const at = mainSource.search(new RegExp(`ipcMain\\.(?:handle|on)\\("${channel}"`));
+  const at = mainSource.search(new RegExp(`ipcMain\\.(?:handle|on)\\((?:"${channel}"|${channel})`));
   assert.ok(at >= 0, `${channel} is not handled`);
   return mainSource.slice(at, at + 260);
 }
 
 test("every preload channel checks that the sender is the main window", () => {
-  const SENDER_CHECK = /isFromMainWindow\(event\)|event\.sender !== win\.webContents/;
+  // One predicate for all of them (DM-28): no handler spells it inline.
+  const SENDER_CHECK = /isFromMainWindow\(event\)/;
+  assert.doesNotMatch(mainSource, /event\.sender !== win\.webContents/);
   for (const channel of [
     "engine:get-status",
     "engine:install",
@@ -24,6 +26,9 @@ test("every preload channel checks that the sender is the main window", () => {
     "permissions:repair",
     "screen-mode:finish",
     "recording-final",
+    "RENDERER_REQUEST_CHANNELS.SHORTCUTS",
+    "RENDERER_REQUEST_CHANNELS.RECORD_TOGGLE",
+    "RENDERER_REQUEST_CHANNELS.REVEAL_RECORDING",
   ]) {
     assert.match(handlerHead(channel), SENDER_CHECK, `${channel} must refuse other senders`);
   }

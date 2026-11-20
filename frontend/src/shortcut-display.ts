@@ -80,18 +80,20 @@ const MAC_MEDIA_FUNCTION_KEY = /^F([1-9]|1[0-2])$/;
  * Two ways a shortcut that looks saved does nothing: the OS refused the
  * registration (another app owns it), or macOS with "F-keys as media
  * keys" swallows an F1–F12 press before the app sees it — registration
- * succeeds and the handler never fires. The screenshot key is bound
- * only while screen mode runs, so "not active" is its normal state at
- * rest; only an error is a conflict for it.
+ * succeeds and the handler never fires.
+ *
+ * One rule for every slot (S-09): a conflict is an error main reported.
+ * "Not active" is not one — the screenshot key is bound only while screen
+ * mode runs, and an optional slot left empty registers nothing — and main
+ * fills ``error`` for every refusal, the screenshot key's included (its
+ * registration probe at rest, its bind during a take).
  */
 export function shortcutBadge(
-  slotId: string,
   status: ShortcutSlotStatus,
   macFnCollision: boolean,
 ): ShortcutBadge {
-  const active = slotId === "screenShot" ? !status.error : !!status.active;
   const desired = status.desired || "";
-  if (!active) {
+  if (status.error) {
     return { conflict: true, title: `Not registered: ${status.error || "unknown reason"}` };
   }
   if (macFnCollision && MAC_MEDIA_FUNCTION_KEY.test(desired)) {
