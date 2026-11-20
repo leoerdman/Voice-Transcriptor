@@ -119,6 +119,11 @@ from backend.deepgram_language import (
     LANGUAGE_HINT_OPTIONS,
     configured_language_hints,
 )
+from backend.transcript_scripts import (
+    strip_foreign_script,
+    strip_foreign_script_payload,
+    transcript_scripts,
+)
 from backend.remote_deepgram import (
     DEEPGRAM_SMALL_AUDIO_BYTES,
     DEEPGRAM_SMALL_AUDIO_READ_TIMEOUT_SEC,
@@ -2689,7 +2694,18 @@ def _transcribe_with_retry(
     raise RuntimeError("transcribe_with_retry failed without exception")
 
 
-def _run_local_transcribe_once(
+def _run_local_transcribe_once(*, language: Optional[str], **kwargs: Any) -> dict[str, Any]:
+    """Transcribe an uploaded file with a local engine — the result every
+    caller (the Upload job, ``/api/transcribe-sync``) delivers.
+
+    The engines' output leaves through here, so the transcript rule
+    (``backend.transcript_scripts``) is applied once for all of them.
+    """
+    result = _decode_local_once(language=language, **kwargs)
+    return strip_foreign_script_payload(result, transcript_scripts(load_config(), language))
+
+
+def _decode_local_once(
     *,
     run_id: str,
     upload_path: Path,
@@ -4572,6 +4588,11 @@ async def ws_transcribe(websocket: WebSocket):
     # the window in which a writer could be holding the spool open.
     _register_live_session(session_id)
     try:
+        # Read once for the whole session, before the first transcript
+        # frame: the transcript rule is bound from it, and the Deepgram
+        # path below takes its key, keyterms and hints from the same read.
+        live_cfg = await asyncio.to_thread(load_config)
+        _bind_live_transcript_scripts(websocket, live_cfg, lang_opt)
         try:
             recovery_ctx = _open_live_recovery(
                 session_id=session_id,
@@ -4592,7 +4613,7 @@ async def ws_transcribe(websocket: WebSocket):
                 exc_info=True,
             )
         if provider == "deepgram":
-            dg_cfg = load_config()
+            dg_cfg = live_cfg
             dg_key = _configured_deepgram_key(dg_cfg)
             if not dg_key:
                 await _ws_send_json(
@@ -5141,6 +5162,22 @@ from backend.remote_deepgram_live import SEND_WEDGE_SEC as _WS_SEND_TIMEOUT_SEC 
 # queue behind, the one still in flight (BW-02).
 _STALLED_CLIENT_SOCKETS: "weakref.WeakSet[WebSocket]" = weakref.WeakSet()
 
+# The scripts each live socket's transcript may contain
+# (``backend.transcript_scripts``), resolved once when the socket opens
+# (``_bind_live_transcript_scripts``). Every live frame the renderer gets
+# — the local assist's and Deepgram's segments and interims, single or
+# dual stream, and every ``final`` envelope, recovery-repaired or not —
+# leaves through ``_ws_send_json``, so that is where the rule is applied:
+# once, for every live source, instead of once per producer. A socket
+# with no entry (or ``None``) is unrestricted.
+_LIVE_TRANSCRIPT_SCRIPTS: "weakref.WeakKeyDictionary[WebSocket, Optional[frozenset[str]]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _bind_live_transcript_scripts(websocket: WebSocket, cfg: dict, language: Optional[str]) -> None:
+    _LIVE_TRANSCRIPT_SCRIPTS[websocket] = transcript_scripts(cfg, language)
+
 
 def _collect_stalled_send(task: "asyncio.Future") -> None:
     if not task.cancelled() and task.exception() is not None:
@@ -5149,6 +5186,10 @@ def _collect_stalled_send(task: "asyncio.Future") -> None:
 
 async def _ws_send_json(websocket: WebSocket, payload: dict) -> bool:
     """Send a JSON payload on a WebSocket, swallowing harmless shutdown races.
+
+    The live transcript's one exit: the payload's texts are first held to
+    the scripts this socket's transcript may contain
+    (``_LIVE_TRANSCRIPT_SCRIPTS``).
 
     Returns ``True`` on success. Logs transient broken-pipe errors and
     returns ``False`` without raising so the caller can continue its
@@ -5159,6 +5200,7 @@ async def _ws_send_json(websocket: WebSocket, payload: dict) -> bool:
     """
     if websocket in _STALLED_CLIENT_SOCKETS:
         return False
+    payload = strip_foreign_script_payload(payload, _LIVE_TRANSCRIPT_SCRIPTS.get(websocket))
     try:
         send = asyncio.ensure_future(
             websocket.send_text(json.dumps(payload, ensure_ascii=False))
@@ -6991,6 +7033,23 @@ async def transcribe_sync(
 
 
 def _run_remote_transcribe_once(
+    *, language: Optional[str], cfg: Optional[dict] = None, **kwargs: Any
+) -> dict[str, Any]:
+    """Transcribe audio with a remote provider — the result every caller
+    (the remote Upload job, ``/api/remote/transcribe-sync``,
+    ``transcribe-on-disk``) delivers.
+
+    Every provider's output leaves through here, so the transcript rule
+    (``backend.transcript_scripts``) is applied once for all of them. The
+    provider's ``raw`` payload is evidence and is kept as it came.
+    """
+    if cfg is None:
+        cfg = load_config()
+    result = _decode_remote_once(language=language, cfg=cfg, **kwargs)
+    return strip_foreign_script_payload(result, transcript_scripts(cfg, language))
+
+
+def _decode_remote_once(
     *,
     provider_norm: str,
     upload_path: Optional[Path] = None,
@@ -7000,7 +7059,7 @@ def _run_remote_transcribe_once(
     diarize: bool,
     num_speakers: str,
     remote_model: str = "",
-    cfg: Optional[dict] = None,
+    cfg: dict,
     cancel_event: Optional[threading.Event] = None,
     progress_cb: Optional[Callable[[float], None]] = None,
 ) -> dict[str, Any]:
@@ -7032,8 +7091,6 @@ def _run_remote_transcribe_once(
             logger.debug("remote progress callback raised: %s", e)
 
     _raise_if_cancelled()
-    if cfg is None:
-        cfg = load_config()
     # Defensive `or {}` — `cfg.get("preferences", {})` returns None when
     # the key IS present with a null value (hand-edited config.json).
     # The rest of the module uses the `or {}` pattern; mirror it here
@@ -7619,7 +7676,10 @@ async def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require
         "preset_name": preset.get("name"),
         "model": used_model,
         "trimmed_chars": trimmed_chars,
-        "text": (out.get("text") or "").strip(),
+        # The rewrite is a transcript too, and a model can write in an
+        # alphabet the speaker never used: the same rule as every other
+        # delivered transcript (``backend.transcript_scripts``).
+        "text": strip_foreign_script((out.get("text") or "").strip(), transcript_scripts(cfg)),
     }
 
 

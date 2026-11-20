@@ -6,7 +6,9 @@
  * The user declares the languages they actually speak; the backend sends
  * them as ``language_hint`` and the dual-stream merge treats a stretch in
  * any other language as a mislabel (``backend/deepgram_language.py``,
- * ``backend/deepgram_dual.py``). The backend owns the offer and the
+ * ``backend/deepgram_dual.py``); every delivered transcript drops words
+ * written only in alphabets none of them use
+ * (``backend/transcript_scripts.py``). The backend owns the offer and the
  * default (bootstrap ``live_defaults.language_hint_options`` /
  * ``language_hints``); this module owns what a stored, missing or broken
  * preference resolves to — with the same rule as ./deepgram-dual: absent
