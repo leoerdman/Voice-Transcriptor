@@ -61,6 +61,7 @@
       "data-dir.js",
       "backend-exit.js",
       "renderer-epoch.js",
+      "shortcut-runtime.js",
       "power-events.js",
       "child-io.js",
       "paste-protocol.js",

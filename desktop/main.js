@@ -132,6 +132,9 @@ const { backendHandleOf, decideBackendExit } = require("./backend-exit");
 // Recording ids are unique only per renderer page: key them with the
 // page's epoch (DM-32).
 const { recordingKey, createBoundedKeySet } = require("./renderer-epoch");
+// The runtime accelerator set and how a Settings update changes it
+// (S-11, DM-23).
+const { normalizeShortcutSet, applyShortcutUpdate } = require("./shortcut-runtime");
 // The record hotkey's renderer round trip, with a press that expires
 // when main stops waiting for it (DM-05).
 const {
@@ -9296,12 +9299,15 @@ app.whenReady().then(async () => {
   let registeredPasteHotkey = "";
   let registeredScreenHotkey = "";
   let shortcutsSuspendedForCapture = false;
+  // The accelerators bound at runtime — the ONE source every
+  // registration reads (S-11). config.json seeds it once, at the first
+  // registration; Settings updates replace it (./shortcut-runtime).
+  let activeShortcuts = null;
 
   function readShortcutsFromConfig() {
     const defaults = shortcutDefaultsForPlatform();
     try {
-      const dataDir = dataDir();
-      const cfgPath = path.join(dataDir, "config.json");
+      const cfgPath = path.join(dataDir(), "config.json");
       if (fs.existsSync(cfgPath)) {
         const raw = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
         const ui = raw?.preferences?.ui || {};
@@ -9417,45 +9423,19 @@ app.whenReady().then(async () => {
     }
   }
 
-  function registerGlobalShortcuts(override = null) {
-    if (shortcutsSuspendedForCapture && !override) {
+  function registerGlobalShortcuts() {
+    if (shortcutsSuspendedForCapture) {
       appendMainLog("[shortcuts] register skipped while Settings capture is active");
       return;
     }
-    // SSOT for the accelerators we actually bind:
-    //   - At startup → readShortcutsFromConfig() (disk-backed, pre-renderer).
-    //   - After a Settings-UI capture → the shortcuts bridge delivers an
-    //     "update" message carrying the accelerators the user just
-    //     typed. Passed in here as `override` so the registration uses
-    //     those IN-MEMORY values, NOT the disk config.
-    //
-    // Why the override exists (root cause of "не ставятся новые при
-    // нажатии клавиш"): the renderer queues a debounced (600 ms) save
-    // to /api/config which the backend writes to disk asynchronously.
-    // Re-reading disk on an update would therefore often return the OLD
-    // shortcut and re-register the very accelerator the user just
-    // changed away from — the displayed shortcut updates in the UI
-    // while the actual global hotkey stays on the previous binding.
-    // Routing the bridge payload through `override` removes the
-    // disk-write dependency
-    // entirely — registration uses exactly what the user pressed.
-    //
-    // Defensive fallback: if `override` is partial (only `record` or
-    // only `paste`) we fill the missing half from disk so we never
-    // unregister an accelerator without re-registering its replacement.
-    let shortcuts;
-    if (override && (override.record || override.paste)) {
-      const fromDisk = (override.record && override.paste) ? null : readShortcutsFromConfig();
-      const screenFromDisk = (override.screen && override.screenShot) ? null : readShortcutsFromConfig();
-      shortcuts = {
-        record: String(override.record || (fromDisk && fromDisk.record) || "").trim(),
-        paste: String(override.paste || (fromDisk && fromDisk.paste) || "").trim(),
-        screen: String(override.screen || (screenFromDisk && screenFromDisk.screen) || "").trim(),
-        screenShot: String(override.screenShot || (screenFromDisk && screenFromDisk.screenShot) || "").trim(),
-      };
-    } else {
-      shortcuts = readShortcutsFromConfig();
-    }
+    // Bind exactly the runtime set (S-11). It is read from disk ONCE, at
+    // the first registration — before the renderer exists, so the very
+    // first hotkey works — and from then on only a Settings update
+    // changes it. Re-reading disk here (resume, capture abort) used to
+    // revert a change whose debounced save had not landed, or had
+    // failed, while Settings kept showing the new keys.
+    if (!activeShortcuts) activeShortcuts = normalizeShortcutSet(readShortcutsFromConfig());
+    const shortcuts = activeShortcuts;
     // Unregister old shortcuts (keep devtools). Clear stored values
     // up-front — only set them back after a
     // successful registration, so a failed accelerator is never
@@ -9619,21 +9599,24 @@ app.whenReady().then(async () => {
       return;
     }
     if (action === "update") {
-      const record = String(message?.record || "").trim();
-      const paste = String(message?.paste || "").trim();
-      const screen = String(message?.screen || "").trim();
-      const screenShot = String(message?.screenShot || "").trim();
-      if (!record || !paste) {
-        appendMainLog(`[shortcuts] bridge update rejected: record=${record || "-"} paste=${paste || "-"}`);
+      if (!activeShortcuts) activeShortcuts = normalizeShortcutSet(readShortcutsFromConfig());
+      const update = applyShortcutUpdate(activeShortcuts, message);
+      if (!update.ok) {
+        // The capture that preceded this update unregistered every
+        // hotkey; a rejected update must put them back now, not leave
+        // the app deaf until the 120 s capture failsafe (DM-23).
+        appendMainLog(`[shortcuts] bridge update rejected (${update.reason}); restoring the previous bindings`);
+        restoreShortcutsAfterCaptureAbort("update-rejected");
         return;
       }
+      activeShortcuts = update.shortcuts;
       shortcutsSuspendedForCapture = false;
       clearShortcutCaptureFailsafe();
       appendMainLog(
-        `[shortcuts] bridge live reload: record=${record} paste=${paste} ` +
-        `screen=${screen || "-"} screenShot=${screenShot || "-"}`,
+        `[shortcuts] bridge live reload: record=${activeShortcuts.record} paste=${activeShortcuts.paste} ` +
+        `screen=${activeShortcuts.screen || "-"} screenShot=${activeShortcuts.screenShot || "-"}`,
       );
-      registerGlobalShortcuts({ record, paste, screen, screenShot });
+      registerGlobalShortcuts();
     }
   }
 
