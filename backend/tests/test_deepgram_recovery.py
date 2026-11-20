@@ -293,6 +293,85 @@ class PcmSliceTests(unittest.TestCase):
                     self.assertEqual(len(wav.readframes(wav.getnframes())) % 2, 0)
 
 
+class DualRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    """BE-11 / BL-10: a ``multi`` re-decode of a Russian speaker's hole
+    returned Devanagari, Telugu and Hebrew words, with no evidence on
+    them and no partner to compare against."""
+
+    @staticmethod
+    def _rest(words):
+        return {"words": [
+            {"word": w, "punctuated_word": w, "start": a, "end": b, "confidence": c,
+             **({"language": lang} if lang else {})}
+            for w, a, b, c, lang in words
+        ]}
+
+    async def test_recovered_words_keep_their_evidence(self):
+        words = await recover_spans(
+            _pcm(12.0), [(5.0, 6.0)], DeepgramLiveConfig(language="auto"), api_key="dg",
+            transcribe=lambda **kw: self._rest([("мама", 0.1, 0.5, 0.91, "ru")]),
+        )
+        self.assertEqual(words[0]["confidence"], 0.91)
+        self.assertEqual(words[0]["language"], "ru")
+
+    async def test_a_dual_recording_re_decodes_in_both_languages_and_merges(self):
+        calls: list[str] = []
+
+        def fake_rest(**kwargs):
+            calls.append(kwargs["language"])
+            if kwargs["language"] == "multi":
+                # Measured shape: ``multi`` hearing Russian as Telugu.
+                return self._rest([("మా", 0.10, 0.40, 0.55, "te"), ("చివత్లో", 0.40, 0.90, 0.50, "te")])
+            return self._rest([("мама", 0.10, 0.40, 0.95, None), ("читает", 0.40, 0.90, 0.93, None)])
+
+        words = await recover_spans(
+            _pcm(12.0), [(5.0, 6.0)], DeepgramLiveConfig(language="auto"), api_key="dg",
+            transcribe=fake_rest, secondary_language="ru",
+        )
+        self.assertEqual(sorted(calls), ["multi", "ru"])
+        self.assertEqual([w["word"] for w in words], ["мама", "читает"])
+        self.assertTrue(all(w["source"] == RECOVERY_SOURCE for w in words))
+
+    async def test_run_recovery_reads_the_partner_from_the_envelope(self):
+        calls: list[str] = []
+
+        def fake_rest(**kwargs):
+            calls.append(kwargs["language"])
+            return self._rest([("слово", 0.1, 0.5, 0.9, "ru")])
+
+        payload = {
+            "type": "final", "source": "deepgram-live", "text": "", "segments": [],
+            "streamedSec": 4.0, "stats": {"dual_stream": True, "dual_secondary_language": "ru"},
+        }
+        await run_recovery(
+            payload=payload, evidence=InterimEvidence(), stream_death_sec=0.0,
+            pcm=_pcm(4.0), cfg=DeepgramLiveConfig(language="auto"), api_key="dg",
+            transcribe=fake_rest,
+        )
+        self.assertEqual(sorted(set(calls)), ["multi", "ru"])
+
+    async def test_the_spool_is_read_off_the_event_loop(self):
+        import threading
+
+        readers: list[str] = []
+
+        def spool() -> bytes:
+            readers.append(threading.current_thread().name)
+            return _pcm(4.0)
+
+        payload = {
+            "type": "final", "source": "deepgram-live", "text": "", "segments": [],
+            "streamedSec": 4.0, "stats": {},
+        }
+        await run_recovery(
+            payload=payload, evidence=InterimEvidence(), stream_death_sec=0.0,
+            pcm=spool, audio_sec=4.0, cfg=DeepgramLiveConfig(language="auto"), api_key="dg",
+            transcribe=lambda **kw: _rest_result([("x", 0.1, 0.4)]),
+        )
+        self.assertEqual(len(readers), 1)
+        self.assertNotEqual(readers[0], threading.main_thread().name, "BW-13")
+
+
 class RecoverSpansTests(unittest.IsolatedAsyncioTestCase):
     async def test_words_come_back_offset_onto_the_recordings_timeline(self):
         calls: list[dict] = []

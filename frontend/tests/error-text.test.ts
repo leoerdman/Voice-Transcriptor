@@ -6,8 +6,45 @@ import {
   explainNetworkError,
   installErrorAwareConsole,
   isGenericFetchFailure,
+  formatErrorDetail,
+  isPermissionRefusal,
   needsErrorText,
 } from "../src/error-text";
+
+describe("formatErrorDetail (FU-18)", () => {
+  it("renders a FastAPI validation array as readable field messages, not JSON", () => {
+    const detail = [
+      { loc: ["body", "model"], msg: "field required", type: "missing" },
+      { loc: ["query", "limit"], msg: "must be > 0", type: "value_error" },
+    ];
+    expect(formatErrorDetail(detail)).toBe("model: field required; limit: must be > 0");
+  });
+
+  it("uses a string detail as is", () => {
+    expect(formatErrorDetail("Preset limit reached")).toBe("Preset limit reached");
+  });
+
+  it("keeps an unplanned shape as JSON", () => {
+    expect(formatErrorDetail({ code: 7 })).toBe('{"code":7}');
+  });
+});
+
+describe("isPermissionRefusal (FU-19)", () => {
+  it("recognises a refusal by its DOMException name, whatever the message says", () => {
+    expect(isPermissionRefusal(new DOMException("Permission dismissed", "NotAllowedError"))).toBe(true);
+    expect(isPermissionRefusal(new DOMException("Доступ запрещён", "NotAllowedError"))).toBe(true);
+    expect(isPermissionRefusal(new DOMException("blocked", "SecurityError"))).toBe(true);
+  });
+
+  it("still recognises a wrapped refusal by its message", () => {
+    expect(isPermissionRefusal(new Error("Permission denied by system"))).toBe(true);
+  });
+
+  it("lets a device that is busy or absent be retried", () => {
+    expect(isPermissionRefusal(new DOMException("Could not start audio source", "NotReadableError"))).toBe(false);
+    expect(isPermissionRefusal(new Error("microphone did not open within 2500 ms"))).toBe(false);
+  });
+});
 
 describe("describeError", () => {
   it("renders a DOMException with its name, which is the diagnostic part", () => {

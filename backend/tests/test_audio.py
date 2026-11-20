@@ -13,7 +13,6 @@ from backend.audio import (
     _run_ffmpeg,
     compact_audio_chunks_for_remote,
     ensure_wav_16k,
-    ensure_wav_16k_preserve_channels,
 )
 from backend.audio_constants import (
     LIVE_PCM_BYTES_PER_SEC,
@@ -137,7 +136,7 @@ class AudioCommandTests(unittest.TestCase):
             with mock.patch("backend.audio._has_ffmpeg", return_value=True), \
                  mock.patch("backend.audio._run_ffmpeg", side_effect=fake_run_ffmpeg):
                 ensure_wav_16k("/tmp/input.m4a", mono_out, channels=1)
-                ensure_wav_16k_preserve_channels("/tmp/input.m4a", stereo_out)
+                ensure_wav_16k("/tmp/input.m4a", stereo_out, channels=None)
 
         self.assertEqual(len(calls), 2)
         self.assertTrue(all(call.get("fail_on_decode_error") for call in calls))
@@ -172,13 +171,11 @@ class AudioCommandTests(unittest.TestCase):
 
             with mock.patch("backend.audio._has_ffmpeg", return_value=False):
                 with self.assertRaisesRegex(AudioError, "PCM_16"):
-                    ensure_wav_16k_preserve_channels(str(src), str(dst))
+                    ensure_wav_16k(str(src), str(dst), channels=None)
 
             self.assertFalse(dst.exists())
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class PcmBytesPerSecondTests(unittest.TestCase):
@@ -271,12 +268,9 @@ class FfmpegStdinTests(unittest.TestCase):
 
         import backend.audio as audio_mod
 
-        for fn in (
-            audio_mod.ensure_wav_16k,
-            audio_mod.ensure_wav_16k_preserve_channels,
-        ):
-            with self.subTest(fn=fn.__name__):
-                self.assertIn('"-nostdin"', inspect.getsource(fn))
+        for channels in (1, None):
+            with self.subTest(channels=channels):
+                self.assertIn("-nostdin", audio_mod._wav16k_cmd("in.m4a", "out.wav", channels))
 
 
 class ConversionTimeoutTests(unittest.TestCase):
@@ -288,11 +282,46 @@ class ConversionTimeoutTests(unittest.TestCase):
         import backend.audio as audio_mod
 
         self.assertEqual(audio_mod._LOCAL_CONVERT_TIMEOUT_SEC, 300)
-        for fn in (
-            audio_mod.ensure_wav_16k,
-            audio_mod.ensure_wav_16k_preserve_channels,
-        ):
+        for fn in (audio_mod.ensure_wav_16k,):
             with self.subTest(fn=fn.__name__):
                 src = inspect.getsource(fn)
                 self.assertIn("_LOCAL_CONVERT_TIMEOUT_SEC", src)
                 self.assertNotIn("timeout_sec=300", src)
+
+
+class OneConversionTests(unittest.TestCase):
+    """BM-14: the mono and the channel-preserving conversion are one
+    function with one argv, and both read the FIRST audio track."""
+
+    def test_both_paths_map_the_first_audio_track(self):
+        import backend.audio as audio_mod
+
+        argvs = []
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch("backend.audio._has_ffmpeg", return_value=True), \
+                mock.patch("backend.audio._run_ffmpeg", side_effect=lambda cmd, **kw: argvs.append(cmd)):
+            audio_mod.ensure_wav_16k("/tmp/talk.mp4", str(Path(td) / "m.wav"), channels=1)
+            audio_mod.ensure_wav_16k("/tmp/talk.mp4", str(Path(td) / "s.wav"), channels=None)
+        for argv in argvs:
+            self.assertEqual(argv[argv.index("-map") + 1], "0:a:0")
+            self.assertIn("-vn", argv)
+        self.assertIn("-ac", argvs[0])
+        self.assertNotIn("-ac", argvs[1])
+
+
+class FfmpegMissingIsATypeTests(unittest.TestCase):
+    """BM-13: "ffmpeg is missing" is decided on a type, not on prose."""
+
+    def test_missing_ffmpeg_raises_its_own_type(self):
+        from backend.audio import FfmpegMissingError
+
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch("backend.audio._has_ffmpeg", return_value=False):
+            with self.assertRaises(FfmpegMissingError):
+                ensure_wav_16k("/tmp/talk.m4a", str(Path(td) / "o.wav"))
+            with self.assertRaises(FfmpegMissingError):
+                compact_audio_chunks_for_remote("/tmp/talk.m4a", td, chunk_sec=900)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -20,6 +20,8 @@ const path = require("node:path");
 
 const {
   REQUIRED_USAGE_DESCRIPTION_KEYS,
+  SCREEN_INPUT_HELPER_IN_BUNDLE,
+  assertScreenInputHelper,
   designatedRequirementIsStable,
   isDeveloperIdIdentity,
   resolveSigningPlan,
@@ -254,4 +256,61 @@ test("no updater metadata is published: the app has no updater", () => {
   // writeUpdateInfo:false deliberately suppresses the other half. There
   // is no electron-updater in the app at all.
   assert.equal(packageJson.build.publish, null);
+});
+
+test("afterPack's helper check: a mac build must carry screen-input, an App Store build must not", () => {
+  const os = require("node:os");
+  const app = fs.mkdtempSync(path.join(os.tmpdir(), "helper-check-")) + "/Transcriptor.app";
+  const helper = path.join(app, SCREEN_INPUT_HELPER_IN_BUNDLE);
+  try {
+    assert.throws(() => assertScreenInputHelper(app, { expected: true }), /missing from the bundle/);
+    assert.equal(assertScreenInputHelper(app, { expected: false }), null);
+    // A thin 64-bit Mach-O executable header (MH_MAGIC_64, MH_EXECUTE).
+    const header = Buffer.alloc(32);
+    header.writeUInt32LE(0xfeedfacf, 0);
+    header.writeUInt32LE(2, 12);
+    fs.mkdirSync(path.dirname(helper), { recursive: true });
+    fs.writeFileSync(helper, header);
+    assert.equal(assertScreenInputHelper(app, { expected: true }), helper);
+    assert.throws(() => assertScreenInputHelper(app, { expected: false }), /must not ship/);
+  } finally {
+    fs.rmSync(path.dirname(app), { recursive: true, force: true });
+  }
+});
+
+test("the install-time requirement check reads the signature without a shell", {
+  skip: fs.existsSync("/usr/bin/codesign") ? false : "codesign is macOS-only",
+}, () => {
+  // The bundle path comes from $TRANSCRIPTOR_INSTALL_DIR. An unsigned
+  // bundle sent the old script to `/bin/sh -c "codesign … <path>"`, where
+  // `$(…)` in the path ran.
+  const os = require("node:os");
+  const { spawnSync } = require("node:child_process");
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "dr-check-"));
+  try {
+    const app = path.join(work, "inj-$(touch pwned)", "Unsigned.app");
+    fs.mkdirSync(path.join(app, "Contents"), { recursive: true });
+    fs.writeFileSync(
+      path.join(app, "Contents", "Info.plist"),
+      '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>local.transcriptor.app</string></dict></plist>',
+    );
+    const run = spawnSync(process.execPath, [path.join(__dirname, "scripts", "check-designated-requirement.js"), app], {
+      cwd: work,
+      encoding: "utf8",
+    });
+    assert.equal(fs.existsSync(path.join(work, "pwned")), false, "a command in the bundle path was executed");
+    assert.equal(run.status, 1);
+    assert.match(run.stderr, /Refusing to install/);
+  } finally {
+    fs.rmSync(work, { recursive: true, force: true });
+  }
+});
+
+test("afterPack runs the helper check for every mac flavour, before signing", () => {
+  const afterPack = fs.readFileSync(path.join(__dirname, "afterPack.js"), "utf8");
+  const check = afterPack.indexOf("assertScreenInputHelper(appPath, { expected: !isMas })");
+  assert.ok(check > 0, "afterPack checks the helper");
+  assert.ok(check < afterPack.indexOf("if (isMas) {"), "before the MAS branch returns");
+  assert.ok(check < afterPack.indexOf("preSignRuntimeBinaries({"), "before the runtime is signed");
+  assert.match(afterPack, /"--verify", "--strict", "--verbose=2", screenInputHelper/);
 });

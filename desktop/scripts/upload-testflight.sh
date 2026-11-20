@@ -66,7 +66,10 @@ elif [ "$has_apple_id" -eq 1 ]; then
   args=(
     --upload-package "$PKG_PATH"
     -u "$ASC_USERNAME"
-    -p "$ASC_APP_SPECIFIC_PASSWORD"
+    # altool reads the password from the environment itself: a value on
+    # the command line is visible in `ps` to every local user for the
+    # length of the upload.
+    -p "@env:ASC_APP_SPECIFIC_PASSWORD"
     --output-format xml
   )
   [ -z "${ASC_PROVIDER_PUBLIC_ID:-}" ] || args+=(--provider-public-id "$ASC_PROVIDER_PUBLIC_ID")

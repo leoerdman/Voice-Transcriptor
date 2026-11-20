@@ -9,6 +9,8 @@ import binascii
 import hashlib
 import importlib
 import socket
+import ssl
+import urllib.error
 import uuid
 import re
 import secrets
@@ -24,7 +26,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from urllib.request import urlopen
 
 from fastapi import (
@@ -78,8 +80,8 @@ from backend.audio_mime import AUDIO_EXT_TO_MIME, audio_content_type
 from backend.audio import (
     AudioError,
     compact_audio_chunks_for_remote,
+    FfmpegMissingError,
     ensure_wav_16k,
-    ensure_wav_16k_preserve_channels,
     split_channels,
     write_wav_from_pcm16_stream,
 )
@@ -87,6 +89,7 @@ from backend.cli_access import (
     CliAccess,
     base_url_from_scope,
     cli_defaults,
+    cli_save_request_refusal,
     cli_token_may_call,
 )
 from backend.config import APP_ROOT, DATA_DIR, load_config, redact_config, save_config
@@ -233,10 +236,55 @@ _ACCESS_LOG_POLLED_PATHS: frozenset[str] = frozenset({
     "/api/ui/live-draft", # live-draft autosave, ~1 per 1.2 s while recording
     "/api/models/local",  # Settings → Local models list
 })
+# Polled by id: a job's progress is read every ~1 s while it runs (BL-15:
+# 28 % of all access lines in November, ~15 per job). The job's start and
+# end are logged by the job store itself.
+_ACCESS_LOG_POLLED_PATH_RE = re.compile(r"^/api/jobs/[^/]+$")
+
+
+# ── Dictated text stays out of the log (BL-02) ──────────────────────────────
+#
+# A recording's file name is ``<timestamp>__<title>``, and the title is the
+# first words of what was dictated. main.log is the artefact users attach
+# for support, so a name is logged as its timestamp plus a short digest:
+# still unique and greppable against the archive, no longer the words.
+def _log_safe_recording_name(name: str) -> str:
+    leaf = Path(str(name or "")).name
+    # Only a suffix this app gives a recording's files is kept: a title
+    # with a dot in it ("v2.1 notes") must not leak through as one.
+    known_suffixes = {screen_sessions.SCREENS_DIR_SUFFIX, ".txt", *ALLOWED_AUDIO_EXTS}
+    raw_suffix = Path(leaf).suffix
+    suffix = raw_suffix if raw_suffix.lower() in known_suffixes else ""
+    stem = leaf[: len(leaf) - len(suffix)] if suffix else leaf
+    stamp = stem.split("__", 1)[0] if "__" in stem else "recording"
+    digest = hashlib.sha1(leaf.encode("utf-8", errors="replace")).hexdigest()[:8]
+    return f"{stamp}#{digest}{suffix}"
+
+
+# Recording routes whose second path segment is a recording's name; every
+# other ``/api/recordings/<x>`` route is a fixed word.
+_ACCESS_LOG_FIXED_RECORDING_ROUTES: frozenset[str] = frozenset({
+    "save", "save-with-audio", "save-from-path", "pick-folder", "open-folder", "stats",
+})
+
+
+def _log_safe_access_path(raw_path: str) -> str:
+    """The request path as the access log may show it: a recording's name
+    reduced to ``_log_safe_recording_name``, and no query string on
+    recording routes (``archive_dir`` names the user's folders)."""
+    path, _, _query = raw_path.partition("?")
+    parts = path.split("/")
+    # ["", "api", "recordings", "<name>", ...]
+    if len(parts) >= 4 and parts[1] == "api" and parts[2] == "recordings":
+        if parts[3] and parts[3] not in _ACCESS_LOG_FIXED_RECORDING_ROUTES:
+            parts[3] = _log_safe_recording_name(unquote(parts[3]))
+        return "/".join(parts)
+    return raw_path
 
 
 class _MutedPollingAccessFilter(logging.Filter):
-    """Drop access-log records for successful polls of the paths above.
+    """Drop access-log records for successful polls of the paths above, and
+    keep a recording's name (its dictated title) out of every other line.
 
     uvicorn emits access records with
     ``args = (client_addr, method, full_path, http_version, status)``.
@@ -251,13 +299,19 @@ class _MutedPollingAccessFilter(logging.Filter):
         raw_path, status = args[2], args[4]
         if not isinstance(raw_path, str):
             return True
+        safe_path = _log_safe_access_path(raw_path)
+        if safe_path != raw_path:
+            record.args = (*args[:2], safe_path, *args[3:])
         try:
             code = int(status)
         except (TypeError, ValueError):
             return True
         if not (200 <= code < 300):
             return True  # a failing poll is signal, not noise
-        return raw_path.split("?", 1)[0] not in _ACCESS_LOG_POLLED_PATHS
+        bare = raw_path.split("?", 1)[0]
+        if bare in _ACCESS_LOG_POLLED_PATHS:
+            return False
+        return not (args[1] == "GET" and _ACCESS_LOG_POLLED_PATH_RE.match(bare))
 
 
 _uvicorn_access_logger = logging.getLogger("uvicorn.access")
@@ -447,6 +501,8 @@ async def _app_lifespan(_app: "FastAPI") -> AsyncIterator[None]:
 app = FastAPI(title="Call Transcriptor", lifespan=_app_lifespan)
 JOB_MAX_WORKERS = 2
 UPLOAD_QUEUE_MAX_PERSISTED_ITEMS = 200
+# A finished item's transcript, as the renderer persists it with the queue.
+UPLOAD_QUEUE_MAX_TEXT_CHARS = 200_000
 jobs = JobStore(max_workers=JOB_MAX_WORKERS)
 
 
@@ -518,6 +574,10 @@ def _safe_error_text(exc: object, *, max_len: int = 200) -> str:
 # and the remote path re-compresses into REMOTE_TRANSCRIBE_CHUNK_SEC
 # Opus/WebM chunks before any provider call.
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+# The largest request body the HTTP middleware lets through: one upload at
+# MAX_UPLOAD_BYTES plus the form fields beside it (see
+# guard_host_and_set_cache_control).
+MAX_REQUEST_BODY_BYTES = MAX_UPLOAD_BYTES + 16 * 1024 * 1024
 # Hard ceiling on the live-recovery SPOOL. Derived from MAX_UPLOAD_BYTES
 # so any file the app accepts as an upload can also exist as a recovery
 # spool; at the current upload ceiling that is 4 GB, and 16 kHz mono
@@ -911,6 +971,17 @@ def _sweep_orphan_tmp_files() -> None:
             if not root.exists() or not root.is_dir():
                 continue
             for p in root.iterdir():
+                # A screenshots folder being assembled or retired by
+                # ``screen_sessions.adopt_session`` when the process died.
+                if screen_sessions.is_screens_work_dir(p):
+                    try:
+                        if p.stat().st_mtime > cutoff:
+                            continue
+                        shutil.rmtree(p)
+                        removed += 1
+                    except OSError:
+                        continue
+                    continue
                 if not p.is_file():
                     continue
                 if not _TMP_ORPHAN_RE.search(p.name):
@@ -1062,8 +1133,63 @@ def _cleanup_live_recovery_files() -> None:
         except OSError as e:
             logger.debug("live recovery cleanup skipped for %s: %s", p, e)
     # Screen-mode screenshots staged for a take whose save never happened
-    # are that take's recovery material too, and age out with it.
-    screen_sessions.sweep_orphan_sessions(DATA_DIR, LIVE_RECOVERY_RETENTION_SEC)
+    # are that take's recovery material too, and age out with it — but
+    # never while that take's audio spool is still here to be promoted
+    # (its staging folder may be older than the spool's last write).
+    screen_sessions.sweep_orphan_sessions(
+        DATA_DIR,
+        LIVE_RECOVERY_RETENTION_SEC,
+        keep_ids=_screen_sessions_referenced_by_recoveries(),
+    )
+
+
+def _screen_sessions_referenced_by_recoveries() -> set[str]:
+    """Screen session ids named by a recovery sidecar whose spool still
+    exists — staged screenshots a promotion will adopt."""
+    ids: set[str] = set()
+    for pcm_path in LIVE_RECOVERY_DIR.glob("*.pcm16"):
+        try:
+            meta = json.loads(pcm_path.with_suffix(".json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        sid = str(meta.get("screen_session_id") or "") if isinstance(meta, dict) else ""
+        if screen_sessions.is_session_id(sid):
+            ids.add(sid)
+    return ids
+
+
+def _adopt_screen_session_for_recording(
+    screen_session_id: str,
+    target_dir: Path,
+    stem: str,
+    *,
+    audio_started_at: Optional[float],
+) -> tuple[Optional[dict[str, Any]], str]:
+    """Adopt a staged screen session as recording *stem*'s screenshots —
+    the one call both the save and the crash-time promotion make.
+
+    Returns ``(manifest, error)``. ``manifest`` is None when there was
+    nothing to adopt or adoption failed; ``error`` is non-empty only for a
+    failure, which ``adopt_session`` guarantees left the staged folder and
+    any previous screenshots intact. The audio and transcript are already
+    durable, so the save answers 200 and says ``screens_error`` instead of
+    pretending the recording simply has no screenshots."""
+    if not screen_session_id:
+        return None, ""
+    try:
+        return (
+            screen_sessions.adopt_session(
+                DATA_DIR,
+                screen_session_id,
+                target_dir,
+                stem,
+                audio_started_at=audio_started_at,
+            ),
+            "",
+        )
+    except screen_sessions.ScreenAdoptionError as e:
+        logger.warning("%s", e)
+        return None, "screenshots could not be attached to this recording"
 
 
 def _normalize_live_session_id(value: str) -> str:
@@ -1073,11 +1199,21 @@ def _normalize_live_session_id(value: str) -> str:
     return str(uuid.uuid4())
 
 
+def _recovery_stem_glob(session_id: str) -> str:
+    """The glob for ONE session's spool stem, exactly as
+    ``_open_live_recovery`` names it: ``YYYYmmdd_HHMMSS_<session id>``.
+    A bare ``*_<id>`` also matched ``<ts>_a_b`` for id ``b`` (ids may hold
+    underscores — BUG-52), so discarding or promoting ``b`` could act on
+    session ``a_b`` (BM-28). The caller validates the id first
+    (``LIVE_SESSION_ID_RE``: no glob metacharacters)."""
+    return f"{'[0-9]' * 8}_{'[0-9]' * 6}_{session_id}"
+
+
 def _live_recovery_paths(session_id: str) -> tuple[Optional[Path], Optional[Path]]:
     safe_session_id = (session_id or "").strip()
     if not safe_session_id or not LIVE_SESSION_ID_RE.fullmatch(safe_session_id):
         return None, None
-    matches = sorted(LIVE_RECOVERY_DIR.glob(f"*_{safe_session_id}.pcm16"))
+    matches = sorted(LIVE_RECOVERY_DIR.glob(f"{_recovery_stem_glob(safe_session_id)}.pcm16"))
     if not matches:
         return None, None
     pcm_path = matches[-1]
@@ -1100,7 +1236,7 @@ def _delete_live_recovery(session_id: str) -> bool:
     Deleting a session's remains must not depend on which half of it
     still happens to exist.
     """
-    stem_glob = f"*_{session_id}" if LIVE_SESSION_ID_RE.fullmatch(session_id or "") else ""
+    stem_glob = _recovery_stem_glob(session_id) if LIVE_SESSION_ID_RE.fullmatch(session_id or "") else ""
     if not stem_glob:
         return False
     removed = False
@@ -1124,11 +1260,74 @@ def _delete_live_recovery(session_id: str) -> bool:
 
 
 def _safe_delete_live_recovery(session_id: str) -> bool:
+    """Delete a session's recovery files — or, while its WebSocket handler
+    still owns them, ask the handler to.
+
+    ONE owner of the spool's deletion (BL-01): from the moment the handler
+    registers the session until it has sent the ``final`` envelope and
+    finalized the sidecar, the spool is the handler's. The finalize-time
+    recovery reads it back (``_recovery_spool_bytes``) to repair holes in
+    the envelope. The renderer's save / discard used to unlink it from
+    under that read whenever it landed first — 400 of 1 591 sessions in
+    November logged "spool not readable at finalize" and shipped holes
+    unrepaired — and the finalize then rewrote a "recoverable" sidecar
+    that no spool backed (the orphan sidecars ``_delete_live_recovery``
+    documents).
+
+    A request that arrives while the handler owns the files is recorded
+    and marked on disk (``status: "discarded"``, so a crash before the
+    handler finishes never offers the take for promotion again); the
+    handler executes it as its last step (``_unregister_live_session``).
+    Returns True when the files are gone or their deletion is scheduled.
+    """
+    with _live_sessions_lock:
+        deferred = session_id in _live_sessions_in_flight
+        if deferred:
+            _live_recovery_discard_pending.add(session_id)
+    if deferred:
+        _mark_live_recovery_discarded(session_id)
+        return True
     try:
         return _delete_live_recovery(session_id)
     except OSError as exc:
         logger.warning("live recovery delete failed for %s: %s", session_id, exc)
         return False
+
+
+LIVE_RECOVERY_STATUS_DISCARDED = "discarded"
+
+
+def _mark_live_recovery_discarded(session_id: str) -> None:
+    """Persist a deferred discard in the sidecar (see
+    ``_safe_delete_live_recovery``). Best effort: the in-memory request is
+    what the handler acts on; the mark only covers a crash in between."""
+    _pcm_path, meta_path = _live_recovery_paths(session_id)
+    if meta_path is None:
+        return
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if not isinstance(meta, dict):
+            return
+        meta["status"] = LIVE_RECOVERY_STATUS_DISCARDED
+        atomic_write_json(meta_path, meta)
+    except (OSError, ValueError) as exc:
+        logger.warning("live recovery %s: could not mark discarded: %s", session_id, exc)
+
+
+def _end_live_session_ownership(session_id: str, recovery: Optional[dict]) -> None:
+    """The WebSocket handler's last step. Finalize the spool while still
+    its owner, THEN release ownership and carry out a save/discard that
+    arrived meanwhile — never the other way round, or that request would
+    unlink the spool under the finalize-time recovery read (BL-01)."""
+    if recovery is not None:
+        _finalize_live_recovery(recovery)
+    if _unregister_live_session(session_id):
+        _safe_delete_live_recovery(session_id)
+
+
+def _live_recovery_discard_is_pending(session_id: str) -> bool:
+    with _live_sessions_lock:
+        return session_id in _live_recovery_discard_pending
 
 
 def _session_id_from_recovery_stem(stem: str) -> str:
@@ -1174,6 +1373,9 @@ def _session_id_from_recovery_stem(stem: str) -> str:
 # Both endpoints consult this, so the list can no longer offer something
 # the promote will reject.
 _live_sessions_in_flight: set[str] = set()
+# Sessions whose recovery files were asked to be deleted while their
+# handler still owned them (``_safe_delete_live_recovery``). Same lock.
+_live_recovery_discard_pending: set[str] = set()
 _live_sessions_lock = threading.Lock()
 
 
@@ -1184,11 +1386,18 @@ def _register_live_session(session_id: str) -> None:
         _live_sessions_in_flight.add(session_id)
 
 
-def _unregister_live_session(session_id: str) -> None:
+def _unregister_live_session(session_id: str) -> bool:
+    """End the handler's ownership. Returns True when a discard of the
+    session's recovery files was requested meanwhile — the caller then
+    deletes them (``_safe_delete_live_recovery`` now acts directly)."""
     if not session_id:
-        return
+        return False
     with _live_sessions_lock:
         _live_sessions_in_flight.discard(session_id)
+        if session_id in _live_recovery_discard_pending:
+            _live_recovery_discard_pending.discard(session_id)
+            return True
+        return False
 
 
 def _live_session_is_streaming(session_id: str) -> bool:
@@ -1207,6 +1416,11 @@ def _list_live_recoveries() -> list[dict[str, Any]]:
                 or _session_id_from_recovery_stem(pcm_path.stem)
             )
             if not LIVE_SESSION_ID_RE.fullmatch(session_id):
+                continue
+            # A take whose save already landed (its discard was deferred
+            # and the process died before the handler executed it) is not
+            # a recovery: promoting it would duplicate the saved recording.
+            if str(raw.get("status") or "") == LIVE_RECOVERY_STATUS_DISCARDED:
                 continue
             # Never offer a session that is streaming right now: promoting
             # it would truncate the WAV and unlink the spool from under the
@@ -1350,10 +1564,27 @@ def _store_live_promote_cache(session_id: str, payload: dict) -> None:
         _live_promote_cache[session_id] = (now, dict(payload))
 
 
+def _recovery_audio_started_at_ms(pcm_path: Path) -> Optional[float]:
+    """Epoch ms of a spool's first sample, from the spool alone.
+
+    The spool is written in real time, each frame as it arrives, so its
+    last write (mtime) minus the audio it holds is when capture began —
+    the renderer's recording clock to within a frame's latency. That is
+    what a screen take's marks are placed against (``audioStartedAt``),
+    and it is available after a crash, when nothing else is."""
+    try:
+        st = pcm_path.stat()
+    except OSError:
+        return None
+    duration_ms = (st.st_size - st.st_size % 2) / float(LIVE_PCM_BYTES_PER_SEC) * 1000.0
+    started = st.st_mtime * 1000.0 - duration_ms
+    return started if started > 0 else None
+
+
 def _promote_live_recovery(
     session_id: str,
     archive_dir: str = "",
-    recording_collection: str = "live",
+    recording_collection: str = "",
 ) -> dict[str, Any]:
     # Fast path: a freshly cached success means we served this promotion
     # recently. Return the stored result so UI retries are idempotent
@@ -1395,6 +1626,10 @@ def _promote_live_recovery(
                     status_code=409,
                     detail="session is still recording; stop it before promoting",
                 )
+            # Same rule as the list: a discarded take is not offered and
+            # cannot be promoted.
+            if str(meta.get("status") or "") == LIVE_RECOVERY_STATUS_DISCARDED:
+                raise HTTPException(status_code=404, detail="live recovery not found")
             # Refuse an oversized spool BEFORE touching it. The
             # conversion below streams (``write_wav_from_pcm16_stream``,
             # ~2 MB per chunk), so this is a bound on how much of the
@@ -1492,6 +1727,16 @@ def _promote_live_recovery(
                 raise
             finally:
                 _best_effort_unlink(tmp_audio, context="live recovery tmp cleanup")
+            # A screen-mode take: its staged screenshots belong to this
+            # audio exactly as on the normal save (H-01/BM-04/S-01) —
+            # adopted beside the recovered recording BEFORE retention
+            # runs, so they are this (exempt) recording's media from now on.
+            screens_manifest, screens_error = _adopt_screen_session_for_recording(
+                str(meta.get("screen_session_id") or ""),
+                target_dir,
+                stem,
+                audio_started_at=_recovery_audio_started_at_ms(pcm_path),
+            )
             # Same retention policy as ``save_recording_with_audio``. The
             # freshly promoted stem is exempt so a clock skew can never
             # collect the audio we just recovered.
@@ -1501,6 +1746,8 @@ def _promote_live_recovery(
                 "name": text_out.name,
                 "audio_name": audio_out.name,
                 "archive_dir": str(target_dir),
+                "screens": screens_manifest,
+                "screens_error": screens_error,
             }
             _safe_delete_live_recovery(session_id)
             _store_live_promote_cache(session_id, result)
@@ -1509,6 +1756,11 @@ def _promote_live_recovery(
         # grow unbounded when callers hit 404/400 and never retry.
         _release_session_promote_lock(session_id)
     return result
+
+
+#: Who ``_require_api_auth`` let in, on ``request.state.api_caller``.
+API_CALLER_RENDERER = "renderer"
+API_CALLER_CLI = "cli"
 
 
 async def _require_api_auth(request: Request) -> None:
@@ -1540,6 +1792,11 @@ async def _require_api_auth(request: Request) -> None:
                 status_code=403,
                 detail="the command-line token may not call this endpoint",
             )
+        # A route both callers share narrows itself for this one
+        # (``save-from-path`` — ``cli_save_request_refusal``).
+        request.state.api_caller = API_CALLER_CLI
+    else:
+        request.state.api_caller = API_CALLER_RENDERER
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         origin = request.headers.get("origin")
         if origin and not _origin_allowed(origin, request):
@@ -1589,6 +1846,19 @@ async def guard_host_and_set_cache_control(request: Request, call_next):
     # request can never rewrite the recorded address.
     if CLI_ACCESS.is_enabled():
         CLI_ACCESS.sync_connection(base_url_from_scope(request.scope))
+    # The upload ceiling, enforced BEFORE the body is read (BM-26): the
+    # per-route check runs while copying from an UploadFile, i.e. after
+    # Starlette's multipart parser has already spooled the whole body to
+    # a temp file — a body past the limit filled the temp volume first.
+    # A declared length is refused here; the allowance covers the form
+    # fields that travel beside the file (a transcript of up to
+    # LIVE_DRAFT_MAX_TEXT_CHARS characters, multipart framing).
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_REQUEST_BODY_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={"detail": f"request body too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB of media)"},
+        )
     response = await call_next(request)
     path = request.url.path or ""
     if path.startswith("/assets/"):
@@ -1739,6 +2009,13 @@ def _hub_offline_error_types() -> tuple[type[BaseException], ...]:
                 types.append(candidate)
     # DNS failure below every client library.
     types.append(socket.gaierror)
+    # The stdlib transport (GigaAM fetches its checkpoint with urllib) and
+    # TLS failures below every client: a host whose certificate expired is
+    # as unreachable as one with no route (BL-11 — the GigaAM CDN's
+    # expired certificate answered this endpoint with HTTP 500 and a stack
+    # trace). ``HTTPError`` is a URLError too, but it is the host
+    # answering, not the host being out of reach — see _is_hub_offline_error.
+    types.extend((urllib.error.URLError, ssl.SSLError))
     return tuple(types)
 
 
@@ -1757,7 +2034,7 @@ def _is_hub_offline_error(exc: BaseException) -> bool:
     current: Optional[BaseException] = exc
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if isinstance(current, _HUB_OFFLINE_ERRORS):
+        if isinstance(current, _HUB_OFFLINE_ERRORS) and not isinstance(current, urllib.error.HTTPError):
             return True
         current = current.__cause__ or current.__context__
     return False
@@ -1833,22 +2110,22 @@ async def network_status(_auth: None = Depends(_require_api_auth)):
     )
 
     def _probe_sync() -> dict:
-        best_latency_ms: Optional[int] = None
-        online = False
+        # The answer is a boolean plus one latency: the first host that
+        # answers settles it (BM-25). Probing all three on every poll
+        # (~every 10 s) tripled the work and sent two third-party hosts a
+        # request each time for nothing; the later hosts are fallbacks
+        # for when an earlier one is down or blocked.
         for url in probes:
             started = time.perf_counter()
             try:
                 with urlopen(url, timeout=2.5) as resp:
                     code = getattr(resp, "status", 200) or 200
                     ok = int(code) < 500
-                elapsed_ms = int((time.perf_counter() - started) * 1000)
-                if ok:
-                    online = True
-                    if best_latency_ms is None or elapsed_ms < best_latency_ms:
-                        best_latency_ms = elapsed_ms
             except Exception:
                 continue
-        return {"online": online, "latency_ms": best_latency_ms if online else None}
+            if ok:
+                return {"online": True, "latency_ms": int((time.perf_counter() - started) * 1000)}
+        return {"online": False, "latency_ms": None}
 
     return await asyncio.to_thread(_probe_sync)
 
@@ -2147,6 +2424,16 @@ def _copy_source_media_file(source_path: Path, target: Path) -> int:
         raise
 
 
+def _job_snapshot_is_kept(payload: Optional[dict]) -> bool:
+    """Whether a from-path job keeps its snapshot of the source after it
+    ends (``keep_source``, default true). The renderer and ``--save`` file
+    the snapshot as the recording's audio afterwards (save-from-path), so
+    they keep it; a plain CLI transcription never uses it again, and
+    without this the full copy of every file (up to 2 GB each) sat in
+    uploads/ until the 24 h sweep (BM-19)."""
+    return _payload_bool(payload, "keep_source", True)
+
+
 def _snapshot_source_media_for_job(source_path: Path, job_id: str) -> Path:
     orig_name = _normalize_filename(source_path.name)
     target = _upload_snapshot_path(job_id, orig_name)
@@ -2377,7 +2664,7 @@ def _run_local_transcribe_once(
         if split_stereo:
             wav_path = str(RESULTS_DIR / f"{run_id}.16k.wav")
             temp_paths.append(wav_path)
-            ensure_wav_16k_preserve_channels(str(upload_path), wav_path)
+            ensure_wav_16k(str(upload_path), wav_path, channels=None)
             set_progress(0.15)
             # Register the channel files BEFORE split_channels writes
             # them (BUG-64): the paths are deterministic, and if the ch2
@@ -2516,11 +2803,14 @@ def _default_upload_queue_state() -> dict[str, Any]:
     }
 
 
-def _upload_queue_str(value: object, max_len: int = 200_000) -> str:
+# The two persisted UI states (upload queue, live draft) clamp untrusted
+# renderer input with the SAME two rules; they were written out twice with
+# different default caps (BM-15). Every caller names its cap.
+def _bounded_text(value: object, max_len: int) -> str:
     return str(value or "").strip()[:max_len]
 
 
-def _upload_queue_number(value: object) -> Optional[float]:
+def _nonneg_finite(value: object) -> Optional[float]:
     if value is None:
         return None
     try:
@@ -2533,10 +2823,10 @@ def _upload_queue_number(value: object) -> Optional[float]:
 def _normalize_upload_queue_item(raw: object) -> Optional[dict[str, Any]]:
     if not isinstance(raw, dict):
         return None
-    display_name = _upload_queue_str(raw.get("displayName"), 512)
+    display_name = _bounded_text(raw.get("displayName"), 512)
     if not display_name:
         return None
-    status = _upload_queue_str(raw.get("status"), 32)
+    status = _bounded_text(raw.get("status"), 32)
     if status not in UPLOAD_QUEUE_STATUSES:
         # "I do not recognise this" is not "this failed". A client that
         # adds a status — a newer renderer against an older backend —
@@ -2545,26 +2835,26 @@ def _normalize_upload_queue_item(raw: object) -> Optional[dict[str, Any]]:
         # item is still there and nothing is claimed about it.
         status = "queued"
     item: dict[str, Any] = {
-        "id": _upload_queue_str(raw.get("id"), 128) or uuid.uuid4().hex,
+        "id": _bounded_text(raw.get("id"), 128) or uuid.uuid4().hex,
         "displayName": display_name,
-        "sizeBytes": int(_upload_queue_number(raw.get("sizeBytes")) or 0),
-        "sourcePath": _upload_queue_str(raw.get("sourcePath"), 4096),
+        "sizeBytes": int(_nonneg_finite(raw.get("sizeBytes")) or 0),
+        "sourcePath": _bounded_text(raw.get("sourcePath"), 4096),
         "status": status,
-        "text": _upload_queue_str(raw.get("text")),
-        "error": _upload_queue_str(raw.get("error"), 4096),
-        "provider": _upload_queue_str(raw.get("provider"), 32),
-        "model": _upload_queue_str(raw.get("model"), 256),
-        "language": _upload_queue_str(raw.get("language"), 32),
-        "audioDurationSec": _upload_queue_number(raw.get("audioDurationSec")) or 0,
-        "requestedProvider": _upload_queue_str(raw.get("requestedProvider"), 32),
-        "requestedLanguage": _upload_queue_str(raw.get("requestedLanguage"), 32),
-        "requestedModel": _upload_queue_str(raw.get("requestedModel"), 256),
+        "text": _bounded_text(raw.get("text"), UPLOAD_QUEUE_MAX_TEXT_CHARS),
+        "error": _bounded_text(raw.get("error"), 4096),
+        "provider": _bounded_text(raw.get("provider"), 32),
+        "model": _bounded_text(raw.get("model"), 256),
+        "language": _bounded_text(raw.get("language"), 32),
+        "audioDurationSec": _nonneg_finite(raw.get("audioDurationSec")) or 0,
+        "requestedProvider": _bounded_text(raw.get("requestedProvider"), 32),
+        "requestedLanguage": _bounded_text(raw.get("requestedLanguage"), 32),
+        "requestedModel": _bounded_text(raw.get("requestedModel"), 256),
         "requestedDiarize": bool(raw.get("requestedDiarize") is True),
-        "savedName": _upload_queue_str(raw.get("savedName"), 512),
-        "savedArchiveDir": _upload_queue_str(raw.get("savedArchiveDir"), 4096),
+        "savedName": _bounded_text(raw.get("savedName"), 512),
+        "savedArchiveDir": _bounded_text(raw.get("savedArchiveDir"), 4096),
     }
     for field in ("startedAt", "endedAt", "completedAt"):
-        value = _upload_queue_number(raw.get(field))
+        value = _nonneg_finite(raw.get(field))
         if value is not None:
             item[field] = value
     return item
@@ -2610,18 +2900,6 @@ def _default_live_draft_state() -> dict[str, Any]:
     }
 
 
-def _live_draft_str(value: object, max_len: int = 4096) -> str:
-    return str(value or "").strip()[:max_len]
-
-
-def _live_draft_number(value: object) -> Optional[float]:
-    if value is None:
-        return None
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if 0 <= parsed < float("inf") else None
 
 
 def _normalize_live_draft(payload: object) -> Optional[dict[str, Any]]:
@@ -2648,19 +2926,19 @@ def _normalize_live_draft(payload: object) -> Optional[dict[str, Any]]:
     if not isinstance(draft_src, dict):
         raise HTTPException(status_code=400, detail="live draft must be an object")
     return {
-        "session_id": _live_draft_str(draft_src.get("session_id"), 128),
-        "started_at": _live_draft_number(draft_src.get("started_at")) or 0,
-        "updated_at": _live_draft_number(draft_src.get("updated_at")) or int(time.time() * 1000),
+        "session_id": _bounded_text(draft_src.get("session_id"), 128),
+        "started_at": _nonneg_finite(draft_src.get("started_at")) or 0,
+        "updated_at": _nonneg_finite(draft_src.get("updated_at")) or int(time.time() * 1000),
         "recording": bool(draft_src.get("recording") is True),
-        "timer": _live_draft_str(draft_src.get("timer"), 32),
-        "title": _live_draft_str(draft_src.get("title"), 512),
-        "source_text": _live_draft_str(draft_src.get("source_text"), LIVE_DRAFT_MAX_TEXT_CHARS),
-        "transcript_text": _live_draft_str(draft_src.get("transcript_text"), LIVE_DRAFT_MAX_TEXT_CHARS),
-        "provider": _live_draft_str(draft_src.get("provider"), 32),
-        "model": _live_draft_str(draft_src.get("model"), 256),
-        "language": _live_draft_str(draft_src.get("language"), 32),
-        "archive_dir": _live_draft_str(draft_src.get("archive_dir"), 4096),
-        "recording_collection": _live_draft_str(draft_src.get("recording_collection"), 64),
+        "timer": _bounded_text(draft_src.get("timer"), 32),
+        "title": _bounded_text(draft_src.get("title"), 512),
+        "source_text": _bounded_text(draft_src.get("source_text"), LIVE_DRAFT_MAX_TEXT_CHARS),
+        "transcript_text": _bounded_text(draft_src.get("transcript_text"), LIVE_DRAFT_MAX_TEXT_CHARS),
+        "provider": _bounded_text(draft_src.get("provider"), 32),
+        "model": _bounded_text(draft_src.get("model"), 256),
+        "language": _bounded_text(draft_src.get("language"), 32),
+        "archive_dir": _bounded_text(draft_src.get("archive_dir"), 4096),
+        "recording_collection": _bounded_text(draft_src.get("recording_collection"), 64),
     }
 
 
@@ -2699,8 +2977,8 @@ def _clear_live_draft_state(session_id: str = "") -> dict[str, Any]:
     """
     current = _read_live_draft_state()
     draft = current.get("draft") if isinstance(current.get("draft"), dict) else None
-    expected_owner = _live_draft_str(session_id, 128)
-    actual_owner = _live_draft_str(draft.get("session_id"), 128) if draft else ""
+    expected_owner = _bounded_text(session_id, 128)
+    actual_owner = _bounded_text(draft.get("session_id"), 128) if draft else ""
     if expected_owner and actual_owner and actual_owner != expected_owner:
         logger.info(
             "live draft not cleared: owned by session %s, not %s",
@@ -3070,8 +3348,9 @@ def _resolve_recordings_target_dir(archive_dir: str = "", *, create: bool = True
 RECORDING_COLLECTION_LIVE = "live"
 RECORDING_COLLECTION_UPLOADS = "uploads"
 # Screen-mode recordings: dictated with drawings and screenshots over the
-# screen. Their screenshots live in the desktop shell's screen-session
-# store (desktop/screen-mode.js), which keeps the same newest-N count.
+# screen. Their screenshots are archived beside the recording as
+# ``<stem>.screens`` and owned by this backend (backend/screen_sessions.py);
+# their retention is the collection's entry in AUDIO_RETENTION_POLICIES.
 RECORDING_COLLECTION_SCREEN = "screen"
 RECORDING_COLLECTION_DIR_NAMES: dict[str, str] = {
     RECORDING_COLLECTION_LIVE: "Live Capsule",
@@ -3099,9 +3378,10 @@ _RECORDING_COLLECTION_DIR_NAME_TO_KEY: dict[str, str] = {
 #                    brought in. Worth keeping around while they are
 #                    still working with that material, but not forever,
 #                    so this is an *age* rule.
-#   Screen Sessions — screen-mode takes. The audio is kept for the
-#                    newest five, the same count the desktop shell keeps
-#                    for their screenshot batches.
+#   Screen Sessions — screen-mode takes. A count rule over the recording's
+#                    media as one thing: its audio AND its screenshots
+#                    folder are kept or collected together (default count
+#                    below, ``TRANSCRIPTOR_SCREEN_AUDIO_KEEP_COUNT``).
 #
 # What this replaced: a single global "keep audio only for the newest
 # recording in the archive" rule, written twice (once for the per-save
@@ -3263,20 +3543,33 @@ def _recordings_scan_dirs(root: Path) -> list[Path]:
         child = root / folder_name
         if child.exists() and child.is_dir():
             candidates.append(child)
-    seen: set[str] = set()
+    seen: set[object] = set()
     dirs: list[Path] = []
     for candidate in candidates:
         try:
             resolved = candidate.resolve()
-            key = str(resolved)
         except OSError:
             resolved = candidate
-            key = str(candidate)
+        key = _dir_identity(resolved)
         if key in seen:
             continue
         seen.add(key)
         dirs.append(resolved)
     return dirs
+
+
+def _dir_identity(path: Path) -> object:
+    """What makes two spellings of a directory the same directory: the
+    file system's (device, inode). ``resolve()`` keeps the spelling it was
+    given, so on a case-insensitive volume ".../Transcriptor/recordings"
+    and ".../transcriptor/recordings" were two archive dirs — swept,
+    scanned and counted twice (BL-14, both are in the registry on the
+    user's machine)."""
+    try:
+        st = path.stat()
+        return (st.st_dev, st.st_ino)
+    except OSError:
+        return str(path)
 
 
 def _iter_recording_files_by_suffix(directory: Path, suffixes: set[str]) -> list[Path]:
@@ -3327,14 +3620,11 @@ def _recordings_scan_cache_key(root: Path) -> tuple:
 
 
 def _recordings_storage_dirs_for_roots(roots: Iterable[Path]) -> list[Path]:
-    seen: set[str] = set()
+    seen: set[object] = set()
     dirs: list[Path] = []
     for root in roots:
         for d in _recordings_scan_dirs(root):
-            try:
-                key = str(d.resolve())
-            except OSError:
-                key = str(d)
+            key = _dir_identity(d)
             if key in seen:
                 continue
             seen.add(key)
@@ -3426,7 +3716,10 @@ def _prune_recording_audio(
       record and are not subject to retention at any age or count.
     * An audio file with no sibling transcript is left alone: it is
       either an orphan or a save still in flight in another process,
-      and neither is ours to collect.
+      and neither is ours to collect. Neither is one whose sibling
+      transcript this app did not write (``_is_app_recording_text``):
+      the archive folder is user-chosen, and a same-stem pair there may
+      be the user's own files.
     * ``keep_stems`` is an unconditional exemption, used by the save
       path for the recording it has just written. Exempt files still
       occupy a slot in the ``max_items`` ranking — the take the user
@@ -3458,55 +3751,112 @@ def _prune_recording_audio(
     # On an archive with a few thousand entries this turned every save
     # (and every startup retention sweep) into seconds of blocking I/O,
     # which the user experiences as the app stalling right after Stop.
-    text_stems = {p.stem for p in _iter_recording_text_files(target_dir)}
-    candidates: list[tuple[float, str, Path]] = []
+    text_by_stem = {p.stem: p for p in _iter_recording_text_files(target_dir)}
+    # Ownership is checked only for stems that have media beside them (a
+    # header read per media file, not per transcript), once per stem.
+    owned_cache: dict[str, bool] = {}
+
+    def _owned(stem: str) -> bool:
+        if stem not in owned_cache:
+            text = text_by_stem.get(stem)
+            owned_cache[stem] = text is not None and _is_app_recording_text(text)
+        return owned_cache[stem]
+
+    # One entry per RECORDING (stem), holding all of its media: the audio
+    # file(s) and the screen-mode screenshots folder. The policy ranks
+    # recordings, and a recording's media is kept or collected together
+    # (BM-07/S-05). Ranking audio files and ``.screens`` folders as two
+    # lists on two different timestamps (a folder's mtime moves whenever
+    # Finder writes a .DS_Store into it) let one recording keep its audio
+    # and lose its screenshots, or the reverse.
+    audio_by_stem: dict[str, list[Path]] = {}
+    screens_by_stem: dict[str, Path] = {}
+    orphan_screens: list[Path] = []
     for entry in entries:
         try:
+            if screen_sessions.is_screens_dir(entry):
+                stem = screen_sessions.screens_stem(entry)
+                if _owned(stem):
+                    screens_by_stem[stem] = entry
+                elif stem not in text_by_stem:
+                    orphan_screens.append(entry)
+                continue
             if not entry.is_file():
                 continue
             if entry.suffix.lower() not in _RECORDING_AUDIO_EXTS:
                 continue
-            if entry.stem not in text_stems:
+            if not _owned(entry.stem):
                 continue
-            candidates.append((entry.stat().st_mtime, entry.name, entry))
+            audio_by_stem.setdefault(entry.stem, []).append(entry)
         except OSError as e:
-            logger.debug("audio retention: skip %s: %s", entry, e)
+            logger.debug("audio retention: skip %s: %s", _log_safe_recording_name(entry.name), e.strerror or type(e).__name__)
+    candidates: list[tuple[float, str]] = []
+    for stem in set(audio_by_stem) | set(screens_by_stem):
+        mtime = _recording_media_mtime(audio_by_stem.get(stem, []), text_by_stem[stem])
+        if mtime is not None:
+            candidates.append((mtime, stem))
     exempt = {stem for stem in keep_stems if stem}
     stamp = time.time() if now is None else now
 
     deleted = 0
-    for entry, reason in _beyond_retention_policy(candidates, effective, exempt=exempt, now=stamp):
-        try:
-            entry.unlink()
-            deleted += 1
-            logger.info("audio retention: removed %s (%s)", entry.name, reason)
-        except OSError as e:
-            logger.warning("audio retention: failed to remove %s: %s", entry, e)
-    deleted += _prune_recording_screens(entries, text_stems, effective, exempt=exempt, now=stamp)
+    for stem, reason in _beyond_retention_policy(candidates, effective, exempt=exempt, now=stamp):
+        for audio in audio_by_stem.get(stem, []):
+            try:
+                audio.unlink()
+                deleted += 1
+                logger.info("audio retention: removed %s (%s)", _log_safe_recording_name(audio.name), reason)
+            except OSError as e:
+                logger.warning("audio retention: failed to remove %s: %s", _log_safe_recording_name(audio.name), e.strerror or type(e).__name__)
+        screens = screens_by_stem.get(stem)
+        if screens is not None:
+            try:
+                shutil.rmtree(screens)
+                deleted += 1
+                logger.info("screens retention: removed %s (%s)", _log_safe_recording_name(screens.name), reason)
+            except OSError as e:
+                logger.warning("screens retention: failed to remove %s: %s", _log_safe_recording_name(screens.name), e.strerror or type(e).__name__)
+    deleted += _prune_orphan_screens(orphan_screens, now=stamp)
     return deleted
 
 
+def _recording_media_mtime(audio: list[Path], text: Path) -> Optional[float]:
+    """The time one recording is ranked by: its audio's (newest, when a
+    re-save left two), else — screenshots whose audio is already gone —
+    its transcript's. Never the ``.screens`` folder's own mtime, which any
+    file written into it moves."""
+    times: list[float] = []
+    for p in audio:
+        try:
+            times.append(p.stat().st_mtime)
+        except OSError:
+            continue
+    if times:
+        return max(times)
+    try:
+        return text.stat().st_mtime
+    except OSError:
+        return None
+
+
 def _beyond_retention_policy(
-    candidates: list[tuple[float, str, Path]],
+    candidates: list[tuple[float, str]],
     policy: AudioRetentionPolicy,
     *,
     exempt: set[str],
     now: float,
-) -> list[tuple[Path, str]]:
-    """The one ranking rule for a recording's media, whatever the kind.
+) -> list[tuple[str, str]]:
+    """The one ranking rule for recordings' media.
 
-    ``candidates`` are ``(mtime, name, path)`` and are ranked newest
-    first (name descending breaks mtime ties). Returns the entries the
+    ``candidates`` are ``(mtime, stem)``, one per recording, ranked newest
+    first (stem descending breaks mtime ties, so the outcome is
+    deterministic rather than filesystem order). Returns the stems the
     policy collects with the reason, skipping exempt stems while still
     counting them toward ``max_items``.
     """
-    ranked = sorted(candidates, key=lambda item: (item[0], item[1]), reverse=True)
+    ranked = sorted(candidates, reverse=True)
     age_cutoff = now - policy.max_age_sec if policy.max_age_sec > 0 else None
-    out: list[tuple[Path, str]] = []
-    for index, (mtime, _name, entry) in enumerate(ranked):
-        stem = screen_sessions.screens_stem(entry) if entry.name.endswith(
-            screen_sessions.SCREENS_DIR_SUFFIX
-        ) else entry.stem
+    out: list[tuple[str, str]] = []
+    for index, (mtime, stem) in enumerate(ranked):
         if stem in exempt:
             continue
         over_count = policy.max_items > 0 and index >= policy.max_items
@@ -3514,43 +3864,33 @@ def _beyond_retention_policy(
         if not (over_count or over_age):
             continue
         out.append((
-            entry,
+            stem,
             "beyond newest %d" % policy.max_items if over_count else "older than %d s" % policy.max_age_sec,
         ))
     return out
 
 
-def _prune_recording_screens(
-    entries: list[Path],
-    text_stems: set[str],
-    policy: AudioRetentionPolicy,
-    *,
-    exempt: set[str],
-    now: float,
-) -> int:
-    """Screen-mode screenshot folders (``<stem>.screens``) follow their
-    recording's audio rule exactly: same policy, same ranking, same
-    exemption — a recording's media is kept or collected as one kind of
-    thing, never by a second count. Transcripts stay forever."""
-    candidates: list[tuple[float, str, Path]] = []
-    for entry in entries:
+def _prune_orphan_screens(orphans: list[Path], *, now: float) -> int:
+    """A ``<stem>.screens`` folder whose transcript is gone (deleted in
+    Finder — the archive is a visible folder) belongs to no recording any
+    more and would otherwise stay forever (BM-08). Collected only when it
+    is provably the app's (``screen_sessions.is_app_screens_dir``) and has
+    sat untouched for the recovery window, the same grace an unadopted
+    staging folder gets."""
+    if LIVE_RECOVERY_RETENTION_SEC <= 0:
+        return 0
+    cutoff = now - LIVE_RECOVERY_RETENTION_SEC
+    removed = 0
+    for entry in orphans:
         try:
-            if not screen_sessions.is_screens_dir(entry):
+            if not screen_sessions.is_app_screens_dir(entry) or entry.stat().st_mtime > cutoff:
                 continue
-            if screen_sessions.screens_stem(entry) not in text_stems:
-                continue
-            candidates.append((entry.stat().st_mtime, entry.name, entry))
-        except OSError as e:
-            logger.debug("screens retention: skip %s: %s", entry, e)
-    deleted = 0
-    for entry, reason in _beyond_retention_policy(candidates, policy, exempt=exempt, now=now):
-        try:
             shutil.rmtree(entry)
-            deleted += 1
-            logger.info("screens retention: removed %s (%s)", entry.name, reason)
+            removed += 1
+            logger.info("screens retention: removed %s (its transcript is gone)", _log_safe_recording_name(entry.name))
         except OSError as e:
-            logger.warning("screens retention: failed to remove %s: %s", entry, e)
-    return deleted
+            logger.warning("screens retention: failed to remove %s: %s", _log_safe_recording_name(entry.name), e.strerror or type(e).__name__)
+    return removed
 
 
 def _register_archive_dir(path: Path) -> None:
@@ -3646,14 +3986,11 @@ def _get_known_archive_dirs() -> list[Path]:
                 candidates.append(p)
         except Exception:
             continue
-    # Deduplicate by resolved absolute path.
-    seen: set[str] = set()
+    # Deduplicate by identity on disk, not by spelling (BL-14).
+    seen: set[object] = set()
     result: list[Path] = []
     for d in candidates:
-        try:
-            key = str(d.resolve())
-        except Exception:
-            key = str(d)
+        key = _dir_identity(d)
         if key not in seen:
             seen.add(key)
             result.append(d)
@@ -3701,6 +4038,22 @@ def _any_audio_retention_enabled() -> bool:
     return any(policy.enabled for policy in AUDIO_RETENTION_POLICIES.values())
 
 
+def _periodic_housekeeping() -> None:
+    """One tick of the timer: recorded-audio retention AND the job results /
+    upload snapshots age limit. The latter used to run only when a new job
+    was created (BL-18: results and a CLI snapshot sat on disk 42 h past a
+    24 h limit because no job followed them)."""
+    if _any_audio_retention_enabled():
+        try:
+            _sweep_recording_audio_retention()
+        except Exception:
+            logger.exception("periodic audio retention sweep failed")
+    try:
+        _cleanup_expired_files()
+    except Exception:
+        logger.exception("periodic results/uploads cleanup failed")
+
+
 def start_audio_retention_sweeper() -> None:
     """Run the audio-retention sweep on a timer, once per process.
 
@@ -3711,7 +4064,7 @@ def start_audio_retention_sweeper() -> None:
     threads.
     """
     global _audio_retention_sweeper_thread
-    if not _any_audio_retention_enabled():
+    if not _any_audio_retention_enabled() and RESULT_RETENTION_SEC <= 0:
         return
     with _audio_retention_sweeper_lock:
         if (
@@ -3723,10 +4076,7 @@ def start_audio_retention_sweeper() -> None:
         def _loop() -> None:
             while True:
                 time.sleep(AUDIO_RETENTION_SWEEP_INTERVAL_SEC)
-                try:
-                    _sweep_recording_audio_retention()
-                except Exception:
-                    logger.exception("periodic audio retention sweep failed")
+                _periodic_housekeeping()
 
         _audio_retention_sweeper_thread = threading.Thread(
             target=_loop, daemon=True, name="audio-retention-sweep"
@@ -3754,6 +4104,30 @@ def _recording_audio_payload(name: str, target_dir: Optional[Path] = None) -> di
         "audio_size_bytes": size_bytes,
         "audio_mime": mime,
     }
+
+
+# Ownership of a transcript: every ``.txt`` this app writes starts with the
+# header ``_render_recording_content`` renders — "Title: …" on the first line
+# and "Saved at: …" on the second (unchanged since the first release). The
+# archive folder is a user-chosen, user-visible folder (it may be ~/Movies,
+# ~/Documents), so a same-stem ``.txt`` beside a media file proves nothing:
+# ``talk.txt`` next to ``talk.mp4`` is the user's own pair. Retention and
+# "delete all" act ONLY on recordings whose transcript carries this header,
+# so they can never delete a file the app did not create.
+_APP_RECORDING_HEADER_RE = re.compile(r"\ATitle: [^\r\n]*\r?\nSaved at: ")
+# The title line is the only variable-length part before "Saved at:".
+_APP_RECORDING_HEADER_READ_BYTES = 8192
+
+
+def _is_app_recording_text(path: Path) -> bool:
+    """True when *path* is a transcript this app wrote (see the header rule
+    above). Unreadable files are not ours to touch."""
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(_APP_RECORDING_HEADER_READ_BYTES)
+    except OSError:
+        return False
+    return bool(_APP_RECORDING_HEADER_RE.match(head.decode("utf-8", errors="replace")))
 
 
 def _render_recording_content(
@@ -4133,6 +4507,7 @@ async def ws_transcribe(websocket: WebSocket):
                 language=lang_opt or "auto",
                 archive_dir=archive_dir,
                 recording_collection=recording_collection,
+                screen_session_id=qp.get("screen_session_id") or "",
             )
         except Exception as e:
             recovery_ctx = None
@@ -4206,9 +4581,7 @@ async def ws_transcribe(websocket: WebSocket):
         else:
             logger.warning("ws/transcribe transient broken pipe: %s", e)
     finally:
-        _unregister_live_session(session_id)
-        if recovery_ctx is not None:
-            _finalize_live_recovery(recovery_ctx)
+        _end_live_session_ownership(session_id, recovery_ctx)
 
 
 def _normalize_live_provider(raw: Optional[str]) -> str:
@@ -4233,8 +4606,15 @@ def _open_live_recovery(
     language: str,
     archive_dir: str,
     recording_collection: str,
+    screen_session_id: str = "",
 ) -> dict:
     """Create a recovery PCM file + metadata for a live session.
+
+    The sidecar carries everything a crash-time promotion needs to file
+    the take where the normal save would have: the archive dir, the
+    collection and — for a screen-mode take — the staged screen session
+    whose screenshots belong to this audio (``screen_session_id``; an
+    invalid id is dropped, never stored).
 
     Ordering is critical for leak-freedom:
       1. Build ``meta_payload`` in memory (infallible).
@@ -4262,6 +4642,9 @@ def _open_live_recovery(
         "language": language,
         "archive_dir": archive_dir,
         "recording_collection": recording_collection,
+        "screen_session_id": (
+            str(screen_session_id) if screen_sessions.is_session_id(screen_session_id) else ""
+        ),
         "status": "recording",
         "provider": provider,
     }
@@ -4422,7 +4805,11 @@ def _finalize_live_recovery(recovery: dict) -> None:
                 "finished_at": datetime.now().isoformat(),
                 "bytes": recovery["bytes"],
                 "chunks": recovery["chunks"],
-                "status": "error" if recovery["had_error"] else "recoverable",
+                "status": (
+                    LIVE_RECOVERY_STATUS_DISCARDED
+                    if _live_recovery_discard_is_pending(str(recovery.get("session_id") or ""))
+                    else "error" if recovery["had_error"] else "recoverable"
+                ),
                 "write_error": str(recovery.get("write_error") or ""),
             }
         )
@@ -4459,9 +4846,10 @@ def _recovery_spool_bytes(recovery: Optional[dict]) -> bytes:
     * the file is opened UNBUFFERED (``_open_live_recovery``), so
       everything ``_record_recovery_chunk`` accepted is already visible
       to this read even though the writer still holds the handle;
-    * it is deleted only by ``_finalize_live_recovery``, which the
-      WebSocket handler runs in its ``finally`` — strictly after the
-      envelope has been sent.
+    * nothing deletes it while the WebSocket handler owns it: a save or
+      discard that arrives meanwhile is deferred until the handler's
+      ``finally`` has finalized it (``_safe_delete_live_recovery``) —
+      strictly after the envelope has been sent.
 
     Returns ``b""`` — never raises — when there is no spool, when it is
     unreadable, or when it is larger than this process will read at
@@ -4623,15 +5011,28 @@ async def _apply_live_recovery(
         return payload
 
 
-# 1.1.25: hard timeout for the per-message WS send.
-# A misbehaving / paused client (background tab, slow renderer) would
-# otherwise let Starlette's send buffer back up and the await would
-# suspend indefinitely. The Deepgram forwarder calls _ws_send_json on
-# every event; one stalled send wedges the entire forwarder loop and
-# prevents stop.set() from being honoured. 5 s is generous for a
-# loopback websocket — anything beyond is a stalled client we should
-# treat as a broken pipe and let recovery proceed.
-_WS_SEND_TIMEOUT_SEC = 5.0
+# 1.1.25: a bound on the per-message WS send. A misbehaving / paused
+# client (background tab, slow renderer) would otherwise let Starlette's
+# send buffer back up and the await would suspend indefinitely; the
+# Deepgram forwarder calls _ws_send_json on every event. The same bound
+# every other socket write in the live path gets (``SEND_WEDGE_SEC``):
+# a write not accepted in that long is a wedge, whichever socket it is.
+import weakref  # noqa: E402
+
+from backend.remote_deepgram_live import SEND_WEDGE_SEC as _WS_SEND_TIMEOUT_SEC  # noqa: E402
+
+# Renderer sockets on which a send stalled past the bound. A stalled send
+# is NEVER cancelled — cancelling a websocket write mid-frame leaves the
+# connection undefined, the rule the upstream path already follows — so
+# it is left to finish or fail on its own, and nothing else is written
+# to that socket after it: the next frame could only interleave with, or
+# queue behind, the one still in flight (BW-02).
+_STALLED_CLIENT_SOCKETS: "weakref.WeakSet[WebSocket]" = weakref.WeakSet()
+
+
+def _collect_stalled_send(task: "asyncio.Future") -> None:
+    if not task.cancelled() and task.exception() is not None:
+        logger.debug("ws send that stalled ended with: %s", task.exception())
 
 
 async def _ws_send_json(websocket: WebSocket, payload: dict) -> bool:
@@ -4639,25 +5040,29 @@ async def _ws_send_json(websocket: WebSocket, payload: dict) -> bool:
 
     Returns ``True`` on success. Logs transient broken-pipe errors and
     returns ``False`` without raising so the caller can continue its
-    cleanup. A send that exceeds ``_WS_SEND_TIMEOUT_SEC`` is treated as
-    a broken pipe — the sender returns False and the caller's normal
-    "client gone" cleanup path runs.
+    cleanup. A send not accepted within ``_WS_SEND_TIMEOUT_SEC`` is
+    treated as a broken pipe — the caller's normal "client gone" path
+    runs — but the write itself is left running, never cancelled, and
+    the socket takes no further frames.
     """
-    try:
-        await asyncio.wait_for(
-            websocket.send_text(json.dumps(payload, ensure_ascii=False)),
-            timeout=_WS_SEND_TIMEOUT_SEC,
-        )
-        return True
-    except asyncio.TimeoutError:
-        # Same return-False semantics as broken-pipe — caller's loop
-        # treats this as "client gone" and shuts the session down,
-        # rather than wedging on a paused renderer indefinitely.
-        logger.warning(
-            "ws send timed out after %.1fs (treating as broken pipe)",
-            _WS_SEND_TIMEOUT_SEC,
-        )
+    if websocket in _STALLED_CLIENT_SOCKETS:
         return False
+    try:
+        send = asyncio.ensure_future(
+            websocket.send_text(json.dumps(payload, ensure_ascii=False))
+        )
+        done, _pending = await asyncio.wait({send}, timeout=_WS_SEND_TIMEOUT_SEC)
+        if not done:
+            _STALLED_CLIENT_SOCKETS.add(websocket)
+            send.add_done_callback(_collect_stalled_send)
+            logger.warning(
+                "ws send not accepted within %.1fs (treating as broken pipe; "
+                "no further frames on this socket)",
+                _WS_SEND_TIMEOUT_SEC,
+            )
+            return False
+        send.result()
+        return True
     except Exception as e:
         if _is_broken_pipe_error(e):
             logger.debug("ws send skipped (pipe closed): %s", e)
@@ -4706,7 +5111,16 @@ async def _run_local_live_session(
     language: Optional[str],
     recovery: Optional[dict],
 ) -> None:
-    """Drive the local faster-whisper assist pipeline for a live session."""
+    """Drive the local faster-whisper assist pipeline for a live session.
+
+    Its stop protocol is deliberately smaller than the Deepgram path's
+    (``_run_deepgram_live_session``): ``finalize`` ends the receive loop
+    at once, with no post-finalize drain — WebSocket frames are ordered,
+    so every frame the renderer sent before ``finalize`` has already been
+    read — and the final envelope is never repaired by the REST recovery
+    pass: nothing here is billed or remote, and what this transport knows
+    about its gaps travels in ``coverage`` instead (BW-18).
+    """
     if model not in ALLOWED_LOCAL_MODELS:
         model = DEFAULT_LOCAL_TRANSCRIPTION_MODEL
     session = LiveSession(model_name=model, language=language)
@@ -4847,15 +5261,23 @@ async def _run_local_live_session(
         )
 
 
-# B2 (audit §3.7): frames buffered while ``session.connect()`` is still
-# in flight, so they can be replayed into Deepgram once it succeeds.
-# Every such frame is ALSO recorded into the recovery spool unconditio-
-# nally as it arrives — this cap only bounds the in-memory replay queue
-# against a pathologically slow/hung connect, it never bounds what the
-# spool retains. At 16 kHz/16-bit mono a live renderer chunk is small
-# (observed: tens to low hundreds of ms of audio per frame), so this
-# comfortably covers the observed 1-12 s connect window.
-_PRECONNECT_FRAME_BUFFER_MAX = 4096
+# The longest a connect can legitimately take: the open timeout plus one
+# retry (``DeepgramLiveSession.connect``). Every in-memory audio bound in
+# this handler that has to outlast a connect is derived from it, in
+# BYTES — the renderer's frame size is not this module's to assume (the
+# worklet posts ~10 ms frames, a ScriptProcessor fallback far larger),
+# and a bound counted in frames was a different number of seconds for
+# each (BW-05).
+_CONNECT_BUDGET_SEC = DEEPGRAM_LIVE_OPEN_TIMEOUT_SEC + DEEPGRAM_LIVE_RETRY_TIMEOUT_SEC
+
+# B2 (audit §3.7): audio buffered while ``session.connect()`` is still in
+# flight, replayed into Deepgram once it succeeds. Every such frame is
+# ALSO recorded into the recovery spool unconditionally as it arrives —
+# this bound only limits the in-memory replay queue, never what the
+# spool retains. One second above the connect budget, so only a connect
+# that overran its own timeouts can reach it; if one does, the oldest
+# audio is dropped, logged and declared undelivered.
+_PRECONNECT_BUFFER_MAX_BYTES = int((_CONNECT_BUDGET_SEC + 1.0) * LIVE_PCM_BYTES_PER_SEC)
 
 # C2: the tail-preserving drain after ``finalize`` — 250 ms was always
 # spent in full because the mic is already stopped by the time the
@@ -4896,20 +5318,18 @@ _SEND_BATCH_BYTES = 1600
 # transcript; a talking user fills 50 ms of audio in 50 ms, so this only
 # fires at the trailing edge of speech.
 _SEND_BATCH_MAX_WAIT_SEC = 0.05
-# Hard cap on the queue. Both bounds exist: the frame count keeps a
-# pathological renderer from making the queue itself the leak, and the
-# byte count is the meaningful one — 320 kB is 10 s of audio, twice the
-# wedge deadline below, so a healthy session never comes close and a
-# wedged one is detected long before the bound bites.
-_SEND_QUEUE_MAX_FRAMES = 8192
-_SEND_QUEUE_MAX_BYTES = 320_000
+# Hard cap on the queue, in bytes. It has to hold everything captured
+# while a warm-socket SWAP connects its replacement (the wedge watchdog
+# is suspended for exactly that), so it is the connect budget plus a
+# second — a wedge outside a swap is still detected at the 5 s bound,
+# long before this one bites. It used to be 10 s, below the 12 s connect
+# a swap may take (BW-05).
+_SEND_QUEUE_MAX_BYTES = int((_CONNECT_BUDGET_SEC + 1.0) * LIVE_PCM_BYTES_PER_SEC)
 # Audio still waiting this long after it was captured means the upstream
-# is not accepting writes. Sized well above any plausible network hiccup
-# (a 1600-byte write on a live socket completes in microseconds) and at
-# the same 5 s the old per-send timeout used, so the failure is reported
-# no later than it used to be — but by closing the socket rather than by
-# cancelling a write.
-_SEND_WEDGE_TIMEOUT_SEC = 5.0
+# is not accepting writes. The one bound for any Deepgram write
+# (``SEND_WEDGE_SEC``, owned by the session module), not a second copy of
+# the same 5 s: tuning one used to leave the other behind (BW-04).
+_SEND_WEDGE_TIMEOUT_SEC = _WS_SEND_TIMEOUT_SEC
 _SEND_WEDGE_POLL_SEC = 0.5
 # At stop: how long the queued audio may take to drain before Finalize
 # goes out anyway. A wedged upstream is detected at
@@ -4950,17 +5370,13 @@ _WARM_PROBE_POLL_SEC = 0.1
 # Audio kept for replay while the probe is unresolved: everything
 # already written to the adopted socket, so a replacement starts from
 # the true beginning of the recording rather than from the moment the
-# swap completed. Bounded at 8 s of 16 kHz PCM16 — the probe window plus
-# a worst-case connect, with room to spare.
+# swap completed. It has to hold every VOICED byte written before the
+# swap is asked for — the probe window after the first voiced frame —
+# and what it drops off the front is leading silence the replacement's
+# offset accounts for exactly. Audio captured DURING the swap's connect
+# waits in the send queue, not here. 8 s is the probe window three
+# times over.
 _WARM_REPLAY_MAX_BYTES = 8 * LIVE_PCM_BYTES_PER_SEC
-
-
-# The live-config builder now lives with the config type
-# (``remote_deepgram_live.live_config``) so the A/B tool, which drives
-# the same warm pool, builds the same query string this handler does —
-# the pool keys its socket on that string. Bound to the old private name
-# because this module and its tests refer to it by that name.
-_live_config = live_config
 
 
 def _new_live_session(
@@ -5024,6 +5440,39 @@ async def _discard_secondary_acquire(task: "Optional[asyncio.Task]") -> None:
         logger.debug("dual-stream: second reading close ignored: %s", e)
 
 
+async def _release_abandoned_upstream(
+    pre_task: "Optional[asyncio.Task]",
+    secondary_task: "Optional[asyncio.Task]",
+    session: Any,
+) -> None:
+    """Release what a recording that is being abandoned already holds.
+
+    Runs in a task of its own: the usual reason a recording is abandoned
+    here is that the handler itself is being CANCELLED, and inside a
+    cancelled task ``await_cancelled`` (correctly) re-raises the moment
+    it sees our own cancellation pending — which would stop this cleanup
+    at its first step. Shielded so the release finishes even then.
+    """
+
+    async def _release() -> None:
+        await cancel_and_await(pre_task, what="deepgram pre-connect reader", log=logger)
+        await _discard_secondary_acquire(secondary_task)
+        if session is not None:
+            try:
+                await session.discard()
+            except Exception as e:
+                logger.warning(
+                    "deepgram: releasing an abandoned upstream failed: %s", e,
+                    exc_info=True,
+                )
+
+    await asyncio.shield(
+        asyncio.get_running_loop().create_task(
+            _release(), name="deepgram-abandoned-upstream-release",
+        )
+    )
+
+
 async def _prewarm_deepgram_at_boot() -> None:
     """Open the first warm socket at backend start, if a key is set.
 
@@ -5042,12 +5491,10 @@ async def _prewarm_deepgram_at_boot() -> None:
     api_key = _configured_deepgram_key(cfg)
     if not api_key:
         return
-    primary_cfg = _live_config(
-        model=DEFAULT_DEEPGRAM_AUDIO_MODEL,
-        language="auto",
-        diarize=False,
-        keyterms=configured_keyterms(cfg),
-    )
+    # The builder's own defaults ARE the renderer's: model, language
+    # "auto", no diarization — restating them here was a third copy
+    # (BW-14). Only the keyterms come from the config.
+    primary_cfg = live_config(keyterms=configured_keyterms(cfg))
     DEEPGRAM_WARM_POOL.rewarm(api_key, primary_cfg)
     # Both readings, when this configuration runs two. The second one is
     # a different query string and therefore a different pool key, so
@@ -5076,11 +5523,13 @@ async def _run_deepgram_live_session(
 
     On a hard Deepgram failure (connect error, mid-stream fatal error,
     socket drop) we do NOT swallow the failure — we surface it to the
-    frontend via ``{"type":"error","fatal":true}`` and the subsequent
-    ``{"type":"final","error":...}``. The frontend then falls back to
-    the Deepgram REST endpoint on the saved canonical WAV. This gives
-    us two independent paths into Deepgram (WS + REST) without coupling
-    the server state machine to either one.
+    frontend via ``{"type":"error","fatal":true}`` at once, and the
+    recording goes on: every frame the user keeps sending is spooled
+    until THEY stop (``finalize``) or disconnect, and the
+    ``{"type":"final","error":...}`` envelope is completed from that
+    spool by the REST recovery pass (``_apply_live_recovery``). One rule
+    for every way the upstream can die — the connect failure, a close,
+    a fatal error, a wedge (BW-01).
 
     Stop-chain wire protocol (wave 2, audit §2/§3.5-3.7):
 
@@ -5106,7 +5555,7 @@ async def _run_deepgram_live_session(
     below is written against one session object either way, because the
     dual facade presents the interface of one.
     """
-    dg_cfg = _live_config(
+    dg_cfg = live_config(
         model=model,
         language=language,
         diarize=diarize,
@@ -5135,12 +5584,17 @@ async def _run_deepgram_live_session(
     # session the user spoke 126 s into. Bytes are recorded to recovery
     # unconditionally as they arrive; the bounded queue is only for
     # replaying them into Deepgram once (if) connect succeeds.
-    pending_frames: "deque[bytes]" = deque(maxlen=_PRECONNECT_FRAME_BUFFER_MAX)
+    pending_frames: "deque[bytes]" = deque()
+    pending_bytes = 0
+    # Audio the pre-connect buffer had to drop (a connect that overran its
+    # own timeouts). Declared to the session once it exists, so its
+    # coverage math sees the true length of the recording.
+    preconnect_dropped_bytes = 0
     preconnect_finalize_payload: Optional[dict] = None
     preconnect_disconnected = False
 
     async def _preconnect_reader() -> None:
-        nonlocal frames_received, bytes_received
+        nonlocal frames_received, bytes_received, pending_bytes, preconnect_dropped_bytes
         nonlocal preconnect_finalize_payload, preconnect_disconnected
         while True:
             msg = await _ws_recv_next(websocket)
@@ -5154,6 +5608,16 @@ async def _run_deepgram_live_session(
                 bytes_received += len(data)
                 _record_recovery_chunk(recovery, data)
                 pending_frames.append(data)
+                pending_bytes += len(data)
+                while pending_bytes > _PRECONNECT_BUFFER_MAX_BYTES and pending_frames:
+                    if preconnect_dropped_bytes == 0:
+                        logger.warning(
+                            "deepgram connect overran its budget; dropping the "
+                            "oldest buffered audio (it stays in the spool)"
+                        )
+                    oldest = pending_frames.popleft()
+                    pending_bytes -= len(oldest)
+                    preconnect_dropped_bytes += len(oldest)
                 continue
             if kind == "control" and msg["payload"].get("type") == "finalize":
                 # Rare (Stop pressed before connect() even resolved), but
@@ -5186,6 +5650,18 @@ async def _run_deepgram_live_session(
         )
         budget_sends.add(task)
         task.add_done_callback(budget_sends.discard)
+
+    async def _join_finalizing_sends() -> None:
+        """Wait for every announcement already in flight.
+
+        Each one is its own task (the announcing callbacks are
+        synchronous), so nothing orders them against the ``final``
+        envelope: a slow client could receive a ``finalizing`` AFTER the
+        ``final`` it bounds, re-arming a deadline whose stop is already
+        over (BW-12). Joined before the envelope goes out.
+        """
+        if budget_sends:
+            await asyncio.gather(*list(budget_sends), return_exceptions=True)
 
     # Both readings are asked for at once. The pool no longer holds its
     # lock across a connect, so two cold connects for a dual-stream
@@ -5235,8 +5711,14 @@ async def _run_deepgram_live_session(
             # dead session running and pretend to deliver an envelope
             # nobody can receive.
             raise
-        except Exception:
-            pass
+        except Exception as reader_error:
+            # The spool may now be short of what the user said; the
+            # recovery below still re-decodes what it holds, and the log
+            # says why it may be incomplete (BW-10).
+            logger.warning(
+                "deepgram pre-connect reader failed; the spool may be "
+                "incomplete: %s", reader_error, exc_info=True,
+            )
         # The primary never opened, so the second reading has nothing to
         # read alongside. Its socket is a billed connection against the
         # account's concurrency limit, so it is disposed of rather than
@@ -5257,6 +5739,12 @@ async def _run_deepgram_live_session(
             source=DEEPGRAM_LIVE_SOURCE,
             error=connect_error,
         )
+        if preconnect_disconnected:
+            # Nobody is left to receive an envelope: a billed re-decode
+            # for a closed socket is money spent on nothing. The spool is
+            # kept (marked above) for the renderer's own recovery (BW-11).
+            logger.info("ws deepgram: client gone before finalize; recovery skipped")
+            return
         final_payload = await _apply_live_recovery(
             payload=final_payload,
             session=None,
@@ -5265,42 +5753,75 @@ async def _run_deepgram_live_session(
             api_key=api_key,
             announce=lambda budget: _send_finalizing(budget, True),
         )
+        # Every ``finalizing`` announcement reaches the renderer BEFORE
+        # the envelope it bounds (BW-12).
+        await _join_finalizing_sends()
         await _ws_send_json(websocket, final_payload)
         return
+    except BaseException:
+        # Anything else — our own cancellation (server shutdown) above
+        # all — must not leave the pre-connect reader consuming the
+        # renderer's socket or the second reading's socket billed and
+        # open: nothing past this point would ever release them (BW-15).
+        await _release_abandoned_upstream(pre_task, secondary_task, None)
+        raise
 
-    # The second reading, if this recording is running two. Its failure
-    # is not the recording's: everything it would have added is what the
-    # user got before this feature existed, so it degrades to one
-    # reading with a warning and never to an aborted recording.
-    if secondary_task is not None:
-        try:
-            secondary = await secondary_task
-            primary_language = resolve_live_language(language)
-            session = DualLiveSession(
-                primary=session,
-                secondary=secondary.session,
-                secondary_language=dual_language,
-                primary_language=primary_language,
-            )
-            logger.info(
-                "dual-stream: second reading opened primary=%s secondary=%s "
-                "(adopted=%s)",
-                primary_language,
-                dual_language,
-                secondary.adopted,
-            )
-        except Exception as e:
-            logger.warning(
-                "dual-stream: second reading (%s) could not be opened, "
-                "continuing single-stream: %s",
-                dual_language,
-                e,
-            )
+    # From here the recording OWNS a live (billed) upstream. Until the
+    # main ``try`` below takes over, a cancellation landing in one of
+    # these awaits used to leave that socket open with its keepalive
+    # running, the second reading's acquire unreleased and the
+    # pre-connect reader still consuming the renderer's socket (BW-15).
+    try:
+        # The second reading, if this recording is running two. Its failure
+        # is not the recording's: everything it would have added is what the
+        # user got before this feature existed, so it degrades to one
+        # reading with a warning and never to an aborted recording.
+        if secondary_task is not None:
+            try:
+                secondary = await secondary_task
+                primary_language = resolve_live_language(language)
+                session = DualLiveSession(
+                    primary=session,
+                    secondary=secondary.session,
+                    secondary_language=dual_language,
+                    primary_language=primary_language,
+                )
+                logger.info(
+                    "dual-stream: second reading opened primary=%s secondary=%s "
+                    "(adopted=%s)",
+                    primary_language,
+                    dual_language,
+                    secondary.adopted,
+                )
+            except Exception as e:
+                logger.warning(
+                    "dual-stream: second reading (%s) could not be opened, "
+                    "continuing single-stream: %s",
+                    dual_language,
+                    e,
+                )
 
-    await cancel_and_await(pre_task, what="deepgram pre-connect reader", log=logger)
+        await cancel_and_await(pre_task, what="deepgram pre-connect reader", log=logger)
+    except BaseException:
+        await _release_abandoned_upstream(pre_task, secondary_task, session)
+        raise
 
     stop = asyncio.Event()
     upstream_fatal = False
+    # The renderer's socket is gone (disconnect, or a send that failed):
+    # nobody can receive an envelope, so the billed recovery pass and the
+    # envelope itself are skipped at stop (BW-11).
+    client_gone = preconnect_disconnected
+
+    def _upstream_dead() -> bool:
+        """Audio offered now would reach no Deepgram reading.
+
+        Closed, or reported FATAL (a wedge closes the socket only after
+        reporting it): either way the recording goes on — the user is
+        still talking and the spool is the transcript's only source for
+        what follows (BW-01) — but nothing more is pushed upstream.
+        """
+        return session.is_closed or session.last_fatal
 
     # ---- Warm-socket liveness (audit §3.7) ---------------------------
     #
@@ -5331,10 +5852,15 @@ async def _run_deepgram_live_session(
     warm_replay_dropped = 0
 
     # ---- Send path: queue, sender task, wedge watchdog (audit §3.6) ---
-    send_queue: "asyncio.Queue[object]" = asyncio.Queue(
-        maxsize=_SEND_QUEUE_MAX_FRAMES
-    )
+    send_queue: "asyncio.Queue[object]" = asyncio.Queue()
     queued_bytes = 0
+    # Totals for the end-of-session line (BW-17).
+    send_dropped_bytes = 0
+    warm_swapped = False
+    # Audio dropped while a swap is connecting its replacement. Declared
+    # to whichever session survives the swap, not to the one about to be
+    # discarded, whose numbers nobody reads again (BW-09).
+    swap_undelivered_bytes = 0
     # Capture time of the oldest byte that has not yet been handed to
     # Deepgram — the age the watchdog judges. ``None`` means everything
     # captured has been written.
@@ -5353,6 +5879,7 @@ async def _run_deepgram_live_session(
         sees the honest length of the recording.
         """
         nonlocal queued_bytes, send_dropped_warned, warm_probe_armed_at
+        nonlocal send_dropped_bytes, swap_undelivered_bytes
         if not data:
             return
         if (
@@ -5361,18 +5888,15 @@ async def _run_deepgram_live_session(
             and pcm_has_voice(data)
         ):
             warm_probe_armed_at = time.monotonic()
-        if queued_bytes + len(data) > _SEND_QUEUE_MAX_BYTES:
-            dropped = True
-        else:
-            try:
-                send_queue.put_nowait((time.monotonic(), data))
-                queued_bytes += len(data)
-                dropped = False
-            except asyncio.QueueFull:
-                dropped = True
-        if not dropped:
+        if queued_bytes + len(data) <= _SEND_QUEUE_MAX_BYTES:
+            send_queue.put_nowait((time.monotonic(), data))
+            queued_bytes += len(data)
             return
-        session.note_undelivered_audio(len(data))
+        send_dropped_bytes += len(data)
+        if warm_swap_in_progress:
+            swap_undelivered_bytes += len(data)
+        else:
+            session.note_undelivered_audio(len(data))
         if not send_dropped_warned:
             send_dropped_warned = True
             logger.warning(
@@ -5421,7 +5945,7 @@ async def _run_deepgram_live_session(
         ``streamedSec`` — is measured from the start of the RECORDING
         and not from the start of this second socket.
         """
-        nonlocal session, warm_probe_active
+        nonlocal session, warm_probe_active, warm_swapped, swap_undelivered_bytes
         nonlocal warm_swap_requested, warm_swap_in_progress
         warm_swap_requested = False
         warm_swap_in_progress = True
@@ -5453,6 +5977,9 @@ async def _run_deepgram_live_session(
             warm_probe_active = False
             warm_replay.clear()
             warm_swap_in_progress = False
+            if swap_undelivered_bytes:
+                session.note_undelivered_audio(swap_undelivered_bytes)
+                swap_undelivered_bytes = 0
             return
         if isinstance(session, DualLiveSession):
             # Only the PRIMARY is probed, so only the primary is
@@ -5462,6 +5989,10 @@ async def _run_deepgram_live_session(
         else:
             session = fresh
         await old.discard()
+        warm_swapped = True
+        if swap_undelivered_bytes:
+            fresh.note_undelivered_audio(swap_undelivered_bytes)
+            swap_undelivered_bytes = 0
         warm_probe_active = False
         warm_replay.clear()
         for pos in range(0, len(replay), _SEND_BATCH_BYTES):
@@ -5511,7 +6042,7 @@ async def _run_deepgram_live_session(
     async def sender() -> None:
         """Own the upstream socket: batch queued audio, write it, stop
         at the finalize sentinel."""
-        nonlocal queued_bytes, pending_since
+        nonlocal queued_bytes, pending_since, upstream_fatal
         buf = bytearray()
         try:
             while True:
@@ -5539,10 +6070,16 @@ async def _run_deepgram_live_session(
                 buf.extend(data)
                 while len(buf) >= _SEND_BATCH_BYTES:
                     await _flush_frame(buf, _SEND_BATCH_BYTES)
-        except asyncio.CancelledError:
-            raise
         except Exception as e:
+            # The only writer to the upstream is gone: nothing queued will
+            # ever reach Deepgram. Said so the way every other upstream
+            # death is said — through the session, so ``events()``,
+            # ``last_error``, ``stream_death_sec`` and the envelope agree,
+            # and the recovery pass re-decodes what follows (BW-06).
             logger.error("deepgram sender failed: %s", e, exc_info=True)
+            _mark_recovery_error(recovery)
+            upstream_fatal = True
+            session.report_fatal(f"Deepgram sender failed: {e}")
 
     async def send_watchdog() -> None:
         """Declare the upstream wedged from the age of unsent audio."""
@@ -5568,20 +6105,23 @@ async def _run_deepgram_live_session(
                 queued_bytes,
             )
             # Reported through the session so ``events()``, ``last_error``
-            # and the final envelope all tell the same story.
+            # and the final envelope all tell the same story. NOT a stop:
+            # the user is still talking, and everything they say from
+            # here on goes to the spool for the recovery pass (BW-01).
             session.report_fatal(
                 f"Deepgram upstream wedged: audio queued {age:.1f}s ago was "
                 "never accepted"
             )
             upstream_fatal = True
-            stop.set()
+            # Closing is what unblocks the pending write — the write
+            # itself is never cancelled. ``close()`` bounds itself (a
+            # close frame nobody accepts aborts the connection), and a
+            # bounded WAIT around it used to cancel the teardown halfway
+            # (BW-03).
             try:
-                # Closing is what unblocks the pending write — the write
-                # itself is never cancelled. Bounded because this is the
-                # one path where the socket is known to be sick.
-                await asyncio.wait_for(session.close(), timeout=3.0)
-            except (asyncio.TimeoutError, Exception) as e:
-                logger.warning("deepgram wedge close failed: %s", e)
+                await session.close()
+            except Exception as e:
+                logger.warning("deepgram wedge close failed: %s", e, exc_info=True)
             return
 
     snd = asyncio.create_task(sender(), name="ws-dg-send")
@@ -5598,12 +6138,25 @@ async def _run_deepgram_live_session(
     # newly arriving frame is forwarded — Deepgram must see this audio
     # first or the transcript's word timings would be shifted. The queue
     # is FIFO, so enqueueing here preserves that order by construction.
+    if preconnect_dropped_bytes:
+        session.note_undelivered_audio(preconnect_dropped_bytes)
     for _chunk in pending_frames:
         _offer_pcm(_chunk)
     pending_frames.clear()
 
     if preconnect_disconnected:
         stop.set()
+
+    def _ingest(data: bytes) -> None:
+        """One renderer frame: counted, spooled, and offered upstream
+        unless no reading is left to take it — the one rule the drain and
+        the receiver used to write out twice each (BW-08)."""
+        nonlocal frames_received, bytes_received
+        frames_received += 1
+        bytes_received += len(data)
+        _record_recovery_chunk(recovery, data)
+        if not _upstream_dead():
+            _offer_pcm(data)
 
     async def _drain_finalize_tail(payload: dict) -> None:
         """C1/C2: drain in-flight binary frames on ``finalize``.
@@ -5624,7 +6177,7 @@ async def _run_deepgram_live_session(
         nothing more is coming. An older renderer that omits the counts
         gets the previous unconditional timed drain, unchanged.
         """
-        nonlocal frames_received, bytes_received
+        nonlocal client_gone
         target_frames = payload.get("framesSent")
         target_bytes = payload.get("bytesSent")
         has_counts = isinstance(target_frames, int) and isinstance(target_bytes, int)
@@ -5648,23 +6201,20 @@ async def _run_deepgram_live_session(
                 break
             tail_kind = tail_msg["kind"]
             if tail_kind == "bytes":
-                tail_data = tail_msg["data"]
-                frames_received += 1
-                bytes_received += len(tail_data)
-                if session.is_closed:
-                    _record_recovery_chunk(recovery, tail_data)
-                    continue
-                _record_recovery_chunk(recovery, tail_data)
-                _offer_pcm(tail_data)
+                _ingest(tail_msg["data"])
                 continue
             if tail_kind == "disconnect":
+                client_gone = True
                 break
             # Any non-bytes non-disconnect frame (stray control msg,
             # text, etc.) ends the drain.
             break
         elapsed_ms = (time.monotonic() - drain_start) * 1000.0
         if has_counts:
-            logger.info(
+            # Unmatched counts mean audio the renderer sent never arrived
+            # here — a lost tail, which is not an INFO event (BW-17).
+            logger.log(
+                logging.INFO if _matched() else logging.WARNING,
                 "finalize drain: %s after %.0f ms (frames %d/%d)",
                 "matched" if _matched() else "timed out",
                 elapsed_ms,
@@ -5679,7 +6229,7 @@ async def _run_deepgram_live_session(
             )
 
     async def receiver() -> None:
-        nonlocal frames_received, bytes_received
+        nonlocal client_gone
         try:
             if preconnect_finalize_payload is not None:
                 # Stop was pressed before connect() even resolved (rare)
@@ -5693,22 +6243,15 @@ async def _run_deepgram_live_session(
                 msg = await _ws_recv_next(websocket)
                 kind = msg["kind"]
                 if kind == "disconnect":
+                    client_gone = True
                     stop.set()
                     return
                 if kind == "bytes":
-                    data = msg["data"]
-                    frames_received += 1
-                    bytes_received += len(data)
-                    if session.is_closed:
-                        # Upstream already died; keep recording the
-                        # PCM locally so the REST fallback has the full
-                        # audio but don't waste cycles pushing it.
-                        _record_recovery_chunk(recovery, data)
-                        continue
-                    _record_recovery_chunk(recovery, data)
                     # Hand off and go straight back to reading the
                     # renderer's socket — the whole point of the queue.
-                    _offer_pcm(data)
+                    # A dead upstream still gets every byte SPOOLED: the
+                    # recovery pass re-decodes it at stop.
+                    _ingest(msg["data"])
                     continue
                 if kind == "control":
                     if msg["payload"].get("type") == "finalize":
@@ -5735,19 +6278,22 @@ async def _run_deepgram_live_session(
         recording onto its replacement instead, and still returns the
         moment a stream ends without one.
         """
-        nonlocal upstream_fatal
+        nonlocal upstream_fatal, client_gone
         try:
             while True:
                 current = session
                 async for event in current.events():
                     if not await _ws_send_json(websocket, event):
+                        client_gone = True
                         stop.set()
                         return
                     if event.get("type") == "error":
                         _mark_recovery_error(recovery)
                         if event.get("fatal"):
+                            # The upstream is dead, the RECORDING is not:
+                            # the join below keeps the receiver spooling
+                            # until the user stops (BW-01).
                             upstream_fatal = True
-                            stop.set()
                             return
                 if session is current or stop.is_set():
                     return
@@ -5761,16 +6307,29 @@ async def _run_deepgram_live_session(
     fw = asyncio.create_task(forwarder(), name="ws-dg-fw")
     try:
         done, _pending = await asyncio.wait({rx, fw}, return_when=asyncio.FIRST_COMPLETED)
-        if fw in done and not rx.done() and session.is_closed and not session.last_fatal:
-            # Deepgram can close the upstream WS before the user presses Stop,
-            # especially on long idle/unstable links. Keep consuming client PCM
-            # until finalize/disconnect so REST/local recovery has the complete
-            # audio instead of only the prefix sent before upstream closed.
+        if fw in done and not rx.done() and _upstream_dead():
+            # Deepgram can close the upstream WS — or fail fatally, or wedge
+            # — before the user presses Stop. Either way the user is still
+            # talking: keep consuming client PCM until finalize/disconnect
+            # so the recovery pass has the complete audio instead of only
+            # the prefix sent before the upstream died. A fatal upstream
+            # used to be the one death that ended the session at once,
+            # sending ``final`` while the microphone was still open
+            # (BW-01) — the same decision the connect-failure path above
+            # already makes the other way.
             _mark_recovery_error(recovery)
             await rx
     finally:
         stop.set()
         await cancel_and_await(rx, what="deepgram websocket receiver", log=logger)
+        # A swap OWNS the session object: it connects a replacement,
+        # rebinds ``session`` and then ``discard()``s the old one — the
+        # very socket ``drain_transcript`` is about to send ``Finalize``
+        # on. So the request is withdrawn FIRST — the probe that raises
+        # it is stopped, then the flag cleared — before the sentinel
+        # gives the sender its last reason to look at the flag (BW-16).
+        await cancel_and_await(warm_probe, what="deepgram warm probe", log=logger)
+        warm_swap_requested = False
 
         # Finalize must reach Deepgram AFTER every byte the renderer
         # sent (audit §3.6). The receiver has now stopped, so everything
@@ -5785,18 +6344,11 @@ async def _run_deepgram_live_session(
             # the audio behind the bound is already accounted for as
             # undelivered, and the sender is cancelled below.
             logger.warning("deepgram send queue full at finalize; sentinel dropped")
-        # A swap OWNS the session object: it connects a replacement,
-        # rebinds ``session`` and then ``discard()``s the old one — the
-        # very socket ``drain_transcript`` is about to send ``Finalize``
-        # on. ``_swap_warm_socket``'s docstring calls the sender "the
-        # only writer to the upstream socket", and that stops being true
-        # the moment the wait below gives up on the sender. So the
-        # request is withdrawn FIRST (the watchdog used to be cancelled
-        # after this wait, which is too late to prevent one starting),
-        # and a swap already running is given the connect budget it can
+        # ``_swap_warm_socket``'s docstring calls the sender "the only
+        # writer to the upstream socket", and that stops being true the
+        # moment the wait below gives up on the sender — so a swap
+        # already running is given the connect budget it can
         # legitimately need before the stop proceeds without it.
-        await cancel_and_await(warm_probe, what="deepgram warm probe", log=logger)
-        warm_swap_requested = False
         send_flush_deadline = _SEND_FLUSH_DEADLINE_SEC + (
             _WARM_SWAP_GRACE_SEC if warm_swap_in_progress else 0.0
         )
@@ -5922,19 +6474,27 @@ async def _run_deepgram_live_session(
         # sent. The renderer has no second reading to fall back on any
         # more, which is the point — two owners of one transcript is
         # what produced every duplication defect of 2026-09-03/04.
-        final_payload = await _apply_live_recovery(
-            payload=final_payload,
-            session=session,
-            recovery=recovery,
-            cfg=dg_cfg,
-            api_key=api_key,
-            announce=_announce_recovery_extension,
-            announced_recovery_sec=announced_recovery_sec,
-        )
-
-        # Envelope out FIRST (C4) — everything below is teardown the
-        # client no longer waits on.
-        await _ws_send_json(websocket, final_payload)
+        if client_gone:
+            # The renderer's socket is gone: a billed re-decode and an
+            # envelope for nobody would be spent on nothing. The spool is
+            # retained (marked) for the renderer's own recovery (BW-11).
+            _mark_recovery_error(recovery)
+            logger.info("ws deepgram: client gone before the envelope; recovery skipped")
+        else:
+            final_payload = await _apply_live_recovery(
+                payload=final_payload,
+                session=session,
+                recovery=recovery,
+                cfg=dg_cfg,
+                api_key=api_key,
+                announce=_announce_recovery_extension,
+                announced_recovery_sec=announced_recovery_sec,
+            )
+            # Envelope out FIRST (C4) — everything below is teardown the
+            # client no longer waits on — and after every ``finalizing``
+            # announcement it bounds (BW-12).
+            await _join_finalizing_sends()
+            await _ws_send_json(websocket, final_payload)
 
         try:
             await session.shutdown(wait_timeout=3.0)
@@ -5989,7 +6549,8 @@ async def _run_deepgram_live_session(
         streamed_sec = float(final_payload.get("streamedSec") or 0.0)
         logger.info(
             "ws deepgram session complete: bytes=%d streamed_sec=%.1f chunks=%d "
-            "final_segs=%d interim_segs=%d connect_ms=%s finalize_ms=%s text_len=%d",
+            "final_segs=%d interim_segs=%d connect_ms=%s finalize_ms=%s text_len=%d "
+            "dropped_bytes=%d queued_bytes=%d swapped=%s upstream_fatal=%s client_gone=%s",
             session.stats.bytes_sent,
             streamed_sec,
             session.stats.chunks_sent,
@@ -5998,6 +6559,11 @@ async def _run_deepgram_live_session(
             f"{session.stats.connect_ms:.0f}" if session.stats.connect_ms else "?",
             f"{session.stats.finalize_ms:.0f}" if session.stats.finalize_ms else "?",
             len(final_payload.get("text") or ""),
+            send_dropped_bytes + preconnect_dropped_bytes,
+            queued_bytes,
+            warm_swapped,
+            upstream_fatal,
+            client_gone,
         )
         # A session that streamed real audio and produced no final segment
         # is a silently lost transcription: the recording exists, the user
@@ -6118,7 +6684,11 @@ async def promote_live_recovery(
     # numpy conversion and a 500 MB cap; both are gone, and the real
     # ceiling is ``MAX_RECOVERY_PROMOTE_BYTES``.)
     archive_dir = str((payload or {}).get("archive_dir") or "").strip()
-    recording_collection = str((payload or {}).get("recording_collection") or "live").strip()
+    # Empty means "where the take was recorded": the recovery sidecar holds
+    # the collection the live session was opened with (S-01). A literal
+    # "live" default here made that field dead and filed every crashed
+    # screen take under Live Capsule.
+    recording_collection = str((payload or {}).get("recording_collection") or "").strip()
     result = await asyncio.to_thread(
         _promote_live_recovery,
         session_id,
@@ -6183,6 +6753,7 @@ async def create_job_from_path(
     split_stereo = _payload_bool(payload, "split_stereo", True)
     word_timestamps = _payload_bool(payload, "word_timestamps", False)
 
+    keep_source = _job_snapshot_is_kept(payload)
     job_id = str(uuid.uuid4())
     upload_path = await asyncio.to_thread(_snapshot_source_media_for_job, source_path, job_id)
     jobs.create(job_id)
@@ -6193,9 +6764,9 @@ async def create_job_from_path(
         language=lang_opt,
         split_stereo=split_stereo,
         word_timestamps=word_timestamps,
-        cleanup_upload_path=False,
+        cleanup_upload_path=not keep_source,
     )
-    return {"job_id": job_id, "audio_source_path": str(upload_path)}
+    return {"job_id": job_id, "audio_source_path": str(upload_path) if keep_source else ""}
 
 
 @app.post("/api/transcribe-sync")
@@ -6390,9 +6961,8 @@ def _run_remote_transcribe_once(
             _raise_if_cancelled()
             _set_progress(0.30)
         except AudioError as e:
-            err_text = str(e).lower()
             native_exts = {"wav", "mp3", "m4a", "mp4", "aac"}
-            if "ffmpeg is not installed" not in err_text:
+            if not isinstance(e, FfmpegMissingError):
                 raise RemoteError(f"audio compression failed: {e}") from e
             if orig_ext not in native_exts or source_size > REMOTE_RAW_FALLBACK_MAX_BYTES:
                 raise RemoteError(
@@ -6639,6 +7209,7 @@ async def create_remote_job_from_path(
     orig_name = _normalize_filename(source_path.name)
     lang_opt = _normalize_language(str((payload or {}).get("language") or "auto"))
 
+    keep_source = _job_snapshot_is_kept(payload)
     job_id = str(uuid.uuid4())
     upload_path = await asyncio.to_thread(_snapshot_source_media_for_job, source_path, job_id)
     jobs.create(job_id)
@@ -6651,9 +7222,9 @@ async def create_remote_job_from_path(
         diarize=_payload_bool(payload, "diarize", False),
         num_speakers=str((payload or {}).get("num_speakers") or ""),
         remote_model=_remote_model_from_payload(payload),
-        cleanup_upload_path=False,
+        cleanup_upload_path=not keep_source,
     )
-    return {"job_id": job_id, "audio_source_path": str(upload_path)}
+    return {"job_id": job_id, "audio_source_path": str(upload_path) if keep_source else ""}
 
 
 @app.post("/api/remote/transcribe-sync")
@@ -7095,7 +7666,19 @@ def enable_cli_access(request: Request, _auth: None = Depends(_require_api_auth)
 
 @app.post("/api/cli/disable")
 def disable_cli_access(request: Request, _auth: None = Depends(_require_api_auth)):
-    CLI_ACCESS.disable()
+    try:
+        CLI_ACCESS.disable()
+    except OSError as e:
+        # Revoked for this run, but the token file — the switch — is still
+        # on disk and the next start would turn access back on. Say so.
+        logger.error("cli access: token revoked in memory but its file survived: %s", e)
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "command-line access is revoked until the app restarts, but its token "
+                f"file could not be removed: {_safe_error_text(e)}"
+            ),
+        )
     logger.info("cli access disabled; token revoked")
     return _cli_status_payload(request)
 
@@ -7525,7 +8108,7 @@ def _build_recordings_list_payload(d: "Path") -> dict:
                 # Finder is missing from History. ``debug``-level so a
                 # routine truncated-during-save won't spam ops, but the
                 # name and exception class are still in the support log.
-                logger.debug("recordings list: skipped %s (%s: %s)", p.name, type(e).__name__, e)
+                logger.debug("recordings list: skipped %s (%s)", _log_safe_recording_name(p.name), type(e).__name__)
                 continue
     _prune_recordings_entry_cache(live_keys)
     items.sort(key=lambda x: x["modified_at"], reverse=True)
@@ -7606,31 +8189,75 @@ def _delete_all_recordings_sync() -> dict:
     failed = 0
     for d in _recordings_storage_dirs_for_roots(_get_known_archive_dirs()):
         for p in _iter_recording_text_files(d):
+            # Only recordings this app wrote: the archive folder is
+            # user-chosen, and a ``.txt`` the user keeps there (with its
+            # same-stem media) is not ours to delete.
+            if not _is_app_recording_text(p):
+                continue
             audio_path = _recording_audio_path(p.name, target_dir=d)
-            audio_backup: Optional[Path] = None
+            screens_path = screen_sessions.recording_screens_dir(d, p.stem)
+            # Every medium is moved aside under a ``.tmp-<hex>`` name
+            # BEFORE the transcript goes, so a failure anywhere up to the
+            # transcript's unlink puts all of it back (S-06/BM-11). The
+            # screenshots used to be removed after the transcript with
+            # ``ignore_errors=True``: a locked file left them on disk with
+            # no transcript — never collectable again — while the
+            # recording was counted deleted.
+            moved_aside: list[tuple[Path, Path]] = []
             try:
-                if audio_path is not None:
-                    audio_backup = audio_path.with_name(f"{audio_path.name}.tmp-{uuid.uuid4().hex}")
-                    os.replace(audio_path, audio_backup)
+                for original in (audio_path, screens_path):
+                    if original is None:
+                        continue
+                    aside = original.with_name(f"{original.name}.tmp-{uuid.uuid4().hex}")
+                    os.replace(original, aside)
+                    moved_aside.append((original, aside))
                 p.unlink()
-                if audio_backup is not None:
-                    _best_effort_unlink(audio_backup, context="delete-all audio cleanup")
-                # A screen-mode recording's screenshots go with it.
-                screens = screen_sessions.screens_dir(d, p.stem)
-                if screen_sessions.is_screens_dir(screens):
-                    shutil.rmtree(screens, ignore_errors=True)
-                deleted += 1
             except Exception as exc:
-                if audio_backup is not None and audio_backup.exists():
+                for original, aside in reversed(moved_aside):
                     try:
-                        os.replace(audio_backup, audio_path)
+                        os.replace(aside, original)
                     except OSError as restore_err:
                         logger.warning(
-                            "delete-all audio rollback failed for %s: %s",
-                            audio_path,
-                            restore_err,
+                            "delete-all rollback failed for %s: %s",
+                            _log_safe_recording_name(original.name),
+                            restore_err.strerror or type(restore_err).__name__,
                         )
-                logger.warning("delete-all recording failed for %s: %s", p, exc)
+                logger.warning("delete-all recording failed for %s: %s", _log_safe_recording_name(p.name), type(exc).__name__)
+                failed += 1
+                continue
+            deleted += 1
+            for _original, aside in moved_aside:
+                try:
+                    if aside.is_dir():
+                        shutil.rmtree(aside)
+                    else:
+                        aside.unlink()
+                except OSError as exc:
+                    # The recording is gone; what is left carries the
+                    # ``.tmp-<hex>`` name the boot sweep collects.
+                    logger.warning(
+                        "delete-all: %s left for the boot sweep: %s",
+                        _log_safe_recording_name(_original.name),
+                        exc.strerror or type(exc).__name__,
+                    )
+        # Screenshots whose transcript was already gone (deleted in
+        # Finder): no recording names them, and "delete all" means them
+        # too (BM-08). Only folders provably the app's.
+        try:
+            leftovers = [e for e in d.iterdir() if screen_sessions.is_app_screens_dir(e)]
+        except OSError:
+            leftovers = []
+        for folder in leftovers:
+            if any((d / f"{screen_sessions.screens_stem(folder)}{ext}").exists() for ext in (".txt", ".TXT")):
+                continue
+            try:
+                shutil.rmtree(folder)
+            except OSError as exc:
+                logger.warning(
+                    "delete-all: orphan screenshots %s not removed: %s",
+                    _log_safe_recording_name(folder.name),
+                    exc.strerror or type(exc).__name__,
+                )
                 failed += 1
     return {"deleted": deleted, "failed": failed}
 
@@ -7661,6 +8288,9 @@ def _read_recording_payload(p: "Path", target_dir: Optional["Path"] = None) -> d
     display = _extract_transcript_text(raw)
     source_file = _recording_source_file(raw)
     archive_dir = target_dir or p.parent
+    # Asked once per recording (H-11): the folder check, the listing and
+    # the manifest read each ran against the same path up to three times.
+    screens_folder = screen_sessions.recording_screens_dir(archive_dir, p.stem)
     return {
         "name": p.name,
         "source_file": source_file,
@@ -7679,19 +8309,11 @@ def _read_recording_payload(p: "Path", target_dir: Optional["Path"] = None) -> d
         # Screen mode: the screenshot file names, in shot order, served by
         # GET /api/recordings/{name}/screens/{file}. Empty for any other
         # recording.
-        "screens": screen_sessions.list_screenshots(archive_dir, p.stem),
+        "screens": screen_sessions.screenshots_in(screens_folder) if screens_folder else [],
         # The archived manifest: what every transcript of this recording
         # places its screen marks from (``frontend/src/screen-annotations.ts``).
-        "screens_manifest": (
-            screen_sessions.read_manifest(screen_sessions.screens_dir(archive_dir, p.stem))
-            if screen_sessions.is_screens_dir(screen_sessions.screens_dir(archive_dir, p.stem))
-            else None
-        ),
-        "screens_dir": (
-            str(screen_sessions.screens_dir(archive_dir, p.stem))
-            if screen_sessions.is_screens_dir(screen_sessions.screens_dir(archive_dir, p.stem))
-            else ""
-        ),
+        "screens_manifest": screen_sessions.read_manifest(screens_folder) if screens_folder else None,
+        "screens_dir": str(screens_folder) if screens_folder else "",
     }
 
 
@@ -7848,6 +8470,40 @@ async def get_recordings_stats(_auth: None = Depends(_require_api_auth)):
         return result
 
 
+@dataclass(frozen=True)
+class _SaveFields:
+    title: str
+    source_text: str
+    transcript_text: str
+    provider: str
+    model: str
+    language: str
+
+
+def _normalize_save_fields(
+    *,
+    title: object,
+    source_text: object,
+    transcript_text: object,
+    provider: object,
+    model: object,
+    language: object,
+) -> _SaveFields:
+    """The text fields of a recording save, normalised ONCE for both save
+    routes (BM-16): the title made a safe file-name part, the rest
+    stripped, and the placeholder source rule (B-031/B-032) applied."""
+    safe_transcript = str(transcript_text or "").strip()
+    safe_provider = str(provider or "").strip()
+    return _SaveFields(
+        title=_sanitize_name(str(title or "recording")),
+        source_text=_placeholder_source_text(str(source_text or "").strip(), safe_transcript, safe_provider),
+        transcript_text=safe_transcript,
+        provider=safe_provider,
+        model=str(model or "").strip(),
+        language=str(language or "").strip(),
+    )
+
+
 @app.post("/api/recordings/save")
 def save_recording(
     payload: dict = Body(...),
@@ -7858,13 +8514,16 @@ def save_recording(
     archive_dir = str(payload.get("archive_dir") or "").strip()
     recording_collection = _normalize_recording_collection(payload.get("recording_collection") or "")
     require_existing = _payload_bool(payload, "require_existing", False)
-    title = _sanitize_name(str(payload.get("title") or "recording"))
-    source_text = str(payload.get("source_text") or "").strip()
-    transcript_text = str(payload.get("transcript_text") or "").strip()
-    provider = str(payload.get("provider") or "").strip()
-    model = str(payload.get("model") or "").strip()
-    language = str(payload.get("language") or "").strip()
-    source_text = _placeholder_source_text(source_text, transcript_text, provider)
+    fields = _normalize_save_fields(
+        title=payload.get("title"),
+        source_text=payload.get("source_text"),
+        transcript_text=payload.get("transcript_text"),
+        provider=payload.get("provider"),
+        model=payload.get("model"),
+        language=payload.get("language"),
+    )
+    title, source_text, transcript_text = fields.title, fields.source_text, fields.transcript_text
+    provider, model, language = fields.provider, fields.model, fields.language
 
     target_dir = _resolve_recordings_collection_target_dir(
         archive_dir,
@@ -7923,15 +8582,16 @@ async def _save_recording_audio_source(
 ) -> dict[str, Any]:
     raw_existing_name = str(name or "").strip()
     existing_name = _recording_text_name_leaf(raw_existing_name) if raw_existing_name else ""
-    safe_title = _sanitize_name(str(title or "recording"))
-    safe_source_text = str(source_text or "").strip()
-    safe_transcript_text = str(transcript_text or "").strip()
-    safe_provider = str(provider or "").strip()
-    safe_model = str(model or "").strip()
-    safe_language = str(language or "").strip()
-    safe_source_text = _placeholder_source_text(
-        safe_source_text, safe_transcript_text, safe_provider
+    fields = _normalize_save_fields(
+        title=title,
+        source_text=source_text,
+        transcript_text=transcript_text,
+        provider=provider,
+        model=model,
+        language=language,
     )
+    safe_title, safe_source_text, safe_transcript_text = fields.title, fields.source_text, fields.transcript_text
+    safe_provider, safe_model, safe_language = fields.provider, fields.model, fields.language
 
     safe_orig_name = _normalize_filename(orig_name or "recording.wav")
     _validate_audio_filename(safe_orig_name)
@@ -7992,8 +8652,12 @@ async def _save_recording_audio_source(
             ) from backup_err
     new_audio_placed = False
     save_completed = False
-    try:
-        await write_tmp_audio(tmp_audio)
+
+    def _place_audio_and_text() -> None:
+        # Blocking file work (an fsync of up to 2 GB, the transcript's
+        # fsync) runs on a worker thread, never on the event loop that
+        # carries live WebSocket frames (BM-12).
+        nonlocal new_audio_placed
         atomic_promote_file(tmp_audio, out_audio)
         new_audio_placed = True
         _write_recording_text_file(
@@ -8006,6 +8670,10 @@ async def _save_recording_audio_source(
             model=safe_model,
             language=safe_language,
         )
+
+    try:
+        await write_tmp_audio(tmp_audio)
+        await asyncio.to_thread(_place_audio_and_text)
         save_completed = True
     except BaseException:
         # Any failure after the prior audio backup was moved aside must
@@ -8041,31 +8709,31 @@ async def _save_recording_audio_source(
         # backup only survives here on the happy path (no rollback).
         if save_completed and audio_backup is not None and audio_backup.exists():
             _best_effort_unlink(audio_backup, context="recording audio backup cleanup")
-    if existing_audio is not None and existing_audio.resolve() != out_audio.resolve():
-        _best_effort_unlink(existing_audio, context="recording superseded audio cleanup")
-    # Screen mode: the take's screenshots become part of this recording —
-    # moved beside it as ``<stem>.screens`` before retention runs, so the
-    # rule below already sees them as this (exempt) recording's media.
-    screens_manifest: Optional[dict[str, Any]] = None
-    if screen_session_id:
-        try:
-            screens_manifest = screen_sessions.adopt_session(
-                DATA_DIR,
-                screen_session_id,
-                target_dir,
-                stem,
-                audio_started_at=screen_audio_started_at,
-            )
-        except OSError as e:
-            logger.warning("screen session %s adoption failed: %s", screen_session_id, e)
-    # Persist this dir only after transcript + audio are durable so startup
-    # retroactive retention does not learn failed/empty archive targets.
-    _register_archive_dir(target_dir)
-    # Audio retention, per the collection's own policy (voice notes keep
-    # the newest N, uploaded media ages out); transcripts stay forever.
-    # The stem we just wrote is exempt — a save must never be able to
-    # delete its own audio — but it still counts toward a count limit.
-    pruned = _prune_recording_audio(target_dir, keep_stems=(stem,))
+    def _file_the_saved_recording() -> tuple[Optional[dict[str, Any]], str, int]:
+        # Same thread rule as above (BM-12): moving screenshots (a copy
+        # across volumes), the retention scan of the whole folder and the
+        # registry write are file work, not event-loop work.
+        if existing_audio is not None and existing_audio.resolve() != out_audio.resolve():
+            _best_effort_unlink(existing_audio, context="recording superseded audio cleanup")
+        # Screen mode: the take's screenshots become part of this recording —
+        # moved beside it as ``<stem>.screens`` before retention runs, so the
+        # rule below already sees them as this (exempt) recording's media.
+        manifest, adopt_error = _adopt_screen_session_for_recording(
+            screen_session_id,
+            target_dir,
+            stem,
+            audio_started_at=screen_audio_started_at,
+        )
+        # Persist this dir only after transcript + audio are durable so startup
+        # retroactive retention does not learn failed/empty archive targets.
+        _register_archive_dir(target_dir)
+        # Audio retention, per the collection's own policy (voice notes keep
+        # the newest N, uploaded media ages out); transcripts stay forever.
+        # The stem we just wrote is exempt — a save must never be able to
+        # delete its own audio — but it still counts toward a count limit.
+        return manifest, adopt_error, _prune_recording_audio(target_dir, keep_stems=(stem,))
+
+    screens_manifest, screens_error, pruned = await asyncio.to_thread(_file_the_saved_recording)
     _invalidate_recordings_cache()
     # Atomically discard the live recovery spool now that the audio is
     # safely on disk. This closes the race window between a successful
@@ -8089,6 +8757,7 @@ async def _save_recording_audio_source(
         "archive_dir": str(target_dir),
         "pruned_audio_count": pruned,
         "screens": screens_manifest,
+        "screens_error": screens_error,
     }
 
 
@@ -8133,8 +8802,17 @@ async def save_recording_with_audio(
 @app.post("/api/recordings/save-from-path")
 async def save_recording_from_path(
     payload: dict = Body(...),
+    *,
+    request: Request,
     _auth: None = Depends(_require_api_auth),
 ):
+    # The CLI token may file a new recording and nothing more (BM-02/S-07):
+    # not overwrite an existing one, not register a folder, not pick a
+    # collection. Refused before the source is even resolved.
+    if getattr(request.state, "api_caller", "") == API_CALLER_CLI:
+        refusal = cli_save_request_refusal(payload or {})
+        if refusal:
+            raise HTTPException(status_code=403, detail=refusal)
     source_path = await asyncio.to_thread(
         _resolve_source_media_path,
         (payload or {}).get("source_path") or (payload or {}).get("path"),

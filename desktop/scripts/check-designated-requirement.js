@@ -20,7 +20,7 @@
 // this script is the two side effects it needs: read the signature, read
 // the bundle id.
 
-const { execFileSync } = require("node:child_process");
+const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -46,28 +46,12 @@ try {
 }
 if (!bundleId) fail(`check-designated-requirement: ${appPath} declares no CFBundleIdentifier`);
 
-let requirements = "";
-try {
-  // codesign writes the requirement to stderr.
-  requirements = execFileSync(
-    "/usr/bin/codesign",
-    ["-d", "--requirements", "-", appPath],
-    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
-  );
-} catch (e) {
-  requirements = `${e?.stdout || ""}\n${e?.stderr || ""}`;
-}
-if (!/designated\s*=>/.test(requirements)) {
-  try {
-    requirements = execFileSync(
-      "/bin/sh",
-      ["-c", `/usr/bin/codesign -d --requirements - ${JSON.stringify(appPath)} 2>&1`],
-      { encoding: "utf8" },
-    );
-  } catch (e) {
-    requirements = String(e?.stdout || "");
-  }
-}
+// One read, no shell: the requirement is printed on stdout and the
+// diagnosis (unsigned, unreadable) on stderr, so both streams are kept
+// and handed to the decision as one text.
+const read = spawnSync("/usr/bin/codesign", ["-d", "--requirements", "-", appPath], { encoding: "utf8" });
+if (read.error) fail(`check-designated-requirement: cannot run codesign: ${read.error.message}`);
+const requirements = `${read.stdout || ""}\n${read.stderr || ""}`;
 
 const verdict = designatedRequirementIsStable(requirements, bundleId);
 if (!verdict.ok) {

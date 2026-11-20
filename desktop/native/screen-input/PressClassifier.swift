@@ -25,6 +25,14 @@
 // The click count plays no part in the decision, so a double-tap-and-drag
 // whose second press this tap does see is a press that moves: a stroke.
 //
+// macOS switches an event tap off when a callback runs late or Secure
+// Input toggles (`tapDisabledByTimeout` / `tapDisabledByUserInput`).
+// Whatever happened to the press while the tap was off never reached this
+// rule, so the press it was in the middle of is abandoned (`interrupt`):
+// an open stroke is ended, a held press is handed to the app it was meant
+// for, and the next press starts from a clean state instead of inheriting
+// a phase whose events went past the tap.
+//
 // Compiled into the helper (main.swift) and, on its own, into the test
 // binary desktop/screen-input.test.js builds.
 
@@ -53,14 +61,42 @@ struct PressClassifier {
   }
 
   /// What the last finished press was, for the helper's one log line.
-  enum Outcome: String { case click, stroke, tap, controlDrag, orphanStroke }
+  /// `handedOver`: a press the tap was switched off in the middle of,
+  /// replayed to the app and passed through to its release.
+  enum Outcome: String { case click, stroke, tap, controlDrag, orphanStroke, handedOver }
+
+  /// What `interrupt` found in progress when the tap was switched off.
+  enum Abandoned: Equatable {
+    /// No press in progress.
+    case none
+    /// A stroke was being drawn; it ends at `at`, its last point.
+    case stroke(at: CGPoint)
+    /// A press was held (not yet a click or a stroke). The caller replays
+    /// it to the app. With the button still down the rest of the press is
+    /// passed through; with the button already up its release went past
+    /// the tap, so the caller completes the click.
+    case heldPress(buttonDown: Bool)
+    /// A press on one of our controls; it taps nothing.
+    case controlPress
+
+    /// The name the helper's log line uses.
+    var name: String {
+      switch self {
+      case .none: return "none"
+      case .stroke: return "stroke"
+      case .heldPress: return "held"
+      case .controlPress: return "control"
+      }
+    }
+  }
 
   let dragThreshold: Double
   var controls: [CGRect] = []
 
-  private enum Phase { case idle, held, drawing, onControl, orphanDrawing }
+  private enum Phase { case idle, held, drawing, onControl, orphanDrawing, handedOver }
   private var phase: Phase = .idle
   private var downPoint = CGPoint.zero
+  private var lastPoint = CGPoint.zero
   private var controlMoved = false
   private(set) var lastOutcome: Outcome? = nil
   private(set) var drags = 0
@@ -75,7 +111,30 @@ struct PressClassifier {
     return (dx * dx + dy * dy).squareRoot() >= dragThreshold
   }
 
+  /// The tap was switched off and is back on: abandon the press in
+  /// progress and say what it was. `buttonDown` is the left button's state
+  /// now. Afterwards the classifier is idle — or, for a held press whose
+  /// button is still down, passes the rest of that press through to the
+  /// app the caller replays it to.
+  mutating func interrupt(buttonDown: Bool) -> Abandoned {
+    let was = phase
+    phase = .idle
+    controlMoved = false
+    switch was {
+    case .idle, .handedOver:
+      return .none
+    case .drawing, .orphanDrawing:
+      return .stroke(at: lastPoint)
+    case .held:
+      if buttonDown { phase = .handedOver }
+      return .heldPress(buttonDown: buttonDown)
+    case .onControl:
+      return .controlPress
+    }
+  }
+
   mutating func classify(_ kind: Kind, at p: CGPoint) -> Decision {
+    lastPoint = p
     switch kind {
     case .down:
       downPoint = p
@@ -96,6 +155,8 @@ struct PressClassifier {
         return .strokeStart(from: downPoint)
       case .drawing, .orphanDrawing:
         return .strokeMove
+      case .handedOver:
+        return .pass
       case .idle:
         phase = .orphanDrawing
         return .strokeStart(from: p)
@@ -117,6 +178,9 @@ struct PressClassifier {
       case .orphanDrawing:
         lastOutcome = .orphanStroke
         return .strokeEndPassingUp
+      case .handedOver:
+        lastOutcome = .handedOver
+        return .pass
       case .idle:
         return .pass
       }

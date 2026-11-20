@@ -36,7 +36,10 @@ import asyncio
 import logging
 from typing import Any, Awaitable, Callable, Optional
 
-logger = logging.getLogger("transcriptor.async_tasks")
+# ``__name__`` (``backend.async_tasks``): the one handler main.py installs is on
+# the ``backend`` logger, so a hand-typed name outside that namespace is
+# dropped at INFO (BL-04).
+logger = logging.getLogger(__name__)
 
 
 async def await_cancelled(

@@ -28,6 +28,8 @@ SOURCE_APP=""
 EXPECTED_BUNDLE_ID="${TRANSCRIPTOR_EXPECTED_BUNDLE_ID:-$DEFAULT_EXPECTED_BUNDLE_ID}"
 MANIFEST_DMG_NAME=""
 MANIFEST_ZIP_NAME=""
+# Set in main() once it knows whether the install root is writable.
+NEEDS_SUDO=0
 
 log() {
   printf '[Transcriptor installer] %s\n' "$*"
@@ -78,6 +80,51 @@ verify_app() {
   local bundle_id
   bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_path/Contents/Info.plist" 2>/dev/null || true)"
   [ "$bundle_id" = "$EXPECTED_BUNDLE_ID" ] || die "Unexpected bundle id: ${bundle_id:-unknown}; expected ${EXPECTED_BUNDLE_ID}"
+}
+
+# Empty when the bundle is unsigned or has no explicit requirement.
+designated_requirement() {
+  local out
+  out="$(codesign -d --requirements - "$1" 2>/dev/null || true)"
+  printf '%s\n' "$out" | sed -n 's/^designated => //p'
+}
+
+is_adhoc_signed() {
+  local info
+  info="$(codesign -dv "$1" 2>&1 || true)"
+  case "$info" in
+    *"Signature=adhoc"*) return 0 ;;
+  esac
+  return 1
+}
+
+# macOS keys every permission grant (Accessibility, Automation, Microphone)
+# to the bundle id AND the designated requirement of the signature that
+# earned it. Installing a bundle signed by another certificate — or ad hoc,
+# whose requirement is the hash of one exact build — over a copy the user
+# has already granted leaves every switch ON in System Settings and the app
+# refused in practice. `codesign --verify` accepts both, so this is checked
+# here, as BUILD.command does with check-designated-requirement.js.
+verify_identity_continuity() {
+  local new_app="$1"
+  local installed_app="$2"
+  local new_req
+  local installed_req
+  if is_adhoc_signed "$new_app"; then
+    die "$(basename "$new_app") is ad-hoc signed: every permission granted to it would stop working at the next install. Use a build signed with the release certificate."
+  fi
+  new_req="$(designated_requirement "$new_app")"
+  [ -n "$new_req" ] || die "Cannot read the signature requirement of $new_app"
+  [ -d "$installed_app" ] || return 0
+  # An unsigned or ad-hoc installed copy had no grants that could survive.
+  if is_adhoc_signed "$installed_app"; then
+    return 0
+  fi
+  installed_req="$(designated_requirement "$installed_app")"
+  [ -n "$installed_req" ] || return 0
+  if [ "$new_req" != "$installed_req" ]; then
+    die "This build is signed by a different certificate than the installed ${installed_app}. Installing it would leave every permission you granted switched on in System Settings but refused. If you mean to switch certificates, remove ${installed_app} first and grant the permissions again."
+  fi
 }
 
 read_manifest_value() {
@@ -187,12 +234,16 @@ prepare_source_app() {
 quit_existing_app() {
   osascript -e "tell application \"${PRODUCT_NAME}\" to quit" >/dev/null 2>&1 || true
   local deadline=$((SECONDS + 12))
+  local killed=0
   while pgrep -x "$PRODUCT_NAME" >/dev/null 2>&1; do
     if [ "$SECONDS" -ge "$deadline" ]; then
+      # Replacing a bundle under a live process is exactly what this step
+      # exists to prevent: stop it, and refuse to go on if it will not go.
+      [ "$killed" = "0" ] || die "${PRODUCT_NAME} is still running; quit it and run the installer again."
       log "Stopping still-running ${PRODUCT_NAME} process"
       pkill -x "$PRODUCT_NAME" >/dev/null 2>&1 || true
-      sleep 1
-      break
+      killed=1
+      deadline=$((SECONDS + 5))
     fi
     sleep 1
   done
@@ -253,6 +304,7 @@ main() {
   load_release_manifest
   prepare_source_app
   verify_app "$SOURCE_APP"
+  verify_identity_continuity "$SOURCE_APP" "$TARGET_APP"
 
   local target_parent
   target_parent="$(dirname "$TARGET_ROOT")"
@@ -277,4 +329,8 @@ main() {
   fi
 }
 
-main "$@"
+# Run when executed; when sourced (desktop/packaging.test.js drives single
+# functions) define the functions only.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

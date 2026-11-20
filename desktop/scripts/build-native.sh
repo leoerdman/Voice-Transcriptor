@@ -10,7 +10,8 @@
 # runtime pre-sign pass signs it with the same identity and options as
 # every other bundled Mach-O.
 #
-# Usage: build-native.sh <target>   (mac-arm64 | mac-x64 | win-x64 | linux-x64)
+# Usage: build-native.sh <target>   (mac-arm64 | win-x64 | linux-x64)
+# macOS release builds are arm64-only (BUILD.command, prepare-runtime.sh).
 set -euo pipefail
 
 TARGET="${1:?usage: build-native.sh <target>}"
@@ -23,7 +24,10 @@ mkdir -p "$OUT_DIR"
 
 case "$TARGET" in
   mac-arm64) ARCH="arm64" ;;
-  mac-x64) ARCH="x86_64" ;;
+  mac-*)
+    echo "[build-native] $TARGET: macOS builds are arm64-only" >&2
+    exit 1
+    ;;
   *)
     # Screen mode is macOS-only; other targets ship an empty directory so
     # the packaging layout is the same everywhere.

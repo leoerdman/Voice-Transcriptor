@@ -179,6 +179,31 @@ class MergeSeamFragmentsTests(unittest.TestCase):
             [w["word"] for w in out[1]["words"]], ["Некоторые", "слова"],
         )
 
+    def test_a_fused_word_keeps_the_evidence_of_its_halves(self):
+        """BE-08: the dual merge decides contested stretches from each
+        word's ``confidence``/``language``; a fused word without them ends
+        a contested run in the middle of the stretch."""
+        segs = [
+            {
+                "start": 0.0, "end": 1.0, "text": "kompiuter",
+                "words": [{"word": "kompiuterių", "start": 0.4, "end": 1.0,
+                           "confidence": 0.9, "language": "lt"}],
+            },
+            {
+                "start": 1.0, "end": 2.0, "text": "ių net",
+                "words": [
+                    {"word": "ių", "start": 1.0, "end": 1.2, "confidence": 0.5, "language": "en"},
+                    {"word": "net", "start": 1.2, "end": 1.6, "confidence": 0.8, "language": "lt"},
+                ],
+            },
+        ]
+        out = merge_seam_fragments(segs)
+        fused = out[0]["words"][-1]
+        self.assertEqual(fused["word"], "kompiuteriųių")
+        # Duration-weighted: 0.6 s at 0.9 and 0.2 s at 0.5.
+        self.assertAlmostEqual(fused["confidence"], 0.8, places=3)
+        self.assertEqual(fused["language"], "lt")
+
     def test_words_far_apart_are_not_merged_even_when_the_text_disagrees(self):
         segs = [
             {

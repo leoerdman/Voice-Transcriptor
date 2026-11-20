@@ -287,6 +287,43 @@ class TestConfigLifecycle(unittest.TestCase):
                 )
 
 
+class LegacyKeyAdoptionTests(unittest.TestCase):
+    """BM-22: adopting the legacy key replaces the keyfile in one rename; a
+    failed write leaves the current key on disk, matching the cipher this
+    process keeps using."""
+
+    def setUp(self):
+        self._old_data_dir = os.environ.get("TRANSCRIPTOR_DATA_DIR")
+        self._tmp = tempfile.TemporaryDirectory()
+        self.mod = _reload_config_module(self._tmp.name)
+        if not self.mod._HAS_CRYPTO:
+            self.skipTest("cryptography is not installed")
+        legacy = os.path.join(self._tmp.name, "legacy")
+        os.makedirs(legacy)
+        from cryptography.fernet import Fernet
+
+        with open(os.path.join(legacy, ".encryption_key"), "wb") as f:
+            f.write(Fernet.generate_key())
+        self.mod.LEGACY_DATA_DIR = self.mod.Path(legacy)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+        if self._old_data_dir is None:
+            os.environ.pop("TRANSCRIPTOR_DATA_DIR", None)
+        else:
+            os.environ["TRANSCRIPTOR_DATA_DIR"] = self._old_data_dir
+
+    def test_a_failed_write_keeps_the_current_keyfile(self):
+        import errno
+        from unittest import mock
+
+        before = self.mod._KEYFILE.read_bytes()
+        with mock.patch("os.fsync", side_effect=OSError(errno.EIO, "Input/output error")):
+            self.mod._adopt_legacy_encryption_key()
+        self.assertEqual(self.mod._KEYFILE.read_bytes(), before, "the key in use no longer exists on disk")
+        self.assertEqual(self.mod._FERNET_KEY, before)
+
+
 class SchemaStampTests(unittest.TestCase):
     """``load_config()`` is a READ (B-018).
 
@@ -452,6 +489,19 @@ class EmptyKeyfileTests(unittest.TestCase):
         self.assertEqual(
             mod.load_config()["providers"]["openrouter"]["key"], "sk-secret"
         )
+
+    def test_a_whitespace_only_keyfile_is_an_empty_one(self):
+        # BM-21: an editor's lone newline read as "no key" when loading and
+        # as "has content" when deciding to replace — encryption off for good.
+        from pathlib import Path
+
+        keyfile = Path(self.data_dir) / ".encryption_key"
+        keyfile.write_bytes(b"\n")
+        mod = _reload_config_module(self.data_dir)
+        if not mod._HAS_CRYPTO:
+            self.skipTest("cryptography is not installed")
+        self.assertIsNotNone(mod._FERNET, "a whitespace keyfile left encryption off")
+        self.assertTrue(keyfile.read_bytes().strip())
 
     def test_a_keyfile_with_content_is_never_replaced(self):
         from pathlib import Path

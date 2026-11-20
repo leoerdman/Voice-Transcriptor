@@ -36,8 +36,20 @@
  *   4. Closing the window (red button, Cmd+W) and Cmd+Q both quit — on
  *      every platform. "Closed" means "not running".
  *   5. Nothing else moves the window. The recording capsule in particular
- *      is a separate, non-focusable, always-on-top panel: it never hides,
+ *      is a separate, non-focusable, always-on-top window: it never hides,
  *      focuses or reorders the main window.
+ *
+ * What rule 5 still rests on, stated so nobody mistakes it for solved:
+ * outside screen mode, a click on the capsule is an ordinary click the
+ * window server delivers to a window of an inactive app, and macOS answers
+ * it with an `activate` the app cannot refuse (measured 2026-11-20: the
+ * main window has focus 0.5 s after a capsule click, `type: "panel"` or
+ * not). main.js marks such an activate as `capsuleInteraction` by a time
+ * window it opens when the capsule reports a click — a clock, not an
+ * identity: a genuine Dock click inside that window is taken for the
+ * capsule's. In screen mode the capsule's clicks never reach the window
+ * server (the native helper turns them into in-process taps), so there the
+ * question does not arise.
  */
 
 /** Every event the Electron side is allowed to report. */
@@ -133,7 +145,7 @@ function decideWindowAction(event, context = {}) {
     return { action: WINDOW_LIFECYCLE_ACTIONS.none, reason: "native-minimise" };
   }
 
-  // capsuleShown — the capsule is a panel, not a window manager.
+  // capsuleShown — the capsule is a window of its own, not a window manager.
   return { action: WINDOW_LIFECYCLE_ACTIONS.none, reason: "capsule-never-moves-main-window" };
 }
 

@@ -7,15 +7,42 @@ import Foundation
 
 typealias D = PressClassifier.Decision
 
-func run(_ name: String, controls: [CGRect] = [], _ steps: [(PressClassifier.Kind, Double, Double, D)]) {
-  var c = PressClassifier(dragThreshold: 5)
-  c.controls = controls
+typealias Step = (PressClassifier.Kind, Double, Double, D)
+
+func fail(_ message: String) -> Never {
+  FileHandle.standardError.write("FAIL \(message)\n".data(using: .utf8)!)
+  exit(1)
+}
+
+func play(_ name: String, _ c: inout PressClassifier, _ steps: [Step]) {
   for (i, step) in steps.enumerated() {
     let got = c.classify(step.0, at: CGPoint(x: step.1, y: step.2))
-    if got != step.3 {
-      FileHandle.standardError.write("FAIL \(name) step \(i): expected \(step.3), got \(got)\n".data(using: .utf8)!)
-      exit(1)
-    }
+    if got != step.3 { fail("\(name) step \(i): expected \(step.3), got \(got)") }
+  }
+}
+
+func run(_ name: String, controls: [CGRect] = [], _ steps: [Step]) {
+  var c = PressClassifier(dragThreshold: 5)
+  c.controls = controls
+  play(name, &c, steps)
+  print("ok \(name)")
+}
+
+/// macOS switches the tap off after `before` and back on: `interrupt`
+/// must report `abandoned`, and `after` must classify from that state.
+func runInterrupted(
+  _ name: String, controls: [CGRect] = [], _ before: [Step],
+  buttonDown: Bool, abandoned: PressClassifier.Abandoned, after: [Step],
+  outcome: PressClassifier.Outcome? = nil
+) {
+  var c = PressClassifier(dragThreshold: 5)
+  c.controls = controls
+  play(name, &c, before)
+  let got = c.interrupt(buttonDown: buttonDown)
+  if got != abandoned { fail("\(name) interrupt: expected \(abandoned), got \(got)") }
+  play(name + " (after)", &c, after)
+  if let outcome = outcome, c.lastOutcome != outcome {
+    fail("\(name): expected outcome \(outcome), got \(String(describing: c.lastOutcome))")
   }
   print("ok \(name)")
 }
@@ -98,4 +125,49 @@ run("a drag with no press seen still draws, and its release passes on", [
 
 run("a release with no press seen passes", [
   (.up, 1, 1, .pass),
+])
+
+// macOS switched the tap off in the middle of a stroke (a late callback,
+// Secure Input). The stroke ends at its last point, and the next press —
+// a trackpad double-tap-and-drag — draws from a clean state instead of
+// inheriting the dead stroke's phase.
+runInterrupted("a tap switched off mid-stroke ends the stroke and the next drag draws", [
+  (.down, 100, 100, .hold),
+  (.dragged, 120, 100, .strokeStart(from: CGPoint(x: 100, y: 100))),
+  (.dragged, 150, 110, .strokeMove),
+], buttonDown: false, abandoned: .stroke(at: CGPoint(x: 150, y: 110)), after: [
+  (.down, 200, 200, .hold),
+  (.up, 200, 200, .replayClick),
+  (.down, 200, 200, .hold),
+  (.dragged, 220, 210, .strokeStart(from: CGPoint(x: 200, y: 200))),
+  (.up, 230, 210, .strokeEnd),
+])
+
+// The release went past the switched-off tap: nothing of the old press is
+// left, and a drag that follows is a fresh stroke of its own.
+runInterrupted("a held press whose release went past the tap is handed over", [
+  (.down, 100, 100, .hold),
+], buttonDown: false, abandoned: .heldPress(buttonDown: false), after: [
+  (.dragged, 300, 300, .strokeStart(from: CGPoint(x: 300, y: 300))),
+  (.up, 300, 300, .strokeEndPassingUp),
+])
+
+// The button is still down: the replayed press belongs to the app now, so
+// the rest of it passes through untouched.
+runInterrupted("a held press still down passes through to its release", [
+  (.down, 100, 100, .hold),
+], buttonDown: true, abandoned: .heldPress(buttonDown: true), after: [
+  (.dragged, 140, 100, .pass),
+  (.up, 140, 100, .pass),
+], outcome: .handedOver)
+
+runInterrupted("a press on a control cut by the tap taps nothing", controls: [capsule], [
+  (.down, 720, 915, .hold),
+], buttonDown: false, abandoned: .controlPress, after: [
+  (.up, 720, 915, .pass),
+])
+
+runInterrupted("an idle tap switched off abandons nothing", [], buttonDown: false, abandoned: .none, after: [
+  (.down, 10, 10, .hold),
+  (.up, 10, 10, .replayClick),
 ])

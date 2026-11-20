@@ -537,9 +537,10 @@ class LiveSession:
                 continue
             if trimmed != text:
                 logger.info(
-                    "trimmed a re-decoded overlap from a live segment: %r -> %r",
-                    text[:60],
-                    trimmed[:60],
+                    "trimmed a re-decoded overlap from a live segment: "
+                    "%d -> %d chars",
+                    len(text),
+                    len(trimmed),
                 )
                 text = trimmed
                 # Move the event's start past the committed watermark,

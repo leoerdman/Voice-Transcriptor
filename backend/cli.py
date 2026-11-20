@@ -65,6 +65,8 @@ except ImportError:  # Run as ``python /abs/path/backend/cli.py`` — it is not.
     from backend.data_dir import default_data_dir
 
 PROGRAM = "transcriptor"
+#: The token override that does not show in the process list (``--token`` does).
+CLI_TOKEN_ENV = "TRANSCRIPTOR_CLI_TOKEN"
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -124,7 +126,13 @@ def load_connection(
     harness, an app started with ``TRANSCRIPTOR_API_TOKEN``. Given both,
     the file is not read at all — so a stale file cannot quietly win
     over what the command said.
+
+    A token on the command line is visible to every user of the machine
+    in the process list, so the same override can come from the
+    environment instead: ``TRANSCRIPTOR_CLI_TOKEN`` (a ``--token`` given
+    explicitly still wins).
     """
+    token = token or os.environ.get(CLI_TOKEN_ENV, "").strip()
     if base_url and token:
         return Connection(base_url, token, source="--base-url/--token")
     path = Path(connection_file).expanduser() if connection_file else default_connection_path()
@@ -327,6 +335,10 @@ def create_job(conn: Connection, source_path: str, options: dict, args: argparse
         if args.speakers:
             payload["num_speakers"] = str(args.speakers)
         route = "/api/remote/jobs/from-path"
+    # The backend snapshots the file for the job; only --save uses that
+    # copy afterwards (it becomes the recording's audio). Otherwise the
+    # app deletes it when the job ends instead of keeping it for 24 h.
+    payload["keep_source"] = bool(getattr(args, "save", False))
     created = _request(conn, "POST", route, payload)
     job_id = str((created or {}).get("job_id") or "").strip()
     if not job_id:
@@ -679,7 +691,8 @@ def _add_common(parser: argparse.ArgumentParser, *, top_level: bool) -> None:
     parser.add_argument("--base-url", default=default(""), metavar="URL",
                         help="the app's address, overriding the connection file")
     parser.add_argument("--token", default=default(""), metavar="TOKEN",
-                        help="command-line token, overriding the connection file")
+                        help="command-line token, overriding the connection file "
+                             "(visible in the process list; prefer TRANSCRIPTOR_CLI_TOKEN)")
     parser.add_argument("--out", default=default(""), metavar="FILE",
                         help="write the output to FILE instead of stdout")
     parser.add_argument("--json", action="store_true", default=default(False),

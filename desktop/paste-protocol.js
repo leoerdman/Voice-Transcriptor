@@ -21,6 +21,14 @@
 /** Successful outcome, e.g. `OK:robust-paste:verified`, `OK:vbs-paste`. */
 const PASTE_OK_PREFIX = "OK:";
 
+/**
+ * The Windows paste scripts' own method names, as printed after
+ * `PASTE_OK_PREFIX` / `PASTE_SENT_PREFIX`: the VBS SendKeys paste and the
+ * PowerShell SendKeys fallback (both built in main.js).
+ */
+const VBS_PASTE_METHOD = "vbs-paste";
+const PWSH_PASTE_METHOD = "pwsh-paste";
+
 /** Considered failure verdict from the script itself, e.g. `ERR:activate`. */
 const PASTE_ERR_PREFIX = "ERR:";
 
@@ -55,6 +63,8 @@ const PASTE_SENT_RECEIPT_RE = new RegExp(`(^|[\\r\\n])(${PASTE_SENT_PREFIX}[A-Za
 
 module.exports = {
   PASTE_OK_PREFIX,
+  VBS_PASTE_METHOD,
+  PWSH_PASTE_METHOD,
   PASTE_ERR_PREFIX,
   PASTE_SENT_PREFIX,
   AX_TRACE_PREFIX,

@@ -61,6 +61,18 @@ node ./scripts/sign-mas.js --preflight
 echo "[mas-build] Preparing bundled runtime"
 bash ./scripts/prepare-runtime.sh mac-arm64
 
+# electron-builder builds the mas target from build.mac MERGED with
+# build.mas (app-builder-lib macPackager getPlatformConfig → deepAssign,
+# which concatenates arrays), so build.mac.extraResources' screen-mode
+# helper entry (native/build/mac-<arch> → runtime/bin) applies here too.
+# The App Store build ships no helper — an active CGEventTap cannot run
+# in the App Sandbox — so that directory is emptied; afterPack refuses a
+# MAS bundle that still carries one. A dev run rebuilds it with
+# `bash scripts/build-native.sh mac-arm64` (every mac dist script does).
+echo "[mas-build] Leaving screen mode's native helper out of the App Store build"
+rm -rf ./native/build/mac-arm64
+mkdir -p ./native/build/mac-arm64
+
 echo "[mas-build] Unlocking previous dist outputs"
 node ./unlockDist.js
 

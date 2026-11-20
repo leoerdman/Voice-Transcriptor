@@ -82,12 +82,24 @@ class AudioRetentionTestBase(unittest.TestCase):
         stamp = NOW - age_sec
         if with_transcript:
             txt = d / f"{stem}.txt"
-            txt.write_text("transcript", encoding="utf-8")
+            txt.write_text(self._app_transcript(stem), encoding="utf-8")
             os.utime(txt, (stamp, stamp))
         audio = d / f"{stem}{ext}"
         audio.write_bytes(b"audio")
         os.utime(audio, (stamp, stamp))
         return audio
+
+    def _app_transcript(self, title: str) -> str:
+        """A transcript as the app writes it — the header is what makes a
+        same-stem media file the app's own (``_is_app_recording_text``)."""
+        return self.main._render_recording_content(
+            title=title,
+            source_text="",
+            transcript_text="transcript",
+            provider="local",
+            model="",
+            language="",
+        )
 
     def _set_live_keep(self, count: int) -> None:
         """Point the LIVE policy at a small count for a sweep test.
@@ -448,11 +460,89 @@ class SweepFanOutTests(AudioRetentionTestBase):
             key: disabled for key in self.main.AUDIO_RETENTION_POLICIES
         }
         self.main.DEFAULT_AUDIO_RETENTION_POLICY = disabled
+        # The timer also owns the job results' age limit (BL-18); with that
+        # off too, there is nothing for it to enforce.
+        self.main.RESULT_RETENTION_SEC = 0
         self.main._audio_retention_sweeper_thread = None
 
         self.main.start_audio_retention_sweeper()
 
         self.assertIsNone(self.main._audio_retention_sweeper_thread)
+
+    def test_sweeper_thread_still_starts_for_the_results_limit_alone(self) -> None:
+        disabled = self.main.AudioRetentionPolicy()
+        self.main.AUDIO_RETENTION_POLICIES = {
+            key: disabled for key in self.main.AUDIO_RETENTION_POLICIES
+        }
+        self.main.DEFAULT_AUDIO_RETENTION_POLICY = disabled
+        self.main.RESULT_RETENTION_SEC = 3600
+        self.main._audio_retention_sweeper_thread = None
+
+        self.main.start_audio_retention_sweeper()
+
+        self.assertIsNotNone(self.main._audio_retention_sweeper_thread)
+
+
+class RetentionLogTests(AudioRetentionTestBase):
+    """BL-02: the retention line names a recording by timestamp + digest —
+    its file name carries the first words dictated, and main.log is what
+    users attach for support."""
+
+    def test_the_removed_line_does_not_carry_the_title(self) -> None:
+        self._recording("2026-11-08_10-00-00-000000__call mum about the tests", age_sec=5 * MINUTE)
+        self._recording("2026-11-08_11-00-00-000000__newer", age_sec=1 * MINUTE)
+        with self.assertLogs("backend.main", level="INFO") as logs:
+            self.main._prune_recording_audio(self.root, now=NOW, policy=self._keep(1))
+        joined = "\n".join(logs.output)
+        self.assertIn("audio retention: removed 2026-11-08_10-00-00-000000#", joined)
+        self.assertNotIn("call mum", joined)
+
+
+class UserFilesAreNeverOursTests(AudioRetentionTestBase):
+    """BM-03: the archive folder is user-chosen (it may be ~/Movies). A
+    media file beside a same-stem ``.txt`` the app did not write is the
+    user's own pair — retention and "delete all" must never touch it."""
+
+    def _user_pair(self, directory: Path, stem: str, *, age_sec: float) -> tuple[Path, Path]:
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = NOW - age_sec
+        txt = directory / f"{stem}.txt"
+        txt.write_text("my notes for the talk", encoding="utf-8")
+        media = directory / f"{stem}.mp4"
+        media.write_bytes(b"user video")
+        for p in (txt, media):
+            os.utime(p, (stamp, stamp))
+        return txt, media
+
+    def test_retention_never_collects_a_users_own_media(self) -> None:
+        txt, media = self._user_pair(self.root, "talk", age_sec=10 * MINUTE)
+        self._recording("old-take", age_sec=5 * MINUTE)
+        self._recording("new-take", age_sec=1 * MINUTE)
+
+        self.main._prune_recording_audio(self.root, now=NOW, policy=self._keep(1))
+
+        self.assertTrue(media.exists(), "the user's own video was deleted by retention")
+        self.assertTrue(txt.exists())
+        self.assertEqual(self._surviving_audio(self.root), {"new-take.webm", "talk.mp4"})
+
+    def test_a_users_pair_does_not_take_a_slot_in_the_count(self) -> None:
+        self._user_pair(self.root, "talk", age_sec=0)
+        self._recording("only-take", age_sec=1 * MINUTE)
+
+        self.main._prune_recording_audio(self.root, now=NOW, policy=self._keep(1))
+
+        self.assertIn("only-take.webm", self._surviving_audio(self.root))
+
+    def test_delete_all_leaves_a_users_own_pair_alone(self) -> None:
+        txt, media = self._user_pair(self.root, "talk", age_sec=0)
+        self._recording("take", age_sec=0)
+
+        result = self.main._delete_all_recordings_sync()
+
+        self.assertTrue(txt.exists(), "delete-all removed the user's own .txt")
+        self.assertTrue(media.exists(), "delete-all removed the user's own video")
+        self.assertFalse((self.root / "take.txt").exists())
+        self.assertEqual(result, {"deleted": 1, "failed": 0})
 
 
 if __name__ == "__main__":

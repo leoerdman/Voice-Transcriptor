@@ -39,8 +39,10 @@ export function acceleratorToDisplayTokens(acc: string, isMac: boolean): string[
     const lc = p.trim().toLowerCase();
     if (isMac && (lc === "command" || lc === "cmd")) { labels.push("Command"); continue; }
     if (!isMac && lc === "super") { labels.push("Super"); continue; }
+    // CommandOrControl never reaches this loop: the normalisation above
+    // already turned it into the platform's word. Restating that mapping
+    // here was a second place to change it.
     if (lc === "control" || lc === "ctrl") { labels.push("Control"); continue; }
-    if (lc === "commandorcontrol" || lc === "cmdorctrl") { labels.push(isMac ? "Command" : "Control"); continue; }
     if (lc === "alt" || lc === "option") { labels.push(isMac ? "Option" : "Alt"); continue; }
     if (lc === "shift") { labels.push("Shift"); continue; }
     if (lc === "tab") { labels.push("Tab"); continue; }
@@ -55,4 +57,52 @@ export function acceleratorToDisplayTokens(acc: string, isMac: boolean): string[
     labels.push(p.trim());
   }
   return labels;
+}
+
+/** What the desktop shell reports for one slot after registering it. */
+export interface ShortcutSlotStatus {
+  active?: string;
+  desired?: string;
+  error?: string;
+}
+
+export interface ShortcutBadge {
+  conflict: boolean;
+  title: string;
+}
+
+/** F1–F12: the keys macOS treats as media keys when Fn mode is off. */
+const MAC_MEDIA_FUNCTION_KEY = /^F([1-9]|1[0-2])$/;
+
+/**
+ * The conflict badge of one shortcut button in Settings.
+ *
+ * Two ways a shortcut that looks saved does nothing: the OS refused the
+ * registration (another app owns it), or macOS with "F-keys as media
+ * keys" swallows an F1–F12 press before the app sees it — registration
+ * succeeds and the handler never fires. The screenshot key is bound
+ * only while screen mode runs, so "not active" is its normal state at
+ * rest; only an error is a conflict for it.
+ */
+export function shortcutBadge(
+  slotId: string,
+  status: ShortcutSlotStatus,
+  macFnCollision: boolean,
+): ShortcutBadge {
+  const active = slotId === "screenShot" ? !status.error : !!status.active;
+  const desired = status.desired || "";
+  if (!active) {
+    return { conflict: true, title: `Not registered: ${status.error || "unknown reason"}` };
+  }
+  if (macFnCollision && MAC_MEDIA_FUNCTION_KEY.test(desired)) {
+    return {
+      conflict: true,
+      title:
+        `macOS is intercepting ${desired} as a media key. `
+        + `Either enable System Settings → Keyboard → Keyboard Shortcuts → Function Keys → "Use F1, F2 as standard function keys", `
+        + `or hold Fn while pressing ${desired}, `
+        + `or pick a non-F-key accelerator here.`,
+    };
+  }
+  return { conflict: false, title: "" };
 }

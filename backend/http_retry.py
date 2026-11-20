@@ -227,6 +227,12 @@ def request_with_retry(
                 )
                 time.sleep(delay)
                 continue
+            if last_resp is not None and last_resp is not resp:
+                # An earlier transient response this call will not return
+                # (BM-24): released on every exit, not only when a newer
+                # transient one replaces it.
+                _close_quietly(last_resp)
+                last_resp = None
             if retried:
                 logger.info(
                     "%s: HTTP %d after %d retr%s in %.2fs",
@@ -264,6 +270,9 @@ def request_with_retry(
             )
             time.sleep(retry_delay)
     if last_err is not None:
+        if last_resp is not None:
+            _close_quietly(last_resp)
+            last_resp = None
         # The end of the road: the user is about to see an error. Record
         # what it cost to get here, because "the upload failed" with no
         # history behind it is the report that cannot be diagnosed.

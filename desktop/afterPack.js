@@ -62,6 +62,7 @@ const { existsSync } = require("node:fs");
 const path = require("node:path");
 const {
   assertNoBundledBytecode,
+  assertScreenInputHelper,
   hardenAppTransportSecurity,
   hasSigningIdentity,
   makeBundledPythonImportsReadOnly,
@@ -113,6 +114,11 @@ exports.default = async function afterPack(context) {
     extendInfo: platformCfg.extendInfo,
     log: (message) => console.log(message.replace("[macos-signing]", "[afterPack]")),
   });
+
+  // Screen mode's helper ships in every mac build except the App Store
+  // one; a build that disagrees fails here instead of shipping a screen
+  // hotkey that is silently never offered (or a helper the sandbox kills).
+  const screenInputHelper = assertScreenInputHelper(appPath, { expected: !isMas });
 
   if (isMas) {
     assertNoBundledBytecode(appPath);
@@ -341,6 +347,14 @@ exports.default = async function afterPack(context) {
   execFileSync(
     "/usr/bin/codesign",
     ["--verify", "--deep", "--strict", "--verbose=2", appPath],
+    { stdio: "inherit" },
+  );
+  // The helper lives under Resources, which `--deep` covers only by the
+  // envelope hash: verify its own signature too (macOS refuses to give an
+  // event tap to an unsigned or broken binary under hardened runtime).
+  execFileSync(
+    "/usr/bin/codesign",
+    ["--verify", "--strict", "--verbose=2", screenInputHelper],
     { stdio: "inherit" },
   );
 

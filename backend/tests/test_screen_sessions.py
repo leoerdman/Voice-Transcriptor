@@ -129,6 +129,87 @@ class AdoptionTests(unittest.TestCase):
         self.assertIsNone(screen_sessions.screenshot_path(self.archive, "r", "../r.txt"))
         self.assertIsNone(screen_sessions.screenshot_path(self.archive, "r", "shot-09.png"))
 
+    # ── BM-05 / BM-06: adoption is all or nothing ─────────────────
+    def _previous_screens(self) -> Path:
+        old = self.archive / "r.screens"
+        old.mkdir()
+        (old / "shot-01.png").write_bytes(b"previous")
+        return old
+
+    def _no_work_dirs(self) -> None:
+        self.assertEqual([p.name for p in self.archive.iterdir() if ".tmp-" in p.name], [])
+
+    def test_a_failed_manifest_write_keeps_the_old_screenshots_and_the_staging(self) -> None:
+        from unittest import mock
+
+        old = self._previous_screens()
+        staged = _stage(self.data)
+        with mock.patch.object(screen_sessions, "atomic_write_json", side_effect=OSError("disk full")):
+            with self.assertRaises(screen_sessions.ScreenAdoptionError):
+                screen_sessions.adopt_session(self.data, SESSION, self.archive, "r")
+        self.assertEqual((old / "shot-01.png").read_bytes(), b"previous")
+        self.assertTrue((staged / "shot-02.png").is_file(), "the staged take must survive for a retry")
+        self._no_work_dirs()
+
+    def test_a_cross_volume_copy_failing_part_way_leaves_no_partial_folder(self) -> None:
+        import errno
+        from unittest import mock
+
+        old = self._previous_screens()
+        staged = _stage(self.data)
+        real_replace = Path.replace
+
+        def exdev_for_staging(path_self, target):
+            if path_self == staged:
+                raise OSError(errno.EXDEV, "cross-device link")
+            return real_replace(path_self, target)
+
+        def partial_copy(src, dst, **_kw):
+            Path(dst).mkdir()
+            (Path(dst) / "shot-01.png").write_bytes(b"half")
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        with mock.patch.object(Path, "replace", exdev_for_staging), \
+                mock.patch.object(screen_sessions.shutil, "copytree", partial_copy):
+            with self.assertRaises(screen_sessions.ScreenAdoptionError):
+                screen_sessions.adopt_session(self.data, SESSION, self.archive, "r")
+        self.assertEqual((old / "shot-01.png").read_bytes(), b"previous")
+        self.assertTrue((staged / "shot-01.png").is_file())
+        self._no_work_dirs()
+
+    def test_a_cross_volume_adoption_removes_the_staging_only_once_archived(self) -> None:
+        import errno
+        from unittest import mock
+
+        staged = _stage(self.data)
+        real_replace = Path.replace
+
+        def exdev_for_staging(path_self, target):
+            if path_self == staged:
+                raise OSError(errno.EXDEV, "cross-device link")
+            return real_replace(path_self, target)
+
+        with mock.patch.object(Path, "replace", exdev_for_staging):
+            manifest = screen_sessions.adopt_session(self.data, SESSION, self.archive, "r")
+        self.assertEqual(manifest["dir"], str(self.archive / "r.screens"))
+        self.assertFalse(staged.exists())
+        self.assertEqual(screen_sessions.list_screenshots(self.archive, "r"), ["shot-01.png", "shot-02.png"])
+        self._no_work_dirs()
+
+    def test_a_reasave_replaces_the_previous_screenshots_atomically(self) -> None:
+        self._previous_screens()
+        _stage(self.data)
+        screen_sessions.adopt_session(self.data, SESSION, self.archive, "r")
+        self.assertEqual((self.archive / "r.screens" / "shot-01.png").read_bytes(), b"\x89PNG fake")
+        self._no_work_dirs()
+
+    def test_malformed_events_do_not_fail_the_adoption(self) -> None:
+        staged = _stage(self.data)
+        (staged / "events.json").write_text(json.dumps({"version": 1, "id": SESSION, "events": 5}), encoding="utf-8")
+        manifest = screen_sessions.adopt_session(self.data, SESSION, self.archive, "r")
+        self.assertEqual(manifest["events"], [])
+        self.assertEqual(screen_sessions.read_manifest(self.archive / "r.screens")["events"], [])
+
     def test_orphans_age_out_and_fresh_ones_stay(self) -> None:
         old = _stage(self.data, "screen-20261101-000000-000")
         fresh = _stage(self.data, "screen-20261120-000000-000")
@@ -181,7 +262,9 @@ class ArchiveIntegrationTests(unittest.TestCase):
         self._home.cleanup()
 
     def _recording(self, stem: str, mtime: float) -> None:
-        (self.screen_dir / f"{stem}.txt").write_text("Title: t\n\nTranscription:\nhi\n", encoding="utf-8")
+        (self.screen_dir / f"{stem}.txt").write_text(
+            "Title: t\nSaved at: 2026-11-20 10:00:00\n\nTranscription:\nhi\n", encoding="utf-8"
+        )
         audio = self.screen_dir / f"{stem}.wav"
         audio.write_bytes(b"RIFF")
         screens = self.screen_dir / f"{stem}.screens"
@@ -229,6 +312,204 @@ class ArchiveIntegrationTests(unittest.TestCase):
         self.assertIsNone(payload["screens_manifest"], "no events.json in this fixture")
         self.assertEqual(payload["screens_dir"], str(self.screen_dir / "take.screens"))
         self.assertEqual(payload["recording_collection"], self.main.RECORDING_COLLECTION_SCREEN)
+
+
+class OneRecordingOneRuleTests(unittest.TestCase):
+    """BM-07/S-05, BM-08, BM-10, BM-11/S-06: a recording's audio and its
+    screenshots are one thing to retention and to "delete all"."""
+
+    setUp = ArchiveIntegrationTests.setUp
+    tearDown = ArchiveIntegrationTests.tearDown
+    _recording = ArchiveIntegrationTests._recording
+
+    def test_a_touched_screens_folder_does_not_outrank_its_recording(self) -> None:
+        # Finder writing .DS_Store into the OLDEST take's folder made it the
+        # "newest" screens folder: its screenshots survived while a newer
+        # take's were collected, and audio/screens of one recording split.
+        for i in range(6):
+            self._recording(f"take-{i}", NOW - (6 - i) * 60)
+        touched = self.screen_dir / "take-0.screens"
+        os.utime(touched, (NOW, NOW))
+        self.main._prune_recording_audio(self.screen_dir, now=NOW)
+        kept_screens = sorted(p.name for p in self.screen_dir.glob("*.screens"))
+        kept_audio = sorted(p.name for p in self.screen_dir.glob("*.wav"))
+        self.assertEqual(kept_audio, [f"take-{i}.wav" for i in range(1, 6)])
+        self.assertEqual(kept_screens, [f"take-{i}.screens" for i in range(1, 6)])
+
+    def _app_screens_without_transcript(self, stem: str, mtime: float) -> Path:
+        folder = self.screen_dir / f"{stem}.screens"
+        folder.mkdir()
+        (folder / "shot-01.png").write_bytes(b"png")
+        (folder / "events.json").write_text(json.dumps({"version": 1, "id": SESSION, "events": []}), encoding="utf-8")
+        os.utime(folder, (mtime, mtime))
+        return folder
+
+    def test_screenshots_whose_transcript_is_gone_are_collected_after_the_grace(self) -> None:
+        stale = self._app_screens_without_transcript("deleted-in-finder", NOW - 10 * 24 * 3600)
+        fresh = self._app_screens_without_transcript("just-now", NOW - 60)
+        user = self.screen_dir / "mine.screens"
+        user.mkdir()
+        os.utime(user, (NOW - 10 * 24 * 3600,) * 2)
+        self.main._prune_recording_audio(self.screen_dir, now=NOW)
+        self.assertFalse(stale.exists())
+        self.assertTrue(fresh.exists())
+        self.assertTrue(user.exists(), "a folder without the app's manifest is not ours")
+
+    def test_delete_all_removes_screenshots_whose_transcript_is_gone(self) -> None:
+        orphan = self._app_screens_without_transcript("deleted-in-finder", NOW)
+        self.main._register_archive_dir(self.root)
+        self.main._delete_all_recordings_sync()
+        self.assertFalse(orphan.exists())
+
+    def test_delete_all_puts_everything_back_when_the_screenshots_are_locked(self) -> None:
+        from unittest import mock
+
+        self._recording("take", NOW)
+        screens = self.screen_dir / "take.screens"
+        real_replace = os.replace
+
+        def locked(src, dst, *a, **kw):
+            if Path(src) == screens:
+                raise PermissionError("locked")
+            return real_replace(src, dst, *a, **kw)
+
+        self.main._register_archive_dir(self.root)
+        with mock.patch.object(self.main.os, "replace", locked):
+            result = self.main._delete_all_recordings_sync()
+        self.assertEqual(result, {"deleted": 0, "failed": 1})
+        self.assertTrue((self.screen_dir / "take.txt").exists())
+        self.assertTrue((self.screen_dir / "take.wav").exists())
+        self.assertTrue((screens / "shot-01.png").exists())
+        self.assertEqual([p.name for p in self.screen_dir.iterdir() if ".tmp-" in p.name], [])
+
+    def test_a_symlinked_screens_folder_is_neither_listed_nor_served(self) -> None:
+        elsewhere = Path(self._tmp.name) / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "shot-01.png").write_bytes(b"png")
+        (self.screen_dir / "take.screens").symlink_to(elsewhere, target_is_directory=True)
+        self.assertEqual(screen_sessions.list_screenshots(self.screen_dir, "take"), [])
+        self.assertIsNone(screen_sessions.screenshot_path(self.screen_dir, "take", "shot-01.png"))
+
+
+class AdoptionFailureIsReportedTests(unittest.TestCase):
+    """BM-05: a failed adoption is reported as such, not as "no screenshots",
+    and a crash's work folder is collected on the next boot."""
+
+    setUp = ArchiveIntegrationTests.setUp
+    tearDown = ArchiveIntegrationTests.tearDown
+
+    def test_the_save_says_screens_error_when_adoption_fails(self) -> None:
+        from unittest import mock
+
+        _stage(Path(self._tmp.name))
+        with mock.patch.object(screen_sessions, "atomic_write_json", side_effect=OSError("disk full")):
+            manifest, error = self.main._adopt_screen_session_for_recording(
+                SESSION, self.screen_dir, "take", audio_started_at=None
+            )
+        self.assertIsNone(manifest)
+        self.assertTrue(error)
+        self.assertTrue((Path(self._tmp.name) / "screen-sessions" / SESSION).is_dir())
+
+    def test_the_boot_sweep_collects_a_crashed_adoptions_work_folder(self) -> None:
+        work = self.screen_dir / "take.screens.tmp-0123456789abcdef"
+        work.mkdir()
+        (work / "shot-01.png").write_bytes(b"png")
+        old = NOW - 3600
+        os.utime(work, (old, old))
+        self.main._register_archive_dir(self.root)
+        self.main._sweep_orphan_tmp_files()
+        self.assertFalse(work.exists())
+
+
+class CrashedScreenTakeRecoveryTests(unittest.TestCase):
+    """H-01 / BM-04 / S-01: a screen take whose app died before the save is
+    promoted from its audio spool — into Screen Sessions, WITH the
+    screenshots staged for it, and those are not swept meanwhile."""
+
+    setUp = ArchiveIntegrationTests.setUp
+    tearDown = ArchiveIntegrationTests.tearDown
+
+    SID = "c0ffee00-0000-4000-8000-000000000001"
+
+    def _open(self, screen_session_id: str) -> dict:
+        from datetime import datetime
+
+        self.main.LIVE_RECOVERY_DIR.mkdir(parents=True, exist_ok=True)
+        return self.main._open_live_recovery(
+            session_id=self.SID,
+            started_at=datetime.now(),
+            provider="deepgram",
+            model="nova-3",
+            language="auto",
+            archive_dir="",
+            recording_collection=self.main.RECORDING_COLLECTION_SCREEN,
+            screen_session_id=screen_session_id,
+        )
+
+    def _crashed_screen_take(self) -> None:
+        """Spool + sidecar exactly as a screen take killed mid-way leaves
+        them (the sidecar shape ``_open_live_recovery`` writes)."""
+        from datetime import datetime
+
+        self.main.LIVE_RECOVERY_DIR.mkdir(parents=True, exist_ok=True)
+        _stage(Path(self._tmp.name))
+        stem = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{self.SID}"
+        (self.main.LIVE_RECOVERY_DIR / f"{stem}.pcm16").write_bytes(
+            b"\x00\x01" * (2 * self.main.LIVE_SAMPLE_RATE_HZ)
+        )
+        (self.main.LIVE_RECOVERY_DIR / f"{stem}.json").write_text(json.dumps({
+            "session_id": self.SID,
+            "started_at": datetime.now().isoformat(),
+            "finished_at": "",
+            "bytes": 0,
+            "status": "recording",
+            "archive_dir": "",
+            "recording_collection": self.main.RECORDING_COLLECTION_SCREEN,
+            "screen_session_id": SESSION,
+        }), encoding="utf-8")
+
+    def test_the_sidecar_names_the_screen_session(self) -> None:
+        recovery = self._open(SESSION)
+        recovery["pcm_file"].close()
+        meta = json.loads(recovery["meta_path"].read_text(encoding="utf-8"))
+        self.assertEqual(meta["screen_session_id"], SESSION)
+        self.assertEqual(meta["recording_collection"], self.main.RECORDING_COLLECTION_SCREEN)
+
+    def test_an_invalid_screen_session_id_is_never_stored(self) -> None:
+        recovery = self._open("../../etc")
+        recovery["pcm_file"].close()
+        meta = json.loads(recovery["meta_path"].read_text(encoding="utf-8"))
+        self.assertEqual(meta["screen_session_id"], "")
+
+    def test_promotion_files_the_take_under_screen_sessions_with_its_screenshots(self) -> None:
+        self._crashed_screen_take()
+        # The renderer sends no collection: the sidecar decides.
+        result = self.main._promote_live_recovery(self.SID, recording_collection="")
+        self.assertEqual(Path(result["archive_dir"]), self.screen_dir)
+        stem = Path(result["name"]).stem
+        self.assertEqual(
+            self.main.screen_sessions.list_screenshots(self.screen_dir, stem),
+            ["shot-01.png", "shot-02.png"],
+        )
+        self.assertIsNotNone(result["screens"])
+        self.assertIn("audioStartedAt", result["screens"])
+        self.assertFalse((Path(self._tmp.name) / "screen-sessions" / SESSION).exists())
+
+    def test_the_promote_route_without_a_collection_lets_the_sidecar_decide(self) -> None:
+        import asyncio
+
+        self._crashed_screen_take()
+        result = asyncio.run(self.main.promote_live_recovery(self.SID, payload={}))
+        self.assertEqual(Path(result["archive_dir"]), self.screen_dir)
+
+    def test_the_orphan_sweep_keeps_a_session_a_pending_recovery_names(self) -> None:
+        self._crashed_screen_take()
+        staged = Path(self._tmp.name) / "screen-sessions" / SESSION
+        old = NOW - 10 * 24 * 3600
+        os.utime(staged, (old, old))
+        self.main._last_cleanup_recovery_at = -1e12
+        self.main._cleanup_live_recovery_files()
+        self.assertTrue(staged.exists(), "staged screenshots of a recoverable take were swept")
 
 
 if __name__ == "__main__":
