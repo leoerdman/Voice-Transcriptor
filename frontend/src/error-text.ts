@@ -228,3 +228,49 @@ export function explainNetworkError(
     ? `${context}: the network request failed. If this is a remote provider (Deepgram/OpenRouter), ${tail}`
     : `Network request failed. If this is a remote provider, ${tail}`;
 }
+
+/**
+ * The `detail` of a backend error body, as one readable line.
+ *
+ * FastAPI answers a validation failure (422) with `detail` as an ARRAY
+ * of `{loc, msg, type}`; `parseError` printed the whole body as JSON
+ * (`HTTP 422: {"detail":[{"loc":["body","model"],…}]}`) into the UI.
+ * A string detail is used as is; the array becomes `model: field
+ * required; …`; anything else stays JSON, because that is still the
+ * most faithful rendering of a shape nobody planned for.
+ */
+export function formatErrorDetail(detail: unknown): string {
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail) && detail.length) {
+    const parts = detail.map((item) => {
+      if (!item || typeof item !== "object") return String(item);
+      const { loc, msg } = item as { loc?: unknown; msg?: unknown };
+      const where = Array.isArray(loc)
+        ? loc.filter((p) => p !== "body" && p !== "query" && p !== "path").join(".")
+        : "";
+      const what = typeof msg === "string" ? msg : JSON.stringify(item);
+      return where ? `${where}: ${what}` : what;
+    });
+    return parts.join("; ");
+  }
+  return JSON.stringify(detail);
+}
+
+/**
+ * A refusal of a media permission — retrying will not turn it into a yes,
+ * and each retry may prompt the user again.
+ *
+ * Decided by the DOMException NAME, which the spec fixes
+ * (`NotAllowedError`; `SecurityError` for a context that may never ask).
+ * The microphone path used to decide by sniffing the MESSAGE for
+ * "notallowed" / "permission denied" — browser text that differs for
+ * "Permission dismissed", a localized message or Electron's own wording,
+ * all of which were retried three times. The message check remains only
+ * for errors that are not DOMExceptions (a wrapped refusal).
+ */
+export function isPermissionRefusal(err: unknown): boolean {
+  const name = String((err as { name?: unknown })?.name || "");
+  if (name === "NotAllowedError" || name === "SecurityError") return true;
+  const msg = String((err as Error)?.message || err || "").toLowerCase();
+  return msg.includes("notallowed") || msg.includes("permission denied");
+}

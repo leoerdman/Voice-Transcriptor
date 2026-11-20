@@ -56,6 +56,8 @@ import {
   explainNetworkError,
   installErrorAwareConsole,
   isGenericFetchFailure,
+  formatErrorDetail,
+  isPermissionRefusal,
 } from "./error-text";
 import {
   RECORDINGS_WINDOW_MINIMUM,
@@ -3136,6 +3138,9 @@ function sanitizeUiErrorMessage(error: unknown, fallback: string): string {
     /failed to fetch dynamically imported module/i.test(cleaned) ||
     /unexpected token/i.test(cleaned)
   ) {
+    // The cause is replaced by a generic sentence on screen; keep it in
+    // the log so the replaced text is not lost along with the jargon.
+    console.warn(`sanitizeUiErrorMessage: showing "${fallback}" instead of:`, raw);
     return fallback;
   }
   // Length cap raised from 160 → 800 chars. The 160 cap was a defensive
@@ -3150,7 +3155,11 @@ function sanitizeUiErrorMessage(error: unknown, fallback: string): string {
   // is plenty for any actionable backend message; raw stack traces
   // are filtered by the regex tests above (which trigger the fallback
   // before we ever reach the length comparison).
-  return cleaned.length > 800 ? fallback : cleaned;
+  if (cleaned.length > 800) {
+    console.warn(`sanitizeUiErrorMessage: showing "${fallback}" instead of an ${cleaned.length}-char message:`, raw);
+    return fallback;
+  }
+  return cleaned;
 }
 
 function normalizeTranscriptSegment(raw: unknown, timeOffsetSec = 0): TranscriptSegment | null {
@@ -3909,13 +3918,9 @@ function syncKeyActionButton(provider: RemoteProvider): void {
 // process recording-state monitor. The frontend only publishes VU/RMS samples.
 
 /**
- * Translate a raw fetch/network error into a user-actionable message.
- *
- * The native "Failed to fetch" / "NetworkError when attempting to
- * fetch" / "ECONNREFUSED" strings are developer jargon. End users need
- * to know: (1) is the internet down, (2) is the provider blocked, or
- * (3) is our local backend dead. This helper inspects the error and
- * surfaces one of those three actionable diagnoses.
+ * The message of a non-ok backend response: its status line plus the
+ * body's ``detail`` (./error-text ``formatErrorDetail``) or raw text.
+ * (Turning network failures into advice is ``explainNetworkError``.)
  */
 async function parseError(r: Response): Promise<string> {
   // 1.1.25 fix: previously called ``await r.json()`` then on failure
@@ -3938,9 +3943,7 @@ async function parseError(r: Response): Promise<string> {
   try {
     const j: unknown = JSON.parse(trimmed);
     if (typeof j === "object" && j && "detail" in j) {
-      const detail = (j as { detail?: unknown }).detail;
-      const detailRaw = typeof detail === "string" ? detail : JSON.stringify(j);
-      return `${status}: ${detailRaw}`;
+      return `${status}: ${formatErrorDetail((j as { detail?: unknown }).detail)}`;
     }
     return `${status}: ${JSON.stringify(j)}`;
   } catch {
@@ -5750,9 +5753,8 @@ async function acquireMicStream(deviceId: string): Promise<MediaStream> {
       lastError = new Error("microphone opened with no live audio track");
     } catch (e) {
       lastError = e;
-      const msg = String((e as Error)?.message || e || "").toLowerCase();
       // A permission refusal will not become a yes on retry.
-      if (msg.includes("notallowed") || msg.includes("permission denied")) throw e;
+      if (isPermissionRefusal(e)) throw e;
     }
     console.warn(
       `[trace startLive] microphone acquire attempt ${i + 1}/${attempts.length} failed: ` +
