@@ -51,4 +51,35 @@ function decideBackendExit({ code = null, signal = null, isQuitting = false, han
   };
 }
 
-module.exports = { BACKEND_HANDLE, backendHandleOf, decideBackendExit };
+/**
+ * Crash-restart policy (DM-20). After BACKEND_RESTART_MAX_ATTEMPTS
+ * restarts the shell stops and shows the boot error: a deterministically
+ * broken backend (corrupt config, missing dep, a port conflict it cannot
+ * escape) would otherwise restart forever, grow the log and hide the real
+ * failure. The backoff grows by one step per attempt up to its ceiling.
+ */
+const BACKEND_RESTART_MAX_ATTEMPTS = 8;
+const BACKEND_RESTART_BACKOFF_STEP_MS = 800;
+const BACKEND_RESTART_BACKOFF_MAX_MS = 5000;
+
+/**
+ * What restart attempt ``attempt`` (1-based) does.
+ * @returns {{giveUp: true} | {giveUp: false, delayMs: number}}
+ */
+function backendRestartPlan(attempt) {
+  if (attempt > BACKEND_RESTART_MAX_ATTEMPTS) return { giveUp: true };
+  return {
+    giveUp: false,
+    delayMs: Math.min(BACKEND_RESTART_BACKOFF_STEP_MS * attempt, BACKEND_RESTART_BACKOFF_MAX_MS),
+  };
+}
+
+module.exports = {
+  BACKEND_HANDLE,
+  BACKEND_RESTART_MAX_ATTEMPTS,
+  BACKEND_RESTART_BACKOFF_STEP_MS,
+  BACKEND_RESTART_BACKOFF_MAX_MS,
+  backendHandleOf,
+  decideBackendExit,
+  backendRestartPlan,
+};

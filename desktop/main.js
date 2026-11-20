@@ -125,11 +125,16 @@ const { createRecordingFinalSlot } = require("./recording-final-slot");
 // decided from the renderer's explicit fields — never from the words the
 // user dictated (Ultra-Audit 2026-11-20 DM-01).
 const {
-  SIGNAL_OUTCOME,
   normalizeTranscriptText,
   isPasteableTranscript,
-  classifyRecordingSignal,
 } = require("./transcript-signal");
+// Which stopped recordings get a post-stop task, and how that task waits
+// for its transcript: the recording-final mailbox, nothing else (DM-15).
+const {
+  POST_STOP_ADMISSION,
+  decidePostStopAdmission,
+  awaitRecordingTranscript,
+} = require("./post-stop-handoff");
 // What a main-process stop does with the renderer's answer — or its
 // silence (DM-03, DM-22).
 const { STOP_ACTION, decideMainProcessStop } = require("./recording-stop");
@@ -137,8 +142,10 @@ const { STOP_ACTION, decideMainProcessStop } = require("./recording-stop");
 const { buildPwshPasteFallbackScript } = require("./windows-paste-fallback");
 // What a backend exit means: restart or not, and whose handle it clears
 // (DM-09, DM-27).
-const { backendHandleOf, decideBackendExit } = require("./backend-exit");
+const { backendHandleOf, decideBackendExit, backendRestartPlan } = require("./backend-exit");
 const { createSingleFlight } = require("./single-flight");
+// A session that grants no permission request or check (the capsule, DM-35).
+const { denyAllSessionPermissions } = require("./session-permissions");
 const { pruneLogArchives } = require("./log-retention");
 // Recording ids are unique only per renderer page: key them with the
 // page's epoch (DM-32).
@@ -151,6 +158,13 @@ const {
   parseShortcutMessage,
   resolveRevealTarget,
 } = require("./renderer-requests");
+// Each window's IPC channels are registered through one sender-guarded
+// registrar (DM-28).
+const { createSenderGuardedIpc } = require("./ipc-sender-guard");
+// The one "is this our own app" rule for the paste target checks (DM-16).
+const { createOwnProcessRules } = require("./own-process");
+// The one way a normal shutdown starts, and the signal handlers (DM-19).
+const { createQuitApp, installSignalQuitHandlers } = require("./quit-path");
 // The capsule window's size (one flag) and when it is placed (DM-13, DM-25).
 const { capsuleWindowSize, capsuleBoundsIn, capsuleNeedsPlacement } = require("./capsule-geometry");
 // What to do once screenMode.start() answered for a take (DM-31).
@@ -655,15 +669,8 @@ const MAIN_WINDOW_PAGE_LOAD_TIMEOUT_MS = 15_000;
  */
 const MAIN_WINDOW_INITIAL_LOAD_TIMEOUT_MS = BACKEND_COLD_START_HEALTH_TIMEOUT_MS + MAIN_WINDOW_PAGE_LOAD_TIMEOUT_MS;
 
-/**
- * Crash-restart policy. After BACKEND_RESTART_MAX_ATTEMPTS restarts the
- * shell stops and shows the boot error: a deterministically broken backend
- * would otherwise restart forever, grow the log and hide the real failure.
- * The backoff grows by one step per attempt up to its ceiling.
- */
-const BACKEND_RESTART_MAX_ATTEMPTS = 8;
-const BACKEND_RESTART_BACKOFF_STEP_MS = 800;
-const BACKEND_RESTART_BACKOFF_MAX_MS = 5000;
+// The crash-restart policy (attempt cap, backoff) is ./backend-exit's
+// backendRestartPlan.
 /** /api/health polling: pause between tries, and one request's ceiling. */
 const BACKEND_HEALTH_RETRY_MS = 250;
 const BACKEND_HEALTH_REQUEST_TIMEOUT_MS = 2000;
@@ -1255,18 +1262,13 @@ async function resolveMainWindowClose() {
 }
 
 /**
- * The one call site that asks Electron to start a normal shutdown.
- * `before-quit` (registered once, below) does the actual teardown —
- * this only starts it, so there is exactly one place in the app that
- * decides "we are quitting now": the lifecycle table's `quit` action
- * above, the paste-capability self-heal relaunch, the tray's Quit item
- * and the SIGINT/SIGTERM/SIGHUP handlers all go through here instead of
- * each calling `app.quit()` on its own (DM-19).
+ * The one call site that asks Electron to start a normal shutdown
+ * (./quit-path, DM-19). `before-quit` (registered once, below) does the
+ * actual teardown — this only starts it: the lifecycle table's `quit`
+ * action above, the paste-capability self-heal relaunch, the tray's Quit
+ * item and the SIGINT/SIGTERM/SIGHUP handlers all go through here.
  */
-function quitApp(reason = "") {
-  appendMainLog(`[main-window] quit requested reason=${normalizeLifecycleReason(reason)}`);
-  app.quit();
-}
+const quitApp = createQuitApp({ app, log: appendMainLog, normalizeReason: normalizeLifecycleReason });
 
 function getRepoRoot() {
   if (app.isPackaged) return process.resourcesPath;
@@ -2045,22 +2047,24 @@ let recordingStatusCapsuleIpcInstalled = false;
 function installRecordingStatusCapsuleIpc() {
   if (recordingStatusCapsuleIpcInstalled) return;
   recordingStatusCapsuleIpcInstalled = true;
-  const fromCapsule = (event) =>
-    !!recordingStatusWindow && !recordingStatusWindow.isDestroyed()
-    && event?.sender === recordingStatusWindow.webContents;
-  ipcMain.on("capsule:pointer", (event) => {
-    if (!fromCapsule(event)) return;
+  const capsuleIpc = createSenderGuardedIpc(ipcMain, {
+    isAllowedSender: (event) =>
+      !!recordingStatusWindow && !recordingStatusWindow.isDestroyed()
+      && event?.sender === recordingStatusWindow.webContents,
+    // Dropped without a log line, as before: the pointer verb fires on
+    // every hover.
+    onRefused: () => { },
+  });
+  capsuleIpc.on("capsule:pointer", () => {
     noteRecordingStatusCapsuleInteraction();
   });
-  ipcMain.on("capsule:shot", (event) => {
-    if (!fromCapsule(event)) return;
+  capsuleIpc.on("capsule:shot", () => {
     noteRecordingStatusCapsuleInteraction();
     void screenMode.takeShot("capsule").catch((e) => {
       appendMainLog(`[screen-mode] capsule shot failed: ${e?.message || e}`);
     });
   });
-  ipcMain.on("capsule:stop", (event) => {
-    if (!fromCapsule(event)) return;
+  capsuleIpc.on("capsule:stop", () => {
     noteRecordingStatusCapsuleInteraction();
     recordingStopInFlight = true;
     // The capsule stops the recording. It does NOT touch the main
@@ -2132,9 +2136,7 @@ async function ensureRecordingStatusCapsuleWindow() {
   // its own partition would otherwise keep Electron's default, which
   // grants every request (DM-35).
   try {
-    const capsuleSession = recordingStatusWindow.webContents.session;
-    capsuleSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
-    capsuleSession.setPermissionCheckHandler(() => false);
+    denyAllSessionPermissions(recordingStatusWindow.webContents.session);
   } catch (e) {
     appendMainLog(`[recording-capsule] permission handlers not installed: ${e?.message || e}`);
   }
@@ -2607,13 +2609,12 @@ function startRecordingStateMonitor() {
   stopRecordingStateMonitor();
   // One probe at a time (DM-14): executeJavaScript cannot be cancelled,
   // so on a wedged renderer an unguarded interval queued another pending
-  // evaluation every tick for as long as the take lasted.
-  let probeInFlight = false;
+  // evaluation every tick for as long as the take lasted. A tick while
+  // the previous probe is pending is skipped (./single-flight).
+  const probeFlight = createSingleFlight();
   recordingStateMonitor = setInterval(() => {
     if (!win || win.isDestroyed() || !win.webContents) return;
-    if (probeInFlight) return;
-    probeInFlight = true;
-    win.webContents
+    probeFlight.tryRun(() => win.webContents
       .executeJavaScript(
         `(() => {
           const vu = Number(window.__transcriptorVuLevel || 0);
@@ -2735,9 +2736,8 @@ function startRecordingStateMonitor() {
           appendMainLog(`[recording-autostop-stale] audio pipeline dead for ${Math.round(RECORDING_DEAD_PIPELINE_MS / 1000)}s, forcing stop`);
           guardedStopFromRecordingStatus("autostop-stale");
         }
-      })
-      .catch(() => { })
-      .finally(() => { probeInFlight = false; });
+      }))
+      ?.catch(() => { });
   }, RECORDING_STATUS_LEVEL_POLL_MS);
   try { recordingStateMonitor.unref?.(); } catch { }
 }
@@ -3567,42 +3567,12 @@ const pasteVerificationPolicy = createPasteVerificationPolicy({
   },
 });
 
-/**
- * Is this process name our own app (DM-16)? Exact names, derived from
- * the app's name rather than retyped: a substring check on the product
- * name would exclude third-party apps whose name contains the word
- * ("Audio Transcriptor Pro"). The one list both target checks use.
- */
-function isOwnAppName(name) {
-  const n = String(name || "").trim().toLowerCase();
-  const own = String(app.getName() || "").trim().toLowerCase();
-  return !!n && !!own && (n === own || n === `${own} helper`);
-}
-
-function isBadActivationTarget(name) {
-  const n = String(name || "").trim().toLowerCase();
-  if (!n) return true;
-  // Our own process family, plus "electron": by name alone a bare
-  // Electron process is not a safe target (it may be us in a dev run, or
-  // the shell of an app whose real window is elsewhere). Electron
-  // helpers have deterministic suffixes that substring match is correct
-  // for.
-  if (n === "electron" || isOwnAppName(n)) return true;
-  if (n.includes("helper (renderer)") ||
-      n.includes("helper (gpu)") ||
-      n.includes("helper (plugin)") ||
-      n.includes("electron helper")) return true;
-  return false;
-}
-
-function shouldUsePasteTarget(front) {
-  const pid = Number(front?.pid || 0);
-  const name = String(front?.name || "").trim().toLowerCase();
-  if (pid > 0 && pid === process.pid) return false;
-  if (isOwnAppName(name)) return false;
-  if (!name && pid <= 0) return false;
-  return true;
-}
+// "Is this our own app?" — one rule for both target checks, derived from
+// the app's name (./own-process, DM-16).
+const { isBadActivationTarget, shouldUsePasteTarget } = createOwnProcessRules({
+  appName: () => app.getName(),
+  pid: process.pid,
+});
 
 /**
  * Does this failure name a macOS permission the user has to grant?
@@ -6145,14 +6115,16 @@ function enqueuePostStopTask(options = {}) {
     epoch: rendererEpoch,
     slot: recordingFinalSlot,
   };
-  if (!task.autoTranscribe) return false;
+  const key = recordingKey(task.epoch, task.recordingId);
+  const admission = decidePostStopAdmission(task, () => _enqueuedRecordings.has(key));
+  if (admission === POST_STOP_ADMISSION.AUTO_TRANSCRIBE_OFF) return false;
   // A task is matched to its transcript by recordingId alone — the IPC
   // hand-off carries nothing else (DM-15). The renderer always reports
   // its positive monotonic id for the recording being stopped; a task
   // without one could only wait out the deadline for a signal that can
   // never match it, so it is refused, and the session is closed here
   // rather than leaving the capsule on "Transcribing".
-  if (!(task.recordingId > 0)) {
+  if (admission === POST_STOP_ADMISSION.NO_RECORDING_ID) {
     appendMainLog(`[post-stop-queue] refused: no recording id (rec=${task.recordingId})`);
     if (!hasActivePostStopWork()) {
       void setRecordingStatus("Saved To App", RECORDING_STATUS_KIND.OK)
@@ -6161,8 +6133,7 @@ function enqueuePostStopTask(options = {}) {
     }
     return false;
   }
-  const key = recordingKey(task.epoch, task.recordingId);
-  if (_enqueuedRecordings.has(key)) {
+  if (admission === POST_STOP_ADMISSION.DUPLICATE) {
     appendMainLog(
       `[post-stop-queue] dedup-skipped rec=${key} ` +
       `(already enqueued; preventing double-paste)`
@@ -6269,43 +6240,38 @@ async function processPostStopTask(task) {
   // add latency to healthy recordings; it only prevents legitimate
   // slow recovery from degrading into "Saved To App" with no paste.
   const POST_STOP_TRANSCRIPT_TIMEOUT_MS = PASTE_POST_STOP_DEADLINE_MS;
-  const deadline = Date.now() + POST_STOP_TRANSCRIPT_TIMEOUT_MS;
-  let transcript = "";
   const stopRequestedAt = Number(task.stopRequestedAt || Date.now());
-  let terminalWithoutPasteStatus = "";
-  // BUGS_AUDIT §6.9: the best text seen for THIS recording that was not
-  // paste-ready — a pre-upscale provisional, or a status-only signal
-  // carrying transcript text. Never pasted (§6.8), but it is what the
-  // deadline-expiry recovery hands to the user instead of nothing.
-  let bestKnownText = "";
-  // Sequence of the last hand-off signal already accounted for, so the
-  // same signal cannot be handled twice by the loop below.
-  let handledSignalSeq = 0;
-
-  // One reading of a hand-off signal, used wherever a signal is picked
-  // up, so the primary path cannot drift from the late-arrival case.
-  // Returns "final" | "terminal" | "provisional".
-  const consumeIpcSignal = (signal) => {
-    handledSignalSeq = signal.seq;
-    // §6.8: finality is stated, never inferred — and so is everything
-    // else. The renderer's ``final`` flag and its "<kind>:<phase>" source
-    // label decide; the text is never read for clues (DM-01: a dictation
-    // that starts with "HTTP " or mentions "silence detected" is still a
-    // dictation). ./transcript-signal owns the rule.
-    const verdict = classifyRecordingSignal(signal);
-    traceStep(trace, signal.final ? "ipc_final" : "ipc_signal", {
-      elapsedMs: Date.now() - stopRequestedAt,
-      recordingId: signal.recordingId,
-      source: signal.source,
-      textLen: normalizeTranscriptText(signal.text).length,
-      outcome: verdict.outcome,
-    });
-    if (verdict.outcome === SIGNAL_OUTCOME.FINAL) {
-      // The only thing on the IPC path that may be pasted.
-      transcript = verdict.text;
-    } else if (verdict.outcome === SIGNAL_OUTCOME.PROVISIONAL) {
-      // Best-known text only (§6.8/§6.9) — keep waiting for the final.
-      bestKnownText = verdict.text;
+  // How the transcript arrives: the renderer's IPC hand-off, and only
+  // that (DM-15, S-13) — ./post-stop-handoff takes the recording's
+  // mailbox and nothing else. An executeJavaScript poll of ~14 renderer
+  // globals and 6 DOM ids used to take over after 2 s of IPC silence,
+  // for "an older renderer built before the bridge existed" — which
+  // cannot occur, because main and renderer ship in one bundle. Every
+  // renderer publish for a recording sends a signal; the slot keeps
+  // them, so one published before this task started is not lost.
+  //
+  // §6.8: finality is stated, never inferred — ./transcript-signal reads
+  // the renderer's ``final`` flag and "<kind>:<phase>" label, never the
+  // text (DM-01). A PROVISIONAL text is best-known only (§6.9): never
+  // pasted, but what the deadline-expiry recovery hands to the user
+  // instead of nothing. A TERMINAL publish (no speech, error,
+  // auto-transcribe off) ends the recording with a status and no paste.
+  const {
+    transcript,
+    bestKnownText,
+    terminalStatus: terminalWithoutPasteStatus,
+  } = await awaitRecordingTranscript({
+    slot: task.slot,
+    recordingId: task.recordingId,
+    deadlineAt: Date.now() + POST_STOP_TRANSCRIPT_TIMEOUT_MS,
+    onSignal: (signal, verdict) => {
+      traceStep(trace, signal.final ? "ipc_final" : "ipc_signal", {
+        elapsedMs: Date.now() - stopRequestedAt,
+        recordingId: signal.recordingId,
+        source: signal.source,
+        textLen: normalizeTranscriptText(signal.text).length,
+        outcome: verdict.outcome,
+      });
       // The renderer's explicit phase: it has the transcript and is
       // running the paste upscale — the only signal of that state.
       if (verdict.upscaling) {
@@ -6313,46 +6279,8 @@ async function processPostStopTask(task) {
           appendMainLog(`[post-stop] upscaling-status failed: ${compactLogText(e?.message || e)}`);
         });
       }
-    } else {
-      // A publish with nothing to paste (no speech, error, auto-transcribe
-      // off): the recording is over and there will be no final.
-      transcript = "";
-      terminalWithoutPasteStatus = verdict.status;
-    }
-    return verdict.outcome;
-  };
-
-  // How the transcript arrives: the renderer's IPC hand-off, and only
-  // that (DM-15, S-13). An executeJavaScript poll of ~14 renderer
-  // globals and 6 DOM ids used to take over after 2 s of IPC silence,
-  // for "an older renderer built before the bridge existed" — which
-  // cannot occur, because main and renderer ship in one bundle. It was a
-  // second owner of the same decision with its own vocabulary (status
-  // literals "Done"/"Idle"/"upscaling") and it started exactly when the
-  // renderer is legitimately still finalising (envelope wait, recovery).
-  // Every renderer publish for a recording sends a signal; the slot
-  // keeps them, so one published before this task started is not lost.
-  // If the renderer never publishes, the deadline hands bestKnownText to
-  // the §6.9 recovery, as before.
-  //
-  // Sleep that ends the moment the renderer publishes something newer
-  // than what has already been handled, so a signal is never sitting in
-  // the slot while this task sleeps on a timer.
-  const restUntilSignalOr = (ms) =>
-    task.slot.waitForSignal(task.recordingId, {
-      sinceSeq: handledSignalSeq,
-      timeoutMs: Math.max(1, ms),
-    });
-
-  while (Date.now() < deadline) {
-    const known = task.slot.peek(task.recordingId);
-    if (known?.last && known.last.seq > handledSignalSeq) {
-      // "provisional" is not an answer — keep waiting for the final.
-      if (consumeIpcSignal(known.last) !== SIGNAL_OUTCOME.PROVISIONAL) break;
-      continue;
-    }
-    await restUntilSignalOr(deadline - Date.now());
-  }
+    },
+  });
 
   let recordingStatusText = "Saved To App";
   // The kind travels with the text all the way to setRecordingStatus, so
@@ -8072,12 +8000,11 @@ async function startBackend() {
       }
       const attempt = backendRestartAttempts + 1;
       backendRestartAttempts = attempt;
-      // Hard cap: after 8 attempts, stop scheduling. A deterministically
-      // broken backend (corrupt config, missing dep, port conflict we
-      // can't escape) would otherwise restart every 5s forever, growing
-      // the log file unboundedly and masking the real failure. The user
-      // sees a permanent backend error in the renderer instead.
-      if (attempt > BACKEND_RESTART_MAX_ATTEMPTS) {
+      // Hard cap (./backend-exit): past it, stop scheduling. The user
+      // sees a permanent backend error in the renderer instead of a
+      // backend restarting every 5 s forever.
+      const restartPlan = backendRestartPlan(attempt);
+      if (restartPlan.giveUp) {
         failBackendBoot(
           BACKEND_BOOT_ERROR_CODES.BACKEND_EXITED,
           `Backend exited (code ${code}, signal ${signal || "none"}) after ${attempt - 1} restart attempts — giving up.`,
@@ -8087,7 +8014,7 @@ async function startBackend() {
         broadcastBackendBootError();
         return;
       }
-      const delay = Math.min(BACKEND_RESTART_BACKOFF_STEP_MS * attempt, BACKEND_RESTART_BACKOFF_MAX_MS);
+      const delay = restartPlan.delayMs;
       appendMainLog(`[backend-restart-scheduled] attempt=${attempt} delayMs=${delay}`);
       backendRestartTimer = setTimeout(() => {
         // 1.1.25 fix: previously nulled ``backendRestartTimer`` BEFORE
@@ -9151,27 +9078,18 @@ process.on("exit", () => {
   isQuitting = true;
   killBackendHard("process-exit", { force: true, synchronous: true });
 });
-const SIGNAL_EXIT_CODES = Object.freeze({
-  SIGHUP: 129,
-  SIGINT: 130,
-  SIGTERM: 143,
+// SIGINT/SIGTERM/SIGHUP quit through quitApp, with a bounded forced exit
+// (./quit-path).
+installSignalQuitHandlers({
+  proc: process,
+  log: appendMainLog,
+  markQuitting: () => { isQuitting = true; },
+  killBackend: killBackendHard,
+  quitApp,
+  exit: (code) => {
+    try { app.exit(code); } catch { process.exit(code); }
+  },
 });
-for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
-  process.on(sig, () => {
-    appendMainLog(`[signal] ${sig}`);
-    isQuitting = true;
-    killBackendHard(`signal-${sig}`, { escalateAfterMs: 250 });
-    try {
-      quitApp(`signal-${sig}`);
-    } catch {
-      try { app.exit(SIGNAL_EXIT_CODES[sig] || 0); } catch { process.exit(SIGNAL_EXIT_CODES[sig] || 0); }
-    }
-    const exitTimer = setTimeout(() => {
-      try { app.exit(SIGNAL_EXIT_CODES[sig] || 0); } catch { process.exit(SIGNAL_EXIT_CODES[sig] || 0); }
-    }, 1500);
-    if (typeof exitTimer.unref === "function") exitTimer.unref();
-  });
-}
 
 app.whenReady().then(async () => {
   // Process-level uncaughtException / unhandledRejection handlers are
@@ -9189,14 +9107,19 @@ app.whenReady().then(async () => {
   // Every channel the preload exposes answers only the main window's own
   // webContents (DM-28). Only that window has the preload today, so
   // nothing else can reach these channels — but the rule once lived in
-  // two handlers only, spelled inline; every handler now asks this one
-  // predicate.
+  // two handlers only, spelled inline. Each channel is now registered
+  // through mainWindowIpc (./ipc-sender-guard), which runs the check
+  // before the handler, so no handler can leave it out.
   const isFromMainWindow = (event) =>
     !!win && !win.isDestroyed() && event?.sender === win.webContents;
   const refusedSender = (channel) => {
     appendMainLog(`[ipc] ${channel} refused: sender is not the main window`);
     return { ok: false, error: "sender" };
   };
+  const mainWindowIpc = createSenderGuardedIpc(ipcMain, {
+    isAllowedSender: isFromMainWindow,
+    onRefused: refusedSender,
+  });
 
   // The backend's API token for the main window's page (BM-01, see
   // ./backend-auth). Synchronous because the renderer reads it at load,
@@ -9213,10 +9136,8 @@ app.whenReady().then(async () => {
     event.returnValue = token;
   });
 
-  ipcMain.handle("engine:get-status", (event) =>
-    (isFromMainWindow(event) ? engineInstallSnapshot() : refusedSender("engine:get-status")));
-  ipcMain.handle("engine:install", async (event) => {
-    if (!isFromMainWindow(event)) return refusedSender("engine:install");
+  mainWindowIpc.handle("engine:get-status", () => engineInstallSnapshot());
+  mainWindowIpc.handle("engine:install", async () => {
     // Every return carries the phase snapshot the renderer branches on.
     // Two of these three paths used to return an object WITHOUT `phase`
     // — so an install that failed because there was no usable Python, or
@@ -9261,8 +9182,7 @@ app.whenReady().then(async () => {
   // asks right after `probePasteCapability("boot")` already ran gets the
   // cached answer for free; the very first ask of a session pays for one
   // probe so the badge is never a beat behind the first recording.
-  ipcMain.handle("paste-capability:get-status", async (event) => {
-    if (!isFromMainWindow(event)) return refusedSender("paste-capability:get-status");
+  mainWindowIpc.handle("paste-capability:get-status", async () => {
     const cap = await ensurePasteCapabilityFresh("renderer-query");
     const context = pasteCapabilityMessageContext();
     return {
@@ -9283,8 +9203,7 @@ app.whenReady().then(async () => {
   // (desktop/paste-capability.js builds it, including the refusal to run
   // it against anything that is not this app's own bundle id); the
   // renderer owns nothing but the click.
-  ipcMain.handle("permissions:repair", async (event) => {
-    if (!isFromMainWindow(event)) return refusedSender("permissions:repair");
+  mainWindowIpc.handle("permissions:repair", async () => {
     try {
       return await repairPastePermissionsOnRequest();
     } catch (e) {
@@ -9313,8 +9232,7 @@ app.whenReady().then(async () => {
   // whichever path stopped the take (either hotkey, the capsule, the
   // dead-pipeline fail-safe). Main owns the session; the renderer asks
   // for it back and writes it into the transcript.
-  ipcMain.handle("screen-mode:finish", async (event, payload) => {
-    if (!isFromMainWindow(event)) return refusedSender("screen-mode:finish");
+  mainWindowIpc.handle("screen-mode:finish", async (_event, payload) => {
     const p = payload && typeof payload === "object" ? payload : {};
     try {
       const id = String(p.id || "");
@@ -9327,8 +9245,7 @@ app.whenReady().then(async () => {
     }
   });
 
-  ipcMain.on("recording-final", (event, payload) => {
-    if (!isFromMainWindow(event)) { refusedSender("recording-final"); return; }
+  mainWindowIpc.on("recording-final", (_event, payload) => {
     const signal = recordingFinalSlot.set(payload);
     if (!signal) {
       appendMainLog(
@@ -9350,8 +9267,7 @@ app.whenReady().then(async () => {
   // channels with the same sender rule as every channel above; what each
   // request may do is decided in ./renderer-requests from the payload
   // alone, so a renderer cannot name a verb or a path main did not allow.
-  ipcMain.on(RENDERER_REQUEST_CHANNELS.SHORTCUTS, (event, payload) => {
-    if (!isFromMainWindow(event)) { refusedSender(RENDERER_REQUEST_CHANNELS.SHORTCUTS); return; }
+  mainWindowIpc.on(RENDERER_REQUEST_CHANNELS.SHORTCUTS, (_event, payload) => {
     const parsed = parseShortcutMessage(payload);
     if (!parsed.message) {
       appendMainLog(`[shortcuts-bridge] ${compactLogText(parsed.error, 60)}`);
@@ -9364,8 +9280,7 @@ app.whenReady().then(async () => {
       pendingShortcutBridgeMessages = pendingShortcutBridgeMessages.slice(-8);
     }
   });
-  ipcMain.on(RENDERER_REQUEST_CHANNELS.RECORD_TOGGLE, (event) => {
-    if (!isFromMainWindow(event)) { refusedSender(RENDERER_REQUEST_CHANNELS.RECORD_TOGGLE); return; }
+  mainWindowIpc.on(RENDERER_REQUEST_CHANNELS.RECORD_TOGGLE, () => {
     // Routed to the very same function the global hotkey calls so there
     // is one recording toggle, not two: same microphone-permission
     // prompt, same frontmost-window capture for auto-paste, same capsule,
@@ -9376,8 +9291,7 @@ app.whenReady().then(async () => {
       appendMainLog(`[record-toggle] failed: ${e?.message || e}`);
     });
   });
-  ipcMain.on(RENDERER_REQUEST_CHANNELS.REVEAL_RECORDING, (event, payload) => {
-    if (!isFromMainWindow(event)) { refusedSender(RENDERER_REQUEST_CHANNELS.REVEAL_RECORDING); return; }
+  mainWindowIpc.on(RENDERER_REQUEST_CHANNELS.REVEAL_RECORDING, (_event, payload) => {
     const appDataDir = dataDir();
     const recordingsRoot = path.resolve(appDataDir, "recordings");
     const allowedRoots = [recordingsRoot];

@@ -20,7 +20,7 @@ const preloadSource = fs.readFileSync(path.join(__dirname, "preload.js"), "utf8"
 
 test("recording-final is sent by the renderer and received by main", () => {
   assert.match(preloadSource, /ipcRenderer\.send\("recording-final"/);
-  assert.match(mainSource, /ipcMain\.on\("recording-final"/);
+  assert.match(mainSource, /mainWindowIpc\.on\("recording-final"/);
 });
 
 test("system-suspend is sent by main and subscribed to by the renderer bridge", () => {
@@ -59,7 +59,7 @@ test("paste-capability:get-status is invoked by the renderer bridge and handled 
   // interval that nothing in frontend/ read; this is the invoke-only
   // replacement, same shape as the engine bridge.
   assert.match(preloadSource, /getStatus: \(\) => ipcRenderer\.invoke\("paste-capability:get-status"\)/);
-  assert.match(mainSource, /ipcMain\.handle\("paste-capability:get-status"/);
+  assert.match(mainSource, /mainWindowIpc\.handle\("paste-capability:get-status"/);
   assert.match(
     preloadSource,
     /exposeInMainWorld\("__transcriptorPasteCapability"/,
@@ -74,7 +74,7 @@ test("permissions:repair is invoked by the renderer bridge and handled by main",
   // The renderer asks for a repair; it never names a service, a bundle
   // id or a command.
   assert.match(preloadSource, /repair: \(\) => ipcRenderer\.invoke\("permissions:repair"\)/);
-  assert.match(mainSource, /ipcMain\.handle\("permissions:repair"/);
+  assert.match(mainSource, /mainWindowIpc\.handle\("permissions:repair"/);
   // The bridge takes no arguments at all — no service, no bundle id —
   // and the command itself is built by the capability module behind one
   // function in main, so a renderer cannot ask for a reset of anything
@@ -210,7 +210,7 @@ test("screen-mode:finish is invoked by the renderer bridge and handled by main",
   // Screen mode's session (screenshots + stroke times) is owned by main;
   // the renderer's stopLive asks for it back on every stop path.
   assert.match(preloadSource, /ipcRenderer\.invoke\("screen-mode:finish"/);
-  assert.match(mainSource, /ipcMain\.handle\("screen-mode:finish"/);
+  assert.match(mainSource, /mainWindowIpc\.handle\("screen-mode:finish"/);
 });
 
 test("the main window's requests ride preload sends, not document.title (DM-10)", () => {
@@ -219,7 +219,7 @@ test("the main window's requests ride preload sends, not document.title (DM-10)"
     assert.match(preloadSource, new RegExp(`ipcRenderer\\.send\\("${channel}"`), `preload must send ${channel}`);
   }
   for (const key of Object.keys(RENDERER_REQUEST_CHANNELS)) {
-    assert.match(mainSource, new RegExp(`ipcMain\\.on\\(RENDERER_REQUEST_CHANNELS\\.${key},`), `main must receive ${key}`);
+    assert.match(mainSource, new RegExp(`mainWindowIpc\\.on\\(RENDERER_REQUEST_CHANNELS\\.${key},`), `main must receive ${key}`);
   }
   // The title channel is gone from both sides of the main window.
   assert.doesNotMatch(mainSource, /page-title-updated/);
