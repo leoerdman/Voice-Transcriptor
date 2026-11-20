@@ -3,6 +3,20 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.10] - 2026-11-20
+
+### Changed
+
+- **The capsule's red line comes in from the right edge** at the press and grows left at the waveform's own speed, starting again for every take, instead of spanning the capsule at once.
+- **The screenshot key is the one under Escape (\` ~)**, bound only while screen mode runs, so outside it the key types as usual. A config still holding the old default Option+↓ moves to it; Settings can record a bare key for this slot only.
+- **A screenshot is taken first, with the drawings still on screen; they vanish the moment it is captured**, then are painted into the image. All displays are captured at once. A failed capture leaves the drawings on screen.
+
+### Fixed
+
+- **A failed or crashed take keeps everything in TRANSCRIBE and History.** A stop that fails (transcription error, no speech, microphone fault, auto-transcribe off or no key, an empty final pass) now shows and saves the live text with its screen marks and screenshot lines, instead of an error line or an empty transcript; a silent take that drew keeps "[ Silence ]" above its marks. After a crash, the recovered take comes back as one entry with its audio, screenshots, live text and marks in their places, instead of two entries with the text and the marks split. Recovered text is never pasted.
+- **"Microphone is not delivering audio" no longer stays up once the microphone works.** A Bluetooth headset is silent for its first second while it switches to its call profile; the warning is now withdrawn when audio arrives.
+- The support log records whether each start and stop tone played (`[cue]`).
+
 ## [1.6.9] - 2026-11-20
 
 ### Changed
