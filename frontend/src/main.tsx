@@ -106,6 +106,7 @@ import { keyAction, performKeyAction, type KeyAction } from "./key-action";
 import { keepaliveFor } from "./keepalive";
 import { parseRuntimeLimits } from "./runtime-limits";
 import { screenThumbLabel, screensStripNote } from "./screens-strip";
+import { fallbackSourceKey, isCurrentPlayerSource } from "./player-source";
 import {
   PROVIDER_DISPLAY_ORDER,
   isRemoteProvider,
@@ -2721,12 +2722,16 @@ async function renderLatestSavedAudio(): Promise<void> {
   // setCurrentRecordingAudio call (post-save, with savedName) was
   // forced through a full re-render, revoking + re-creating an
   // unused ObjectURL on every save tick.
+  // The in-memory fallback attached after a failed backend fetch counts
+  // as "this recording's source" too (./player-source).
   if (
     latestSavedAudioState
     && latestSavedAudioState.savedName
-    && desiredBackendKey
-    && currentRecordingAudioSourceKey === desiredBackendKey
-    && !!audioEl.getAttribute("src")
+    && isCurrentPlayerSource({
+      desiredBackendKey,
+      attachedKey: currentRecordingAudioSourceKey,
+      hasSrc: !!audioEl.getAttribute("src"),
+    })
   ) {
     row.hidden = false;
     const retranscribeBtn = document.getElementById("retranscribeBtn");
@@ -2809,7 +2814,7 @@ async function renderLatestSavedAudio(): Promise<void> {
   if (!playbackUrl && latestSavedAudioState.file) {
     playbackUrl = URL.createObjectURL(latestSavedAudioState.file);
     playbackSourceKey = latestSavedAudioState.savedName
-      ? `${desiredBackendKey}\nfallback-file`
+      ? fallbackSourceKey(desiredBackendKey)
       : "session-file";
   }
   if (!playbackUrl) {
@@ -2974,9 +2979,12 @@ function setCurrentRecordingAudio(file: File | null, savedName = "", archiveDir 
 })();
 
 // Audio element error handler — Windows users reported playback fails
-// on the just-recorded clip. Without this hook the failure was silent;
-// now any media-element error is logged so we can diagnose codec /
-// MIME / blob-revocation issues from the support bundle.
+// on the just-recorded clip: the in-memory fallback can be an OPFS-lazy
+// blob whose spool was already destroyed (error code=4). Logging alone
+// left the controls enabled over a player that plays nothing; the
+// failure is now reported like every other audio-load failure in this
+// pane, and the source key is dropped so the next refresh tries the
+// backend again instead of keeping the dead source.
 (() => {
   const audioEl = document.getElementById("currentRecordingAudio") as HTMLAudioElement | null;
   if (!audioEl) return;
@@ -2987,6 +2995,10 @@ function setCurrentRecordingAudio(file: File | null, savedName = "", archiveDir 
     const src = audioEl.currentSrc || audioEl.src || "";
     const fileType = latestSavedAudioState?.file?.type || "";
     console.warn(`[currentRecordingAudio] media error code=${code} msg=${msg} mime=${fileType} src=${src.slice(0, 120)}`);
+    if (!audioEl.getAttribute("src")) return;
+    currentRecordingAudioSourceKey = "";
+    setPlayerEnabled(false, AUDIO_LOAD_FAILED_TEXT);
+    showRecordSessionNotice(AUDIO_LOAD_FAILED_TEXT, "warning", UI_TOKENS.notice.briefMs);
   });
 })();
 
