@@ -50,6 +50,8 @@ import {
   uploadQueueTitle,
   uploadRetryPlan,
   uploadSourceValidationError,
+  enterUploadProcessingStage,
+  type UploadItemStage,
 } from "./upload-item";
 import { UPLOAD_QUEUE_SAVE_FAILED_STATUS, nextQueueSaveRetry } from "./upload-queue-persist";
 import { classifyBootError, type BootFailure } from "./boot-error";
@@ -138,6 +140,7 @@ import { keepaliveFor } from "./keepalive";
 import { customPresetLimitReached, parseRuntimeLimits, smallAudioUiTimeoutMs, type RuntimeLimits } from "./runtime-limits";
 import { screenThumbLabel, screensStripNote } from "./screens-strip";
 import { fallbackSourceKey, isCurrentPlayerSource } from "./player-source";
+import { mediaErrorRecovery, parseMintedMediaUrl, type MintedMediaUrl } from "./media-url";
 import {
   parseRecordingSaveResponse,
   parseScreensError,
@@ -166,7 +169,14 @@ import {
   providerLabel,
   requireRemoteProvider,
 } from "./providers";
-import { JobPollHttpError, waitForJob } from "./job-poll";
+import { JobPollHttpError, createThenWaitForJob, waitForJob } from "./job-poll";
+import {
+  runSavedRecordingDecode,
+  savedDecodeFailureView,
+  type SavedDecodeAttempt,
+  type SavedDecodeResult,
+  type SavedDecodeStep,
+} from "./saved-recording-decode";
 import {
   LIVE_DRAFT_SCHEMA_VERSION,
   LiveDraftOperationQueue,
@@ -190,12 +200,6 @@ import {
   decideUploadQueueRestore,
   shouldDropLegacyUploadQueueSnapshot,
 } from "./upload-queue-restore";
-
-declare global {
-  interface Window {
-    __transcriptorMicHealth?: { get(): MicHealthSnapshot };
-  }
-}
 
 /**
  * The provider a transcription is sent to, in the shape the wire uses.
@@ -2473,7 +2477,8 @@ let hasStoredUpscaleModelPreference = false;
 let currentRecordingAudioObjectUrl = "";
 let currentRecordingAudioSourceKey = "";
 let currentRecordingAudioRenderSeq = 0;
-let recordingViewerAudioObjectUrl = "";
+/** What the History player streams: the recording and its minted URL (./media-url). */
+let recordingViewerStream: { name: string; archiveDir: string; minted: MintedMediaUrl } | null = null;
 let activeLiveSessionId = "";
 let activeLiveArchiveDir = "";
 let activeLiveSessionSnapshot: LiveSessionSnapshot | null = null;
@@ -2582,10 +2587,50 @@ function revokeCurrentRecordingAudioUrl(): void {
   currentRecordingAudioSourceKey = "";
 }
 
-function revokeRecordingViewerAudioUrl(): void {
-  if (!recordingViewerAudioObjectUrl) return;
-  URL.revokeObjectURL(recordingViewerAudioObjectUrl);
-  recordingViewerAudioObjectUrl = "";
+function clearRecordingViewerStream(): void {
+  recordingViewerStream = null;
+}
+
+/**
+ * A URL the History player can stream this recording from (S-15): the
+ * backend mints a short-lived capability for this one file, because a
+ * media element cannot send the API token header and the token must never
+ * be put in a URL.
+ */
+async function mintRecordingStreamUrl(name: string, archiveDir: string): Promise<MintedMediaUrl> {
+  return parseMintedMediaUrl(await apiPost<unknown>(
+    `/api/recordings/${encodeURIComponent(name)}/audio/stream-url`,
+    { archive_dir: archiveDir },
+  ));
+}
+
+/**
+ * The History player's URL expired while the recording stayed open (a
+ * seek after a long pause is answered 401): mint again and resume where it
+ * was. A fresh URL that fails is a real failure — the opening flow reports
+ * that one — so nothing here loops.
+ */
+async function recoverRecordingViewerStream(player: HTMLAudioElement): Promise<void> {
+  const stream = recordingViewerStream;
+  if (!stream || player.getAttribute("src") !== stream.minted.url) return;
+  if (mediaErrorRecovery(stream.minted, Date.now()) !== "remint") return;
+  const resumeAt = player.currentTime;
+  const resumePlaying = !player.paused;
+  let fresh: MintedMediaUrl;
+  try {
+    fresh = await mintRecordingStreamUrl(stream.name, stream.archiveDir);
+  } catch (e) {
+    console.warn("Recording audio stream re-mint failed", e);
+    return;
+  }
+  if (recordingViewerStream !== stream) return;
+  recordingViewerStream = { ...stream, minted: fresh };
+  player.src = fresh.url;
+  player.addEventListener("loadedmetadata", () => {
+    player.currentTime = resumeAt;
+    if (resumePlaying) void player.play().catch((err) => console.debug("resume after re-mint refused", err));
+  }, { once: true });
+  player.load();
 }
 
 function setRecordingViewerAudioRowVisible(visible: boolean, hydrating = false): void {
@@ -3105,6 +3150,12 @@ function setCurrentRecordingAudio(file: File | null, savedName = "", archiveDir 
     }
   });
 })();
+
+// The History player streams from a URL that expires (S-15); an error
+// after the expiry re-mints and resumes (recoverRecordingViewerStream).
+($("recordingAudio") as HTMLAudioElement).addEventListener("error", (ev) => {
+  void recoverRecordingViewerStream(ev.currentTarget as HTMLAudioElement);
+});
 
 // Audio element error handler — Windows users reported playback fails
 // on the just-recorded clip: the in-memory fallback can be an OPFS-lazy
@@ -4068,7 +4119,7 @@ async function apiGet<T>(url: string, signal?: AbortSignal): Promise<T> {
 async function apiPost<T>(
   url: string,
   body: unknown,
-  options: { keepalive?: boolean } = {},
+  options: { keepalive?: boolean; signal?: AbortSignal } = {},
 ): Promise<T> {
   const payload = JSON.stringify(body);
   const r = await fetch(url, {
@@ -4076,6 +4127,7 @@ async function apiPost<T>(
     headers: { "Content-Type": "application/json", ...authHeaders() },
     body: payload,
     keepalive: keepaliveFor(payload, !!options.keepalive),
+    signal: options.signal,
   });
   if (!r.ok) throw new Error(await parseError(r));
   return (await r.json()) as T;
@@ -4994,7 +5046,6 @@ async function waitForQueuedRemoteJob(
     diarize: boolean;
     remoteModel?: string;
     signal?: AbortSignal;
-    onProcessingProgress?: (fraction: number) => void;
   },
 ): Promise<RemoteTranscriptionResult> {
   const onAbort = () => { void cancelBackendJob(created.job_id); };
@@ -5005,12 +5056,7 @@ async function waitForQueuedRemoteJob(
   opts.signal?.addEventListener("abort", onAbort, { once: true });
   let result: RemoteTranscriptionResult;
   try {
-    result = await waitForBackendJob<RemoteTranscriptionResult>(created.job_id, {
-      signal: opts.signal,
-      onProgress: (job) => {
-        opts.onProcessingProgress?.(Math.max(0, Math.min(1, Number(job.progress || 0))));
-      },
-    });
+    result = await waitForBackendJob<RemoteTranscriptionResult>(created.job_id, { signal: opts.signal });
   } finally {
     opts.signal?.removeEventListener("abort", onAbort);
   }
@@ -5031,10 +5077,10 @@ async function remoteJobQueued(
     diarize: boolean;
     remoteModel?: string;
     signal?: AbortSignal;
-    onProcessingProgress?: (fraction: number) => void;
+    onJobCreated?: () => void;
   },
 ): Promise<RemoteTranscriptionResult> {
-  return waitForQueuedRemoteJob(await remoteJob(file, opts), opts);
+  return createThenWaitForJob(() => remoteJob(file, opts), (created) => waitForQueuedRemoteJob(created, opts), opts.onJobCreated);
 }
 
 async function remoteJobQueuedFromPath(
@@ -5045,10 +5091,10 @@ async function remoteJobQueuedFromPath(
     diarize: boolean;
     remoteModel?: string;
     signal?: AbortSignal;
-    onProcessingProgress?: (fraction: number) => void;
+    onJobCreated?: () => void;
   },
 ): Promise<RemoteTranscriptionResult> {
-  return waitForQueuedRemoteJob(await remoteJobFromPath(sourcePath, opts), opts);
+  return createThenWaitForJob(() => remoteJobFromPath(sourcePath, opts), (created) => waitForQueuedRemoteJob(created, opts), opts.onJobCreated);
 }
 
 function normalizeLocalTranscriptionResult(raw: { text?: string; duration?: number; segments?: Array<{ start?: number; end?: number; text?: string }> } | null | undefined): LocalTranscriptionResult {
@@ -5087,16 +5133,16 @@ async function waitForQueuedLocalJob(
 
 async function localJobQueued(
   file: File,
-  opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean; signal?: AbortSignal },
+  opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean; signal?: AbortSignal; onJobCreated?: () => void },
 ): Promise<LocalTranscriptionResult> {
-  return waitForQueuedLocalJob(await localJob(file, opts), opts);
+  return createThenWaitForJob(() => localJob(file, opts), (created) => waitForQueuedLocalJob(created, opts), opts.onJobCreated);
 }
 
 async function localJobQueuedFromPath(
   sourcePath: string,
-  opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean; signal?: AbortSignal },
+  opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean; signal?: AbortSignal; onJobCreated?: () => void },
 ): Promise<LocalTranscriptionResult> {
-  return waitForQueuedLocalJob(await localJobFromPath(sourcePath, opts), opts);
+  return createThenWaitForJob(() => localJobFromPath(sourcePath, opts), (created) => waitForQueuedLocalJob(created, opts), opts.onJobCreated);
 }
 
 async function remoteJobSync(
@@ -5231,6 +5277,89 @@ async function transcribeCanonicalAudioLocally(
     wordTimestamps: false,
     signal,
   });
+}
+
+function traceSavedDecodeAttempt(tag: string, a: SavedDecodeAttempt): void {
+  const step = a.route === "fetch-audio"
+    ? "audio read"
+    : a.provider === "deepgram" ? `deepgram REST ${a.route}` : "local whisper";
+  if (a.skipped) {
+    console.log(`[trace ${tag}] deepgram skipped — ${a.error instanceof Error ? a.error.message : String(a.error)}`);
+  } else if (a.error !== undefined) {
+    console.log(`[trace ${tag}] ${step} FAIL durMs=${a.durMs.toFixed(0)} err="${a.error instanceof Error ? a.error.message : String(a.error)}"`);
+  } else {
+    const text = a.text || "";
+    console.log(`[trace ${tag}] ${step} durMs=${a.durMs.toFixed(0)} model="${a.model}" textLen=${text.length} wordCount=${text.split(/\s+/).filter(Boolean).length}`);
+  }
+}
+
+/**
+ * Decode a saved recording again: Deepgram REST (in place when the
+ * recording is persisted), then local Whisper. The one chain behind
+ * Re-transcribe and stopLive's no-envelope recovery (FL-08); the order
+ * and failure rules are ./saved-recording-decode. Settings are passed in,
+ * read once by the caller (the stop path's snapshot, Re-transcribe's
+ * click), never re-read from the DOM mid-chain.
+ */
+async function decodeSavedRecording(input: {
+  name: string;
+  archiveDir: string;
+  language: string;
+  diarize: boolean;
+  localModel: string;
+  /** The audio for the upload and local steps (backend copy, or the stop path's in-memory file). */
+  fetchAudio: () => Promise<File | null>;
+  deepgramReachabilityHint?: boolean;
+  signal?: AbortSignal;
+  traceTag: string;
+  onStep?: (step: SavedDecodeStep) => void;
+}): Promise<SavedDecodeResult> {
+  const deepgramModel = getRemoteModelValue("deepgram");
+  const hint = !!input.deepgramReachabilityHint;
+  return runSavedRecordingDecode<File>(
+    {
+      persisted: !!input.name,
+      deepgram: isProviderKeyConfigured("deepgram")
+        ? {
+          model: deepgramModel,
+          unavailableReason: isRemoteProviderReachable("deepgram", hint) ? "" : remoteProviderOfflineMessage("deepgram"),
+        }
+        : null,
+      localModel: input.localModel,
+    },
+    {
+      // In place: the backend reads the archived file, no loopback
+      // GET + upload of the same bytes (``transcribe-on-disk``).
+      deepgramOnDisk: async (signal) => {
+        const data = await apiPost<{ result?: { text?: string } }>(
+          `/api/recordings/${encodeURIComponent(input.name)}/transcribe-on-disk`,
+          {
+            provider: "deepgram",
+            language: input.language,
+            diarize: input.diarize,
+            ...remoteModelJsonFields("deepgram", deepgramModel),
+            archive_dir: input.archiveDir || "",
+          },
+          { signal },
+        );
+        return String(data?.result?.text || "");
+      },
+      fetchAudio: input.fetchAudio,
+      deepgramUpload: async (file, signal) => (await remoteJobSync(file, {
+        provider: "deepgram",
+        language: input.language,
+        diarize: input.diarize,
+        remoteModel: deepgramModel,
+        providerReachabilityHint: hint,
+        signal,
+      })).text,
+      localDecode: async (file, signal) => (await transcribeCanonicalAudioLocally(file, input.language, input.localModel, signal)).text,
+      now: () => performance.now(),
+      onStep: input.onStep,
+      onAttempt: (a) => traceSavedDecodeAttempt(input.traceTag, a),
+    },
+    input.signal,
+  );
 }
 
 /**
@@ -5879,9 +6008,6 @@ function resetVU(): void {
 }
 
 const micHealth = new MicHealthTracker();
-window.__transcriptorMicHealth = {
-  get: () => micHealth.get(),
-};
 
 /** Topbar pill labels. Hidden entirely while the mic is idle. */
 const MIC_PILL_LABEL: Record<MicHealthState, string> = {
@@ -7918,7 +8044,7 @@ function resetRecordingViewer(placeholder: string = UI_COPY.recordings.viewerPla
   $("recordingContent").textContent = "";
   const player = $("recordingAudio") as HTMLAudioElement;
   player.pause();
-  revokeRecordingViewerAudioUrl();
+  clearRecordingViewerStream();
   player.removeAttribute("src");
   player.load();
   setRecordingViewerAudioRowVisible(false);
@@ -7934,7 +8060,7 @@ function setRecordingViewerLoading(displayName: string, willLoadAudio = false): 
   $("recordingContent").textContent = "";
   const player = $("recordingAudio") as HTMLAudioElement;
   player.pause();
-  revokeRecordingViewerAudioUrl();
+  clearRecordingViewerStream();
   player.removeAttribute("src");
   player.load();
   setRecordingViewerAudioRowVisible(willLoadAudio, willLoadAudio);
@@ -8708,12 +8834,14 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
         setRecordingViewerAudioRowVisible(true);
       } else {
         try {
-          const audioFile = await fetchSavedAudioFromBackend(name, String(r.archive_dir || effectiveArchiveDir).trim());
+          // Streamed, not fetched whole (S-15): playback starts on the
+          // first bytes and a seek reads only what it needs.
+          const audioArchiveDir = String(r.archive_dir || effectiveArchiveDir).trim();
+          const minted = await mintRecordingStreamUrl(name, audioArchiveDir);
           if (requestSeq !== recordingOpenRequestSeq || selectedRecordingKey() !== requestKey) return;
           player.pause();
-          revokeRecordingViewerAudioUrl();
-          recordingViewerAudioObjectUrl = URL.createObjectURL(audioFile);
-          player.src = recordingViewerAudioObjectUrl;
+          recordingViewerStream = { name, archiveDir: audioArchiveDir, minted };
+          player.src = minted.url;
           setRecordingViewerAudioRowVisible(true, true);
           player.load();
           await waitForRecordingViewerAudioReady(player);
@@ -8723,7 +8851,7 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
           if (requestSeq !== recordingOpenRequestSeq || selectedRecordingKey() !== requestKey) return;
           console.warn("Recording audio playback fetch failed", audioErr);
           player.pause();
-          revokeRecordingViewerAudioUrl();
+          clearRecordingViewerStream();
           player.removeAttribute("src");
           player.load();
           setRecordingViewerAudioRowVisible(false);
@@ -8736,7 +8864,7 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
       }
     } else {
       player.pause();
-      revokeRecordingViewerAudioUrl();
+      clearRecordingViewerStream();
       player.removeAttribute("src");
       player.load();
       setRecordingViewerAudioRowVisible(false);
@@ -8767,7 +8895,7 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
     $("recordingContent").textContent = "";
     const player = $("recordingAudio") as HTMLAudioElement;
     player.pause();
-    revokeRecordingViewerAudioUrl();
+    clearRecordingViewerStream();
     player.removeAttribute("src");
     player.load();
     setRecordingViewerAudioRowVisible(false);
@@ -9036,94 +9164,40 @@ $("retranscribeBtn").addEventListener("click", async () => {
       $("finalOutput").textContent = text;
     }
   };
-  // Track which providers were actually attempted so the final error
-  // message tells the user precisely what was tried — "switch to local
-  // in Settings" was misleading when the code had already fallen
-  // through to local under the hood and local ALSO failed. The hint
-  // surface is rebuilt below from this list, not hardcoded.
-  const triedProviders: string[] = [];
-  // Lifted out of the inner ``try`` so the outer ``catch`` can include
-  // the FIRST upstream error (typically the Deepgram failure) in the
-  // user-visible error message. Previously the Deepgram error was
-  // captured only inside the inner try, so by the time we reached the
-  // outer catch the variable was out of scope and only the LAST
-  // (local Whisper) error was displayed.
-  let lastProviderError: unknown = null;
   try {
     setRetranscribeStatus("Preparing audio…");
-    // ALWAYS fetch from the backend — never trust the in-memory blob.
-    //
-    // The previous "prefer in-memory ``audioState.file`` over backend
-    // GET" optimization saved one loopback round-trip but had two
-    // catastrophic failure modes that hit the user simultaneously:
-    //
-    //  1. ``audioState.file`` is the lazy OPFS-backed ``Blob([header,
-    //     spool])`` from ``OpfsPcmSink.finalize()``. After
-    //     ``deferredSinkDestroy.destroy()`` runs (right after the
-    //     initial save completes, in stopLive's tail), the spool is
-    //     gone and the Blob reads as zero bytes. The same lifecycle
-    //     bug already broke playback on Windows and was fixed in
-    //     ``renderLatestSavedAudio`` (line 601-605) by routing through
-    //     the backend URL — Re-transcribe was missed.
-    //  2. The construction also FORCED ``.wav`` extension and
-    //     ``audio/wav`` MIME on a payload that is usually WebM-Opus
-    //     for live recordings (see selectCanonicalCapturedAudio at
-    //     line 1841: ``live-<ts>.webm``). That lie breaks Deepgram
-    //     REST (Content-Type-driven container detection) and breaks
-    //     local Whisper (ensure_wav_16k's ``.wav``-fast-path probes
-    //     soundfile.info → fails → falls through to ffmpeg which
-    //     sometimes succeeds via content-sniffing, sometimes raises
-    //     a generic non-AudioError exception that the backend's
-    //     ``except AudioError`` handler at main.py:2823 lets escape
-    //     as HTTP 500). User-visible: BOTH providers fail on the
-    //     same valid 1.3 MB / 41-second recording.
-    //
-    // ``fetchSavedAudioFromBackend`` derives BOTH the filename and
-    // the MIME from the backend's response headers — the on-disk
-    // file is the canonical source.
-    const audioFile = await fetchSavedAudioFromBackend(audioState.savedName, audioState.archiveDir || "");
+    // Settings are read once, at the click: a change in the toolbar while
+    // the decode runs does not apply halfway through it.
     const lang = (($("language") as HTMLSelectElement).value || "auto").trim();
-    let text = "";
-    let usedProvider: Provider = "local";
-
-    // 1. Try Deepgram REST — higher accuracy than local Whisper for most
-    //    languages. Only attempted when the user has a key configured.
-    if (isProviderKeyConfigured("deepgram")) {
-      const dgModel = getRemoteModelValue("deepgram") || DEFAULT_DEEPGRAM_AUDIO_MODEL;
-      triedProviders.push(`Deepgram ${dgModel}`);
-      setRetranscribeStatus(`Re-transcribing via Deepgram (${dgModel})…`);
-      try {
-        const result = await remoteJobSync(audioFile, {
-          provider: "deepgram",
-          language: lang,
-          diarize: readDiarizeEnabled(),
-          remoteModel: dgModel,
-        });
-        text = String(result.text || "").trim();
-        usedProvider = "deepgram";
-      } catch (deepgramErr) {
-        // Network timeout, rate-limit, bad key — log and fall through to
-        // local Whisper so the user still gets a usable transcript.
-        lastProviderError = deepgramErr;
-        console.warn("Re-transcribe: Deepgram REST failed, trying local Whisper:", deepgramErr);
-      }
-    }
-
-    // 2. Local Whisper fallback — always available, no API key required.
-    if (!text) {
-      const model = selectedLocalModel();
-      triedProviders.push(`local Whisper ${model}`);
-      // Two-line message captures both the fallback context AND the
-      // current step: the user sees Deepgram-failed reason without
-      // losing the "we are still working" signal.
-      const fallbackHint = lastProviderError
-        ? `Deepgram failed — trying local Whisper (${model})…`
-        : `Re-transcribing via local Whisper (${model})…`;
-      setRetranscribeStatus(fallbackHint);
-      const localResult = await transcribeCanonicalAudioLocally(audioFile, lang, model);
-      text = localResult.text.trim();
-      usedProvider = "local";
-    }
+    // ALWAYS read the audio from the backend — never the in-memory blob.
+    // ``audioState.file`` can be the lazy OPFS-backed ``Blob([header,
+    // spool])`` that reads as zero bytes once the spool is destroyed after
+    // the save, and constructing a File from it forced a ``.wav`` name
+    // and MIME onto what is usually WebM-Opus — both providers then
+    // failed on a valid recording. ``fetchSavedAudioFromBackend`` takes
+    // the name and MIME from the backend's response headers.
+    const savedName = audioState.savedName;
+    const archiveDir = audioState.archiveDir || "";
+    const decoded = await decodeSavedRecording({
+      name: savedName,
+      archiveDir,
+      language: lang,
+      diarize: readDiarizeEnabled(),
+      localModel: selectedLocalModel(),
+      fetchAudio: () => fetchSavedAudioFromBackend(savedName, archiveDir),
+      traceTag: "retranscribe",
+      // A two-line message keeps the fallback context ("Deepgram failed")
+      // AND the "still working" signal visible in the result pane.
+      onStep: (step) => setRetranscribeStatus(
+        step.provider === "deepgram"
+          ? `Re-transcribing via Deepgram (${step.model})…`
+          : step.afterFailure
+            ? `Deepgram failed — trying local Whisper (${step.model})…`
+            : `Re-transcribing via local Whisper (${step.model})…`,
+      ),
+    });
+    let text = decoded.text;
+    const usedProvider: Provider = decoded.provider === "deepgram" ? "deepgram" : "local";
 
     if (text) {
       // A screen-mode recording's transcript carries its marks, whichever
@@ -9156,9 +9230,7 @@ $("retranscribeBtn").addEventListener("click", async () => {
           sourceText: spokenText,
           transcriptText: text,
           provider: usedProvider,
-          model: usedProvider === "deepgram"
-            ? getRemoteModelValue("deepgram")
-            : selectedLocalModel(),
+          model: decoded.model,
           language: lang,
         });
       } catch (saveErr) {
@@ -9197,47 +9269,35 @@ $("retranscribeBtn").addEventListener("click", async () => {
           }, capturedToken);
         }
       }
-    } else {
-      if (stillOwnsResultPane()) {
-        const tried = triedProviders.length ? ` (tried: ${triedProviders.join(", ")})` : "";
+    } else if (stillOwnsResultPane()) {
+      const view = savedDecodeFailureView(decoded);
+      if (view.kind === "error") {
+        // The message names what was tried: "switch Provider to local"
+        // is not suggested once local already ran and failed, and
+        // Deepgram's own failure is shown beside local's — logged only,
+        // it was invisible to a packaged-build user, who could not tell
+        // "Deepgram 401, local failed for another reason" from "both
+        // failed for the same reason".
+        const msg = explainNetworkError(view.error, "Re-transcribe failed", {
+          suggestLocalFallback: !view.localTried,
+        });
+        const triedSuffix = view.tried.length ? ` Tried: ${view.tried.join(", ")}.` : "";
+        const firstMsg = view.firstError === undefined
+          ? ""
+          : view.firstError instanceof Error ? view.firstError.message : String(view.firstError || "");
+        const firstShort = firstMsg.split("\n")[0].slice(0, 200).trim();
+        $("finalOutput").textContent = `${msg}${triedSuffix}${firstShort ? ` First: ${firstShort}.` : ""}`;
+      } else {
+        const tried = view.kind === "empty" && view.tried.length ? ` (tried: ${view.tried.join(", ")})` : "";
         $("finalOutput").textContent = `Re-transcribe returned empty result${tried}.`;
       }
     }
   } catch (e) {
+    // Past the decode (which reports its failures as a result): the
+    // marks, the save and the upscale handle their own errors, so this
+    // is a defect, not a provider failure.
     if (stillOwnsResultPane()) {
-      // Build a precise error message that names what was tried.
-      // The default ``explainNetworkError`` hint suggested "switch
-      // Provider to local in Settings" — misleading here because the
-      // code ALREADY fell through to local under the hood (and local
-      // is what just failed). Append the tried-providers tail so the
-      // user understands the local fallback ran and also failed; the
-      // suggestion to "switch to local" is suppressed when local is
-      // in the tried list.
-      const msg = explainNetworkError(e, "Re-transcribe failed", {
-        // Local already ran, under the hood, and failed: telling the
-        // user to switch to it is actively unhelpful.
-        suggestLocalFallback: !triedProviders.some((p) => p.startsWith("local")),
-      });
-      const triedSuffix = triedProviders.length ? ` Tried: ${triedProviders.join(", ")}.` : "";
-      // Surface the FIRST upstream error (typically the Deepgram
-      // failure) when both providers were attempted. Previously the
-      // Deepgram error was logged only via console.warn — invisible
-      // to a packaged-build user — and the toast showed only the
-      // local Whisper failure. With both errors visible, the user can
-      // distinguish "Deepgram returned 401 → expected, local picked
-      // it up but failed for unrelated reason" from "both failed for
-      // the SAME reason (e.g., upload bytes corrupt)".
-      let firstProviderTail = "";
-      if (lastProviderError && triedProviders.length > 1) {
-        const firstMsg = lastProviderError instanceof Error
-          ? lastProviderError.message
-          : String(lastProviderError || "");
-        const firstShort = firstMsg.split("\n")[0].slice(0, 200).trim();
-        if (firstShort) {
-          firstProviderTail = ` First: ${firstShort}.`;
-        }
-      }
-      $("finalOutput").textContent = `${msg}${triedSuffix}${firstProviderTail}`;
+      $("finalOutput").textContent = explainNetworkError(e, "Re-transcribe failed");
     }
   } finally {
     btn.disabled = false;
@@ -12920,34 +12980,6 @@ async function stopLive(
     //     manual Re-transcribe which the user clearly preferred).
     // Centralizing them ensures every path tries the highest-
     // quality available transcription before giving up.
-    // Deepgram REST against an already-saved recording — skips the
-    // ``GET /api/recordings/<name>/audio`` + ``POST /api/remote/
-    // transcribe-sync`` round-trip by hitting the in-place
-    // ``transcribe-on-disk`` endpoint added in 1.1.18. Saves
-    // 500 ms-1 s of loopback overhead on every recovery call when
-    // the recording was successfully persisted (the common case).
-    const deepgramRestOnDisk = async (signal?: AbortSignal): Promise<string | null> => {
-      if (!persistedRecordingName) return null;
-      const url = `/api/recordings/${encodeURIComponent(persistedRecordingName)}/transcribe-on-disk`;
-      const resp = await fetch(url, {
-        method: "POST",
-        headers: { ...authHeaders(), "Content-Type": "application/json" },
-        signal,
-        body: JSON.stringify({
-          provider: "deepgram",
-          language: languageValue,
-          diarize: diarizeValue,
-          ...remoteModelJsonFields("deepgram", getRemoteModelValue("deepgram")),
-          archive_dir: persistedRecordingArchiveDir || "",
-        }),
-      });
-      if (!resp.ok) {
-        const detail = await resp.text().catch(() => "");
-        throw new Error(`HTTP ${resp.status}${detail ? ": " + detail.slice(0, 200) : ""}`);
-      }
-      const data = await resp.json();
-      return String(data?.result?.text || "").trim();
-    };
     // Hard time-bound on recovery so a stalled provider doesn't block
     // stopLive indefinitely. Short live captures get a much tighter
     // budget: if a 12 s recording has no live text and Deepgram is
@@ -12959,90 +12991,28 @@ async function stopLive(
         : LIVE_DEFAULT_EMPTY_RECOVERY_TIMEOUT_MS;
     const recoverFromEmptyTranscriptInner = async (reason: string, signal?: AbortSignal): Promise<string> => {
       console.log(`[trace recover] enter reason="${reason}" persistedRecordingName="${persistedRecordingName}" hasInMemoryFile=${!!transcribeInputFile}`);
-      if (isProviderKeyConfigured("deepgram") && isRemoteProviderReachable("deepgram", deepgramReachabilityHint)) {
-        if (isCurrentUiSession(sessionUiToken)) {
+      const decoded = await decodeSavedRecording({
+        name: persistedRecordingName,
+        archiveDir: persistedRecordingArchiveDir || "",
+        language: languageValue,
+        diarize: diarizeValue,
+        localModel: liveSnapshot.finalLocalModel,
+        fetchAudio: fetchRecoveryAudioFile,
+        deepgramReachabilityHint,
+        signal,
+        traceTag: "recover",
+        onStep: (step) => {
+          if (!isCurrentUiSession(sessionUiToken)) return;
           patchCurrentRecordingSummary({
             title: provisionalTitle,
-            status: `${reason} Recovering via Deepgram REST.`,
+            status: step.provider === "deepgram"
+              ? `${reason} Recovering via Deepgram REST.`
+              : `${reason} Recovering via local Whisper.`,
             tone: "warning",
           }, sessionUiToken);
-        }
-        const tDg = performance.now();
-        // FAST PATH: backend transcribes the on-disk file directly
-        // (no upload). Falls through to upload-based path only when
-        // the recording wasn't persisted (extremely rare — stopLive's
-        // two-attempt save handles every common failure).
-        try {
-          const onDisk = await deepgramRestOnDisk(signal);
-          if (onDisk !== null) {
-            console.log(`[trace recover] deepgram REST on-disk durMs=${(performance.now() - tDg).toFixed(0)} textLen=${onDisk.length} wordCount=${onDisk.split(/\s+/).filter(Boolean).length}`);
-            if (onDisk) return onDisk;
-          } else {
-            console.log(`[trace recover] no persistedRecordingName — falling back to upload-based REST`);
-          }
-        } catch (e) {
-          console.log(`[trace recover] deepgram REST on-disk FAIL durMs=${(performance.now() - tDg).toFixed(0)} err="${e instanceof Error ? e.message : String(e)}" — falling back to upload-based REST`);
-        }
-        // SLOW PATH (kept as fallback when on-disk endpoint is
-        // unavailable, e.g., older backend, or when the recording
-        // wasn't persisted): fetch audio + upload via FormData.
-        const audioFile = await fetchRecoveryAudioFile();
-        if (audioFile) {
-          const tDg2 = performance.now();
-          try {
-            const result = await remoteJobSync(audioFile, {
-              provider: "deepgram",
-              language: languageValue,
-              diarize: diarizeValue,
-              remoteModel: getRemoteModelValue("deepgram"),
-              providerReachabilityHint: deepgramReachabilityHint,
-              signal,
-            });
-            const text = String(result.text || "").trim();
-            console.log(`[trace recover] deepgram REST upload durMs=${(performance.now() - tDg2).toFixed(0)} textLen=${text.length} wordCount=${text.split(/\s+/).filter(Boolean).length}`);
-            if (text) return text;
-          } catch (e) {
-            console.log(`[trace recover] deepgram REST upload FAIL durMs=${(performance.now() - tDg2).toFixed(0)} err="${e instanceof Error ? e.message : String(e)}"`);
-          }
-        }
-      } else {
-        console.log(
-          isProviderKeyConfigured("deepgram")
-            ? `[trace recover] deepgram skipped — ${remoteProviderOfflineMessage("deepgram")}`
-            : `[trace recover] deepgram skipped — no API key configured`,
-        );
-      }
-      // Local Whisper — last resort. Always uses the in-memory /
-      // backend-fetched file path (no in-place equivalent because
-      // local pass already runs server-side and there's no upload
-      // boundary worth saving).
-      const audioFile = await fetchRecoveryAudioFile();
-      if (!audioFile) {
-        console.log(`[trace recover] no audio file for local whisper — abort`);
-        return "";
-      }
-      if (isCurrentUiSession(sessionUiToken)) {
-        patchCurrentRecordingSummary({
-          title: provisionalTitle,
-          status: `${reason} Recovering via local Whisper.`,
-          tone: "warning",
-        }, sessionUiToken);
-      }
-      const tLocal = performance.now();
-      try {
-        const local = await transcribeCanonicalAudioLocally(
-          audioFile,
-          languageValue,
-          liveSnapshot.finalLocalModel,
-          signal,
-        );
-        const text = String(local.text || "").trim();
-        console.log(`[trace recover] local whisper OK durMs=${(performance.now() - tLocal).toFixed(0)} model="${liveSnapshot.finalLocalModel}" textLen=${text.length} wordCount=${text.split(/\s+/).filter(Boolean).length}`);
-        return text;
-      } catch (e) {
-        console.log(`[trace recover] local whisper FAIL durMs=${(performance.now() - tLocal).toFixed(0)} err="${e instanceof Error ? e.message : String(e)}"`);
-        return "";
-      }
+        },
+      });
+      return decoded.text;
     };
     // Public helper: wraps the inner chain in a hard timeout so a
     // stalled provider can't hang the stopLive flow forever. The
@@ -13201,8 +13171,9 @@ async function stopLive(
         // expired with no ``final``. The backend produced no reading of
         // this recording, so the renderer decodes the audio it saved
         // (``recoverFromEmptyTranscript``: Deepgram REST on the saved
-        // file, then local Whisper). Re-transcribe runs its own,
-        // separate decode of the saved audio (FL-08).
+        // file, then local Whisper) — the same ``decodeSavedRecording``
+        // chain the Re-transcribe button runs (FL-08), inside this
+        // stop's latency budget.
         //
         // An envelope with EMPTY text and no error is NOT missing: that
         // is the backend saying the recording holds no speech, and
@@ -14007,7 +13978,7 @@ interface UploadQueueItem {
   //                is being written to the archive — no longer stoppable)
   //   none      → status's own label (done/error/cancelled)
   status: UploadQueueStatus;
-  stage?: "queued" | "uploading" | "processing" | "saving" | "done";
+  stage?: UploadItemStage;
   text?: string;
   error?: string;
   startedAt?: number;
@@ -14888,24 +14859,12 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
   item.abortController = new AbortController();
   saveUploadQueueSnapshot();
   renderUploadQueue();
-  // Heuristic stage transition: ``fetch`` doesn't expose a clean
-  // "request body fully sent" event in the browser, so we mark the
-  // crossover from "uploading" to "processing" after a small delay
-  // proportional to the file size — at typical broadband speeds,
-  // 1 MB ≈ 100ms, so a 50 MB video is ~5 s of uploading. Capped at
-  // 8 s so a slow link doesn't pin "uploading" forever, and the
-  // backend's actual response time then takes over the "processing"
-  // perception. The crossover is replaced by the real transition
-  // when the response arrives below.
-  const _stageCrossoverDelay = sourceFile ? Math.min(8000, Math.max(800, sourceFile.size / 10000)) : 0;
-  const _stageTimer = sourceFile && !useSourcePath
-    ? window.setTimeout(() => {
-      if (item.status === "transcribing" && item.stage === "uploading") {
-        item.stage = "processing";
-        renderUploadQueue();
-      }
-    }, _stageCrossoverDelay)
-    : 0;
+  // "Uploading… → Processing…" flips when the backend has created the
+  // job, i.e. once the whole request body is sent — the transport reports
+  // that moment for both providers (./job-poll createThenWaitForJob).
+  const onJobCreated = () => {
+    if (enterUploadProcessingStage(item)) renderUploadQueue();
+  };
   const selectedProvider = normalizeUploadProvider(item.requestedProvider || item.provider);
   // Upload is a batch workflow: if the selected remote provider is
   // unavailable or has no key, keep the file moving through Local
@@ -14952,6 +14911,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
         splitStereo: true,
         wordTimestamps: false,
         signal: item.abortController.signal,
+        onJobCreated,
       };
       const out = useSourcePath
         ? await localJobQueuedFromPath(sourcePath, localOpts)
@@ -14974,14 +14934,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
         // for upload + ffmpeg + provider processing. Large videos can
         // legitimately run past the old 5-minute XHR ceiling; the
         // backend job owns the long work and this renderer only polls.
-        // Every poll tick (0.9 s, then 3 s) lands here; only the first
-        // changes anything. Re-rendering on each tick rebuilt the whole
-        // queue DOM and dropped focus/hover once a second (FQ-07).
-        onProcessingProgress: () => {
-          if (item.status !== "transcribing" || item.stage === "processing") return;
-          item.stage = "processing";
-          renderUploadQueue();
-        },
+        onJobCreated,
       };
       const out = useSourcePath
         ? await remoteJobQueuedFromPath(sourcePath, remoteOpts)
@@ -15024,7 +14977,6 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
     item.endedAt = Date.now();
     item.completedAt = Date.now();
   } finally {
-    clearTimeout(_stageTimer);
     item.abortController = undefined;
     item.cancelRequested = false;
     renderUploadQueue();

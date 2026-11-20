@@ -568,6 +568,16 @@ describe("live socket close handler (FL-03)", () => {
   });
 });
 
+describe("S-15: the History player streams instead of fetching the whole file", () => {
+  it("openRecording plays a minted stream URL and never builds a Blob of the audio", () => {
+    const open = mainTsxSlice("async function openRecording(", "\n}\n");
+    expect(open).toContain("mintRecordingStreamUrl(name, audioArchiveDir)");
+    expect(open).toContain("player.src = minted.url;");
+    expect(open).not.toContain("fetchSavedAudioFromBackend(");
+    expect(open).not.toContain("createObjectURL(");
+  });
+});
+
 /** Slice one top-level function of main.tsx, from its header to the next marker. */
 function mainTsxSlice(header: string, next: string): string {
   const start = mainTsx.indexOf(header);
@@ -616,9 +626,14 @@ describe("upload queue wiring for a failed History save (FQ-01/FQ-05/FQ-18)", ()
     expect(mainTsx).not.toContain('window.addEventListener("beforeunload", flushUploadQueueSnapshotBestEffort');
   });
 
-  it("FQ-06/FQ-07: no invented progress, and a poll tick re-renders only when the stage changes", () => {
+  it("FQ-06/FQ-07: no invented progress; the stage flips once, when the transport reports the job created", () => {
     expect(mainTsx).not.toContain("uploadProgress");
-    expect(mainTsx).toContain('if (item.status !== "transcribing" || item.stage === "processing") return;');
+    // The size-guessed timer and the poll-tick hook are gone; the one source
+    // is the transport's onJobCreated (behaviour: job-poll / upload-item tests).
+    expect(mainTsx).not.toContain("_stageTimer");
+    expect(mainTsx).not.toContain("onProcessingProgress");
+    expect(mainTsx).toContain("if (enterUploadProcessingStage(item)) renderUploadQueue();");
+    expect(mainTsx.match(/createThenWaitForJob\(/g) || []).toHaveLength(4);
   });
 
   it("FQ-08: the pump starts the oldest queued item", () => {

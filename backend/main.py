@@ -26,7 +26,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlencode, urlparse
 from urllib.request import urlopen
 
 from fastapi import (
@@ -77,6 +77,7 @@ from backend.model_catalog import (
     health_model_catalog,
 )
 from backend.audio_mime import AUDIO_EXT_TO_MIME, audio_content_type
+from backend.media_tokens import MediaTokens
 from backend.audio import (
     AudioError,
     compact_audio_chunks_for_remote,
@@ -935,6 +936,9 @@ API_TOKEN = _load_or_create_api_token()
 # token opens. Loaded once here so the auth path compares against
 # memory and never touches the disk per request.
 CLI_ACCESS = CliAccess(DATA_DIR)
+#: Streaming-audio capabilities (S-15): see backend/media_tokens.py. One
+#: per process, so no token outlives the backend that minted it.
+MEDIA_TOKENS = MediaTokens()
 CLI_ACCESS.load()
 
 
@@ -8477,19 +8481,91 @@ async def get_recording(
     return await asyncio.to_thread(_read_recording_payload, p, target_dir)
 
 
+def _recording_audio_file_or_404(recording_name: str, archive_dir: str) -> Path:
+    """The audio file of *recording_name* in *archive_dir* (default archive
+    when empty), resolved the one way every audio route resolves it."""
+    target_dir = _resolve_recordings_target_dir(archive_dir, create=False) if str(archive_dir or "").strip() else None
+    p = _recording_path_or_404(recording_name, target_dir=target_dir)
+    audio_path = _recording_audio_path(p.name, target_dir=target_dir)
+    if audio_path is None:
+        raise HTTPException(status_code=404, detail="recording audio not found")
+    return audio_path
+
+
+def _media_token_scope(audio_path: Path) -> str:
+    """What a streaming token is bound to: the resolved file itself."""
+    return str(audio_path.resolve())
+
+
 @app.get("/api/recordings/{recording_name}/audio")
 def get_recording_audio(
     recording_name: str,
     archive_dir: str = "",
     _auth: None = Depends(_require_api_auth),
 ):
-    target_dir = _resolve_recordings_target_dir(archive_dir, create=False) if str(archive_dir or "").strip() else None
-    p = _recording_path_or_404(recording_name, target_dir=target_dir)
-    audio_path = _recording_audio_path(p.name, target_dir=target_dir)
-    if audio_path is None:
-        raise HTTPException(status_code=404, detail="recording audio not found")
+    audio_path = _recording_audio_file_or_404(recording_name, archive_dir)
     media_type = _audio_content_type(audio_path.name)
     return FileResponse(str(audio_path), media_type=media_type, filename=audio_path.name)
+
+
+@app.post("/api/recordings/{recording_name}/audio/stream-url")
+def mint_recording_audio_stream_url(
+    recording_name: str,
+    payload: dict = Body(default_factory=dict),
+    _auth: None = Depends(_require_api_auth),
+):
+    """A URL an ``<audio>`` element can play this recording from (S-15).
+
+    The element cannot send ``X-API-Token``; the URL carries a short-lived
+    capability for this one file instead (backend/media_tokens.py — the
+    threat model is there). Renderer-only: the CLI token's route list does
+    not include it.
+    """
+    archive_dir = str(payload.get("archive_dir") or "").strip()
+    audio_path = _recording_audio_file_or_404(recording_name, archive_dir)
+    token, expires_at = MEDIA_TOKENS.mint(_media_token_scope(audio_path))
+    params = {"media_token": token}
+    if archive_dir:
+        params["archive_dir"] = archive_dir
+    url = f"/api/recordings/{quote(recording_name, safe='')}/audio/stream?{urlencode(params)}"
+    return {"url": url, "expires_at": expires_at}
+
+
+@app.get("/api/recordings/{recording_name}/audio/stream")
+def stream_recording_audio(
+    request: Request,
+    recording_name: str,
+    media_token: str = "",
+    archive_dir: str = "",
+):
+    """The recording's audio for a media element, authorised ONLY by a
+    ``media_token`` minted for this file (never the API token: it must not
+    travel in a URL). Range requests are answered by ``FileResponse`` (206),
+    so playback starts at once and a seek reads only what it needs."""
+    client_key = request.client.host if request.client else "unknown"
+    if not _touch_rate_limit(_request_windows, client_key, RATE_LIMIT_PER_MIN):
+        raise HTTPException(status_code=429, detail="rate limit exceeded")
+    # Anything short of a verified token answers 401 whatever the reason
+    # (bad, expired, another file, a file or folder that is gone or
+    # refused): a caller without a capability learns nothing about the
+    # archive, and the renderer re-mints once — the mint route, behind the
+    # API token, is where "not found" is reported.
+    try:
+        audio_path = _recording_audio_file_or_404(recording_name, archive_dir)
+    except HTTPException:
+        raise HTTPException(status_code=401, detail="unauthorized") from None
+    if not MEDIA_TOKENS.verify(media_token, _media_token_scope(audio_path)):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    media_type = _audio_content_type(audio_path.name)
+    return FileResponse(
+        str(audio_path),
+        media_type=media_type,
+        filename=audio_path.name,
+        content_disposition_type="inline",
+        # The URL is a credential for the next minutes: nothing should
+        # keep the response (and with it the URL as a cache key) on disk.
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/recordings/{recording_name}/screens/{file_name}")

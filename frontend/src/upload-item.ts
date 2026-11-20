@@ -122,3 +122,18 @@ export function uploadErrorView(item: UploadItemSaveState & { error?: string }):
   const transcript = uploadTranscriptAwaitingSave(item) ? String(item.text || "").trim() : "";
   return { error: String(item.error || ""), transcript, copyable: !!transcript };
 }
+
+export type UploadItemStage = "queued" | "uploading" | "processing" | "saving" | "done";
+
+/**
+ * The backend has the whole file (its job exists): an item still shown as
+ * "Uploading…" moves to "Processing…". Returns whether anything changed, so
+ * the caller re-renders only then (FQ-07). Any other stage — already
+ * processing (a from-path job never uploads), saving, or an item no longer
+ * transcribing — stays as it is.
+ */
+export function enterUploadProcessingStage(item: { status: UploadItemStatus; stage?: UploadItemStage }): boolean {
+  if (item.status !== "transcribing" || item.stage !== "uploading") return false;
+  item.stage = "processing";
+  return true;
+}

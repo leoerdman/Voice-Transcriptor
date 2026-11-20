@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  enterUploadProcessingStage,
   isUploadClearable,
   pickNextQueuedUpload,
   uploadErrorView,
@@ -133,5 +134,25 @@ describe("FQ-05: Retry of a save failure re-runs the save, not the paid transcri
   it("plans a full transcription when there is nothing to save", () => {
     expect(uploadRetryPlan({ status: "error", text: "   " })).toBe("transcribe");
     expect(uploadRetryPlan({ status: "error" })).toBe("transcribe");
+  });
+});
+
+describe("FQ-06: Uploading → Processing flips when the job exists, once", () => {
+  it("moves an uploading item to processing and says it changed", () => {
+    const item = { status: "transcribing" as const, stage: "uploading" as const };
+    expect(enterUploadProcessingStage(item)).toBe(true);
+    expect(item.stage).toBe("processing");
+  });
+
+  it("leaves an item already processing (a from-path job) and reports no change", () => {
+    const item = { status: "transcribing" as const, stage: "processing" as const };
+    expect(enterUploadProcessingStage(item)).toBe(false);
+    expect(item.stage).toBe("processing");
+  });
+
+  it("leaves an item that stopped transcribing meanwhile", () => {
+    const item = { status: "cancelled" as const, stage: "uploading" as const };
+    expect(enterUploadProcessingStage(item)).toBe(false);
+    expect(item.stage).toBe("uploading");
   });
 });
