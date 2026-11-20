@@ -20,6 +20,9 @@ The fixes of the 2026-11-20 audit (275 findings — `BUGSAUDIT-2026-11-20.md`), 
 - The Live toolbar no longer offers the "None" provider; a stored "None" becomes the default provider.
 - Shortcut badges in Settings update the moment registration changes; the window and main process talk over preload channels instead of the page title.
 - Archive statistics label their durations as estimates.
+- **History plays audio as a stream** instead of loading the whole file into memory first. The player gets a short-lived link that opens only that one recording (it never carries the app's API token) and renews it if it expires mid-playback.
+- **Re-transcribe decodes the saved file in place** through the same chain the stop's fallback uses, instead of downloading and re-uploading it; History records the model that actually decoded.
+- The upload queue switches from *Uploading…* to *Processing…* when the job really exists, not on a guess from the file size.
 
 ### Fixed
 
@@ -29,6 +32,7 @@ The fixes of the 2026-11-20 audit (275 findings — `BUGSAUDIT-2026-11-20.md`), 
 - A dictation that starts with "HTTP …" or contains "network error" is pasted like any other.
 - The History entry is named after the final transcript again, not the live text; the capsule shows *Upscaling* again.
 - An upload job no longer hangs after one failed status poll, and a missing job ends the wait at once.
+- The recording monitor could stop updating for the rest of a take after one failed probe.
 - A long live draft keeps its newest text; GigaAM stops re-downloading from an unreachable host for 10 minutes; the passive update check no longer writes "Couldn't check…" into Settings; the boot overlay no longer flashes "Ready" before a boot error.
 - **Documentation: the voice-mode capsule can still bring the window forward on macOS.** The 1.6.4 entry said the capsule never moves the main window. That holds for everything the app does with the capsule, and for screen mode, where a press on the capsule never reaches the window server. Outside screen mode a click on the capsule is an ordinary click on a window of an inactive app, and macOS answers it by activating the app; the app ignores that one activate (it is told apart by a short time window, so a genuine Dock click inside that window is ignored too), but macOS may already have raised the window. `desktop/window-lifecycle.js` states the limit; removing it needs the screen-mode tap path for the voice capsule as well.
 
