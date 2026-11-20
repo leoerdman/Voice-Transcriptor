@@ -142,3 +142,14 @@ test("an inactive capsule erases the line", () => {
   capsule.setState({ status: "", mode: "idle", level: 0 });
   assert.equal(capsule.draws.length, 0, "nothing is left on the canvas");
 });
+
+test("a new take brings the line in from the right again, even with no idle state between takes", () => {
+  const capsule = loadCapsule();
+  capsule.setState({ status: "Recording", mode: "recording", level: 0, startedAt: 1000 });
+  for (let i = 0; i < 60; i += 1) capsule.step();
+  const lineOf = () => capsule.draws.find((d) => d.h === tokens.waveBaselineHeight);
+  assert.equal(lineOf().x, 0, "the first take's line spans the waveform");
+  capsule.setState({ status: "Starting", mode: "recording", level: 0, startedAt: 99000 });
+  capsule.step();
+  assert.ok(lineOf().x > 0, "the second take starts at the right edge");
+});

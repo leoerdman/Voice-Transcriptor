@@ -1970,7 +1970,11 @@ function recordingStatusCapsuleHtml() {
       renderWave(now);
     }
     window.__setCapsuleState = (next) => {
+      const previousStart = Number(state.startedAt || 0);
       state = { ...state, ...(next || {}) };
+      // A new take (a new start time) brings its line in from the right
+      // edge again, even when no empty status came between the takes.
+      if (Number(state.startedAt || 0) !== previousStart && Number(state.startedAt || 0) > 0) baselineSince = 0;
       const nextScreen = !!state.screen;
       if (nextScreen !== screenMode) {
         screenMode = nextScreen;
