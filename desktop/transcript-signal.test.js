@@ -122,7 +122,7 @@ test("main.js classifies hand-off signals through ./transcript-signal and sniffs
 });
 
 test("the pasted text keeps its line breaks; only the ends are trimmed (2026-11-21: a screen take pasted as one line)", () => {
-  const take = "Диктовка с рисованием по экрану · 1 скрин\nКак читать: …\n\nВот [✏️1 скрин 1: красный прямоугольник, в центре] это [/1]\n\nСводка по скринам:\nСкрин 1 · shot-01.png\n  1 · 00:02 красный прямоугольник";
+  const take = "Диктовка с рисованием по экрану · 1 скрин\nКак читать: …\n\n### Скрин 1 · 00:00–00:05 · shot-01-preview.jpg\nШтрихи: 1 — 40–60% × 40–60%\nВот [✏️1 красный, в центре] это [/1]\n\n### После последнего скрина\nвсё";
   const verdict = classifyRecordingSignal({ final: true, kind: "transcript", text: `\n ${take}\r\n` });
   assert.equal(verdict.outcome, SIGNAL_OUTCOME.FINAL);
   assert.equal(verdict.text, take);
