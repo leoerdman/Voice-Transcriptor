@@ -19,10 +19,7 @@
  * broken mic for a couple of extra seconds.
  *
  * The FSM below is pure and clock-injected so it can be unit tested
- * deterministically (see ``frontend/tests/mic-health.test.ts``; the older
- * ``backend/tests/test_mic_health.py`` compiles this file with tsc from a
- * pytest scenario runner and predates the frontend having a test runner at
- * all — it is a second, weaker copy of the same coverage). All
+ * deterministically (see ``frontend/tests/mic-health.test.ts``). All
  * user-visible copy lives in ``STATUS_FOR_STATE`` and is derived from
  * the resulting state, never passed alongside it — that keeps status
  * text single-sourced.

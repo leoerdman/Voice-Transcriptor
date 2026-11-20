@@ -1386,9 +1386,6 @@ const RECORDING_STATUS_CAPSULE = Object.freeze((() => {
   const t = {
   width: 110,
   height: 30,
-  minWidth: 110,
-  minHeight: 30,
-  maxHeight: 30,
   bottomMargin: 16,
   pillHeight: 30,
   pillPadLeft: 4,
@@ -1470,8 +1467,8 @@ function shouldSuppressActivateForRecordingStatusCapsule() {
 // The window is exactly the pill, and the pill's size is a function of
 // one flag (./capsule-geometry, DM-13). It used to be measured in the
 // capsule page and reported back over document.title, which left the
-// window 110 px wide — clipping the 126 px screen-mode pill — until the
-// first measurement arrived.
+// window at ``width`` — clipping the wider screen-mode pill (``maxWidth``)
+// — until the first measurement arrived.
 function getRecordingStatusCapsuleWindowSize() {
   return capsuleWindowSize(RECORDING_STATUS_CAPSULE, !!recordingStatusCapsuleState.screen);
 }
@@ -1549,7 +1546,7 @@ function recordingStatusCapsuleHtml() {
       gap: ${t.pillGap}px;
     }
     #pill.screen {
-      width: ${t.width + t.pillGap + t.screenIconSize}px;
+      width: ${t.maxWidth}px;
     }
     #pill.screen #core {
       grid-template-columns: ${t.statusControlSize}px minmax(0, 1fr) ${t.timerWidth}px ${t.screenIconSize}px;
@@ -2816,6 +2813,16 @@ async function toggleRecordingFromShortcut(mode = "voice") {
       appendMainLog(`[shortcut] toggle aborted: renderer probe timed out (${RENDERER_TOGGLE_BUDGET_MS}ms); the press expires unrun`);
       resetRecordingStatusState();
       traceEnd(trace, "failed", { reason: "renderer-probe-timeout" });
+      return;
+    }
+    if (result?.expired) {
+      // The renderer reached this press after its notAfter (the toggle
+      // budget minus the return margin, desktop/renderer-toggle.js) and
+      // refused to run it. The renderer is up — "App Loading" would be
+      // false; the press simply did nothing, so the user presses again.
+      appendMainLog("[shortcut] toggle press expired before the renderer ran it; nothing was toggled");
+      resetRecordingStatusState();
+      traceEnd(trace, "failed", { reason: "press-expired" });
       return;
     }
     if (!result?.ok || !result.uiReady) {
@@ -6387,12 +6394,26 @@ async function handlePostStopTranscriptTimeout(trace, bestKnownText = "") {
       lastTranscriptText = recovered;
       saveLastTranscriptToDisk(recovered);
     }
-    try { clipboard.writeText(recovered); } catch { }
+    // No paste happens here, so this write stands outside the clipboard
+    // lease (the exception desktop/clipboard-lease.js names).
+    let onClipboard = true;
+    try { clipboard.writeText(recovered); } catch { onClipboard = false; }
     traceStep(trace, "transcript_recovered_after_timeout", {
       len: recovered.length,
       digest: textDigest(recovered),
       source: fromBestKnown ? "best_known_text" : "latest_transcript_lookup",
+      onClipboard,
     });
+    if (!onClipboard) {
+      // The status must not claim a clipboard that does not hold it; the
+      // paste-last hotkey reads the persisted copy either way.
+      return {
+        text: pasteAccel
+          ? `Timed out — press ${pasteAccel} to paste the transcript.`
+          : "Timed out — the transcript could not be put on the clipboard.",
+        kind: RECORDING_STATUS_KIND.WARN,
+      };
+    }
     // WARN, not "still working": this IS the final answer, and it says
     // the transcript survived. It used to fall through both substring
     // ladders into "transcribing"/neutral, so the recovery status looked
@@ -8652,11 +8673,8 @@ async function createWindow(options = {}) {
   win.on("moved", () => noteMainWindowUserGeometry("moved"));
 
   win.on("closed", () => {
-    // The webContents and its listeners are destroyed with the window.
-    // (A removeAllListeners block used to sit here behind
-    // ``!win.isDestroyed()`` — always false inside "closed" — so it
-    // never ran; it was deleted rather than "fixed", because there is
-    // nothing left to remove.)
+    // The webContents and its listeners are destroyed with the window,
+    // so there is nothing to remove here.
     win = null;
   });
 

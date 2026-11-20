@@ -10619,14 +10619,13 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
     window.__transcriptorLastFinishedText = pasteText;
   }
 
-  // Channel 1b: the same fact, pushed to the Electron main process
-  // instead of waiting to be polled for it (§6.7). Every publish for a
-  // real recording emits one signal — a recording that ends without a
-  // transcript at all still says so, which is how the main process
-  // learns it is terminal without waiting out its deadline. The text on
-  // a non-final signal is whatever the UI is showing; judging it is the
-  // main process's job (it owns the paste decision), and a second
-  // opinion here would be a second policy.
+  // Push to the Electron main process (desktop/transcript-signal.js):
+  // every publish for a real recording emits one signal — a recording
+  // that ends without a transcript at all still says so, which is how
+  // main learns it is terminal without waiting out its deadline. Main
+  // decides from ``final`` and the kind/phase label, not by reading the
+  // text (only whole-string equality with the renderer's own no-speech
+  // placeholders); the text rides along to be pasted when ``final``.
   if (rid > 0) {
     window.transcriptor?.recordingFinal?.({
       recordingId: rid,

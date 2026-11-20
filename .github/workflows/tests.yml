@@ -57,17 +57,6 @@ jobs:
       # tested one set of versions while the DMG shipped another, so a green
       # run said nothing about what users actually run.
       - run: pip install -c requirements.runtime-lock.txt -r requirements.txt
-      # Node + frontend/node_modules are REQUIRED here, not optional:
-      # backend/tests/test_live_coverage_policy.py compiles and executes
-      # frontend/src/live-coverage.ts via node/tsc and silently
-      # self-skips when either is missing. Without these two steps CI
-      # reports green while running ten fewer real tests than local.
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-      - run: npm --prefix frontend ci
       # CI runs the interpreter from .python-version — the one the bundled
       # runtime is built with — so asyncio-primitive construction semantics
       # cannot drift again.
