@@ -189,11 +189,8 @@ function paletteHtml(colors, selected) {
 </style></head>
 <body><div id="pill">${dots}</div>
 <script>
-  document.getElementById("pill").addEventListener("click", (e) => {
-    const b = e.target.closest(".dot");
-    if (!b) return;
-    document.title = "__screen_palette__" + b.dataset.c + "__" + Date.now();
-  });
+  // A tap on a dot reaches this page only as the helper's tap, which the
+  // controller resolves to the dot's colour itself (\`deliverTap\`).
   window.__select = (c) => {
     for (const b of document.querySelectorAll(".dot")) b.classList.toggle("sel", b.dataset.c === c);
     return true;
@@ -481,13 +478,6 @@ function createScreenModeController(deps) {
     palette = w;
     optional("palette setAlwaysOnTop", () => w.setAlwaysOnTop(true, "screen-saver", 1));
     optional("palette setVisibleOnAllWorkspaces", () => w.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }));
-    w.webContents.on("page-title-updated", (event, title) => {
-      const raw = String(title || "");
-      if (!raw.startsWith("__screen_palette__")) return;
-      event.preventDefault();
-      const color = raw.slice("__screen_palette__".length).split("__")[0];
-      setColor(color);
-    });
     const html = paletteHtml(SCREEN_MODE.colors, session ? session.color : SCREEN_MODE.colors[0]);
     await w.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
     if (!w.isDestroyed()) w.showInactive();
@@ -522,11 +512,15 @@ function createScreenModeController(deps) {
   }
 
   /**
-   * A tap the helper took on one of our controls: click whatever is at
-   * that point inside the control's own page. The window server never
+   * A tap the helper took on one of our controls. The window server never
    * sees it, so the app is never activated and its main window never
-   * comes forward. The page's own click handlers do the rest — the same
-   * handlers a real click runs.
+   * comes forward.
+   *   * On the palette: the colour of the dot under the point is read
+   *     back and selected here — the palette page has no channel of its
+   *     own to the main process.
+   *   * On the capsule: whatever is at that point inside its page is
+   *     clicked, and the page's own click handlers do the rest — the same
+   *     handlers a real click runs.
    */
   function deliverTap(x, y) {
     const target = controlWindows().find((w) => {
@@ -537,6 +531,19 @@ function createScreenModeController(deps) {
     const b = target.getBounds();
     const localX = x - b.x;
     const localY = y - b.y;
+    if (target === palette) {
+      target.webContents.executeJavaScript(
+        `(() => {
+          const el = document.elementFromPoint(${localX}, ${localY});
+          const dot = el && el.closest(".dot");
+          return dot ? dot.dataset.c : null;
+        })()`,
+        true,
+      ).then((color) => {
+        if (color) setColor(color);
+      }, (e) => log(`[screen-mode] palette tap failed: ${e?.message || e}`));
+      return;
+    }
     target.webContents.executeJavaScript(
       `(() => {
         const el = document.elementFromPoint(${localX}, ${localY});

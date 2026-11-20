@@ -458,6 +458,27 @@ test("Screen Recording that is not granted yet is warned about at start", async 
   }
 });
 
+// ── DX-13 ──────────────────────────────────────────────────────────────
+test("a tap on a palette dot selects its colour without a title channel", async () => {
+  const { SCREEN_MODE } = require("./screen-mode");
+  const picked = SCREEN_MODE.colors[2];
+  const world = createWorld({ hit: () => ({ closest: (sel) => (sel === ".dot" ? { dataset: { c: picked } } : null) }) });
+  try {
+    await world.controller.start(ID);
+    const palette = world.palette();
+    assert.equal(palette.webContents.listenerCount("page-title-updated"), 0, "no document.title IPC");
+    const b = palette.getBounds();
+    world.say({ t: "tap", x: b.x + b.width / 2, y: b.y + b.height / 2 });
+    await tick(5);
+    drawStroke(world, [[100, 100], [200, 100]]);
+    await world.controller.takeShot("hotkey");
+    const manifest = (await world.controller.finish({ id: ID })).manifest;
+    assert.equal(manifest.events.find((e) => e.type === "stroke").color, picked);
+  } finally {
+    world.cleanup();
+  }
+});
+
 // ── DX-10: the helper's documented protocol, line by line ──────────────
 test("every stdout line main.swift documents is understood by the controller", async () => {
   const swift = fs.readFileSync(path.join(__dirname, "native", "screen-input", "main.swift"), "utf8");

@@ -147,3 +147,22 @@ are logged (`[screen-mode] warning <kind>`) but not shown until main adds copy.
 A stroke whose display could not be captured stays pending; if the stop's own
 shot cannot capture it either, it is not in the manifest (it was never in an
 image) — the log line `capture failed (stop): …` records it.
+
+### C4 — DX-13
+Files: `desktop/screen-mode-controller.js`, `desktop/screen-mode-controller.test.js`.
+Check: `node --test --test-name-pattern="palette dot" desktop/screen-mode-controller.test.js`.
+Before (controller at C3):
+```
+exit=1
+✖ a tap on a palette dot selects its colour without a title channel (11.3765ms)
+  AssertionError [ERR_ASSERTION]: no document.title IPC
+    actual: 1,
+    expected: 0,
+```
+After:
+```
+exit=0
+✔ a tap on a palette dot selects its colour without a title channel (14.803375ms)
+ℹ pass 1
+```
+The capsule's own title channel (костыль 1, main.js) is unchanged — main.js lane.
