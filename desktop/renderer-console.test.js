@@ -135,6 +135,13 @@ test("the tail-gap verdict is always mirrored, flag or no flag", () => {
   assert.equal(shouldMirrorConsoleMessage("INFO", line, false), true);
 });
 
+test("the recording tones are always mirrored, flag or no flag", () => {
+  // Whether the start/stop tone played: a tone leaves no other trace, so
+  // "I don't hear the sound" is answerable only from this line.
+  assert.equal(shouldMirrorConsoleMessage("INFO", "[cue] start played", false), true);
+  assert.equal(shouldMirrorConsoleMessage("INFO", "[cue] stop resuming", false), true);
+});
+
 test("the high-volume trace stream stays behind the flag", () => {
   // Thousands of lines per session — the reason the flag exists.
   const line = '[trace] {"id":"paste-1","scope":"paste","step":1}';

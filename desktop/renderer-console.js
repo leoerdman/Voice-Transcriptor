@@ -72,6 +72,11 @@ const MAX_MESSAGE_CHARS = 600;
  * diagnosis, and it was written only to a devtools console nobody had
  * open — two or three lines per stop.
  *
+ * `[cue]` says whether the start and stop tones played (`played`,
+ * `resuming`, `unavailable`, `failed`). A tone leaves no other trace, and
+ * "I don't hear the sound" (2026-11-20) was undiagnosable without it —
+ * two lines per recording.
+ *
  * A handful of lines per recording. Anything added here must stay that
  * cheap.
  */
@@ -79,6 +84,7 @@ const ALWAYS_MIRRORED_PREFIXES = Object.freeze([
   "[trace stopLive]",
   "[trace startLive]",
   "[trace tail-gap]",
+  "[cue]",
 ]);
 
 const LEVEL_ERROR = "ERROR";
