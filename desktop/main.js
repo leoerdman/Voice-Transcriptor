@@ -3364,16 +3364,27 @@ const pasteVerificationPolicy = createPasteVerificationPolicy({
   },
 });
 
+/**
+ * Is this process name our own app (DM-16)? Exact names, derived from
+ * the app's name rather than retyped: a substring check on the product
+ * name would exclude third-party apps whose name contains the word
+ * ("Audio Transcriptor Pro"). The one list both target checks use.
+ */
+function isOwnAppName(name) {
+  const n = String(name || "").trim().toLowerCase();
+  const own = String(app.getName() || "").trim().toLowerCase();
+  return !!n && !!own && (n === own || n === `${own} helper`);
+}
+
 function isBadActivationTarget(name) {
   const n = String(name || "").trim().toLowerCase();
   if (!n) return true;
-  // Exact matches only for our own process family. Previous substring
-  // check on "transcriptor" would exclude third-party apps whose name
-  // or window title contains the word (e.g. "Audio Transcriptor Pro",
-  // a browser tab titled "Transcriptor tutorial", another voice tool).
-  // Electron helpers have deterministic suffixes that substring match
-  // is correct for.
-  if (n === "electron" || n === "transcriptor" || n === "transcriptor helper") return true;
+  // Our own process family, plus "electron": by name alone a bare
+  // Electron process is not a safe target (it may be us in a dev run, or
+  // the shell of an app whose real window is elsewhere). Electron
+  // helpers have deterministic suffixes that substring match is correct
+  // for.
+  if (n === "electron" || isOwnAppName(n)) return true;
   if (n.includes("helper (renderer)") ||
       n.includes("helper (gpu)") ||
       n.includes("helper (plugin)") ||
@@ -3385,9 +3396,7 @@ function shouldUsePasteTarget(front) {
   const pid = Number(front?.pid || 0);
   const name = String(front?.name || "").trim().toLowerCase();
   if (pid > 0 && pid === process.pid) return false;
-  // Exact match for our own app; substring would block legitimate
-  // third-party apps with "transcriptor" in their window title.
-  if (name === "transcriptor" || name === "transcriptor helper") return false;
+  if (isOwnAppName(name)) return false;
   if (!name && pid <= 0) return false;
   return true;
 }
@@ -3642,7 +3651,7 @@ async function activateLinuxWindowById(windowId) {
     timeoutMs: activationTimeoutMs(),
   });
   if (wmctrlRes.ok) {
-    await sleep(X11_ACTIVATION_SETTLE_MS);
+    await sleep(WINDOW_ACTIVATION_SETTLE_MS);
     return true;
   }
   const decimalId = linuxWindowIdToDecimal(normalizedId);
@@ -3651,7 +3660,7 @@ async function activateLinuxWindowById(windowId) {
     timeoutMs: activationTimeoutMs(),
   });
   if (!xdotoolRes.ok) return false;
-  await sleep(X11_ACTIVATION_SETTLE_MS);
+  await sleep(WINDOW_ACTIVATION_SETTLE_MS);
   return true;
 }
 
@@ -3989,15 +3998,17 @@ async function getFrontmostAppInfoWithTimeout(timeoutMs = 1200) {
 }
 
 // How long an activation is given to take effect before the caller acts
-// on it. Distinct per mechanism because they differ by an order of
-// magnitude: a Win32 SetForegroundWindow is asynchronous and the shell
-// needs a moment to repaint, while an X11 activation is acknowledged by
-// the call itself.
-const WIN_ACTIVATION_SETTLE_MS = 350;
+// on it, named by what is activated rather than by one platform (DM-16:
+// the "WIN_" value also served macOS, the "X11_" value Windows hwnds).
+// Activating an APP (by process name or pid: Win32 SetForegroundWindow
+// of its main window, macOS `activate`) is asynchronous and the shell
+// needs a moment to repaint; activating one specific WINDOW by id (an
+// X11 window id, a Win32 hwnd) is acknowledged far sooner.
+const APP_ACTIVATION_SETTLE_MS = 350;
 // Auto-send re-raises the target before firing its chord; this is the
 // pause between that activation and the keystroke.
 const AUTO_SEND_ACTIVATION_SETTLE_MS = 110;
-const X11_ACTIVATION_SETTLE_MS = 180;
+const WINDOW_ACTIVATION_SETTLE_MS = 180;
 
 /** Wall-clock bound for one target-activation child, from PASTE_BUDGET. */
 function activationTimeoutMs() {
@@ -4055,7 +4066,7 @@ async function activateAppByName(name) {
     // usually Transcriptor itself.
     if (!res.ok) return false;
     if (String(res.stdout || "").trim() !== "1") return false;
-    await sleep(WIN_ACTIVATION_SETTLE_MS);
+    await sleep(APP_ACTIVATION_SETTLE_MS);
     return true;
   }
   if (process.platform === "linux") {
@@ -4068,7 +4079,7 @@ async function activateAppByName(name) {
     timeoutMs: activationTimeoutMs(),
   });
   if (!res.ok) return false;
-  await sleep(WIN_ACTIVATION_SETTLE_MS);
+  await sleep(APP_ACTIVATION_SETTLE_MS);
   return true;
 }
 
@@ -4155,7 +4166,7 @@ async function activateWindowsWindowByHwnd(hwnd) {
     timeoutMs: activationTimeoutMs(),
   });
   if (!res.ok) return false;
-  await sleep(X11_ACTIVATION_SETTLE_MS);
+  await sleep(WINDOW_ACTIVATION_SETTLE_MS);
   return String(res.stdout || "").trim() === "1";
 }
 
@@ -6317,7 +6328,7 @@ async function handlePostStopTranscriptTimeout(trace, bestKnownText = "") {
   const best = normalizeTranscriptText(bestKnownText);
   const fromBestKnown = isPasteableTranscript(best);
   const recovered = fromBestKnown ? best : await getLatestTranscriptText();
-  const pasteAccel = lastShortcutStatus?.paste?.active || lastShortcutStatus?.paste?.desired || "";
+  const pasteAccel = pasteLastAccelerator();
   if (isPasteableTranscript(recovered)) {
     // getLatestTranscriptText already persists what it returns; the
     // best-known path has to do it here so the paste-last hotkey (and
@@ -6411,7 +6422,7 @@ async function pasteLatestTranscriptFromShortcut() {
       // This paste is happening WHILE the hotkey chord is held — see
       // awaitModifierRelease.
       trigger: "hotkey",
-      accelerator: lastShortcutStatus?.paste?.active || lastShortcutStatus?.paste?.desired || "",
+      accelerator: pasteLastAccelerator(),
     });
     traceStep(trace, "paste_result", {
       ok: !!pasted.ok,
