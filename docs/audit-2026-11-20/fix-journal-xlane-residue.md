@@ -117,3 +117,44 @@ Branch `worktree-agent-ac1b88dd03eb0f9b9`, cut from `main` at 54b8770. Items lef
   lint clean; vitest `Test Files 53 passed · Tests 671 passed`; build OK.
 - Not verified live: Chromium's media element against the 401-after-expiry path (re-mint and resume) was not
   exercised in the packaged app; Range/206 is verified with Starlette's TestClient.
+
+## Commit 4 · dead global `window.__transcriptorMicHealth`
+
+- **Check.** `grep -rIl 'transcriptorMic\|MicHealth'` over the whole tree (excluding `node_modules`, `.git`,
+  `dist`): the global appears only where `frontend/src/main.tsx` declares and assigns it. Nothing in `desktop/`
+  (no `executeJavaScript` string, no preload, no test), nothing in the frontend tests, nothing in `backend/`, no
+  doc that names it as a devtools aid. `micHealth` itself is read through the module (`micHealth.get()`), which
+  stays.
+- **After.** The `declare global { interface Window { __transcriptorMicHealth … } }` block and the assignment are
+  deleted. No behaviour to pin: nothing read it.
+- Files: `frontend/src/main.tsx`.
+- Suites: backend `Ran 1046 tests OK`; desktop `tests 477 · pass 477 · fail 0`; `node --check` OK; typecheck,
+  lint clean; vitest `Test Files 53 passed · Tests 671 passed`; build OK.
+
+## FL-07, local-waiter half — stated, not changed
+
+The local-assist stop path still waits for the final envelope through `waitForLiveFinalEnvelope` with
+`UI_TOKENS.finalize.envelopeWaitMs` (4 s). Routing it through `waitForLiveEnvelopeWithAnnouncedBudget` would make
+its budget `announcedEnvelope.confirmMs` (1.5 s), because the backend announces `finalizing` only for Deepgram —
+a 4 s → 1.5 s change of the local stop budget. That is a product decision; this lane did not change it. The
+numbers already live in `UI_TOKENS.finalize` (ui-desktop-p2 commit 4).
+
+## Not done (ID → reason)
+- **FL-07, local-waiter half** → product decision (above).
+- **S-15, Live pane player** → the Live pane's "current recording" player still fetches the saved file into a
+  Blob (`renderLatestSavedAudio`). S-15 is about History; the Live player's source logic also falls back to the
+  in-memory file when the backend fetch fails (`player-source.ts`), and moving it to a stream would turn that
+  synchronous fallback into an asynchronous media-error path — its own change. `mintRecordingStreamUrl` is
+  ready for it.
+- **FL-08, timeout for Re-transcribe** → not adopted (reason in commit 2).
+
+## Cross-domain, for the lead
+1. **Merge note, stopLive** — commit 2 replaces the body of `recoverFromEmptyTranscriptInner` and deletes the
+   `deepgramRestOnDisk` closure above it, and edits the FL-08 comment in the no-envelope branch. None of it is in
+   the collection decision or the `onScreenVoiceTake` handler, but it is inside `stopLive`.
+2. **New backend routes** — `POST /api/recordings/{name}/audio/stream-url` (API token) and
+   `GET /api/recordings/{name}/audio/stream` (media token only). Neither is on the CLI route list; neither needs
+   a desktop change. `apiPost` in the renderer gained an optional `signal`.
+3. **CHANGELOG** (not written here): History audio starts playing at once for large recordings (streamed, not
+   downloaded first); Re-transcribe decodes the saved file in place and keeps the settings it was started with;
+   the Upload queue's "Uploading… → Processing…" flips when the file has actually reached the backend.

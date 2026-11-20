@@ -199,12 +199,6 @@ import {
   shouldDropLegacyUploadQueueSnapshot,
 } from "./upload-queue-restore";
 
-declare global {
-  interface Window {
-    __transcriptorMicHealth?: { get(): MicHealthSnapshot };
-  }
-}
-
 /**
  * The provider a transcription is sent to, in the shape the wire uses.
  *
@@ -6012,9 +6006,6 @@ function resetVU(): void {
 }
 
 const micHealth = new MicHealthTracker();
-window.__transcriptorMicHealth = {
-  get: () => micHealth.get(),
-};
 
 /** Topbar pill labels. Hidden entirely while the mic is idle. */
 const MIC_PILL_LABEL: Record<MicHealthState, string> = {
