@@ -1142,8 +1142,14 @@ class WarmSwapAtFinalizeTests(_WarmHandlerCase):
                 {"type": "websocket.receive", "bytes": _voiced(1600)}
             )
             # The probe expires, the sender starts a swap, and the
-            # replacement's connect does not return yet.
-            await asyncio.sleep(0.15)
+            # replacement's connect does not return yet. Waited for as a
+            # condition, not a fixed sleep: under a loaded full-suite run
+            # 0.15 s of wall clock was sometimes not enough for the 0.05 s
+            # probe to expire and the swap to start.
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 5.0
+            while len(_WarmFakeUpstream.instances) < 2 and loop.time() < deadline:
+                await asyncio.sleep(0.01)
             self.assertEqual(
                 len(_WarmFakeUpstream.instances), 2, "no swap was started"
             )
