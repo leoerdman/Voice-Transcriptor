@@ -269,3 +269,56 @@ keys); after: OK.
 
 Suites for C7+C8 (one run, disjoint files): backend 1005 OK; desktop 436;
 vitest 607; typecheck, lint, build clean.
+
+## C9 — DX-21 notarytool half: no password on the command line
+
+Files: `.env.example` (Apple ID block removed, a note on why and what to use
+instead), `desktop/scripts/notarize-dmg.sh` (the `--apple-id/--team-id/
+--password` branch removed; the error names the keychain profile — Apple ID
+credentials stored once with `xcrun notarytool store-credentials` — or the
+API key). Readers checked first: no other script reads `NOTARYTOOL_APPLE_ID`
+/ `_TEAM_ID` / `_PASSWORD` (BUILD.command, CONTRIBUTING.md — which already
+documents the keychain profile —, desktop tests). The TestFlight half
+(`altool -p @env:…`) was already on main.
+Check: `bash -n desktop/scripts/notarize-dmg.sh` clean; desktop 436 pass
+(packaging.test reads the script). Notarization not run (no Developer ID here).
+
+## Not done (ID → reason)
+- **FQ-04 "cancel in `finally` of waitForQueued*Job"** → already provided by
+  `waitForJob`'s catch one level down (FG-13); a second cancel site would be
+  a second owner. Only the 404/4xx classification was missing (C1).
+- **FG-06 "publish the limit"** → not needed: the backend keeps the tail
+  itself, one owner of the cap.
+- **FG-10 "UI timeout = connect + read + margin"** → would move the UI
+  deadline from 13 s to 23 s; kept today's read + 1 s, now derived (C5).
+- **BW-13 off-loop finalize read (`asyncio.to_thread(pcm)`)** → lives in
+  `backend/deepgram_recovery.py` `run_recovery` (engines lane's file).
+- **BM-13 `http_retry` hint substrings** → decorate the final message only,
+  no control flow; DNS failures are distinguishable only by text in requests.
+- **BL-02 old rotated main.log archives** keep their previous mode (log
+  files: AGENTS.md rule 3; they age out by the existing sweep).
+- **FU-13c** (desktop auto-stop default copy) → not in this lane's list.
+- Full app not launched for BM-01; the IPC path was verified in a real
+  Electron probe (C2).
+
+## Cross-domain / for the lead
+1. **BM-01 user-visible side effect**: in the desktop app
+   `<data>/api_token.txt` is no longer the live token (left on disk,
+   untouched — delete it or keep it, user's call). Opening
+   `http://127.0.0.1:<port>/` in an ordinary browser now shows a renderer
+   without API access, by design. Manual `curl` against the running app:
+   use the CLI token (`transcriptor`).
+2. **Merge notes**: `desktop/main.js` — new requires near the `./child-io`
+   and `./data-dir` requires, `BACKEND_API_TOKEN` after `BACKEND_BOOT_NONCE`,
+   one env line in the backend spawn, `_isBackendOrigin` body, a new
+   `ipcMain.on(API_TOKEN_CHANNEL)` before `engine:get-status`, and
+   `appendMainLog`'s append line. `desktop/preload.js` — one block at the top.
+   `desktop/package.json` build.files + `PROJECT_STRUCTURE.md` gain
+   `backend-auth.js`, `private-log.js`.
+3. **Renderer** (`frontend/src/main.tsx`): `waitForBackendJob` fetchJob,
+   `applyRuntimeLimits`, `inferRemoteJobTimeoutMs`, `loadUpscalePresets`
+   (add-button), `renderRecordingsStats`, `UI_TOKENS.finalize.smallAudioUiMarginMs`.
+4. CHANGELOG entries worth writing: the API token no longer travels in the
+   page; main.log is owner-only; a long live draft keeps its newest text;
+   archive stats durations are labelled as estimates; GigaAM stops
+   re-downloading from an unreachable host for 10 minutes.
