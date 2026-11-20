@@ -30,12 +30,21 @@ The helper swallows a press. On release it re-posts the held down and the up, ma
 
 - I assumed BetterTouchTool re-posts copies, which keep the timestamp. If it builds new events instead, the timestamp will not match and the loop can still happen. The next live attempt settles this: look for `echoes>0` on press lines (fix working), or a collapsed `(xN more)` run with `by=BetterTouchTool` (new events, need another way to identify them).
 - I did not post real mouse events on the user's machine (that would click real UI), so the loop has not been reproduced end to end.
-- Mark coalescing in `frontend/src/screen-annotations.ts` (identical stroke marks, meaning same second, same place and same shot, printed once) is not done yet.
+- Marks: `screenMarksFromManifest` now gives one mark for strokes whose mark text is identical (same second, same place in %, same shot). Test `gives strokes of the same second, place and shot one mark` failed before the change (16 marks) and passes after it. Strokes at different places, or in a different second, still get their own mark.
 
 ## Bug 2: drawings should disappear before the screenshot is saved
 
-Plan, not committed at the time of writing. Add a "detached" state to the overlay page:
-- `__detach(ids)` moves the strokes to a held map and redraws right away. This happens at the start of `takeShotNow`, after `pendingStrokes` is snapshotted.
-- `__composite` paints from the held map.
-- On success, `__drop(ids)` deletes them. A display whose capture failed gets `__restore(ids)`, so its strokes come back on screen and stay pending for the next shot, which keeps the existing guarantee.
-- Log the clear latency.
+- `takeShotNow` snapshots the pending strokes. It then calls `__detach(ids)` on every overlay and waits for it, which removes the strokes from the screen and keeps their data aside. Only after that does it run `screencapture` and the composite. The composite paints the strokes from the kept data.
+- Afterwards, the strokes of captured displays are dropped with `__drop`. The strokes of a display whose capture failed are put back on the screen with `__restore`, so they stay pending for the next shot (the existing guarantee). A stroke that finishes during the capture is not part of the snapshot, so it stays on screen and goes into the next shot (unchanged).
+- New log line: `[screen-mode] strokes off screen for shot (<reason>) in N ms`.
+- Tests: `a shot takes its strokes off the screen before the capture, and still paints them into the image` (checked while the capture is held back) and `a failed capture puts its strokes back on the screen`. With the old order (clear after capture), the first test would fail on the check made during the capture. I worked that out from the code and did not run the old code against it.
+
+## Suites
+
+Desktop 513/513, including the Swift classifier, which was compiled and run on this Mac. Frontend: typecheck and lint are clean, 677/677 tests pass, build passes. `node --check` passes for main and preload.
+
+## To check live
+
+1. Trackpad double-tap-and-drag with BetterTouchTool running. Expected: one line, no cursor jump, and no burst of press lines. The press lines should show `echoes>0` (the fix is working). If a burst appears as `(xN more, identical)` with `by=BetterTouchTool`, then BTT builds new events rather than copies, and the timestamp identity does not catch them.
+2. Note what `by=` shows for a plain hardware click. It is expected to be `WindowServer` or `pid0`.
+3. Screen button: the drawings should vanish right away, and the saved PNG should still contain them.
