@@ -21,7 +21,11 @@
 //           {"t":"start","x":..,"y":..} {"t":"move","x":..,"y":..} {"t":"end","x":..,"y":..}
 //           {"t":"tap","x":..,"y":..}                  a press-and-release on a control
 //           {"t":"press","outcome":"click|stroke|tap|controlDrag|orphanStroke|handedOver",
-//            "clicks":n,"drags":n}                     one line per finished press
+//            "clicks":n,"drags":n,"echoes":n,"by":name} one line per finished
+//                                                      press; `echoes`: replayed
+//                                                      events another tap posted
+//                                                      back since the last line;
+//                                                      `by`: the release's poster
 //           {"t":"tap-disabled","reason":"timeout|user-input",
 //            "abandoned":"none|stroke|held|control"}   macOS switched the tap
 //                                                      off; it is back on and
@@ -65,6 +69,17 @@ func emit(_ object: [String: Any]) {
 
 func emitPoint(_ kind: String, _ p: CGPoint) {
   emit(["t": kind, "x": (p.x * 10).rounded() / 10, "y": (p.y * 10).rounded() / 10])
+}
+
+// Which process posted an event (`eventSourceUnixProcessID`), by name:
+// the window server for the user's own hardware, an app's name for an
+// event an app posted. One syscall per finished press, for its log line.
+func posterName(_ event: CGEvent) -> String {
+  let pid = pid_t(truncatingIfNeeded: event.getIntegerValueField(.eventSourceUnixProcessID))
+  if pid <= 0 { return "pid\(pid)" }
+  var buffer = [CChar](repeating: 0, count: 256)
+  let length = proc_name(pid, &buffer, UInt32(buffer.count))
+  return length > 0 ? String(cString: buffer) : "pid\(pid)"
 }
 
 func repost(_ event: CGEvent) {
@@ -125,12 +140,16 @@ let callback: CGEventTapCallBack = { _, type, event, _ in
   let p = event.location
   let clicks = event.getIntegerValueField(.mouseEventClickState)
   state.lock.lock()
-  let decision = state.classifier.classify(kind, at: p)
+  let decision = state.classifier.classify(kind, at: p, stamp: event.timestamp)
   let outcome = kind == .up ? state.classifier.lastOutcome : nil
   let drags = state.classifier.drags
+  let echoes = outcome != nil ? state.classifier.takeEchoes() : 0
   state.lock.unlock()
   if let outcome = outcome {
-    emit(["t": "press", "outcome": outcome.rawValue, "clicks": clicks, "drags": drags])
+    emit([
+      "t": "press", "outcome": outcome.rawValue, "clicks": clicks, "drags": drags,
+      "echoes": echoes, "by": posterName(event),
+    ])
   }
   switch decision {
   case .pass:

@@ -275,6 +275,45 @@ test("a shot leaves a stroke still being drawn on the screen, with what it has d
   }
 });
 
+// The user: "make them disappear first, then the screenshot is saved."
+test("a shot takes its strokes off the screen before the capture, and still paints them into the image", async () => {
+  const world = createWorld();
+  try {
+    await world.controller.start(ID);
+    drawStroke(world, [[100, 100], [150, 100], [200, 100]]);
+    await tick(30);
+    const overlay = world.overlays()[0];
+    let release;
+    world.captureGate = new Promise((resolve) => { release = resolve; });
+    const shot = world.controller.takeShot("capsule");
+    await tick(5);
+    assert.equal(world.captures.length, 1, "the capture is under way");
+    assert.equal(await overlay.webContents.executeJavaScript("window.__hasStrokes([1])"), false, "gone from the screen while the capture runs");
+    release();
+    const result = await shot;
+    assert.equal(paintedMoveTos(result.files[0]).length, 1, "the image still holds the stroke");
+    assert.ok(world.logs.some((l) => /strokes off screen for shot \(capsule\) in \d+ ms/.test(l)));
+  } finally {
+    world.cleanup();
+  }
+});
+
+test("a failed capture puts its strokes back on the screen", async () => {
+  const world = createWorld();
+  try {
+    await world.controller.start(ID);
+    drawStroke(world, [[100, 100], [200, 100]]);
+    await tick(30);
+    world.captureFails = () => true;
+    assert.equal(await world.controller.takeShot("hotkey"), null);
+    await tick(5);
+    const overlay = world.overlays()[0];
+    assert.equal(await overlay.webContents.executeJavaScript("window.__hasStrokes([1])"), true);
+  } finally {
+    world.cleanup();
+  }
+});
+
 // ── DX-04 ──────────────────────────────────────────────────────────────
 test("unplugging a display does not move the strokes already drawn on it", async () => {
   const external = { id: 2, bounds: { x: 1000, y: 0, width: 1000, height: 1000 }, workArea: { x: 1000, y: 0, width: 1000, height: 1000 } };

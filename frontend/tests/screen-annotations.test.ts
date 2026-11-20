@@ -40,6 +40,27 @@ describe("screen manifest", () => {
     ]);
   });
 
+  // 2026-11-20: a gesture torn into 17 one-point strokes at one spot gave
+  // 16 identical marks. Strokes in the same second, at the same place, in
+  // the same shot say nothing more than one of them: one mark.
+  it("gives strokes of the same second, place and shot one mark", () => {
+    const m = parseScreenManifest({
+      id: "s",
+      dir: "/d",
+      startedAt: START,
+      events: [
+        ...Array.from({ length: 16 }, (_, i) => ({ type: "stroke", at: START + 39_100 + i * 40, shot: 2, xPct: 40, yPct: 55 })),
+        { type: "stroke", at: START + 39_900, shot: 2, xPct: 70, yPct: 55 },
+        { type: "stroke", at: START + 41_000, shot: 2, xPct: 40, yPct: 55 },
+      ],
+    })!;
+    expect(screenMarksFromManifest(m, START).map((x) => x.text)).toEqual([
+      "[✏️ 00:39 линия в центре (40%, 55%) → скрин 2]",
+      "[✏️ 00:39 линия справа (70%, 55%) → скрин 2]",
+      "[✏️ 00:41 линия в центре (40%, 55%) → скрин 2]",
+    ]);
+  });
+
   it("says a screenshot was not saved when its capture failed", () => {
     const m = parseScreenManifest({ id: "s", dir: "/d", startedAt: START, events: [{ type: "shot", at: START + 1000, shot: 2, files: [] }] })!;
     expect(screenMarksFromManifest(m, START)[0].text).toBe("[📸 00:01 скрин 2 — не сохранён (нет доступа к записи экрана)]");

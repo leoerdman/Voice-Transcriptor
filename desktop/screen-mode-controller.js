@@ -221,8 +221,29 @@ function overlayHtml() {
   };
   // A shot names the strokes it holds; nothing else is touched, so a
   // stroke still being drawn keeps what it has drawn and keeps drawing.
+  // A shot takes its strokes off the screen the moment it is asked for
+  // (__detach) and keeps their data for the image (__composite) until it
+  // is done: dropped once the image holds them (__drop), put back on the
+  // screen when the capture failed (__restore).
+  const detached = new Map();
   window.__hasStrokes = (ids) => ids.some((id) => strokes.has(id));
-  window.__clear = (ids) => { for (const id of ids) strokes.delete(id); redraw(); return true; };
+  window.__detach = (ids) => {
+    for (const id of ids) {
+      const s = strokes.get(id);
+      if (s) { detached.set(id, s); strokes.delete(id); }
+    }
+    redraw();
+    return true;
+  };
+  window.__drop = (ids) => { for (const id of ids) detached.delete(id); return true; };
+  window.__restore = (ids) => {
+    for (const id of ids) {
+      const s = detached.get(id);
+      if (s) { strokes.set(id, s); detached.delete(id); }
+    }
+    redraw();
+    return true;
+  };
   window.__flash = () => {
     const f = document.getElementById("flash");
     f.style.transition = "none"; f.style.opacity = ".35";
@@ -241,7 +262,7 @@ function overlayHtml() {
       const c = out.getContext("2d");
       c.drawImage(img, 0, 0);
       for (const id of ids) {
-        const s = strokes.get(id);
+        const s = detached.get(id) || strokes.get(id);
         if (s) drawStroke(c, s, scale);
       }
       resolve(out.toDataURL("image/png"));
@@ -757,11 +778,33 @@ function createScreenModeController(deps) {
     }, 1000).unref?.();
   }
 
+  // A run of identical press lines is logged once, then counted: a
+  // gesture that turns into a burst of presses (2026-11-20: ~20,800
+  // "press outcome=click" lines in five seconds, a re-posting loop now
+  // closed in the helper) is still on record with its size, without
+  // rotating the whole log away. The count is written when the run ends:
+  // a different press, any other helper line, or the session's end.
+  let pressRun = { line: "", repeats: 0 };
+  function logPress(line) {
+    if (line === pressRun.line) {
+      pressRun.repeats += 1;
+      return;
+    }
+    flushPressRepeats();
+    log(line);
+    pressRun = { line, repeats: 0 };
+  }
+  function flushPressRepeats() {
+    if (pressRun.repeats) log(`${pressRun.line} (x${pressRun.repeats} more, identical)`);
+    pressRun = { line: "", repeats: 0 };
+  }
+
   function onHelperLine(line) {
     let msg;
     try { msg = JSON.parse(line); } catch { return; }
     if (!session) return;
     const t = msg.t;
+    if (t !== "press") flushPressRepeats();
     if (t === "ready") {
       log("[screen-mode] mouse helper ready");
       if (helperStart) helperStart.settle(null);
@@ -773,10 +816,10 @@ function createScreenModeController(deps) {
       return;
     }
     if (t === "press") {
-      // One line per finished press: what the hardware sent and what the
-      // rule made of it — the record any "this gesture did not draw"
-      // report is diagnosed from.
-      log(`[screen-mode] press outcome=${msg.outcome} clicks=${msg.clicks} drags=${msg.drags}`);
+      // One line per finished press: what the hardware sent, who posted
+      // it and what the rule made of it — the record any "this gesture
+      // did not draw" report is diagnosed from.
+      logPress(`[screen-mode] press outcome=${msg.outcome} clicks=${msg.clicks} drags=${msg.drags} echoes=${msg.echoes ?? 0} by=${msg.by ?? "?"}`);
       return;
     }
     if (t === "tap-disabled") {
@@ -836,6 +879,15 @@ function createScreenModeController(deps) {
     }
     const allDisplays = screen.getAllDisplays();
     const at = Date.now();
+    // The strokes leave the screen first, the moment the shot is asked
+    // for: the capture never shows them anyway (the overlays are
+    // content-protected) and the image gets them painted from their data,
+    // which the overlay keeps aside until the shot is done.
+    if (ids.length) {
+      const clearStarted = Date.now();
+      await Promise.all([...overlays.values()].map((entry) => overlayCall(entry, `window.__detach(${JSON.stringify(ids)})`)));
+      log(`[screen-mode] strokes off screen for shot (${reason}) in ${Date.now() - clearStarted} ms`);
+    }
     const files = [];
     const captured = new Set();
     const failures = [];
@@ -876,15 +928,19 @@ function createScreenModeController(deps) {
       log(`[screen-mode] capture failed (${reason}): ${failures.join("; ")}`);
       deps.onWarning(SCREEN_MODE_WARNING.CAPTURE_FAILED);
     }
-    if (!files.length) return null;
     const taken = pending.filter((s) => captured.has(s.displayId)).map((s) => s.id);
-    const shot = recordShot(session, { at, files, strokeIds: taken, reason });
-    // Only the strokes the shot took leave the screen. Queued ops are
-    // kept: they belong to strokes still being drawn or begun since.
+    const kept = pending.filter((s) => !captured.has(s.displayId)).map((s) => s.id);
+    // Only the strokes the shot took are gone for good; those of a display
+    // that was not captured come back on the screen, pending for the next
+    // shot. Queued ops are kept: they belong to strokes still being drawn
+    // or begun since.
     for (const entry of overlays.values()) {
-      overlayCall(entry, `window.__clear(${JSON.stringify(shot.strokeIds)})`);
-      overlayCall(entry, "window.__flash()");
+      if (taken.length) overlayCall(entry, `window.__drop(${JSON.stringify(taken)})`);
+      if (kept.length) overlayCall(entry, `window.__restore(${JSON.stringify(kept)})`);
     }
+    if (!files.length) return null;
+    const shot = recordShot(session, { at, files, strokeIds: taken, reason });
+    for (const entry of overlays.values()) overlayCall(entry, "window.__flash()");
     writeEvents();
     log(`[screen-mode] shot ${shot.index} reason=${reason} files=${files.length} strokes=${shot.strokeIds.length}`);
     return { index: shot.index, files };
@@ -1003,6 +1059,7 @@ function createScreenModeController(deps) {
   function teardown() {
     unwatchDisplays();
     stopHelper();
+    flushPressRepeats();
     for (const entry of overlays.values()) {
       try { if (!entry.win.isDestroyed()) entry.win.destroy(); } catch { }
     }

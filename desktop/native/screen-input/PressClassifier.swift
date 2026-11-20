@@ -22,6 +22,17 @@
 //     that saw a press must see it end, and one that did not ignores a
 //     stray release.
 //
+// A click this helper replays is the app's, and stays the app's when it
+// comes back. The helper marks what it posts (`eventSourceUserData`), but
+// another app's event tap can take the replayed events and post them
+// again with its own user data in the marker's place; they then arrive as
+// a press nobody made, and replaying THAT feeds a loop — thousands of
+// "clicks" a second, the cursor warped back to the press point each
+// round, a double-tap-and-drag torn into one-point strokes (the user's
+// take of 2026-11-20 14:55, with BetterTouchTool's left-button session
+// tap on the machine). Every replayed event's timestamp is remembered,
+// and an event carrying one passes untouched and is counted (`echoes`).
+//
 // The click count plays no part in the decision, so a double-tap-and-drag
 // whose second press this tap does see is a press that moves: a stroke.
 //
@@ -96,6 +107,21 @@ struct PressClassifier {
   private enum Phase { case idle, held, drawing, onControl, orphanDrawing, handedOver }
   private var phase: Phase = .idle
   private var downPoint = CGPoint.zero
+  private var downStamp: UInt64 = 0
+  /// The timestamps of the events this helper handed back to the app
+  /// (`replayClick`, a press handed over by `interrupt`), newest last.
+  /// Bounded: an echo comes back within the same burst of events, so
+  /// only the last few replays can still return.
+  private var replayed: [UInt64] = []
+  private static let replayedKept = 8
+  /// Replayed events that came back re-posted since `takeEchoes` was last
+  /// called — the helper reports them on its next press line.
+  private var echoes = 0
+
+  mutating func takeEchoes() -> Int {
+    defer { echoes = 0 }
+    return echoes
+  }
   private var lastPoint = CGPoint.zero
   private var controlMoved = false
   private(set) var lastOutcome: Outcome? = nil
@@ -109,6 +135,11 @@ struct PressClassifier {
     let dx = p.x - downPoint.x
     let dy = p.y - downPoint.y
     return (dx * dx + dy * dy).squareRoot() >= dragThreshold
+  }
+
+  private mutating func remember(_ stamps: UInt64...) {
+    replayed.append(contentsOf: stamps.filter { $0 != 0 })
+    if replayed.count > Self.replayedKept { replayed.removeFirst(replayed.count - Self.replayedKept) }
   }
 
   /// The tap was switched off and is back on: abandon the press in
@@ -127,17 +158,27 @@ struct PressClassifier {
       return .stroke(at: lastPoint)
     case .held:
       if buttonDown { phase = .handedOver }
+      remember(downStamp)
       return .heldPress(buttonDown: buttonDown)
     case .onControl:
       return .controlPress
     }
   }
 
-  mutating func classify(_ kind: Kind, at p: CGPoint) -> Decision {
+  mutating func classify(_ kind: Kind, at p: CGPoint, stamp: UInt64) -> Decision {
+    if kind != .dragged, stamp != 0, replayed.contains(stamp) {
+      // An event this helper already handed to the app, back again
+      // without its marker: another tap re-posted it. It is the app's;
+      // the press in progress, if any, is not touched by it.
+      lastOutcome = nil
+      echoes += 1
+      return .pass
+    }
     lastPoint = p
     switch kind {
     case .down:
       downPoint = p
+      downStamp = stamp
       drags = 0
       controlMoved = false
       lastOutcome = nil
@@ -171,6 +212,7 @@ struct PressClassifier {
         return controlMoved ? .hold : .tap(at: downPoint)
       case .held:
         lastOutcome = .click
+        remember(downStamp, stamp)
         return .replayClick
       case .drawing:
         lastOutcome = .stroke
