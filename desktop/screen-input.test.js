@@ -42,6 +42,7 @@ const CASES = [
   "a press that wanders off a control taps nothing",
   "a drag that ends on a control is still a stroke",
   "a drag with no press seen still draws, and its release passes on",
+  "a replayed click that comes back re-posted is passed, not pressed again",
   "a release with no press seen passes",
   "a stray release after a click reports no second outcome",
   "a tap switched off mid-stroke ends the stroke and the next drag draws",

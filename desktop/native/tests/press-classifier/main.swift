@@ -14,9 +14,14 @@ func fail(_ message: String) -> Never {
   exit(1)
 }
 
+// Every hardware event has a timestamp of its own; the suite hands each
+// step a fresh one, the way the window server does.
+var clock: UInt64 = 1_000_000
+
 func play(_ name: String, _ c: inout PressClassifier, _ steps: [Step]) {
   for (i, step) in steps.enumerated() {
-    let got = c.classify(step.0, at: CGPoint(x: step.1, y: step.2))
+    clock += 1_000
+    let got = c.classify(step.0, at: CGPoint(x: step.1, y: step.2), stamp: clock)
     if got != step.3 { fail("\(name) step \(i): expected \(step.3), got \(got)") }
   }
 }
@@ -122,6 +127,51 @@ run("a drag with no press seen still draws, and its release passes on", [
   (.dragged, 340, 320, .strokeMove),
   (.up, 340, 320, .strokeEndPassingUp),
 ])
+
+// Another app's event tap (BetterTouchTool on the user's Mac keeps a
+// modifying one on left-button events at the session level) can take the
+// click this helper replays and post it again with its OWN user data in
+// place of this helper's marker. The press comes back carrying the
+// replayed events' timestamps. Classified as a new press, it was held and
+// replayed again — a loop that logged ~20,800 "press outcome=click" lines
+// in two bursts of one take (2026-11-20 14:55) and warped the cursor back
+// to the press point on every round. A replayed event is recognised by
+// its timestamp and passes; the press in progress is untouched.
+do {
+  let name = "a replayed click that comes back re-posted is passed, not pressed again"
+  var c = PressClassifier(dragThreshold: 5)
+  let downAt: UInt64 = 7_000_000
+  let upAt: UInt64 = 7_050_000
+  func step(_ kind: PressClassifier.Kind, _ x: Double, _ stamp: UInt64, _ want: D) {
+    let got = c.classify(kind, at: CGPoint(x: x, y: 100), stamp: stamp)
+    if got != want { fail("\(name): \(kind) at \(x) stamp \(stamp): expected \(want), got \(got)") }
+  }
+  step(.down, 100, downAt, .hold)
+  step(.up, 100, upAt, .replayClick)
+  if c.lastOutcome != .click { fail("\(name): the click itself has no outcome") }
+  // The echo, several rounds of it: nothing is held, nothing replayed,
+  // and no press is reported for it.
+  for _ in 0..<3 {
+    step(.down, 100, downAt, .pass)
+    step(.up, 100, upAt, .pass)
+    if c.lastOutcome != nil { fail("\(name): the echo reported an outcome") }
+  }
+  // The user's own next press — the hold of a double-tap-and-drag —
+  // draws one stroke, and an echo arriving in the middle of it neither
+  // ends it nor starts another.
+  step(.down, 100, 7_200_000, .hold)
+  step(.dragged, 130, 7_210_000, .strokeStart(from: CGPoint(x: 100, y: 100)))
+  step(.up, 100, upAt, .pass)
+  step(.down, 100, downAt, .pass)
+  step(.dragged, 160, 7_220_000, .strokeMove)
+  step(.up, 160, 7_230_000, .strokeEnd)
+  if c.lastOutcome != .stroke { fail("\(name): expected one stroke, got \(String(describing: c.lastOutcome))") }
+  // Every echo is counted for the helper's log line, once.
+  let echoes = c.takeEchoes()
+  if echoes != 8 { fail("\(name): expected 8 echoes counted, got \(echoes)") }
+  if c.takeEchoes() != 0 { fail("\(name): echoes counted twice") }
+  print("ok \(name)")
+}
 
 run("a release with no press seen passes", [
   (.up, 1, 1, .pass),

@@ -757,11 +757,33 @@ function createScreenModeController(deps) {
     }, 1000).unref?.();
   }
 
+  // A run of identical press lines is logged once, then counted: a
+  // gesture that turns into a burst of presses (2026-11-20: ~20,800
+  // "press outcome=click" lines in five seconds, a re-posting loop now
+  // closed in the helper) is still on record with its size, without
+  // rotating the whole log away. The count is written when the run ends:
+  // a different press, any other helper line, or the session's end.
+  let pressRun = { line: "", repeats: 0 };
+  function logPress(line) {
+    if (line === pressRun.line) {
+      pressRun.repeats += 1;
+      return;
+    }
+    flushPressRepeats();
+    log(line);
+    pressRun = { line, repeats: 0 };
+  }
+  function flushPressRepeats() {
+    if (pressRun.repeats) log(`${pressRun.line} (x${pressRun.repeats} more, identical)`);
+    pressRun = { line: "", repeats: 0 };
+  }
+
   function onHelperLine(line) {
     let msg;
     try { msg = JSON.parse(line); } catch { return; }
     if (!session) return;
     const t = msg.t;
+    if (t !== "press") flushPressRepeats();
     if (t === "ready") {
       log("[screen-mode] mouse helper ready");
       if (helperStart) helperStart.settle(null);
@@ -773,10 +795,10 @@ function createScreenModeController(deps) {
       return;
     }
     if (t === "press") {
-      // One line per finished press: what the hardware sent and what the
-      // rule made of it — the record any "this gesture did not draw"
-      // report is diagnosed from.
-      log(`[screen-mode] press outcome=${msg.outcome} clicks=${msg.clicks} drags=${msg.drags}`);
+      // One line per finished press: what the hardware sent, who posted
+      // it and what the rule made of it — the record any "this gesture
+      // did not draw" report is diagnosed from.
+      logPress(`[screen-mode] press outcome=${msg.outcome} clicks=${msg.clicks} drags=${msg.drags} echoes=${msg.echoes ?? 0} by=${msg.by ?? "?"}`);
       return;
     }
     if (t === "tap-disabled") {
@@ -1003,6 +1025,7 @@ function createScreenModeController(deps) {
   function teardown() {
     unwatchDisplays();
     stopHelper();
+    flushPressRepeats();
     for (const entry of overlays.values()) {
       try { if (!entry.win.isDestroyed()) entry.win.destroy(); } catch { }
     }
