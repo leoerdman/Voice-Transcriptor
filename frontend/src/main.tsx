@@ -2,8 +2,10 @@ import "./styles.css";
 import {
   MicHealthTracker,
   describeMicHealth,
+  reconcileMicHealthStatus,
   type MicHealthSnapshot,
   type MicHealthState,
+  type MicHealthStatusLine,
 } from "./mic-health";
 import {
   createCaptureLevel,
@@ -5937,11 +5939,19 @@ function renderMicHealthPill(snap: MicHealthSnapshot): void {
 
 micHealth.subscribe(renderMicHealthPill);
 
+/** The status line the mic-health warning replaced, put back when the mic recovers. */
+let micHealthDisplacedStatus: MicHealthStatusLine | null = null;
+
 function applyMicHealthStatus(snap: MicHealthSnapshot): void {
-  if (snap.state !== "silent" && snap.state !== "muted" && snap.state !== "lost") return;
-  const { statusText, statusTone } = describeMicHealth(snap.state);
+  const { patch, displaced } = reconcileMicHealthStatus(
+    snap.state,
+    { status: currentRecordingSummary?.status || "", tone: currentRecordingSummary?.tone || "neutral" },
+    micHealthDisplacedStatus,
+  );
+  micHealthDisplacedStatus = displaced;
+  if (!patch) return;
   patchCurrentRecordingSummary(
-    { status: statusText, tone: statusTone },
+    { status: patch.status, tone: patch.tone as UiTone },
     activeUiSessionToken || "",
   );
 }

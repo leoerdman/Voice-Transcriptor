@@ -127,6 +127,53 @@ export function describeMicHealth(state: MicHealthState): {
   return STATUS_FOR_STATE[state];
 }
 
+/** A recording summary's status line, as the mic-health warning sees it. */
+export interface MicHealthStatusLine {
+  status: string;
+  tone: string;
+}
+
+const MIC_HEALTH_STATUS_TEXTS: ReadonlySet<string> = new Set(
+  Object.values(STATUS_FOR_STATE).map((s) => s.statusText).filter(Boolean),
+);
+
+/**
+ * What the recording summary's status line should become when the
+ * microphone's health changes — the warning's own lifecycle, not just its
+ * entry.
+ *
+ * Entering a bad state shows its warning and keeps the line it displaced.
+ * Returning to `live` puts that line back, but only while the warning is
+ * still what the summary shows: a status written since (a stream error,
+ * "Saving…") is newer news and stays. Before this, the warning was only
+ * ever written, never withdrawn: a Bluetooth headset is digitally silent
+ * for its first second while it switches to its call profile, the probe
+ * rightly said "not delivering audio", the pill went back to *Mic live*
+ * — and the red banner stayed for the whole take (user, 2026-11-20 15:47).
+ *
+ * @returns the patch to apply (null: leave the line alone) and the line
+ *          to restore later.
+ */
+export function reconcileMicHealthStatus(
+  state: MicHealthState,
+  current: MicHealthStatusLine,
+  displaced: MicHealthStatusLine | null,
+): { patch: MicHealthStatusLine | null; displaced: MicHealthStatusLine | null } {
+  const showingWarning = MIC_HEALTH_STATUS_TEXTS.has(current.status);
+  if (state === "silent" || state === "muted" || state === "lost") {
+    const { statusText, statusTone } = STATUS_FOR_STATE[state];
+    return {
+      patch: { status: statusText, tone: statusTone },
+      displaced: showingWarning ? displaced : { ...current },
+    };
+  }
+  if (state === "live" && showingWarning) {
+    return { patch: displaced ?? { status: "", tone: "info" }, displaced: null };
+  }
+  if (state === "idle") return { patch: null, displaced: null };
+  return { patch: null, displaced };
+}
+
 export function initialSnapshot(): MicHealthSnapshot {
   return {
     state: "idle",

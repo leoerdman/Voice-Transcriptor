@@ -10,6 +10,7 @@ import {
   PROBE_TIMEOUT_MS,
   SILENT_CONFIRM_MS,
   describeMicHealth,
+  reconcileMicHealthStatus,
   initialSnapshot,
   isDigitalSilence,
   nextMicHealth,
@@ -378,5 +379,36 @@ describe("MicHealthTracker", () => {
     tracker.reset();
     expect(seen).toEqual(["probing", "idle"]);
     expect(tracker.get()).toEqual(initialSnapshot());
+  });
+});
+
+describe("reconcileMicHealthStatus — the warning is withdrawn when the mic recovers", () => {
+  const recording = { status: "Recording. Deepgram live streaming is active.", tone: "info" };
+
+  it("a Bluetooth headset's silent first second: warning, then the recording line back", () => {
+    const silent = reconcileMicHealthStatus("silent", recording, null);
+    expect(silent.patch?.status).toBe(MIC_SILENT_HELP);
+    expect(silent.displaced).toEqual(recording);
+    const shown = { status: silent.patch!.status, tone: silent.patch!.tone };
+    const live = reconcileMicHealthStatus("live", shown, silent.displaced);
+    expect(live.patch).toEqual(recording);
+    expect(live.displaced).toBeNull();
+  });
+
+  it("a newer status written meanwhile is not overwritten by the recovery", () => {
+    const silent = reconcileMicHealthStatus("silent", recording, null);
+    const newer = { status: "Live stream error: offline", tone: "error" };
+    expect(reconcileMicHealthStatus("live", newer, silent.displaced).patch).toBeNull();
+  });
+
+  it("a second bad state keeps the original line, not the first warning", () => {
+    const silent = reconcileMicHealthStatus("silent", recording, null);
+    const muted = reconcileMicHealthStatus("muted", silent.patch!, silent.displaced);
+    expect(muted.displaced).toEqual(recording);
+  });
+
+  it("a healthy take never touches the line", () => {
+    expect(reconcileMicHealthStatus("live", recording, null).patch).toBeNull();
+    expect(reconcileMicHealthStatus("probing", recording, null).patch).toBeNull();
   });
 });
