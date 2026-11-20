@@ -5180,6 +5180,58 @@ async def _ws_recv_next(websocket: WebSocket) -> dict:
     return {"kind": "text", "data": text}
 
 
+#: Live-socket control message: the take's collection changed after the
+#: socket opened. A screen take whose screen session could not start is a
+#: voice take (desktop ``screen-mode:voice-take``), and the renderer says
+#: so here: ``{"type": "take", "recording_collection": "live"}``.
+LIVE_TAKE_CONTROL_TYPE = "take"
+
+
+def _apply_live_take_update(recovery: Optional[dict], payload: dict) -> None:
+    """Re-file the recovery sidecar of a take whose collection changed.
+
+    The sidecar is written when the socket opens — before desktop knows
+    whether a screen take's screen session started — so a take demoted to
+    a voice take still read ``screen`` + its session id on disk, and a
+    crash after the demotion promoted it into Screen Sessions (keep-5
+    retention, no screenshots). The live session owns its sidecar, so the
+    change arrives on the live socket and is written here, atomically.
+    Leaving the screen collection drops ``screen_session_id``: a voice
+    take has no screenshots to adopt.
+    """
+    if not recovery:
+        return
+    try:
+        collection = _normalize_recording_collection(payload.get("recording_collection"))
+    except HTTPException:
+        logger.warning("live take update ignored: unsupported collection")
+        return
+    if not collection:
+        return
+    meta = recovery["meta"]
+    meta["recording_collection"] = collection
+    if collection != RECORDING_COLLECTION_SCREEN:
+        meta["screen_session_id"] = ""
+    try:
+        atomic_write_json(recovery["meta_path"], dict(meta))
+    except OSError as e:
+        logger.warning("live take update: sidecar write failed: %s", e)
+        return
+    logger.info("live take re-filed under %s", collection)
+
+
+async def _ws_recv_live(websocket: WebSocket, recovery: Optional[dict]) -> dict:
+    """``_ws_recv_next`` for a live session: take updates are applied here
+    and never reach the session's loops, so all of them (pre-connect,
+    receiver, finalize drain, local) honour one rule."""
+    while True:
+        msg = await _ws_recv_next(websocket)
+        if msg["kind"] == "control" and msg["payload"].get("type") == LIVE_TAKE_CONTROL_TYPE:
+            _apply_live_take_update(recovery, msg["payload"])
+            continue
+        return msg
+
+
 async def _run_local_live_session(
     *,
     websocket: WebSocket,
@@ -5205,7 +5257,7 @@ async def _run_local_live_session(
     async def receiver() -> None:
         try:
             while not stop.is_set():
-                msg = await _ws_recv_next(websocket)
+                msg = await _ws_recv_live(websocket, recovery)
                 kind = msg["kind"]
                 if kind == "disconnect":
                     stop.set()
@@ -5679,7 +5731,7 @@ async def _run_deepgram_live_session(
         nonlocal frames_received, bytes_received, pending_bytes, preconnect_dropped_bytes
         nonlocal preconnect_finalize_payload, preconnect_disconnected
         while True:
-            msg = await _ws_recv_next(websocket)
+            msg = await _ws_recv_live(websocket, recovery)
             kind = msg["kind"]
             if kind == "disconnect":
                 preconnect_disconnected = True
@@ -6277,7 +6329,7 @@ async def _run_deepgram_live_session(
         while time.monotonic() < drain_deadline and not _matched():
             try:
                 tail_msg = await asyncio.wait_for(
-                    _ws_recv_next(websocket),
+                    _ws_recv_live(websocket, recovery),
                     timeout=max(0.0, drain_deadline - time.monotonic()),
                 )
             except asyncio.TimeoutError:
@@ -6323,7 +6375,7 @@ async def _run_deepgram_live_session(
                 stop.set()
                 return
             while not stop.is_set():
-                msg = await _ws_recv_next(websocket)
+                msg = await _ws_recv_live(websocket, recovery)
                 kind = msg["kind"]
                 if kind == "disconnect":
                     client_gone = True
