@@ -47,7 +47,19 @@ function fakeCanvas() {
 function pageContext(html, { width, height, hit }) {
   const script = (html.match(/<script>([\s\S]*?)<\/script>/) || [])[1] || "";
   const screenCanvas = fakeCanvas();
-  const element = () => ({ style: {}, addEventListener() { }, classList: { toggle() { } } });
+  const animations = [];
+  const element = (id) => ({
+    id,
+    style: {},
+    addEventListener() { },
+    classList: { toggle() { } },
+    animate(keyframes, options) {
+      const animation = { id, keyframes, options, cancelled: false, cancel() { this.cancelled = true; } };
+      animations.push(animation);
+      return animation;
+    },
+  });
+  const elements = new Map();
   const context = {
     innerWidth: width,
     innerHeight: height,
@@ -56,7 +68,11 @@ function pageContext(html, { width, height, hit }) {
     requestAnimationFrame: (fn) => fn(),
     document: {
       title: "",
-      getElementById: (id) => (id === "cv" ? screenCanvas : element()),
+      getElementById: (id) => {
+        if (id === "cv") return screenCanvas;
+        if (!elements.has(id)) elements.set(id, element(id));
+        return elements.get(id);
+      },
       createElement: () => fakeCanvas(),
       querySelectorAll: () => [],
       elementFromPoint: (x, y) => hit(x, y),
@@ -74,7 +90,7 @@ function pageContext(html, { width, height, hit }) {
   context.window = context;
   vm.createContext(context);
   vm.runInContext(script, context);
-  return { context, screenCanvas };
+  return { context, screenCanvas, animations };
 }
 
 // ── Electron fakes ─────────────────────────────────────────────────────
@@ -295,6 +311,29 @@ test("a shot is captured with its strokes still on the screen; they leave the mo
     assert.equal(await overlay.webContents.executeJavaScript("window.__hasStrokes([1])"), false, "gone once it is taken");
     assert.equal(paintedMoveTos(result.files[0]).length, 1, "the image holds the stroke");
     assert.ok(world.logs.some((l) => /shot captured \(capsule\) displays=1 capture_ms=\d+ strokes_off=1 compose_ms=\d+/.test(l)));
+  } finally {
+    world.cleanup();
+  }
+});
+
+test("every shot plays the white flash, from visible to gone, however quickly shots follow", async () => {
+  const world = createWorld();
+  try {
+    await world.controller.start(ID);
+    const flashes = () => world.overlays()[0].page.animations.filter((a) => a.id === "flash");
+    for (let i = 0; i < 3; i += 1) {
+      drawStroke(world, [[100 + i * 10, 100], [200, 100]]);
+      await tick(30);
+      await world.controller.takeShot("hotkey");
+    }
+    assert.equal(flashes().length, 3, "one flash per shot");
+    for (const flash of flashes()) {
+      // Both ends are in the one animation: it cannot start from 0.
+      assert.ok(flash.keyframes[0].opacity > 0, "it starts visible");
+      assert.equal(flash.keyframes[flash.keyframes.length - 1].opacity, 0, "and ends gone");
+      assert.ok(flash.options.duration >= 250);
+    }
+    assert.ok(flashes().slice(0, -1).every((f) => f.cancelled), "a flash still running is restarted, not stacked");
   } finally {
     world.cleanup();
   }

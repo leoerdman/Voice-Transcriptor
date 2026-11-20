@@ -158,7 +158,7 @@ function overlayHtml() {
 <style>
   html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; }
   #frame { position: fixed; inset: 0; border: ${border}px solid ${SCREEN_MODE.borderColor}; box-sizing: border-box; pointer-events: none; }
-  #flash { position: fixed; inset: 0; background: #fff; opacity: 0; pointer-events: none; transition: opacity .25s ease-out; }
+  #flash { position: fixed; inset: 0; background: #fff; opacity: 0; pointer-events: none; }
   canvas { position: fixed; inset: 0; width: 100%; height: 100%; }
 </style></head>
 <body>
@@ -244,10 +244,21 @@ function overlayHtml() {
     redraw();
     return true;
   };
+  // The "shot taken" flash: one animation that owns both ends. It used to
+  // set opacity .35 and start the fade to 0 on the next animation frame —
+  // but that frame's callback runs BEFORE the frame is painted, so both
+  // writes usually landed in one style pass, the transition began at 0,
+  // and nothing showed; it flashed only when a paint happened to fall in
+  // between (user, 2026-11-20: "the white flash does not always show").
+  // A flash still running is cut and started again.
+  let flashAnimation = null;
   window.__flash = () => {
     const f = document.getElementById("flash");
-    f.style.transition = "none"; f.style.opacity = ".35";
-    requestAnimationFrame(() => { f.style.transition = "opacity .25s ease-out"; f.style.opacity = "0"; });
+    if (flashAnimation) flashAnimation.cancel();
+    flashAnimation = f.animate(
+      [{ opacity: 0.4 }, { opacity: 0.4, offset: 0.25 }, { opacity: 0 }],
+      { duration: 320, easing: "ease-out" },
+    );
     return true;
   };
   // Paint the strokes \`ids\` onto a capture of this display, at the
