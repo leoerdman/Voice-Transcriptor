@@ -30,6 +30,10 @@ test("main.js resolves the data directory in exactly one place", () => {
   assert.doesNotMatch(mainSource, /process\.env\.TRANSCRIPTOR_DATA_DIR \|\|/, "no restated override rule");
 });
 
+test("no local binding shadows dataDir() (a `const dataDir = dataDir()` throws in its TDZ)", () => {
+  assert.doesNotMatch(mainSource, /\b(?:const|let|var)\s+dataDir\b/);
+});
+
 test("main.log follows the data directory instead of caching its first path (DM-07)", () => {
   assert.doesNotMatch(mainSource, /let mainLogFilePath\b/, "a cached log path outlives the OneDrive re-home");
   assert.match(topLevelFunctionSource("mainLogFilePath"), /path\.join\(dataDir\(\), MAIN_LOG_FILE\)/);

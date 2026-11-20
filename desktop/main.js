@@ -115,7 +115,6 @@ const { createRecordingFinalSlot } = require("./recording-final-slot");
 // decided from the renderer's explicit fields — never from the words the
 // user dictated (Ultra-Audit 2026-11-20 DM-01).
 const {
-  NO_SPEECH_STATUS,
   SIGNAL_OUTCOME,
   normalizeTranscriptText,
   isPasteableTranscript,
@@ -967,8 +966,7 @@ function applyMacDockPolicy() {
 }
 
 function mainWindowStatePath() {
-  const dataDir = dataDir();
-  return path.join(dataDir, MAIN_WINDOW_STATE_FILE);
+  return path.join(dataDir(), MAIN_WINDOW_STATE_FILE);
 }
 
 function loadMainWindowState() {
@@ -2280,8 +2278,7 @@ function screenModeHelperPath() {
 // Where a take's screenshots are staged until its recording is saved; the
 // backend then moves them beside the recording (backend/screen_sessions.py).
 function screenModeStagingRoot() {
-  const dataDir = dataDir();
-  return path.join(dataDir, SCREEN_MODE.stagingDirName);
+  return path.join(dataDir(), SCREEN_MODE.stagingDirName);
 }
 
 const SCREEN_MODE_WARNINGS = Object.freeze({
@@ -8169,11 +8166,11 @@ async function createWindow(options = {}) {
         const rel = path.relative(root, candidate);
         return rel === "" || (!!rel && !rel.startsWith("..") && !path.isAbsolute(rel));
       };
-      const dataDir = dataDir();
-      const recordingsRoot = path.resolve(dataDir, "recordings");
+      const appDataDir = dataDir();
+      const recordingsRoot = path.resolve(appDataDir, "recordings");
       const allowedRecordingRoots = [recordingsRoot];
       try {
-        const cfgPath = path.join(dataDir, "config.json");
+        const cfgPath = path.join(appDataDir, "config.json");
         if (fs.existsSync(cfgPath)) {
           const rawCfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
           const configuredRoot = String(rawCfg?.preferences?.recordings_dir || "").trim();
@@ -8181,7 +8178,7 @@ async function createWindow(options = {}) {
             allowedRecordingRoots.push(
               path.isAbsolute(configuredRoot)
                 ? path.resolve(configuredRoot)
-                : path.resolve(dataDir, configuredRoot)
+                : path.resolve(appDataDir, configuredRoot)
             );
           }
         }
