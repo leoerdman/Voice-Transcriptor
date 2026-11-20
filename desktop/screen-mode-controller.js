@@ -221,8 +221,29 @@ function overlayHtml() {
   };
   // A shot names the strokes it holds; nothing else is touched, so a
   // stroke still being drawn keeps what it has drawn and keeps drawing.
+  // A shot takes its strokes off the screen the moment it is asked for
+  // (__detach) and keeps their data for the image (__composite) until it
+  // is done: dropped once the image holds them (__drop), put back on the
+  // screen when the capture failed (__restore).
+  const detached = new Map();
   window.__hasStrokes = (ids) => ids.some((id) => strokes.has(id));
-  window.__clear = (ids) => { for (const id of ids) strokes.delete(id); redraw(); return true; };
+  window.__detach = (ids) => {
+    for (const id of ids) {
+      const s = strokes.get(id);
+      if (s) { detached.set(id, s); strokes.delete(id); }
+    }
+    redraw();
+    return true;
+  };
+  window.__drop = (ids) => { for (const id of ids) detached.delete(id); return true; };
+  window.__restore = (ids) => {
+    for (const id of ids) {
+      const s = detached.get(id);
+      if (s) { strokes.set(id, s); detached.delete(id); }
+    }
+    redraw();
+    return true;
+  };
   window.__flash = () => {
     const f = document.getElementById("flash");
     f.style.transition = "none"; f.style.opacity = ".35";
@@ -241,7 +262,7 @@ function overlayHtml() {
       const c = out.getContext("2d");
       c.drawImage(img, 0, 0);
       for (const id of ids) {
-        const s = strokes.get(id);
+        const s = detached.get(id) || strokes.get(id);
         if (s) drawStroke(c, s, scale);
       }
       resolve(out.toDataURL("image/png"));
@@ -858,6 +879,15 @@ function createScreenModeController(deps) {
     }
     const allDisplays = screen.getAllDisplays();
     const at = Date.now();
+    // The strokes leave the screen first, the moment the shot is asked
+    // for: the capture never shows them anyway (the overlays are
+    // content-protected) and the image gets them painted from their data,
+    // which the overlay keeps aside until the shot is done.
+    if (ids.length) {
+      const clearStarted = Date.now();
+      await Promise.all([...overlays.values()].map((entry) => overlayCall(entry, `window.__detach(${JSON.stringify(ids)})`)));
+      log(`[screen-mode] strokes off screen for shot (${reason}) in ${Date.now() - clearStarted} ms`);
+    }
     const files = [];
     const captured = new Set();
     const failures = [];
@@ -898,15 +928,19 @@ function createScreenModeController(deps) {
       log(`[screen-mode] capture failed (${reason}): ${failures.join("; ")}`);
       deps.onWarning(SCREEN_MODE_WARNING.CAPTURE_FAILED);
     }
-    if (!files.length) return null;
     const taken = pending.filter((s) => captured.has(s.displayId)).map((s) => s.id);
-    const shot = recordShot(session, { at, files, strokeIds: taken, reason });
-    // Only the strokes the shot took leave the screen. Queued ops are
-    // kept: they belong to strokes still being drawn or begun since.
+    const kept = pending.filter((s) => !captured.has(s.displayId)).map((s) => s.id);
+    // Only the strokes the shot took are gone for good; those of a display
+    // that was not captured come back on the screen, pending for the next
+    // shot. Queued ops are kept: they belong to strokes still being drawn
+    // or begun since.
     for (const entry of overlays.values()) {
-      overlayCall(entry, `window.__clear(${JSON.stringify(shot.strokeIds)})`);
-      overlayCall(entry, "window.__flash()");
+      if (taken.length) overlayCall(entry, `window.__drop(${JSON.stringify(taken)})`);
+      if (kept.length) overlayCall(entry, `window.__restore(${JSON.stringify(kept)})`);
     }
+    if (!files.length) return null;
+    const shot = recordShot(session, { at, files, strokeIds: taken, reason });
+    for (const entry of overlays.values()) overlayCall(entry, "window.__flash()");
     writeEvents();
     log(`[screen-mode] shot ${shot.index} reason=${reason} files=${files.length} strokes=${shot.strokeIds.length}`);
     return { index: shot.index, files };
