@@ -1,6 +1,42 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { flashButtonFeedback } from "../src/button-feedback";
+import { flashButtonFeedback, flashCopyOutcome } from "../src/button-feedback";
+import { UI_COPY } from "../src/ui-copy";
+
+describe("flashCopyOutcome (FU-12)", () => {
+  function make(): HTMLButtonElement {
+    const b = document.createElement("button");
+    b.setAttribute("aria-label", "Copy transcript");
+    return b;
+  }
+  const opts = { durationMs: 900, setTimer: () => 1, clearTimer: () => {} };
+
+  it("takes the visual state from the outcome, not from the label's wording", () => {
+    const ok = make();
+    flashCopyOutcome(ok, true, "Copy transcript", opts);
+    expect(ok.classList.contains("is-copy-ok")).toBe(true);
+    expect(ok.getAttribute("aria-label")).toBe(UI_COPY.copyFeedback.ok);
+
+    const failed = make();
+    flashCopyOutcome(failed, false, "Copy transcript", opts);
+    expect(failed.classList.contains("is-copy-failed")).toBe(true);
+    expect(failed.getAttribute("aria-label")).toBe(UI_COPY.copyFeedback.failed);
+  });
+
+  it("keeps a success a success when the copy is reworded", () => {
+    const copy = UI_COPY.copyFeedback as { ok: string };
+    const original = copy.ok;
+    copy.ok = "Copied to clipboard";
+    try {
+      const b = make();
+      flashCopyOutcome(b, true, "Copy transcript", opts);
+      expect(b.classList.contains("is-copy-ok")).toBe(true);
+      expect(b.getAttribute("aria-label")).toBe("Copied to clipboard");
+    } finally {
+      copy.ok = original;
+    }
+  });
+});
 
 /**
  * The flash mechanism, with its timers injected so the restore can be

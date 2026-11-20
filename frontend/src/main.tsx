@@ -39,7 +39,7 @@ import {
   type DualStreamDefaults,
 } from "./deepgram-dual";
 import { UI_COPY, applyStaticUiCopy, renderAcceptedFormatsHint, resultPaneTitle } from "./ui-copy";
-import { flashButtonFeedback } from "./button-feedback";
+import { flashButtonFeedback, flashCopyOutcome } from "./button-feedback";
 import { acceleratorToDisplayTokens, shortcutBadge } from "./shortcut-display";
 // D-015: the ONE retired-shortcut-pair rule, shared with desktop/main.js
 // rather than re-derived here. See the module's own docstring for why —
@@ -7545,7 +7545,7 @@ function renderCliSection(): void {
 
 async function copyCliCard(btn: HTMLButtonElement, text: string, title: string): Promise<void> {
   const ok = await writeTextToClipboard(text);
-  flashButtonFeedback(btn, ok ? "Copied" : "Copy failed", `Copy: ${title}`, {
+  flashCopyOutcome(btn, ok, `Copy: ${title}`, {
     durationMs: UI_TOKENS.feedback.flashMs,
     // A text button: the visible label swaps too, not only the one a
     // screen reader hears.
@@ -7912,7 +7912,7 @@ async function copyRecordingText(): Promise<void> {
   if (!text) return;
   const btn = $("recordingCopyBtn") as HTMLButtonElement;
   const ok = await writeTextToClipboard(text);
-  flashButtonFeedback(btn, ok ? "Copied" : "Copy failed", "Copy recording text", {
+  flashCopyOutcome(btn, ok, "Copy recording text", {
     durationMs: UI_TOKENS.feedback.flashMs,
   });
 }
@@ -7923,9 +7923,9 @@ async function copyTextContent(text: string, btnId = ""): Promise<void> {
   const ok = await writeTextToClipboard(value);
   if (btnId) {
     const btn = $(btnId) as HTMLButtonElement;
-    flashButtonFeedback(
+    flashCopyOutcome(
       btn,
-      ok ? "Copied" : "Copy failed",
+      ok,
       btnId === "resultCopyBtn" ? "Copy result text" : "Copy upscale text",
       { durationMs: UI_TOKENS.feedback.flashMs },
     );

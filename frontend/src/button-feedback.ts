@@ -23,6 +23,8 @@
  * numbers.
  */
 
+import { UI_COPY } from "./ui-copy";
+
 interface ButtonRestoreState {
   timer: number;
   aria: string;
@@ -48,8 +50,41 @@ export interface FlashOptions {
   clearTimer?: (handle: number) => void;
 }
 
+/**
+ * Flash the outcome of a Copy. The outcome is a boolean, and the
+ * label and the visual state are both derived from it.
+ *
+ * The outcome used to be encoded in the label: `flashButtonFeedback`
+ * chose the success or failure style by comparing its text argument to
+ * the literal "Copied", so any rewording (or translation) of that word
+ * would have turned every success into the failure style.
+ */
+export function flashCopyOutcome(
+  btn: HTMLButtonElement,
+  ok: boolean,
+  restingLabel: string,
+  options: FlashOptions,
+): void {
+  flash(btn, ok, ok ? UI_COPY.copyFeedback.ok : UI_COPY.copyFeedback.failed, restingLabel, options);
+}
+
+/**
+ * The label-only entry point, kept for the two Upload call sites outside
+ * this module's lane until they move to `flashCopyOutcome`; the outcome
+ * is read against the ui-copy token, not a literal.
+ */
 export function flashButtonFeedback(
   btn: HTMLButtonElement,
+  flashLabel: string,
+  restingLabel: string,
+  options: FlashOptions,
+): void {
+  flash(btn, flashLabel === UI_COPY.copyFeedback.ok, flashLabel, restingLabel, options);
+}
+
+function flash(
+  btn: HTMLButtonElement,
+  ok: boolean,
   flashLabel: string,
   restingLabel: string,
   options: FlashOptions,
@@ -67,7 +102,7 @@ export function flashButtonFeedback(
   };
 
   btn.classList.remove("is-copy-ok", "is-copy-failed");
-  btn.classList.add(flashLabel === "Copied" ? "is-copy-ok" : "is-copy-failed");
+  btn.classList.add(ok ? "is-copy-ok" : "is-copy-failed");
   btn.setAttribute("aria-label", flashLabel);
   btn.title = flashLabel;
   if (options.swapLabel) btn.textContent = flashLabel;

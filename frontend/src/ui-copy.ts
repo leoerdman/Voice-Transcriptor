@@ -57,6 +57,11 @@ export const UI_COPY = {
     resultTitleEmpty: "Result",
     resultTitlePrefix: "Result · ",
   },
+  /** The flash on every Copy button (History, Result, Upload, CLI cards). */
+  copyFeedback: {
+    ok: "Copied",
+    failed: "Copy failed",
+  },
 } as const;
 
 /**
