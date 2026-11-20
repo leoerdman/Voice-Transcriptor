@@ -91,6 +91,42 @@ def cli_token_may_call(method: str, path: str) -> bool:
     return any(m == allowed and pattern.match(p) for allowed, pattern in _CLI_ROUTES)
 
 
+#: The fields the CLI token may send to ``POST /api/recordings/save-from-path``
+#: — exactly what ``cli.save_to_archive`` sends: file a NEW recording from the
+#: job's snapshot. The route also serves the renderer, whose body may name an
+#: existing recording to overwrite (``name``/``require_existing``), a folder
+#: (``archive_dir`` — which then joins the retention registry) or a
+#: collection. None of that is "transcribe a file", so for this token the
+#: route answers 403 rather than honour it.
+CLI_SAVE_FROM_PATH_FIELDS: frozenset[str] = frozenset({
+    "source_path",
+    "path",
+    "title",
+    "transcript_text",
+    "provider",
+    "model",
+    "language",
+    "consume_source_path",
+})
+
+
+def cli_save_request_refusal(payload: Mapping[str, Any]) -> str:
+    """Why the CLI token may not send *payload* to save-from-path, or ``""``.
+
+    A field outside ``CLI_SAVE_FROM_PATH_FIELDS`` is refused only when it
+    carries a value: an empty ``name`` asks for nothing beyond the
+    defaults."""
+    if not isinstance(payload, Mapping):
+        return ""
+    extra = sorted(
+        key for key, value in payload.items()
+        if key not in CLI_SAVE_FROM_PATH_FIELDS and value not in (None, "", False)
+    )
+    if not extra:
+        return ""
+    return "the command-line token may not set: " + ", ".join(extra)
+
+
 def base_url_from_scope(scope: Mapping[str, Any]) -> str:
     """The address this backend was reached at, from an ASGI scope.
 
@@ -349,7 +385,12 @@ class CliAccess:
             self._write_wrapper()
         except OSError:
             if not was_enabled:
-                self.disable()
+                try:
+                    self.disable()
+                except OSError as rollback_error:
+                    # The enable failure below is what the caller reports;
+                    # the token is already revoked in memory.
+                    logger.error("cli switch-on rollback left the token file: %s", rollback_error)
             raise
 
     def sync_connection(self, base_url: str) -> None:
@@ -365,9 +406,19 @@ class CliAccess:
             logger.warning("cli connection file not updated at %s: %s", self.connection_path, e)
 
     def disable(self) -> None:
-        """Revoke: forget the token and remove every file. Never raises."""
+        """Revoke: forget the token and remove every file.
+
+        The token stops working in this process at once, whatever happens
+        on disk. But the switch IS the token file: if it cannot be removed
+        the next boot's ``load`` adopts it and access is back on. So that
+        failure raises ``OSError`` (after every file was attempted) for the
+        caller to report — answering "disabled" over a surviving token file
+        is the lie this module exists to prevent. A connection file or
+        wrapper left behind grants nothing without the token and is only
+        logged."""
         self._token = ""
         self._base_url = ""
+        token_error: Optional[OSError] = None
         for path in (self.token_path, self.connection_path, self.wrapper_path):
             try:
                 path.unlink()
@@ -375,6 +426,10 @@ class CliAccess:
                 continue
             except OSError as e:
                 logger.warning("cli file %s not removed: %s", path, e)
+                if path == self.token_path:
+                    token_error = e
+        if token_error is not None:
+            raise token_error
 
     # ── views ────────────────────────────────────────────────────────
 

@@ -15,6 +15,9 @@ from unittest import mock
 
 TEST_WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 
+# What ``_require_api_auth`` leaves on a request the renderer's token let in.
+_RENDERER_REQUEST = SimpleNamespace(state=SimpleNamespace(api_caller="renderer"))
+
 
 def _fresh_main_module(data_dir: str):
     os.environ["TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG"] = "1"
@@ -1007,7 +1010,7 @@ class RecordingNameTests(unittest.TestCase):
         payload = b"tiny mp3 payload"
         source.write_bytes(payload)
 
-        result = asyncio.run(self.main.save_recording_from_path({
+        result = asyncio.run(self.main.save_recording_from_path(request=_RENDERER_REQUEST, payload={
             "source_path": str(source),
             "title": "Lecture",
             "source_text": "source",
@@ -1034,7 +1037,7 @@ class RecordingNameTests(unittest.TestCase):
         payload = b"tiny mp3 payload"
         source.write_bytes(payload)
 
-        result = asyncio.run(self.main.save_recording_from_path({
+        result = asyncio.run(self.main.save_recording_from_path(request=_RENDERER_REQUEST, payload={
             "source_path": str(source),
             "title": "Lecture",
             "source_text": "source",
@@ -1056,7 +1059,7 @@ class RecordingNameTests(unittest.TestCase):
         payload = b"tiny mp3 payload"
         source.write_bytes(payload)
 
-        result = asyncio.run(self.main.save_recording_from_path({
+        result = asyncio.run(self.main.save_recording_from_path(request=_RENDERER_REQUEST, payload={
             "source_path": str(source),
             "title": "Lecture",
             "source_text": "source",

@@ -87,6 +87,7 @@ from backend.cli_access import (
     CliAccess,
     base_url_from_scope,
     cli_defaults,
+    cli_save_request_refusal,
     cli_token_may_call,
 )
 from backend.config import APP_ROOT, DATA_DIR, load_config, redact_config, save_config
@@ -1688,6 +1689,11 @@ def _promote_live_recovery(
     return result
 
 
+#: Who ``_require_api_auth`` let in, on ``request.state.api_caller``.
+API_CALLER_RENDERER = "renderer"
+API_CALLER_CLI = "cli"
+
+
 async def _require_api_auth(request: Request) -> None:
     # ``/api/health`` is unauthenticated because it declares no
     # ``Depends(_require_api_auth)``, and that route declaration is the
@@ -1717,6 +1723,11 @@ async def _require_api_auth(request: Request) -> None:
                 status_code=403,
                 detail="the command-line token may not call this endpoint",
             )
+        # A route both callers share narrows itself for this one
+        # (``save-from-path`` — ``cli_save_request_refusal``).
+        request.state.api_caller = API_CALLER_CLI
+    else:
+        request.state.api_caller = API_CALLER_RENDERER
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         origin = request.headers.get("origin")
         if origin and not _origin_allowed(origin, request):
@@ -7327,7 +7338,19 @@ def enable_cli_access(request: Request, _auth: None = Depends(_require_api_auth)
 
 @app.post("/api/cli/disable")
 def disable_cli_access(request: Request, _auth: None = Depends(_require_api_auth)):
-    CLI_ACCESS.disable()
+    try:
+        CLI_ACCESS.disable()
+    except OSError as e:
+        # Revoked for this run, but the token file — the switch — is still
+        # on disk and the next start would turn access back on. Say so.
+        logger.error("cli access: token revoked in memory but its file survived: %s", e)
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "command-line access is revoked until the app restarts, but its token "
+                f"file could not be removed: {_safe_error_text(e)}"
+            ),
+        )
     logger.info("cli access disabled; token revoked")
     return _cli_status_payload(request)
 
@@ -8365,8 +8388,17 @@ async def save_recording_with_audio(
 @app.post("/api/recordings/save-from-path")
 async def save_recording_from_path(
     payload: dict = Body(...),
+    *,
+    request: Request,
     _auth: None = Depends(_require_api_auth),
 ):
+    # The CLI token may file a new recording and nothing more (BM-02/S-07):
+    # not overwrite an existing one, not register a folder, not pick a
+    # collection. Refused before the source is even resolved.
+    if getattr(request.state, "api_caller", "") == API_CALLER_CLI:
+        refusal = cli_save_request_refusal(payload or {})
+        if refusal:
+            raise HTTPException(status_code=403, detail=refusal)
     source_path = await asyncio.to_thread(
         _resolve_source_media_path,
         (payload or {}).get("source_path") or (payload or {}).get("path"),

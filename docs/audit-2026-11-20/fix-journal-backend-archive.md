@@ -87,3 +87,21 @@ Proof method: SKILL §7.1 — the fixed file is put aside, `git show HEAD:<path>
   ```
 - After: `Ran 25 tests ... OK`; full suite `Ran 901 tests ... OK (skipped=2)`.
 - Cross-domain (renderer): `save-with-audio` / promote now answer `screens_error` (string, empty on success). The renderer should show it and must not fall back to staging paths when it is set (main.tsx ~12682 `parseScreenManifest(persisted.screensManifest) || stagedScreenManifest`).
+
+### C5 · BM-02 = S-07 (P1/P2), H-02 = BM-18 (P1) · the CLI token files new recordings only; revoke reports a surviving token file
+- Files: `backend/cli_access.py` (`CLI_SAVE_FROM_PATH_FIELDS`, `cli_save_request_refusal`; `disable()` raises when the token file — the switch — survives, after attempting every file; `enable()` rollback logs a failed revoke and re-raises the enable error), `backend/main.py` (`API_CALLER_RENDERER/CLI` on `request.state.api_caller` set by `_require_api_auth`; `save_recording_from_path` answers 403 to a CLI request carrying `name`/`require_existing`/`archive_dir`/`recording_collection`/any other field, before the source is resolved; `disable_cli_access` answers 500 naming the surviving file), tests: `test_cli_access.py` (new `CliSaveScopeTests` through the real app with `TestClient`, `test_disable_reports_a_token_file_it_could_not_remove`; `_FakeRequest` gained `state`), `test_recording_names.py` (the three direct handler calls pass a renderer request), `test_live.py` (its fake request gained `state`).
+- Check: `python -m unittest backend.tests.test_cli_access`
+- Before (main.py + cli_access.py at HEAD):
+  ```
+  FAIL: test_disable_reports_a_token_file_it_could_not_remove (...)
+  AssertionError: HTTPException not raised
+  FAIL: test_the_cli_token_may_not_overwrite_or_redirect_a_save (...) (extra={'name': 'Existing.txt', 'require_existing': True})
+  AssertionError: 404 != 403 : {"detail":"source file is no longer available"}
+  FAIL: test_the_cli_token_may_not_overwrite_or_redirect_a_save (...) (extra={'archive_dir': '/Users/someone/Music'})
+  AssertionError: 404 != 403 : {"detail":"source file is no longer available"}
+  FAIL: test_the_cli_token_may_not_overwrite_or_redirect_a_save (...) (extra={'recording_collection': 'live'})
+  AssertionError: 404 != 403 : {"detail":"source file is no longer available"}
+  Ran 35 tests in 1.482s
+  FAILED (failures=4)
+  ```
+- After: `Ran 35 tests ... OK`; full suite `Ran 905 tests ... OK (skipped=2)`.
