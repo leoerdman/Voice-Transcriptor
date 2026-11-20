@@ -62,6 +62,7 @@
       "backend-exit.js",
       "renderer-epoch.js",
       "shortcut-runtime.js",
+      "capsule-geometry.js",
       "power-events.js",
       "child-io.js",
       "paste-protocol.js",

@@ -134,6 +134,8 @@ const { recordingKey, createBoundedKeySet } = require("./renderer-epoch");
 // The runtime accelerator set and how a Settings update changes it
 // (S-11, DM-23).
 const { normalizeShortcutSet, applyShortcutUpdate, screenShotSlotStatus } = require("./shortcut-runtime");
+// The capsule window's size (one flag) and when it is placed (DM-13, DM-25).
+const { capsuleWindowSize, capsuleBoundsIn, capsuleNeedsPlacement } = require("./capsule-geometry");
 // The record hotkey's renderer round trip, with a press that expires
 // when main stops waiting for it (DM-05).
 const {
@@ -1376,7 +1378,6 @@ const RECORDING_STATUS_CAPSULE = Object.freeze((() => {
   const t = {
   width: 110,
   height: 30,
-  geometryPadding: 0,
   minWidth: 110,
   minHeight: 30,
   maxHeight: 30,
@@ -1429,7 +1430,10 @@ const recordingStatusCapsuleState = {
   screen: false,
 };
 
-let recordingStatusCapsuleGeometry = null;
+// The size the capsule window was last placed with; null while hidden.
+// Placement happens when the capsule appears or changes size — never on
+// a status or level tick (DM-25).
+let recordingStatusCapsulePlacedSize = null;
 // Every intent to change what the capsule shows takes the next number.
 // An update that has to wait for its window — a cold create is 110-380 ms
 // — checks the counter again before it paints, so a slow publish can
@@ -1444,19 +1448,6 @@ let recordingStatusCapsuleLevelUpdateInFlight = false;
 let recordingStatusCapsuleLastLevelSent = -1;
 let recordingStatusCapsuleLastLevelSentAt = 0;
 
-function clampRecordingStatusCapsuleDimension(value, min, max) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return min;
-  return Math.max(min, Math.min(max, Math.ceil(n)));
-}
-
-function getRecordingStatusCapsuleFallbackWindowSize() {
-  return {
-    width: RECORDING_STATUS_CAPSULE.width,
-    height: RECORDING_STATUS_CAPSULE.height,
-  };
-}
-
 function noteRecordingStatusCapsuleInteraction() {
   recordingStatusSuppressActivateUntil = Date.now() + RECORDING_STATUS_CAPSULE_ACTIVATE_SUPPRESS_MS;
 }
@@ -1466,60 +1457,23 @@ function shouldSuppressActivateForRecordingStatusCapsule() {
   return true;
 }
 
+// The window is exactly the pill, and the pill's size is a function of
+// one flag (./capsule-geometry, DM-13). It used to be measured in the
+// capsule page and reported back over document.title, which left the
+// window 110 px wide — clipping the 126 px screen-mode pill — until the
+// first measurement arrived.
 function getRecordingStatusCapsuleWindowSize() {
-  const geometry = recordingStatusCapsuleGeometry;
-  if (!geometry) {
-    return getRecordingStatusCapsuleFallbackWindowSize();
-  }
-  const pad = Math.max(0, Number(RECORDING_STATUS_CAPSULE.geometryPadding) || 0);
-  return {
-    width: clampRecordingStatusCapsuleDimension(
-      geometry.width + pad,
-      RECORDING_STATUS_CAPSULE.minWidth,
-      RECORDING_STATUS_CAPSULE.maxWidth,
-    ),
-    height: clampRecordingStatusCapsuleDimension(
-      geometry.height + pad,
-      RECORDING_STATUS_CAPSULE.minHeight,
-      RECORDING_STATUS_CAPSULE.maxHeight,
-    ),
-  };
+  return capsuleWindowSize(RECORDING_STATUS_CAPSULE, !!recordingStatusCapsuleState.screen);
 }
 
-function applyRecordingStatusCapsuleWindowSize() {
-  if (!recordingStatusWindow || recordingStatusWindow.isDestroyed()) return;
+/** Size and position the capsule window, and let screen mode re-lay out. */
+function placeRecordingStatusCapsule(capsuleWindow) {
   const size = getRecordingStatusCapsuleWindowSize();
   try {
-    recordingStatusWindow.setSize(size.width, size.height, false);
-    recordingStatusWindow.setBounds(recordingStatusCapsuleBounds(), false);
+    capsuleWindow.setBounds(recordingStatusCapsuleBounds(size, capsuleWindow), false);
+    recordingStatusCapsulePlacedSize = size;
   } catch { }
   screenMode.refreshLayout();
-}
-
-function applyRecordingStatusCapsuleGeometryPayload(rawPayload) {
-  let payload = null;
-  try {
-    payload = JSON.parse(decodeURIComponent(String(rawPayload || "")));
-  } catch {
-    return;
-  }
-  const width = Number(payload?.width);
-  const height = Number(payload?.height);
-  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return;
-  const next = {
-    width: clampRecordingStatusCapsuleDimension(width, 1, RECORDING_STATUS_CAPSULE.maxWidth),
-    height: clampRecordingStatusCapsuleDimension(height, 1, RECORDING_STATUS_CAPSULE.maxHeight),
-  };
-  const prev = recordingStatusCapsuleGeometry;
-  if (
-    prev &&
-    prev.width === next.width &&
-    prev.height === next.height
-  ) {
-    return;
-  }
-  recordingStatusCapsuleGeometry = next;
-  applyRecordingStatusCapsuleWindowSize();
 }
 
 // The two substring ladders that used to live here — one for the mode,
@@ -1759,7 +1713,6 @@ function recordingStatusCapsuleHtml() {
     </div>
   </div>
   <script>
-    const stackEl = document.getElementById("stack");
     const pillEl = document.getElementById("pill");
     let screenMode = false;
     const stateIcon = document.getElementById("stateIcon");
@@ -1786,7 +1739,6 @@ function recordingStatusCapsuleHtml() {
       timerRunning: false,
       level: 0
     };
-    let geometryEmitScheduled = false;
     let lastLevelAt = 0;
     let lastWavePushAt = 0;
     let lastRenderFrameAt = 0;
@@ -1801,26 +1753,6 @@ function recordingStatusCapsuleHtml() {
       const mm = String(Math.floor(total / 60)).padStart(2, "0");
       const ss = String(total % 60).padStart(2, "0");
       return mm + ":" + ss;
-    }
-    function emitGeometry() {
-      const stackRect = stackEl.getBoundingClientRect();
-      let left = stackRect.left;
-      let top = stackRect.top;
-      let right = stackRect.right;
-      let bottom = stackRect.bottom;
-      const payload = {
-        width: Math.max(1, Math.ceil(right - left)),
-        height: Math.max(1, Math.ceil(bottom - top))
-      };
-      document.title = "__recording_capsule_geometry__" + encodeURIComponent(JSON.stringify(payload));
-    }
-    function scheduleGeometryEmit() {
-      if (geometryEmitScheduled) return;
-      geometryEmitScheduled = true;
-      requestAnimationFrame(() => {
-        geometryEmitScheduled = false;
-        setTimeout(emitGeometry, 0);
-      });
     }
     function applyStatusMode(mode) {
       const next = String(mode || "idle");
@@ -1961,7 +1893,6 @@ function recordingStatusCapsuleHtml() {
       if (nextScreen !== screenMode) {
         screenMode = nextScreen;
         pillEl.classList.toggle("screen", screenMode);
-        scheduleGeometryEmit();
       }
       render();
       if (pageIsActive()) {
@@ -1972,7 +1903,6 @@ function recordingStatusCapsuleHtml() {
       }
       return true;
     };
-    window.addEventListener("resize", scheduleGeometryEmit);
     document.addEventListener("pointerdown", () => {
       if (pointerEmitLocked) return;
       pointerEmitLocked = true;
@@ -2012,29 +1942,44 @@ function recordingStatusCapsuleHtml() {
     }
     render();
     if (pageIsActive()) requestAnimationLoop();
-    scheduleGeometryEmit();
   </script>
 </body>
 </html>`;
 }
 
-function recordingStatusCapsuleBounds() {
-  const size = getRecordingStatusCapsuleWindowSize();
-  const fallback = { x: 0, y: 0, width: 1440, height: 900 };
-  let workArea = fallback;
+/**
+ * Where the capsule goes: the display it is already on while it is
+ * visible (a resize or a display change must not move it to another
+ * monitor), else the display under the cursor — the one the user is
+ * looking at as it appears.
+ */
+function recordingStatusCapsuleBounds(size = getRecordingStatusCapsuleWindowSize(), capsuleWindow = null) {
+  let workArea = null;
   try {
-    const point = screen.getCursorScreenPoint();
-    const display = screen.getDisplayNearestPoint(point) || screen.getPrimaryDisplay();
-    workArea = display?.workArea || fallback;
+    const visible = !!capsuleWindow && !capsuleWindow.isDestroyed() && capsuleWindow.isVisible();
+    const display = visible
+      ? screen.getDisplayMatching(capsuleWindow.getBounds())
+      : (screen.getDisplayNearestPoint(screen.getCursorScreenPoint()) || screen.getPrimaryDisplay());
+    workArea = display?.workArea || null;
   } catch {
-    workArea = fallback;
+    workArea = null;
   }
-  return {
-    x: Math.round(workArea.x + (workArea.width - size.width) / 2),
-    y: Math.round(workArea.y + workArea.height - size.height - RECORDING_STATUS_CAPSULE.bottomMargin),
-    width: size.width,
-    height: size.height,
+  return capsuleBoundsIn(workArea, size, RECORDING_STATUS_CAPSULE.bottomMargin);
+}
+
+let recordingStatusCapsuleDisplayWatch = false;
+/** Keep a visible capsule on screen when displays are added, removed or rescaled. */
+function watchDisplaysForRecordingStatusCapsule() {
+  if (recordingStatusCapsuleDisplayWatch) return;
+  recordingStatusCapsuleDisplayWatch = true;
+  const replace = () => {
+    const capsuleWindow = recordingStatusWindow;
+    if (!capsuleWindow || capsuleWindow.isDestroyed() || !capsuleWindow.isVisible()) return;
+    placeRecordingStatusCapsule(capsuleWindow);
   };
+  for (const event of ["display-added", "display-removed", "display-metrics-changed"]) {
+    try { screen.on(event, replace); } catch { }
+  }
 }
 
 async function ensureRecordingStatusCapsuleWindow() {
@@ -2125,10 +2070,6 @@ async function ensureRecordingStatusCapsuleWindow() {
       guardedStopFromRecordingStatus("capsule-click");
       return;
     }
-    if (raw.startsWith("__recording_capsule_geometry__")) {
-      applyRecordingStatusCapsuleGeometryPayload(raw.replace("__recording_capsule_geometry__", ""));
-      return;
-    }
   });
 
   const html = recordingStatusCapsuleHtml();
@@ -2182,10 +2123,17 @@ async function updateRecordingStatusCapsule(patch = {}) {
   // while holding the newest sequence number silences the one that would
   // have painted.
   if (seq !== recordingStatusCapsuleUpdateSeq) return;
-  try {
-    capsuleWindow.setBounds(recordingStatusCapsuleBounds(), false);
-  } catch { }
-  screenMode.refreshLayout();
+  // Placed when it appears or changes size (screen mode adds a button),
+  // on the display it is on — not on every status and level tick, and
+  // not on whatever display the cursor has wandered to (DM-25).
+  if (capsuleNeedsPlacement({
+    visible: capsuleWindow.isVisible(),
+    placedSize: recordingStatusCapsulePlacedSize,
+    size: getRecordingStatusCapsuleWindowSize(),
+  })) {
+    watchDisplaysForRecordingStatusCapsule();
+    placeRecordingStatusCapsule(capsuleWindow);
+  }
   if (!recordingStatusWindowReady) {
     // The load failed; ensure() already logged it. Nothing to paint on.
     appendMainLog(`[recording-capsule] update dropped: window never loaded (status="${status}")`);
@@ -2452,7 +2400,7 @@ function hideRecordingStatusCapsule() {
   recordingStatusCapsuleState.startedAt = 0;
   recordingStatusCapsuleState.elapsedMs = 0;
   recordingStatusCapsuleState.timerRunning = false;
-  recordingStatusCapsuleGeometry = null;
+  recordingStatusCapsulePlacedSize = null;
   recordingStatusCapsuleLastLevelSent = -1;
   recordingStatusCapsuleLastLevelSentAt = 0;
   if (recordingStatusWindow && !recordingStatusWindow.isDestroyed()) {
