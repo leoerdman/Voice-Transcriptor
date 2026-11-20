@@ -129,6 +129,9 @@ const { buildPwshPasteFallbackScript } = require("./windows-paste-fallback");
 // What a backend exit means: restart or not, and whose handle it clears
 // (DM-09, DM-27).
 const { backendHandleOf, decideBackendExit } = require("./backend-exit");
+// Recording ids are unique only per renderer page: key them with the
+// page's epoch (DM-32).
+const { recordingKey, createBoundedKeySet } = require("./renderer-epoch");
 // The record hotkey's renderer round trip, with a press that expires
 // when main stops waiting for it (DM-05).
 const {
@@ -561,7 +564,19 @@ let pendingTranscriptionCount = 0;
 // post-stop task starts waiting for it (fast recording, queued task) —
 // an event fired into no listener would be lost, and the recording
 // would wait out its deadline for a transcript that already exists.
-const recordingFinalSlot = createRecordingFinalSlot();
+//
+// One mailbox per renderer EPOCH (DM-32): the renderer restarts its
+// recording ids at 1 on every page load, so a new page's recording 1 must
+// not be answered from the old page's mailbox. beginRendererEpoch()
+// replaces it; a task keeps the mailbox of the epoch it was stopped in.
+let rendererEpoch = 1;
+let recordingFinalSlot = createRecordingFinalSlot();
+
+function beginRendererEpoch(reason) {
+  rendererEpoch += 1;
+  recordingFinalSlot = createRecordingFinalSlot();
+  appendMainLog(`[renderer-epoch] ${rendererEpoch} (${reason})`);
+}
 let backendRestartTimer = null;
 // Render-process-gone recovery timer. Schedules a loadURL to recreate
 // the renderer 500 ms after a crash. Tracked at module scope so
@@ -5872,12 +5887,13 @@ async function sendCommandEnterToFocusedApp(target = emptyCapturedPasteTarget())
 // invoke both before either flag has been observed, producing TWO
 // enqueuePostStopTask calls for the SAME recordingId — two
 // transcript polls, two clipboard writes, two AppleScript Cmd+V's.
-// Dedup at the enqueue gate is the simplest enterprise-correct fix:
-// recordingId is monotonic (++liveRecordingSeq in startLive), unique
-// per recording, and already on the task. We track up to 4096
-// recordingIds (~weeks of normal usage) and roll the oldest out.
-const _enqueuedRecordingIds = new Set();
-const _ENQUEUED_RECORDING_IDS_CAP = 4096;
+// Dedup at the enqueue gate is the simplest enterprise-correct fix. The
+// key is (renderer epoch, recordingId): recordingId is monotonic only
+// within one renderer page (++liveRecordingSeq in startLive restarts at
+// 1 on every load), so the epoch is what makes it unique (DM-32) — and
+// what lets these sets live without ever being cleared. We track up to
+// 4096 keys (~weeks of normal usage) and roll the oldest out.
+const _enqueuedRecordings = createBoundedKeySet(4096);
 function enqueuePostStopTask(options = {}) {
   const task = {
     autoTranscribe: !!options.autoTranscribe,
@@ -5885,6 +5901,9 @@ function enqueuePostStopTask(options = {}) {
     stopRequestedAt: Number(options.stopRequestedAt || Date.now()),
     recordingId: Number(options.recordingId || 0),
     target: normalizeCapturedPasteTarget(options.target),
+    // The renderer page this recording belongs to, and its mailbox.
+    epoch: rendererEpoch,
+    slot: recordingFinalSlot,
   };
   if (!task.autoTranscribe) return false;
   // A task is matched to its transcript by recordingId alone — the IPC
@@ -5902,20 +5921,15 @@ function enqueuePostStopTask(options = {}) {
     }
     return false;
   }
-  if (_enqueuedRecordingIds.has(task.recordingId)) {
+  const key = recordingKey(task.epoch, task.recordingId);
+  if (_enqueuedRecordings.has(key)) {
     appendMainLog(
-      `[post-stop-queue] dedup-skipped rec=${task.recordingId} ` +
+      `[post-stop-queue] dedup-skipped rec=${key} ` +
       `(already enqueued; preventing double-paste)`
     );
     return false;
   }
-  _enqueuedRecordingIds.add(task.recordingId);
-  // Roll the oldest entry out when the cap is reached.
-  if (_enqueuedRecordingIds.size > _ENQUEUED_RECORDING_IDS_CAP) {
-    const iter = _enqueuedRecordingIds.values();
-    const oldest = iter.next().value;
-    if (oldest !== undefined) _enqueuedRecordingIds.delete(oldest);
-  }
+  _enqueuedRecordings.add(key);
   postStopQueue.push(task);
   pendingTranscriptionCount += 1;
   appendMainLog(`[post-stop-queue] enqueue pending=${pendingTranscriptionCount} rec=${task.recordingId} ${pasteTargetSummary(task.target)}`);
@@ -5974,7 +5988,7 @@ async function runPostStopQueue() {
 
 // Second-line dedup: tracks recordingIds that have ACTUALLY been pasted.
 //
-// The two gates are not one guard written twice. `_enqueuedRecordingIds`
+// The two gates are not one guard written twice. `_enqueuedRecordings`
 // is an idempotency key at queue ADMISSION — it stops the duplicate work
 // (a transcript poll, a clipboard write) before it is done. This one sits
 // at the IRREVERSIBLE boundary: injecting keystrokes into another
@@ -5985,27 +5999,18 @@ async function runPostStopQueue() {
 //
 // Both gates key on a positive recordingId; enqueuePostStopTask admits no
 // other (the hand-off protocol has nothing to match a task to without one).
-const _pastedRecordingIds = new Set();
-const _PASTED_RECORDING_IDS_CAP = 4096;
-function _markRecordingPasted(recordingId) {
-  if (!recordingId || recordingId <= 0) return;
-  _pastedRecordingIds.add(recordingId);
-  if (_pastedRecordingIds.size > _PASTED_RECORDING_IDS_CAP) {
-    const oldest = _pastedRecordingIds.values().next().value;
-    if (oldest !== undefined) _pastedRecordingIds.delete(oldest);
-  }
-}
+const _pastedRecordings = createBoundedKeySet(4096);
 
 async function processPostStopTask(task) {
   const trace = createTrace("post_stop", { autoTranscribe: !!task.autoTranscribe, queuePending: pendingTranscriptionCount });
   // SECOND-LINE DEDUP — the guard in front of the irreversible action. If
   // the same recordingId reaches this function through any path that
   // bypassed the admission gate, refuse to paste a recording that already
-  // produced one. (Not the `recordingId === 0` path: an id of 0 is exempt
-  // from both gates, because there is nothing to key on.)
-  if (task.recordingId > 0 && _pastedRecordingIds.has(task.recordingId)) {
+  // produced one. Same (epoch, recordingId) key as the admission gate.
+  const recordingKeyOfTask = recordingKey(task.epoch, task.recordingId);
+  if (_pastedRecordings.has(recordingKeyOfTask)) {
     appendMainLog(
-      `[post-stop-paste] dedup-skipped rec=${task.recordingId} ` +
+      `[post-stop-paste] dedup-skipped rec=${recordingKeyOfTask} ` +
       `(already pasted; second-line guard fired)`,
     );
     traceEnd(trace, "skipped", { reason: "already-pasted" });
@@ -6087,13 +6092,13 @@ async function processPostStopTask(task) {
   // than what has already been handled, so a signal is never sitting in
   // the slot while this task sleeps on a timer.
   const restUntilSignalOr = (ms) =>
-    recordingFinalSlot.waitForSignal(task.recordingId, {
+    task.slot.waitForSignal(task.recordingId, {
       sinceSeq: handledSignalSeq,
       timeoutMs: Math.max(1, ms),
     });
 
   while (Date.now() < deadline) {
-    const known = recordingFinalSlot.peek(task.recordingId);
+    const known = task.slot.peek(task.recordingId);
     if (known?.last && known.last.seq > handledSignalSeq) {
       // "provisional" is not an answer — keep waiting for the final.
       if (consumeIpcSignal(known.last) !== SIGNAL_OUTCOME.PROVISIONAL) break;
@@ -6169,7 +6174,7 @@ async function processPostStopTask(task) {
       // hand-off is the only thing that fills ``transcript``. So
       // paste-last and the double-paste guard cannot end up covering one
       // path and not another.
-      _markRecordingPasted(task.recordingId);
+      _pastedRecordings.add(recordingKeyOfTask);
       // Show success immediately once the paste actually happened.
       await setRecordingStatus("Pasted", RECORDING_STATUS_KIND.OK);
     }
@@ -8383,7 +8388,11 @@ async function createWindow(options = {}) {
   // A reload of the main document is the other way to lose the renderer
   // that owns a screen-mode take.
   win.webContents.on("did-start-navigation", (details) => {
-    if (details?.isMainFrame && !details?.isSameDocument) endScreenModeForLostRenderer("navigation");
+    if (!details?.isMainFrame || details?.isSameDocument) return;
+    // A new document is a new renderer page: its recording ids start
+    // again at 1, so they are a new epoch with a fresh mailbox (DM-32).
+    beginRendererEpoch("navigation");
+    endScreenModeForLostRenderer("navigation");
   });
   win.webContents.on("render-process-gone", (_event, details) => {
     const reason = String(details?.reason || "unknown");
@@ -8417,21 +8426,6 @@ async function createWindow(options = {}) {
       const dropped = postStopQueue.length;
       postStopQueue = [];
       appendMainLog(`[render-process-gone] dropped postStopQueue=${dropped}`);
-    }
-    // Clear dedup Sets — the post-crash renderer's ``liveRecordingSeq``
-    // resets to 0 on reload, so the new recordings will reuse ids 1, 2,
-    // 3, ... that the pre-crash session already added to these Sets.
-    // Without this clear, the next recording's recordingId=1 silently
-    // collides with the dead-session entry and the dedup gate falsely
-    // skips the post-stop paste task — user records, stops, and sees
-    // NO paste happen until ids climb past the highest pre-crash id.
-    if (_enqueuedRecordingIds.size > 0 || _pastedRecordingIds.size > 0) {
-      appendMainLog(
-        `[render-process-gone] clearing dedup sets ` +
-        `enqueued=${_enqueuedRecordingIds.size} pasted=${_pastedRecordingIds.size}`,
-      );
-      _enqueuedRecordingIds.clear();
-      _pastedRecordingIds.clear();
     }
     // Tear down recording status state: it may be waiting on a transcript
     // that will never arrive.
@@ -8500,50 +8494,6 @@ async function createWindow(options = {}) {
     appendMainLog(`[did-finish-load] frontendSignature=${loadedFrontendBuildSignature || "none"}`);
     if (shortcutCaptureAbortHandler) {
       shortcutCaptureAbortHandler("did-finish-load");
-    }
-    // Clear paste-dedup Sets on every renderer (re)load — but ONLY
-    // when no in-flight recording or queued post-stop work exists.
-    //
-    // ``liveRecordingSeq`` (the renderer-side monotonic counter that
-    // produces ``recordingId`` values) resets to 0 in every new
-    // renderer instance — initial window load AND after a user-
-    // initiated ``location.reload()`` (recoverFromBackendBoot,
-    // DevTools refresh, F5). Without a clear at that boundary, ids
-    // 1, 2, 3 from the new renderer collide with stale Set entries
-    // from the previous renderer — ``handleRecordingPostStop`` then
-    // falsely flags the next recording as a duplicate and silently
-    // drops the paste task.
-    //
-    // BUT: a careless unconditional clear is itself a regression
-    // surface. ``did-finish-load`` also fires when DevTools refreshes
-    // mid-recording (Cmd-R / F5 while a recording is active). At that
-    // moment ``pendingTranscriptionCount > 0`` (the in-flight stop is
-    // queued) and ``postStopQueue`` is non-empty — clearing the Sets
-    // there drops the active recording's id, then the post-stop
-    // signal arrives and bypasses dedup, allowing the SAME content
-    // to be pasted twice (once by the queued task, once by the
-    // post-reload retry). That is the exact paste-duplication
-    // regression the 1b05c52 / 1.1.10 hardening fixed.
-    //
-    // Idle-gate: clear only when both signals say "no work in
-    // flight". On a normal cold load both are zero / empty — clear
-    // runs as before. On a mid-recording reload the clear is
-    // skipped, the in-flight id stays in the Set, and the queued
-    // task's eventual paste is correctly deduped.
-    const idle = pendingTranscriptionCount === 0 && postStopQueue.length === 0;
-    if (!idle) {
-      appendMainLog(
-        `[did-finish-load] dedup clear SKIPPED ` +
-        `(pending=${pendingTranscriptionCount} queue=${postStopQueue.length}) — ` +
-        `mid-recording reload protected from paste-dup regression`,
-      );
-    } else if (_enqueuedRecordingIds.size > 0 || _pastedRecordingIds.size > 0) {
-      appendMainLog(
-        `[did-finish-load] clearing dedup sets ` +
-        `enqueued=${_enqueuedRecordingIds.size} pasted=${_pastedRecordingIds.size}`,
-      );
-      _enqueuedRecordingIds.clear();
-      _pastedRecordingIds.clear();
     }
     // Replay the cached shortcut status. If the initial
     // registerGlobalShortcuts() call happened before this window

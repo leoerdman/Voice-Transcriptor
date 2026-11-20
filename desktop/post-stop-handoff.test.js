@@ -13,7 +13,8 @@ const { topLevelFunctionSource } = require("./main-source");
 test("processPostStopTask reads only the IPC hand-off", () => {
   const fn = topLevelFunctionSource("processPostStopTask");
   assert.ok(fn, "processPostStopTask not found");
-  assert.match(fn, /recordingFinalSlot\.peek\(task\.recordingId\)/);
+  // The recording-final mailbox of the task's renderer epoch (DM-32).
+  assert.match(fn, /task\.slot\.peek\(task\.recordingId\)/);
   assert.doesNotMatch(fn, /queryRendererState\(/, "no renderer poll");
   assert.doesNotMatch(fn, /POST_STOP_IPC_GRACE_MS|pollFallbackStarted|heardIpcSignal/);
   assert.doesNotMatch(fn, /state\.status === "Done"|statusLower === "upscaling"/, "no renderer status vocabulary");
