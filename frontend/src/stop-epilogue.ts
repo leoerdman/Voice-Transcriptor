@@ -221,9 +221,22 @@ export interface KeptTranscript {
   text: string;
   /** One sentence for the summary saying what ``text`` is; "" with no text. */
   note: string;
+  /** ``text`` holds words that were said, not only screen marks. */
+  spoken: boolean;
 }
 
-export const NOTHING_KEPT: KeptTranscript = Object.freeze({ text: "", note: "" });
+export const NOTHING_KEPT: KeptTranscript = Object.freeze({ text: "", note: "", spoken: false });
+
+/**
+ * The transcript a no-transcript stop stores and shows: the kept text, but
+ * a take that kept only marks still says WHY there is no speech — the
+ * "[ Silence ]" / "[ Mic not delivering audio ]" marker stays above them.
+ */
+export function keptTranscriptText(kept: KeptTranscript, marker: string): string {
+  if (!kept.text) return String(marker || "");
+  if (kept.spoken || !String(marker || "").trim()) return kept.text;
+  return `${String(marker).trim()}\n\n${kept.text}`;
+}
 
 export function keepLiveTranscript(
   liveText: string,
@@ -238,7 +251,7 @@ export function keepLiveTranscript(
     : live
       ? "The live text is kept as the transcript."
       : "The screen marks are kept as the transcript.";
-  return { text, note };
+  return { text, note, spoken: !!live };
 }
 
 /** A summary that says what the take kept, when it kept anything. */
@@ -330,12 +343,16 @@ export async function runStopEpilogue(
   fx: StopEpilogueEffects,
 ): Promise<FinalSaveOutcome> {
   const kept = plan.kept || NOTHING_KEPT;
-  fx.publish(plan.signal, kept.text || plan.signal.domText);
+  // The marker a marks-only take keeps above its marks is the transcript
+  // the take would have stored without them ("[ Silence ]"), never a
+  // status sentence ("Auto transcribe is off…"); with no such transcript
+  // the panel falls back to the status, as before.
+  fx.publish(plan.signal, kept.text ? keptTranscriptText(kept, plan.transcriptText || "") : plan.signal.domText);
   fx.hideProgress();
   fx.setStatus(plan.statusLabel);
   let outcome: FinalSaveOutcome = { kind: "not-attempted" };
   try {
-    if (plan.save) outcome = await fx.save(kept.text || plan.transcriptText || "");
+    if (plan.save) outcome = await fx.save(keptTranscriptText(kept, plan.transcriptText || ""));
   } finally {
     fx.release();
   }

@@ -345,6 +345,7 @@ describe("keepLiveTranscript — a take without a final transcript keeps its liv
     expect(keepLiveTranscript(" hello there ", [], 5_000)).toEqual({
       text: "hello there",
       note: "The live text is kept as the transcript.",
+      spoken: true,
     });
   });
 
@@ -373,7 +374,7 @@ describe("runStopEpilogue — a failed stop keeps the live text with marks in th
   }
   const kept = keepLiveTranscript("live words [mark]", [], 1_000);
 
-  it("mic not delivering audio: the capsule gets the status, the panel and History the kept marks", async () => {
+  it("mic not delivering audio: the capsule gets the status, the panel and History the reason above the kept marks", async () => {
     const { published, saved, summaries, fx } = keptRecorder();
     const marksOnly = keepLiveTranscript("", [{ atMs: 0, text: "[📸 00:00 скрин 1: /x/shot-01.png]" }], 1_000);
     await runStopEpilogue({
@@ -384,8 +385,9 @@ describe("runStopEpilogue — a failed stop keeps the live text with marks in th
       transcriptText: "[ Mic not delivering audio ]",
       kept: marksOnly,
     }, fx);
-    expect(published).toEqual([{ domText: "[ Mic not delivering audio ]", panelText: marksOnly.text }]);
-    expect(saved).toEqual([marksOnly.text]);
+    const stored = `[ Mic not delivering audio ]\n\n${marksOnly.text}`;
+    expect(published).toEqual([{ domText: "[ Mic not delivering audio ]", panelText: stored }]);
+    expect(saved).toEqual([stored]);
     expect(summaries[0].status).toBe("The microphone delivered no audio. The screen marks are kept as the transcript.");
   });
 
@@ -436,5 +438,17 @@ describe("runStopEpilogue — a failed stop keeps the live text with marks in th
       tone: "error",
       savedName: "take.txt",
     });
+  });
+});
+
+describe("review findings, 2026-11-20", () => {
+  it("a silent take that drew keeps the reason above its marks", async () => {
+    const { keptTranscriptText, keepLiveTranscript } = await import("../src/stop-epilogue");
+    const marksOnly = { text: "[✏️ 00:02 линия в центре (54%, 48%) → скрин 1]", note: "x", spoken: false };
+    expect(keptTranscriptText(marksOnly, "[ Silence ]")).toBe(`[ Silence ]\n\n${marksOnly.text}`);
+    expect(keptTranscriptText({ ...marksOnly, spoken: true }, "[ Silence ]")).toBe(marksOnly.text);
+    expect(keptTranscriptText({ text: "", note: "", spoken: false }, "[ Mic not delivering audio ]")).toBe("[ Mic not delivering audio ]");
+    expect(keepLiveTranscript("привет", [], 1000).spoken).toBe(true);
+    expect(keepLiveTranscript("", [], 1000).spoken).toBe(false);
   });
 });

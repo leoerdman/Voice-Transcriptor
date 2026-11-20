@@ -6189,14 +6189,17 @@ async function recoverLiveDraftIfAny(promoted: ReadonlyArray<PromotedTake> = [])
       domText: shown.text,
       kind: "transcript",
     });
+    // A crashed screen take can come back with no draft at all (its audio
+    // and marks were recovered, nothing was autosaved): say what it is.
+    const recoveredWhat = draft ? "the last unsaved draft" : "the recording the previous session was making";
     setCurrentRecordingSummary({
       title: shown.title,
-      status: "Recovered unsaved draft from the previous session.",
+      status: `Recovered ${recoveredWhat} from the previous session.`,
       tone: "warning",
       savedName: shown.savedName,
     });
     showRecordSessionNotice(
-      "Recovered the last unsaved draft from a previous session.",
+      `Recovered ${recoveredWhat} from a previous session.`,
       "warning",
       UI_TOKENS.notice.longMs,
     );
@@ -12693,6 +12696,9 @@ async function stopLive(
    *  (./stop-epilogue). Read late: final events can still land while the
    *  socket drains. */
   const keptLiveTranscript = (): KeptTranscript => keepLiveTranscript(latestSourceForSave(), screenMarks, recordedMs);
+  /** The final transcript (with its marks) once it has been shown: a stop
+   *  that fails after this point keeps the final, not the live draft. */
+  let finalTranscriptShown = "";
 
   if (startupAbortReason && !savedAudioFile && !transcribeInputFile && captureLevel.frames === 0) {
     await endWithoutTranscript({
@@ -13227,6 +13233,7 @@ async function stopLive(
       transcribeLatencyMs: transcriptReadyLatencyMs,
     }, sessionUiToken);
 
+    if (transcriptRaw) finalTranscriptShown = transcriptRaw;
     publishRecordingOutput({
       recordingId,
       pasteText: "",
@@ -13291,7 +13298,11 @@ async function stopLive(
     // is what the TRANSCRIBE panel shows and History stores
     // (./stop-epilogue); the error stays the capsule's status and the
     // summary's.
-    const kept = keptLiveTranscript();
+    // A throw after the final transcript was shown (a later save or paste
+    // step) keeps that final; before it, the live text with its marks.
+    const kept: KeptTranscript = finalTranscriptShown
+      ? { text: finalTranscriptShown, note: "The final transcript is kept.", spoken: true }
+      : keptLiveTranscript();
     publishRecordingOutput({
       recordingId,
       pasteText: "",
