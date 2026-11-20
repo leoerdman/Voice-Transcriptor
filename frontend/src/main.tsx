@@ -50,6 +50,8 @@ import {
   uploadQueueTitle,
   uploadRetryPlan,
   uploadSourceValidationError,
+  enterUploadProcessingStage,
+  type UploadItemStage,
 } from "./upload-item";
 import { UPLOAD_QUEUE_SAVE_FAILED_STATUS, nextQueueSaveRetry } from "./upload-queue-persist";
 import { classifyBootError, type BootFailure } from "./boot-error";
@@ -164,7 +166,7 @@ import {
   providerLabel,
   requireRemoteProvider,
 } from "./providers";
-import { JobPollHttpError, waitForJob } from "./job-poll";
+import { JobPollHttpError, createThenWaitForJob, waitForJob } from "./job-poll";
 import {
   LIVE_DRAFT_SCHEMA_VERSION,
   LiveDraftOperationQueue,
@@ -4992,7 +4994,6 @@ async function waitForQueuedRemoteJob(
     diarize: boolean;
     remoteModel?: string;
     signal?: AbortSignal;
-    onProcessingProgress?: (fraction: number) => void;
   },
 ): Promise<RemoteTranscriptionResult> {
   const onAbort = () => { void cancelBackendJob(created.job_id); };
@@ -5003,12 +5004,7 @@ async function waitForQueuedRemoteJob(
   opts.signal?.addEventListener("abort", onAbort, { once: true });
   let result: RemoteTranscriptionResult;
   try {
-    result = await waitForBackendJob<RemoteTranscriptionResult>(created.job_id, {
-      signal: opts.signal,
-      onProgress: (job) => {
-        opts.onProcessingProgress?.(Math.max(0, Math.min(1, Number(job.progress || 0))));
-      },
-    });
+    result = await waitForBackendJob<RemoteTranscriptionResult>(created.job_id, { signal: opts.signal });
   } finally {
     opts.signal?.removeEventListener("abort", onAbort);
   }
@@ -5029,10 +5025,10 @@ async function remoteJobQueued(
     diarize: boolean;
     remoteModel?: string;
     signal?: AbortSignal;
-    onProcessingProgress?: (fraction: number) => void;
+    onJobCreated?: () => void;
   },
 ): Promise<RemoteTranscriptionResult> {
-  return waitForQueuedRemoteJob(await remoteJob(file, opts), opts);
+  return createThenWaitForJob(() => remoteJob(file, opts), (created) => waitForQueuedRemoteJob(created, opts), opts.onJobCreated);
 }
 
 async function remoteJobQueuedFromPath(
@@ -5043,10 +5039,10 @@ async function remoteJobQueuedFromPath(
     diarize: boolean;
     remoteModel?: string;
     signal?: AbortSignal;
-    onProcessingProgress?: (fraction: number) => void;
+    onJobCreated?: () => void;
   },
 ): Promise<RemoteTranscriptionResult> {
-  return waitForQueuedRemoteJob(await remoteJobFromPath(sourcePath, opts), opts);
+  return createThenWaitForJob(() => remoteJobFromPath(sourcePath, opts), (created) => waitForQueuedRemoteJob(created, opts), opts.onJobCreated);
 }
 
 function normalizeLocalTranscriptionResult(raw: { text?: string; duration?: number; segments?: Array<{ start?: number; end?: number; text?: string }> } | null | undefined): LocalTranscriptionResult {
@@ -5085,16 +5081,16 @@ async function waitForQueuedLocalJob(
 
 async function localJobQueued(
   file: File,
-  opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean; signal?: AbortSignal },
+  opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean; signal?: AbortSignal; onJobCreated?: () => void },
 ): Promise<LocalTranscriptionResult> {
-  return waitForQueuedLocalJob(await localJob(file, opts), opts);
+  return createThenWaitForJob(() => localJob(file, opts), (created) => waitForQueuedLocalJob(created, opts), opts.onJobCreated);
 }
 
 async function localJobQueuedFromPath(
   sourcePath: string,
-  opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean; signal?: AbortSignal },
+  opts: { language: string; model: string; splitStereo: boolean; wordTimestamps: boolean; signal?: AbortSignal; onJobCreated?: () => void },
 ): Promise<LocalTranscriptionResult> {
-  return waitForQueuedLocalJob(await localJobFromPath(sourcePath, opts), opts);
+  return createThenWaitForJob(() => localJobFromPath(sourcePath, opts), (created) => waitForQueuedLocalJob(created, opts), opts.onJobCreated);
 }
 
 async function remoteJobSync(
@@ -13983,7 +13979,7 @@ interface UploadQueueItem {
   //                is being written to the archive — no longer stoppable)
   //   none      → status's own label (done/error/cancelled)
   status: UploadQueueStatus;
-  stage?: "queued" | "uploading" | "processing" | "saving" | "done";
+  stage?: UploadItemStage;
   text?: string;
   error?: string;
   startedAt?: number;
@@ -14864,24 +14860,12 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
   item.abortController = new AbortController();
   saveUploadQueueSnapshot();
   renderUploadQueue();
-  // Heuristic stage transition: ``fetch`` doesn't expose a clean
-  // "request body fully sent" event in the browser, so we mark the
-  // crossover from "uploading" to "processing" after a small delay
-  // proportional to the file size — at typical broadband speeds,
-  // 1 MB ≈ 100ms, so a 50 MB video is ~5 s of uploading. Capped at
-  // 8 s so a slow link doesn't pin "uploading" forever, and the
-  // backend's actual response time then takes over the "processing"
-  // perception. The crossover is replaced by the real transition
-  // when the response arrives below.
-  const _stageCrossoverDelay = sourceFile ? Math.min(8000, Math.max(800, sourceFile.size / 10000)) : 0;
-  const _stageTimer = sourceFile && !useSourcePath
-    ? window.setTimeout(() => {
-      if (item.status === "transcribing" && item.stage === "uploading") {
-        item.stage = "processing";
-        renderUploadQueue();
-      }
-    }, _stageCrossoverDelay)
-    : 0;
+  // "Uploading… → Processing…" flips when the backend has created the
+  // job, i.e. once the whole request body is sent — the transport reports
+  // that moment for both providers (./job-poll createThenWaitForJob).
+  const onJobCreated = () => {
+    if (enterUploadProcessingStage(item)) renderUploadQueue();
+  };
   const selectedProvider = normalizeUploadProvider(item.requestedProvider || item.provider);
   // Upload is a batch workflow: if the selected remote provider is
   // unavailable or has no key, keep the file moving through Local
@@ -14928,6 +14912,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
         splitStereo: true,
         wordTimestamps: false,
         signal: item.abortController.signal,
+        onJobCreated,
       };
       const out = useSourcePath
         ? await localJobQueuedFromPath(sourcePath, localOpts)
@@ -14950,14 +14935,7 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
         // for upload + ffmpeg + provider processing. Large videos can
         // legitimately run past the old 5-minute XHR ceiling; the
         // backend job owns the long work and this renderer only polls.
-        // Every poll tick (0.9 s, then 3 s) lands here; only the first
-        // changes anything. Re-rendering on each tick rebuilt the whole
-        // queue DOM and dropped focus/hover once a second (FQ-07).
-        onProcessingProgress: () => {
-          if (item.status !== "transcribing" || item.stage === "processing") return;
-          item.stage = "processing";
-          renderUploadQueue();
-        },
+        onJobCreated,
       };
       const out = useSourcePath
         ? await remoteJobQueuedFromPath(sourcePath, remoteOpts)
@@ -15000,7 +14978,6 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
     item.endedAt = Date.now();
     item.completedAt = Date.now();
   } finally {
-    clearTimeout(_stageTimer);
     item.abortController = undefined;
     item.cancelRequested = false;
     renderUploadQueue();

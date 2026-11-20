@@ -135,3 +135,26 @@ export async function waitForJob<T>(
     throw e;
   }
 }
+
+/**
+ * Create a backend job, report the moment it exists, then wait for it.
+ *
+ * The creation POST resolves only after its request body has been sent
+ * in full and the backend has accepted the job, so "created" is the real
+ * end of an upload — the event the Upload queue's "Uploading… →
+ * Processing…" label is about (FQ-06 b). The queue used to guess that
+ * moment from the file size (size/10 000 ms, capped at 8 s), which said
+ * "Processing…" eight seconds into a minutes-long local upload; the
+ * remote path also flipped on its first poll, so two sources set the
+ * same field (FQ-06 c). `onJobCreated` is now the only source, for every
+ * provider. It is not called when creation fails.
+ */
+export async function createThenWaitForJob<C, R>(
+  create: () => Promise<C>,
+  wait: (created: C) => Promise<R>,
+  onJobCreated?: (created: C) => void,
+): Promise<R> {
+  const created = await create();
+  onJobCreated?.(created);
+  return wait(created);
+}

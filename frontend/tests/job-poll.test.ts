@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyJobPollFailure, JobPollHttpError, nextJobPollDelayMs, waitForJob, type JobPollPolicy, type JobPollState } from "../src/job-poll";
+import { classifyJobPollFailure, createThenWaitForJob, JobPollHttpError, nextJobPollDelayMs, waitForJob, type JobPollPolicy, type JobPollState } from "../src/job-poll";
 
 const policy: JobPollPolicy = { fastMs: 900, slowMs: 3_000, slowAfterMs: 30_000, maxConsecutiveFailures: 3 };
 
@@ -109,5 +109,28 @@ describe("waitForJob failure classes (FQ-04)", () => {
     expect(classifyJobPollFailure(new JobPollHttpError(429, ""))).toBe("transient");
     expect(classifyJobPollFailure(new JobPollHttpError(404, ""))).toBe("job-gone");
     expect(classifyJobPollFailure(new JobPollHttpError(400, ""))).toBe("terminal");
+  });
+});
+
+describe("createThenWaitForJob (FQ-06 b, c)", () => {
+  it("reports the job's creation after the creation request resolves and before the wait", async () => {
+    const log: string[] = [];
+    const out = await createThenWaitForJob(
+      async () => { log.push("create"); return { job_id: "j1" }; },
+      async (created) => { log.push(`wait:${created.job_id}`); return "text"; },
+      (created) => { log.push(`created:${created.job_id}`); },
+    );
+    expect(out).toBe("text");
+    expect(log).toEqual(["create", "created:j1", "wait:j1"]);
+  });
+
+  it("does not report a job that was never created", async () => {
+    const log: string[] = [];
+    await expect(createThenWaitForJob(
+      async () => { throw new Error("HTTP 413"); },
+      async () => { log.push("wait"); return "never"; },
+      () => { log.push("created"); },
+    )).rejects.toThrow("HTTP 413");
+    expect(log).toEqual([]);
   });
 });
