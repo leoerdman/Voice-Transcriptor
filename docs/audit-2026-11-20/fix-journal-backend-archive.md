@@ -222,3 +222,18 @@ Proof method: SKILL §7.1 — the fixed file is put aside, `git show HEAD:<path>
 - After: `Ran 9 tests ... OK`; full suite `Ran 939 tests ... OK (skipped=2)`. `test_sweeper_thread_not_started_when_every_policy_is_disabled` now also turns the results limit off (the timer owns it too), and `test_sweeper_thread_still_starts_for_the_results_limit_alone` pins the new case.
 - BM-25 behaviour note: `latency_ms` is now the first answering host's latency, not the best of three.
 - BM-13 remainder (`upscale_text` falls back on `"HTTP 404"`/`"not found"` in `OpenRouterError` prose; `http_retry` hints by substring) → Cross-domain: `OpenRouterError` needs a `status_code` (engine module).
+
+### C11 · BM-15, BM-16, BM-26 (P2) · one clamp, one save normalisation, upload ceiling before the body
+- Files: `backend/main.py` (`_bounded_text` / `_nonneg_finite` replace `_upload_queue_str|_number` and `_live_draft_str|_number`, every caller names its cap, `UPLOAD_QUEUE_MAX_TEXT_CHARS`; `_SaveFields` + `_normalize_save_fields` used by `save_recording` and `_save_recording_audio_source`; `MAX_REQUEST_BODY_BYTES` and a declared-`Content-Length` check in the HTTP middleware answering 413 before the multipart parser spools the body), `backend/tests/test_archive_housekeeping.py` (`OneNormalisationTests`, `UploadCeilingBeforeTheBodyTests`).
+- Check: `python -m unittest backend.tests.test_archive_housekeeping.OneNormalisationTests backend.tests.test_archive_housekeeping.UploadCeilingBeforeTheBodyTests`
+- Before (main.py at HEAD):
+  ```
+  ERROR: test_both_save_routes_normalise_through_one_function (...)
+  AttributeError: module 'backend.main' has no attribute '_normalize_save_fields'
+  ERROR: test_both_ui_states_clamp_with_the_same_helpers (...)
+  AttributeError: module 'backend.main' has no attribute '_bounded_text'
+  FAIL: test_an_oversized_declared_body_is_413_before_auth_or_parsing (...)
+  AssertionError: 422 != 413 : {"detail":[{"type":"missing","loc":["body","file"],"msg":"Field required","input":null}]}
+  ```
+- After: OK; full suite `Ran 942 tests ... OK (skipped=2)` (one earlier run at load average 346 failed two timing tests in `test_deepgram_warm`, untouched here; they pass alone and on the rerun).
+- BM-26 scope: a chunked body without `Content-Length` is still bounded only by the per-route copy check.

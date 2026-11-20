@@ -501,6 +501,8 @@ async def _app_lifespan(_app: "FastAPI") -> AsyncIterator[None]:
 app = FastAPI(title="Call Transcriptor", lifespan=_app_lifespan)
 JOB_MAX_WORKERS = 2
 UPLOAD_QUEUE_MAX_PERSISTED_ITEMS = 200
+# A finished item's transcript, as the renderer persists it with the queue.
+UPLOAD_QUEUE_MAX_TEXT_CHARS = 200_000
 jobs = JobStore(max_workers=JOB_MAX_WORKERS)
 
 
@@ -572,6 +574,10 @@ def _safe_error_text(exc: object, *, max_len: int = 200) -> str:
 # and the remote path re-compresses into REMOTE_TRANSCRIBE_CHUNK_SEC
 # Opus/WebM chunks before any provider call.
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+# The largest request body the HTTP middleware lets through: one upload at
+# MAX_UPLOAD_BYTES plus the form fields beside it (see
+# guard_host_and_set_cache_control).
+MAX_REQUEST_BODY_BYTES = MAX_UPLOAD_BYTES + 16 * 1024 * 1024
 # Hard ceiling on the live-recovery SPOOL. Derived from MAX_UPLOAD_BYTES
 # so any file the app accepts as an upload can also exist as a recovery
 # spool; at the current upload ceiling that is 4 GB, and 16 kHz mono
@@ -1840,6 +1846,19 @@ async def guard_host_and_set_cache_control(request: Request, call_next):
     # request can never rewrite the recorded address.
     if CLI_ACCESS.is_enabled():
         CLI_ACCESS.sync_connection(base_url_from_scope(request.scope))
+    # The upload ceiling, enforced BEFORE the body is read (BM-26): the
+    # per-route check runs while copying from an UploadFile, i.e. after
+    # Starlette's multipart parser has already spooled the whole body to
+    # a temp file — a body past the limit filled the temp volume first.
+    # A declared length is refused here; the allowance covers the form
+    # fields that travel beside the file (a transcript of up to
+    # LIVE_DRAFT_MAX_TEXT_CHARS characters, multipart framing).
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_REQUEST_BODY_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={"detail": f"request body too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB of media)"},
+        )
     response = await call_next(request)
     path = request.url.path or ""
     if path.startswith("/assets/"):
@@ -2784,11 +2803,14 @@ def _default_upload_queue_state() -> dict[str, Any]:
     }
 
 
-def _upload_queue_str(value: object, max_len: int = 200_000) -> str:
+# The two persisted UI states (upload queue, live draft) clamp untrusted
+# renderer input with the SAME two rules; they were written out twice with
+# different default caps (BM-15). Every caller names its cap.
+def _bounded_text(value: object, max_len: int) -> str:
     return str(value or "").strip()[:max_len]
 
 
-def _upload_queue_number(value: object) -> Optional[float]:
+def _nonneg_finite(value: object) -> Optional[float]:
     if value is None:
         return None
     try:
@@ -2801,10 +2823,10 @@ def _upload_queue_number(value: object) -> Optional[float]:
 def _normalize_upload_queue_item(raw: object) -> Optional[dict[str, Any]]:
     if not isinstance(raw, dict):
         return None
-    display_name = _upload_queue_str(raw.get("displayName"), 512)
+    display_name = _bounded_text(raw.get("displayName"), 512)
     if not display_name:
         return None
-    status = _upload_queue_str(raw.get("status"), 32)
+    status = _bounded_text(raw.get("status"), 32)
     if status not in UPLOAD_QUEUE_STATUSES:
         # "I do not recognise this" is not "this failed". A client that
         # adds a status — a newer renderer against an older backend —
@@ -2813,26 +2835,26 @@ def _normalize_upload_queue_item(raw: object) -> Optional[dict[str, Any]]:
         # item is still there and nothing is claimed about it.
         status = "queued"
     item: dict[str, Any] = {
-        "id": _upload_queue_str(raw.get("id"), 128) or uuid.uuid4().hex,
+        "id": _bounded_text(raw.get("id"), 128) or uuid.uuid4().hex,
         "displayName": display_name,
-        "sizeBytes": int(_upload_queue_number(raw.get("sizeBytes")) or 0),
-        "sourcePath": _upload_queue_str(raw.get("sourcePath"), 4096),
+        "sizeBytes": int(_nonneg_finite(raw.get("sizeBytes")) or 0),
+        "sourcePath": _bounded_text(raw.get("sourcePath"), 4096),
         "status": status,
-        "text": _upload_queue_str(raw.get("text")),
-        "error": _upload_queue_str(raw.get("error"), 4096),
-        "provider": _upload_queue_str(raw.get("provider"), 32),
-        "model": _upload_queue_str(raw.get("model"), 256),
-        "language": _upload_queue_str(raw.get("language"), 32),
-        "audioDurationSec": _upload_queue_number(raw.get("audioDurationSec")) or 0,
-        "requestedProvider": _upload_queue_str(raw.get("requestedProvider"), 32),
-        "requestedLanguage": _upload_queue_str(raw.get("requestedLanguage"), 32),
-        "requestedModel": _upload_queue_str(raw.get("requestedModel"), 256),
+        "text": _bounded_text(raw.get("text"), UPLOAD_QUEUE_MAX_TEXT_CHARS),
+        "error": _bounded_text(raw.get("error"), 4096),
+        "provider": _bounded_text(raw.get("provider"), 32),
+        "model": _bounded_text(raw.get("model"), 256),
+        "language": _bounded_text(raw.get("language"), 32),
+        "audioDurationSec": _nonneg_finite(raw.get("audioDurationSec")) or 0,
+        "requestedProvider": _bounded_text(raw.get("requestedProvider"), 32),
+        "requestedLanguage": _bounded_text(raw.get("requestedLanguage"), 32),
+        "requestedModel": _bounded_text(raw.get("requestedModel"), 256),
         "requestedDiarize": bool(raw.get("requestedDiarize") is True),
-        "savedName": _upload_queue_str(raw.get("savedName"), 512),
-        "savedArchiveDir": _upload_queue_str(raw.get("savedArchiveDir"), 4096),
+        "savedName": _bounded_text(raw.get("savedName"), 512),
+        "savedArchiveDir": _bounded_text(raw.get("savedArchiveDir"), 4096),
     }
     for field in ("startedAt", "endedAt", "completedAt"):
-        value = _upload_queue_number(raw.get(field))
+        value = _nonneg_finite(raw.get(field))
         if value is not None:
             item[field] = value
     return item
@@ -2878,18 +2900,6 @@ def _default_live_draft_state() -> dict[str, Any]:
     }
 
 
-def _live_draft_str(value: object, max_len: int = 4096) -> str:
-    return str(value or "").strip()[:max_len]
-
-
-def _live_draft_number(value: object) -> Optional[float]:
-    if value is None:
-        return None
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if 0 <= parsed < float("inf") else None
 
 
 def _normalize_live_draft(payload: object) -> Optional[dict[str, Any]]:
@@ -2916,19 +2926,19 @@ def _normalize_live_draft(payload: object) -> Optional[dict[str, Any]]:
     if not isinstance(draft_src, dict):
         raise HTTPException(status_code=400, detail="live draft must be an object")
     return {
-        "session_id": _live_draft_str(draft_src.get("session_id"), 128),
-        "started_at": _live_draft_number(draft_src.get("started_at")) or 0,
-        "updated_at": _live_draft_number(draft_src.get("updated_at")) or int(time.time() * 1000),
+        "session_id": _bounded_text(draft_src.get("session_id"), 128),
+        "started_at": _nonneg_finite(draft_src.get("started_at")) or 0,
+        "updated_at": _nonneg_finite(draft_src.get("updated_at")) or int(time.time() * 1000),
         "recording": bool(draft_src.get("recording") is True),
-        "timer": _live_draft_str(draft_src.get("timer"), 32),
-        "title": _live_draft_str(draft_src.get("title"), 512),
-        "source_text": _live_draft_str(draft_src.get("source_text"), LIVE_DRAFT_MAX_TEXT_CHARS),
-        "transcript_text": _live_draft_str(draft_src.get("transcript_text"), LIVE_DRAFT_MAX_TEXT_CHARS),
-        "provider": _live_draft_str(draft_src.get("provider"), 32),
-        "model": _live_draft_str(draft_src.get("model"), 256),
-        "language": _live_draft_str(draft_src.get("language"), 32),
-        "archive_dir": _live_draft_str(draft_src.get("archive_dir"), 4096),
-        "recording_collection": _live_draft_str(draft_src.get("recording_collection"), 64),
+        "timer": _bounded_text(draft_src.get("timer"), 32),
+        "title": _bounded_text(draft_src.get("title"), 512),
+        "source_text": _bounded_text(draft_src.get("source_text"), LIVE_DRAFT_MAX_TEXT_CHARS),
+        "transcript_text": _bounded_text(draft_src.get("transcript_text"), LIVE_DRAFT_MAX_TEXT_CHARS),
+        "provider": _bounded_text(draft_src.get("provider"), 32),
+        "model": _bounded_text(draft_src.get("model"), 256),
+        "language": _bounded_text(draft_src.get("language"), 32),
+        "archive_dir": _bounded_text(draft_src.get("archive_dir"), 4096),
+        "recording_collection": _bounded_text(draft_src.get("recording_collection"), 64),
     }
 
 
@@ -2967,8 +2977,8 @@ def _clear_live_draft_state(session_id: str = "") -> dict[str, Any]:
     """
     current = _read_live_draft_state()
     draft = current.get("draft") if isinstance(current.get("draft"), dict) else None
-    expected_owner = _live_draft_str(session_id, 128)
-    actual_owner = _live_draft_str(draft.get("session_id"), 128) if draft else ""
+    expected_owner = _bounded_text(session_id, 128)
+    actual_owner = _bounded_text(draft.get("session_id"), 128) if draft else ""
     if expected_owner and actual_owner and actual_owner != expected_owner:
         logger.info(
             "live draft not cleared: owned by session %s, not %s",
@@ -8282,6 +8292,40 @@ async def get_recordings_stats(_auth: None = Depends(_require_api_auth)):
         return result
 
 
+@dataclass(frozen=True)
+class _SaveFields:
+    title: str
+    source_text: str
+    transcript_text: str
+    provider: str
+    model: str
+    language: str
+
+
+def _normalize_save_fields(
+    *,
+    title: object,
+    source_text: object,
+    transcript_text: object,
+    provider: object,
+    model: object,
+    language: object,
+) -> _SaveFields:
+    """The text fields of a recording save, normalised ONCE for both save
+    routes (BM-16): the title made a safe file-name part, the rest
+    stripped, and the placeholder source rule (B-031/B-032) applied."""
+    safe_transcript = str(transcript_text or "").strip()
+    safe_provider = str(provider or "").strip()
+    return _SaveFields(
+        title=_sanitize_name(str(title or "recording")),
+        source_text=_placeholder_source_text(str(source_text or "").strip(), safe_transcript, safe_provider),
+        transcript_text=safe_transcript,
+        provider=safe_provider,
+        model=str(model or "").strip(),
+        language=str(language or "").strip(),
+    )
+
+
 @app.post("/api/recordings/save")
 def save_recording(
     payload: dict = Body(...),
@@ -8292,13 +8336,16 @@ def save_recording(
     archive_dir = str(payload.get("archive_dir") or "").strip()
     recording_collection = _normalize_recording_collection(payload.get("recording_collection") or "")
     require_existing = _payload_bool(payload, "require_existing", False)
-    title = _sanitize_name(str(payload.get("title") or "recording"))
-    source_text = str(payload.get("source_text") or "").strip()
-    transcript_text = str(payload.get("transcript_text") or "").strip()
-    provider = str(payload.get("provider") or "").strip()
-    model = str(payload.get("model") or "").strip()
-    language = str(payload.get("language") or "").strip()
-    source_text = _placeholder_source_text(source_text, transcript_text, provider)
+    fields = _normalize_save_fields(
+        title=payload.get("title"),
+        source_text=payload.get("source_text"),
+        transcript_text=payload.get("transcript_text"),
+        provider=payload.get("provider"),
+        model=payload.get("model"),
+        language=payload.get("language"),
+    )
+    title, source_text, transcript_text = fields.title, fields.source_text, fields.transcript_text
+    provider, model, language = fields.provider, fields.model, fields.language
 
     target_dir = _resolve_recordings_collection_target_dir(
         archive_dir,
@@ -8357,15 +8404,16 @@ async def _save_recording_audio_source(
 ) -> dict[str, Any]:
     raw_existing_name = str(name or "").strip()
     existing_name = _recording_text_name_leaf(raw_existing_name) if raw_existing_name else ""
-    safe_title = _sanitize_name(str(title or "recording"))
-    safe_source_text = str(source_text or "").strip()
-    safe_transcript_text = str(transcript_text or "").strip()
-    safe_provider = str(provider or "").strip()
-    safe_model = str(model or "").strip()
-    safe_language = str(language or "").strip()
-    safe_source_text = _placeholder_source_text(
-        safe_source_text, safe_transcript_text, safe_provider
+    fields = _normalize_save_fields(
+        title=title,
+        source_text=source_text,
+        transcript_text=transcript_text,
+        provider=provider,
+        model=model,
+        language=language,
     )
+    safe_title, safe_source_text, safe_transcript_text = fields.title, fields.source_text, fields.transcript_text
+    safe_provider, safe_model, safe_language = fields.provider, fields.model, fields.language
 
     safe_orig_name = _normalize_filename(orig_name or "recording.wav")
     _validate_audio_filename(safe_orig_name)

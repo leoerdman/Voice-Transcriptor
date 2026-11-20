@@ -166,5 +166,48 @@ class NetworkProbeTests(_MainCase):
         self.assertEqual(len(calls), 1, calls)
 
 
+class OneNormalisationTests(_MainCase):
+    """BM-15 / BM-16: one clamp for persisted UI state, one normalisation
+    of a save's text fields."""
+
+    def test_both_ui_states_clamp_with_the_same_helpers(self) -> None:
+        self.assertEqual(self.main._bounded_text("  abc  ", 2), "ab")
+        self.assertIsNone(self.main._nonneg_finite(-1))
+        self.assertIsNone(self.main._nonneg_finite(float("inf")))
+        self.assertEqual(self.main._nonneg_finite("2.5"), 2.5)
+        for gone in ("_upload_queue_str", "_live_draft_str", "_upload_queue_number", "_live_draft_number"):
+            self.assertFalse(hasattr(self.main, gone), gone)
+
+    def test_both_save_routes_normalise_through_one_function(self) -> None:
+        fields = self.main._normalize_save_fields(
+            title="a/b", source_text="", transcript_text="  hi  ",
+            provider=" deepgram ", model=None, language=" ru ",
+        )
+        self.assertEqual(fields.transcript_text, "hi")
+        self.assertEqual(fields.provider, "deepgram")
+        self.assertEqual(fields.model, "")
+        self.assertEqual(fields.language, "ru")
+        self.assertNotIn("/", fields.title)
+
+
+class UploadCeilingBeforeTheBodyTests(_MainCase):
+    """BM-26: a declared body past the upload ceiling is refused before the
+    multipart parser spools it to the temp volume."""
+
+    def test_an_oversized_declared_body_is_413_before_auth_or_parsing(self) -> None:
+        from fastapi.testclient import TestClient
+
+        client = TestClient(self.main.app, base_url="http://127.0.0.1:8321")
+        r = client.post(
+            "/api/jobs",
+            content=b"x",
+            headers={
+                "content-length": str(self.main.MAX_UPLOAD_BYTES * 2),
+                "x-api-token": self.main.API_TOKEN,
+            },
+        )
+        self.assertEqual(r.status_code, 413, r.text)
+
+
 if __name__ == "__main__":
     unittest.main()
