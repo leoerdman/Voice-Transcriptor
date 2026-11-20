@@ -525,7 +525,8 @@ const RECORDING_STATUS_TERMINAL_DWELL_MS = 900;
 
 // ── Recording-monitor bounds ──────────────────────────────────────────
 //
-// The four numbers the 1 Hz recording-state monitor and the capsule spend.
+// The numbers the recording-state monitor (RECORDING_STATUS_LEVEL_POLL_MS,
+// ~5.5 Hz) and the capsule spend.
 // They were bare literals inside the monitor body, which is where a product
 // parameter goes to stop being one: nothing named them, nothing could state
 // them, and one of them was retyped into the message the user reads.
@@ -2394,8 +2395,14 @@ function stopRecordingStateMonitor() {
 
 function startRecordingStateMonitor() {
   stopRecordingStateMonitor();
+  // One probe at a time (DM-14): executeJavaScript cannot be cancelled,
+  // so on a wedged renderer an unguarded interval queued another pending
+  // evaluation every tick for as long as the take lasted.
+  let probeInFlight = false;
   recordingStateMonitor = setInterval(() => {
     if (!win || win.isDestroyed() || !win.webContents) return;
+    if (probeInFlight) return;
+    probeInFlight = true;
     win.webContents
       .executeJavaScript(
         `(() => {
@@ -2519,7 +2526,8 @@ function startRecordingStateMonitor() {
           guardedStopFromRecordingStatus("autostop-stale");
         }
       })
-      .catch(() => { });
+      .catch(() => { })
+      .finally(() => { probeInFlight = false; });
   }, RECORDING_STATUS_LEVEL_POLL_MS);
   try { recordingStateMonitor.unref?.(); } catch { }
 }
