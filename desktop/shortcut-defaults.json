@@ -2,7 +2,9 @@
   "platformDefaults": {
     "darwin": {
       "record": "Alt+Left",
-      "paste": "Alt+Shift+V"
+      "paste": "Alt+Shift+V",
+      "screen": "Alt+Right",
+      "screenShot": "Alt+Down"
     },
     "default": {
       "record": "Control+Alt+Shift+R",

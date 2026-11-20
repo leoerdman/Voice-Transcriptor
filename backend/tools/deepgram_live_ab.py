@@ -45,7 +45,7 @@ import logging
 import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # Set BEFORE importing backend.config, which resolves config.json off
@@ -116,6 +116,9 @@ class RunResult:
     recovery_ms: float = 0.0
     uncovered_sec: float = 0.0
     error: "str | None" = None
+    # (start, end, confidence, language, source, word) per delivered word,
+    # printed with ``--words``.
+    word_rows: list = field(default_factory=list)
 
 
 def _load_api_key() -> str:
@@ -229,6 +232,18 @@ async def _run_one(
 
     stats = result.get("stats") or {}
     recovery = stats.get("recovery") or {}
+    word_rows = [
+        (
+            float(w.get("start") or 0.0),
+            float(w.get("end") or 0.0),
+            w.get("confidence"),
+            str(w.get("language") or ""),
+            str(w.get("source") or ""),
+            str(w.get("word") or ""),
+        )
+        for seg in (result.get("segments") or [])
+        for w in (seg.get("words") or [])
+    ]
     text = str(result.get("text") or "")
     label = f"{language}+{dual_language}" if dual_language else language
     return RunResult(
@@ -241,7 +256,18 @@ async def _run_one(
         recovery_words=int(recovery.get("words") or 0),
         recovery_ms=float(recovery.get("ms") or 0.0),
         uncovered_sec=float(result.get("uncoveredSpeechSec") or 0.0),
+        word_rows=word_rows,
     )
+
+
+def _format_words(r: RunResult) -> str:
+    """One line per delivered word: time, Deepgram's confidence and
+    language, which reading it came from (dual), and the word."""
+    lines = []
+    for start, end, conf, lang, source, word in r.word_rows:
+        c = f"{conf:.3f}" if isinstance(conf, (int, float)) else "  n/a"
+        lines.append(f"    {start:7.2f}-{end:7.2f} conf={c} lang={lang or '-':<3} src={source or '-':<5} {word}")
+    return "\n".join(lines)
 
 
 def _format_row(r: RunResult, *, full: bool) -> str:
@@ -328,6 +354,8 @@ async def _main_async(args: argparse.Namespace) -> int:
     rows.sort(key=lambda r: (r.file, r.language, r.run))
     for r in rows:
         print(_format_row(r, full=args.full))
+        if args.words and not r.error:
+            print(_format_words(r))
 
     return 1 if had_error else 0
 
@@ -396,6 +424,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--full", action="store_true",
         help=f"Print the full transcript text instead of truncating to "
              f"{_TEXT_TRUNCATE_CHARS} chars.",
+    )
+    parser.add_argument(
+        "--words", action="store_true",
+        help="Also print every delivered word with its time, Deepgram "
+             "confidence, language and (with --dual) the reading it came from.",
     )
     return parser
 

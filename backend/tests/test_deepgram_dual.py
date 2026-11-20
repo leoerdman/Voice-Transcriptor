@@ -348,7 +348,10 @@ class ForwardedSegmentWireShapeTests(unittest.TestCase):
     under the dual-stream feature that depends on it.
     """
 
-    def test_a_final_segment_carries_exactly_word_start_end_per_word(self):
+    def test_a_final_segment_carries_word_start_end_and_deepgrams_evidence(self):
+        # ``confidence`` (every model) and ``language`` (``multi``, per
+        # word) travel with the word since 2026-11-20: they are what the
+        # contested-stretch rule decides from (``_settle_contested_stretches``).
         session = DeepgramLiveSession(api_key="k")
         msg = {
             "type": "Results",
@@ -367,6 +370,7 @@ class ForwardedSegmentWireShapeTests(unittest.TestCase):
                                 "start": 1.0,
                                 "end": 1.4,
                                 "confidence": 0.95,
+                                "language": "en",
                                 "punctuated_word": "Hello",
                             },
                             {
@@ -388,12 +392,12 @@ class ForwardedSegmentWireShapeTests(unittest.TestCase):
         self.assertEqual(
             words,
             [
-                {"word": "Hello", "start": 1.0, "end": 1.4},
-                {"word": "world.", "start": 1.4, "end": 2.5},
+                {"word": "Hello", "start": 1.0, "end": 1.4, "confidence": 0.95, "language": "en"},
+                {"word": "world.", "start": 1.4, "end": 2.5, "confidence": 0.88},
             ],
         )
         for w in words:
-            self.assertEqual(set(w.keys()), {"word", "start", "end"})
+            self.assertTrue({"word", "start", "end"} <= set(w.keys()))
 
     def test_a_final_with_no_word_list_omits_the_key_entirely(self):
         # An empty list would read as "no words here"; omitting the key
@@ -761,6 +765,90 @@ class DualLiveSessionDrainTests(unittest.IsolatedAsyncioTestCase):
 # ---------------------------------------------------------------------
 # B-001 / B-002: a final without words, and the cost of the merge
 # ---------------------------------------------------------------------
+
+
+def _ev(word: str, start: float, end: float, conf: float, lang: Optional[str] = None) -> dict:
+    out = {"word": word, "start": start, "end": end, "confidence": conf}
+    if lang:
+        out["language"] = lang
+    return out
+
+
+class ContestedStretchTests(unittest.TestCase):
+    """One owner per stretch the readings hear in different languages.
+
+    Every number below is a real Deepgram reading (2026-11-20 replay via
+    ``backend.tools.deepgram_live_ab --words``): the screen-mode take
+    where ``multi`` heard Russian as Lithuanian, and the 2026-09-03
+    trilingual recording where it heard Russian as German and English as
+    English.
+    """
+
+    # multi, take 2026-11-20 16:11:56, 10.83-13.55 s — tagged ``lt``.
+    LT_MULTI = [
+        _ev("Ir", 10.83, 11.23, 0.908, "lt"), _ev("galgenas", 11.23, 11.87, 0.711, "lt"),
+        _ev("žamanas", 11.87, 12.27, 0.888, "lt"), _ev("tačiau", 12.27, 12.59, 0.853, "lt"),
+        _ev("kompiuterių", 12.59, 13.23, 0.837, "lt"), _ev("net", 13.23, 13.55, 0.893, "lt"),
+        _ev("окно", 14.04, 14.52, 0.800, "ru"),
+    ]
+    LT_RU = [
+        _ev("Когда", 10.75, 11.63, 0.330), _ev("я", 11.63, 11.71, 0.995),
+        _ev("нажимаю", 11.71, 12.03, 0.917), _ev("на", 12.03, 12.27, 0.990),
+        _ev("значок", 12.27, 12.59, 0.999), _ev("компьютера,", 12.59, 13.23, 0.886),
+        _ev("у", 13.23, 13.31, 0.974), _ev("меня", 13.31, 13.47, 1.0),
+        _ev("окно", 13.64, 14.44, 0.319),
+    ]
+
+    def test_a_hallucinated_language_goes_to_the_confident_reading_whole(self):
+        merged = merge_readings([_segment(self.LT_MULTI)], [_segment(self.LT_RU)])
+        self.assertTrue(merged.text.startswith("Когда я нажимаю на значок компьютера, у меня окно"))
+        for foreign in ("Ir", "galgenas", "žamanas", "tačiau", "kompiuterių", "net"):
+            self.assertNotIn(foreign, merged.text.split())
+        self.assertEqual((merged.contested_to_secondary, merged.contested_to_primary), (1, 0))
+
+    def test_real_foreign_speech_stays_with_the_multilingual_reading_whole(self):
+        # Trilingual 14.58-17.30: genuine English; ``ru`` was less sure.
+        multi = [_ev("Agents", 14.58, 15.46, 0.995, "en"), _ev("workflow.", 15.78, 17.30, 0.957, "en")]
+        ru = [_ev("Agents,", 14.66, 15.78, 0.649), _ev("workflow.", 15.78, 17.06, 0.914),
+              _ev("Да,", 17.14, 17.46, 0.967)]
+        merged = merge_readings([_segment(multi)], [_segment(ru)])
+        self.assertEqual(merged.text, "Agents workflow. Да,")
+        self.assertEqual((merged.contested_to_secondary, merged.contested_to_primary), (0, 1))
+
+    def test_german_hallucination_on_russian_speech_goes_to_ru(self):
+        multi = [_ev("Von", 32.95, 33.3, 0.55, "de"), _ev("der", 33.3, 33.6, 0.62, "de"),
+                 _ev("Französkomme", 33.6, 34.4, 0.70, "de"), _ev("gehören,", 34.4, 35.43, 0.69, "de")]
+        ru = [_ev("На", 32.95, 33.2, 0.96), _ev("французском", 33.2, 34.0, 0.95),
+              _ev("я", 34.0, 34.2, 0.97), _ev("обычно", 34.2, 34.8, 0.94), _ev("не", 34.8, 35.0, 0.93),
+              _ev("говорю,", 35.0, 35.4, 0.95)]
+        merged = merge_readings([_segment(multi)], [_segment(ru)])
+        self.assertEqual(merged.text, "На французском я обычно не говорю,")
+
+    def test_a_stretch_only_the_multilingual_reading_heard_is_kept(self):
+        # The September French clause ``ru`` skipped entirely.
+        multi = [_ev("de", 30.0, 30.3, 0.6, "fr"), _ev("la", 30.3, 30.5, 0.6, "fr"),
+                 _ev("France.", 30.5, 31.0, 0.6, "fr")]
+        merged = merge_readings([_segment(multi)], [_segment([_ev("Да", 1.0, 1.3, 0.99)])])
+        self.assertIn("de la France.", merged.text)
+        self.assertEqual((merged.contested_to_secondary, merged.contested_to_primary), (0, 0))
+
+    def test_without_confidence_the_word_rules_decide_as_before(self):
+        multi = [_w("Hello", 1.0, 1.4) | {"language": "en"}]
+        ru = [_w("Хелло", 1.0, 1.4)]
+        merged = merge_readings([_segment(multi)], [_segment(ru)])
+        self.assertEqual(merged.text, "Hello")
+        self.assertEqual((merged.contested_to_secondary, merged.contested_to_primary), (0, 0))
+
+    def test_words_in_the_secondarys_own_language_are_never_contested(self):
+        multi = [_ev("привет", 1.0, 1.4, 0.2, "ru")]
+        ru = [_ev("привет", 1.0, 1.4, 0.99)]
+        merged = merge_readings([_segment(multi)], [_segment(ru)])
+        self.assertEqual((merged.contested_to_secondary, merged.contested_to_primary), (0, 0))
+
+    def test_flatten_keeps_the_evidence(self):
+        words = flatten_words([_segment([_ev("Hi", 0.0, 0.5, 0.9, "en")])], "multi")
+        self.assertEqual(words[0]["confidence"], 0.9)
+        self.assertEqual(words[0]["language"], "en")
 
 
 class WordlessFinalMergeTests(unittest.TestCase):

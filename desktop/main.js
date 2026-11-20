@@ -124,6 +124,12 @@ const {
   recordingStatusPresentation,
 } = require("./recording-status");
 
+// Screen mode: a recording during which the user draws on the screen and
+// takes screenshots. Rules in ./screen-mode, windows/helper/capture in
+// ./screen-mode-controller; the instance is `screenMode` below.
+const { SCREEN_MODE, isScreenSessionId, screenSessionId } = require("./screen-mode");
+const { createScreenModeController } = require("./screen-mode-controller");
+
 // SSOT for the interpreter version: `.python-version` at the repo root, the
 // same file prepare-runtime.sh builds the bundled runtime from and CI installs.
 const { readPythonVersion } = require("./python-version");
@@ -165,6 +171,10 @@ function shortcutDefaultsForPlatform(platform = process.platform) {
   return {
     record: String(defaults.record || "").trim(),
     paste: String(defaults.paste || "").trim(),
+    // Screen mode is macOS-only; platforms without it have no default and
+    // the two slots stay empty (nothing is registered).
+    screen: String(defaults.screen || "").trim(),
+    screenShot: String(defaults.screenShot || "").trim(),
   };
 }
 
@@ -1339,13 +1349,13 @@ function hasActivePostStopWork() {
 // status control and the timer are sized by their content, and squeezing
 // the waveform column hard enough to absorb the whole reduction left too
 // few bars to read. The waveform keeps a 30 px column.
-const RECORDING_STATUS_CAPSULE = Object.freeze({
+const RECORDING_STATUS_CAPSULE = Object.freeze((() => {
+  const t = {
   width: 110,
   height: 30,
   geometryPadding: 0,
   minWidth: 110,
   minHeight: 30,
-  maxWidth: 116,
   maxHeight: 30,
   bottomMargin: 16,
   pillHeight: 30,
@@ -1355,6 +1365,9 @@ const RECORDING_STATUS_CAPSULE = Object.freeze({
   statusControlSize: 22,
   timerWidth: 29,
   timerFontSize: 9,
+  // Screen mode: the white "computer" button after the timer — a click
+  // saves a screenshot with the drawings and clears them.
+  screenIconSize: 16,
   waveWidth: 30,
   // Bar heights scale with ``waveHeight - 2``, so this is the vertical
   // scale of the waveform. 15 of the 30 px pill reads as taller than the
@@ -1367,7 +1380,12 @@ const RECORDING_STATUS_CAPSULE = Object.freeze({
   waveLevelTickMs: 220,
   waveIdleTickMs: 360,
   waveActiveStaleMs: 900,
-});
+  };
+  // Screen mode adds the screenshot button to the right of the timer and
+  // the pill grows by exactly that: one more gap and the icon.
+  t.maxWidth = t.width + t.pillGap + t.screenIconSize;
+  return t;
+})());
 const RECORDING_STATUS_CAPSULE_SESSION_PARTITION = "recording-status-capsule";
 const RECORDING_STATUS_LEVEL_POLL_MS = 180;
 const RECORDING_STATUS_LEVEL_MIN_DELTA = 0.012;
@@ -1383,6 +1401,9 @@ const recordingStatusCapsuleState = {
   elapsedMs: 0,
   timerRunning: false,
   level: 0,
+  // True while a screen-mode recording owns the screen: the capsule
+  // shows the screenshot button. Set only by the screen-mode controller.
+  screen: false,
 };
 
 let recordingStatusCapsuleGeometry = null;
@@ -1449,6 +1470,7 @@ function applyRecordingStatusCapsuleWindowSize() {
     recordingStatusWindow.setSize(size.width, size.height, false);
     recordingStatusWindow.setBounds(recordingStatusCapsuleBounds(), false);
   } catch { }
+  screenMode.refreshLayout();
 }
 
 function applyRecordingStatusCapsuleGeometryPayload(rawPayload) {
@@ -1539,6 +1561,27 @@ function recordingStatusCapsuleHtml() {
       justify-content: center;
       gap: ${t.pillGap}px;
     }
+    #pill.screen {
+      width: ${t.width + t.pillGap + t.screenIconSize}px;
+    }
+    #pill.screen #core {
+      grid-template-columns: ${t.statusControlSize}px minmax(0, 1fr) ${t.timerWidth}px ${t.screenIconSize}px;
+    }
+    #shotBtn {
+      display: none;
+      width: ${t.screenIconSize}px;
+      height: ${t.screenIconSize}px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      cursor: pointer;
+      justify-self: center;
+      opacity: .96;
+    }
+    #shotBtn:hover { opacity: 1; transform: scale(1.08); }
+    #shotBtn:active { transform: scale(.92); }
+    #pill.screen #shotBtn { display: block; }
+    #shotBtn svg { display: block; width: 100%; height: 100%; }
     #wave {
       display: block;
       width: 100%;
@@ -1688,11 +1731,14 @@ function recordingStatusCapsuleHtml() {
         <span id="stateIcon" aria-hidden="true"></span>
         <canvas id="wave" width="${t.waveWidth}" height="${t.waveHeight}"></canvas>
         <span id="timer">00:00</span>
+        <button id="shotBtn" type="button" aria-label="Screenshot"><svg viewBox="0 0 16 16" fill="none" stroke="#fff" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"><rect x="1.75" y="2.5" width="12.5" height="8.5" rx="1.3"/><path d="M5.5 14h5M8 11v3"/></svg></button>
       </div>
     </div>
   </div>
   <script>
     const stackEl = document.getElementById("stack");
+    const pillEl = document.getElementById("pill");
+    let screenMode = false;
     const stateIcon = document.getElementById("stateIcon");
     const timeEl = document.getElementById("timer");
     const cv = document.getElementById("wave");
@@ -1888,6 +1934,12 @@ function recordingStatusCapsuleHtml() {
     }
     window.__setCapsuleState = (next) => {
       state = { ...state, ...(next || {}) };
+      const nextScreen = !!state.screen;
+      if (nextScreen !== screenMode) {
+        screenMode = nextScreen;
+        pillEl.classList.toggle("screen", screenMode);
+        scheduleGeometryEmit();
+      }
       render();
       if (pageIsActive()) {
         requestAnimationLoop();
@@ -1904,6 +1956,11 @@ function recordingStatusCapsuleHtml() {
       setTimeout(() => { pointerEmitLocked = false; }, 80);
       document.title = "__recording_capsule_pointer__" + Date.now();
     }, true);
+    document.getElementById("shotBtn").addEventListener("click", (event) => {
+      // Inside #core, whose click stops the recording: this one must not.
+      event.stopPropagation();
+      if (screenMode) document.title = "__recording_capsule_shot__" + Date.now();
+    });
     document.getElementById("core").addEventListener("click", (event) => {
       // "autostop" too: the capsule is amber and counting down, but the
       // recording IS still running, so a click on it must still stop it.
@@ -2001,6 +2058,12 @@ async function ensureRecordingStatusCapsuleWindow() {
     show: false,
     focusable: false,
     hasShadow: false,
+    // A click on the capsule (stop, the screen-mode screenshot button)
+    // must not activate the app: activation raises every window of it,
+    // the main window included. NSPanel's non-activating mask is the
+    // platform's own answer — the panel takes the click, the app stays
+    // in the background, the user's app keeps focus.
+    ...(process.platform === "darwin" ? { type: "panel" } : {}),
     title: "Transcriptor Recording",
     backgroundColor: "#00000000",
     webPreferences: {
@@ -2015,6 +2078,7 @@ async function ensureRecordingStatusCapsuleWindow() {
 
   recordingStatusWindow.setMenuBarVisibility(false);
   try { recordingStatusWindow.setAlwaysOnTop(true, "floating"); } catch { }
+  if (recordingStatusCapsuleState.screen) applyCapsuleScreenModeLayer(true);
   try { recordingStatusWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }); } catch { }
   recordingStatusWindow.on("closed", () => {
     recordingStatusWindow = null;
@@ -2028,6 +2092,12 @@ async function ensureRecordingStatusCapsuleWindow() {
     event.preventDefault();
     noteRecordingStatusCapsuleInteraction();
     if (raw.startsWith("__recording_capsule_pointer__")) {
+      return;
+    }
+    if (raw.startsWith("__recording_capsule_shot__")) {
+      void screenMode.takeShot("capsule").catch((e) => {
+        appendMainLog(`[screen-mode] capsule shot failed: ${e?.message || e}`);
+      });
       return;
     }
     if (raw === "__recording_capsule_stop__") {
@@ -2098,6 +2168,7 @@ async function updateRecordingStatusCapsule(patch = {}) {
   try {
     capsuleWindow.setBounds(recordingStatusCapsuleBounds(), false);
   } catch { }
+  screenMode.refreshLayout();
   if (!recordingStatusWindowReady) {
     // The load failed; ensure() already logged it. Nothing to paint on.
     appendMainLog(`[recording-capsule] update dropped: window never loaded (status="${status}")`);
@@ -2111,6 +2182,7 @@ async function updateRecordingStatusCapsule(patch = {}) {
     elapsedMs: Math.max(0, Number(recordingStatusCapsuleState.elapsedMs || 0)),
     timerRunning: !!recordingStatusCapsuleState.timerRunning,
     level: Math.max(0, Math.min(1, Number(recordingStatusCapsuleState.level || 0))),
+    screen: !!recordingStatusCapsuleState.screen,
   };
   try {
     await capsuleWindow.webContents.executeJavaScript(
@@ -2135,6 +2207,129 @@ async function updateRecordingStatusCapsule(patch = {}) {
   } catch (e) {
     appendMainLog(`[recording-capsule] update failed: ${e?.message || e}`);
   }
+}
+
+// ── Screen mode ──────────────────────────────────────────────────────
+// The screenshot hotkey is bound only while a screen-mode take is
+// running: outside screen mode it would steal a key for nothing. The
+// accelerator itself is configured like every other hotkey and set by
+// registerGlobalShortcuts.
+let desiredScreenShotHotkey = "";
+let registeredScreenShotHotkey = "";
+
+function bindScreenShotHotkey() {
+  unbindScreenShotHotkey();
+  if (!desiredScreenShotHotkey) return;
+  const canonical = canonicalAcceleratorForPlatform(desiredScreenShotHotkey, process.platform);
+  try {
+    const ok = globalShortcut.register(canonical, () => {
+      void screenMode.takeShot("hotkey").catch((e) => {
+        appendMainLog(`[screen-mode] hotkey shot failed: ${e?.message || e}`);
+      });
+    });
+    if (ok) registeredScreenShotHotkey = canonical;
+    appendMainLog(`[shortcuts] screenshot hotkey ${ok ? "bound" : "FAILED"}: ${canonical}`);
+  } catch (e) {
+    appendMainLog(`[shortcuts] screenshot hotkey failed: ${canonical} (${e?.message || e})`);
+  }
+}
+
+function unbindScreenShotHotkey() {
+  if (!registeredScreenShotHotkey) return;
+  try { globalShortcut.unregister(registeredScreenShotHotkey); } catch { }
+  registeredScreenShotHotkey = "";
+}
+
+// The capsule stays the user's control surface in screen mode, so it is
+// lifted above the overlays (which sit at the screen-saver level) and
+// kept out of the screenshots, exactly like the overlays themselves.
+function applyCapsuleScreenModeLayer(active) {
+  if (!recordingStatusWindow || recordingStatusWindow.isDestroyed()) return;
+  try { recordingStatusWindow.setContentProtection(!!active); } catch { }
+  try {
+    if (active) recordingStatusWindow.setAlwaysOnTop(true, "screen-saver", 2);
+    else recordingStatusWindow.setAlwaysOnTop(true, "floating");
+  } catch { }
+  try { if (active) recordingStatusWindow.moveTop(); } catch { }
+}
+
+function screenModeHelperPath() {
+  if (app.isPackaged) return path.join(process.resourcesPath, "runtime", "bin", "screen-input");
+  return path.join(__dirname, "native", "build", `mac-${process.arch}`, "screen-input");
+}
+
+// Where a take's screenshots are staged until its recording is saved; the
+// backend then moves them beside the recording (backend/screen_sessions.py).
+function screenModeStagingRoot() {
+  const dataDir = process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData");
+  return path.join(dataDir, SCREEN_MODE.stagingDirName);
+}
+
+const SCREEN_MODE_WARNINGS = Object.freeze({
+  accessibility: {
+    title: "Screen mode can't draw",
+    body: "Allow Transcriptor in System Settings → Privacy & Security → Accessibility, then start screen mode again.",
+  },
+  "screen-recording": {
+    title: "Screen mode can't take screenshots",
+    body: "Allow Transcriptor in System Settings → Privacy & Security → Screen & System Audio Recording.",
+  },
+});
+
+const screenMode = createScreenModeController({
+  BrowserWindow,
+  screen,
+  childProcess: require("child_process"),
+  fs,
+  path,
+  helperPath: screenModeHelperPath,
+  stagingRoot: screenModeStagingRoot,
+  log: (line) => appendMainLog(line),
+  capsuleBounds: () => {
+    if (!recordingStatusWindow || recordingStatusWindow.isDestroyed() || !recordingStatusWindow.isVisible()) {
+      return null;
+    }
+    return recordingStatusWindow.getBounds();
+  },
+  onActiveChange: (active) => {
+    if (active) bindScreenShotHotkey();
+    else unbindScreenShotHotkey();
+    recordingStatusCapsuleState.screen = !!active;
+    applyCapsuleScreenModeLayer(active);
+    if (String(recordingStatusCapsuleState.status || "").trim()) {
+      void updateRecordingStatusCapsule({}).catch(() => { });
+    }
+  },
+  onWarning: (kind) => {
+    const copy = SCREEN_MODE_WARNINGS[kind];
+    appendMainLog(`[screen-mode] warning ${kind}`);
+    if (!copy) return;
+    try {
+      const { Notification } = require("electron");
+      if (Notification.isSupported()) new Notification({ title: copy.title, body: copy.body }).show();
+    } catch { }
+  },
+  screenCaptureAccess: () => {
+    try {
+      return String(systemPreferences.getMediaAccessStatus("screen") || "");
+    } catch {
+      return "";
+    }
+  },
+});
+
+/**
+ * The renderer that owns the take is gone (crashed, killed, reloaded):
+ * its stopLive will never ask for the session, so main ends it here and
+ * keeps the screenshots staged — the backend's recovery sweep owns them
+ * from then on, exactly like the take's audio spool.
+ */
+function endScreenModeForLostRenderer(reason) {
+  if (!screenMode.isActive()) return;
+  appendMainLog(`[screen-mode] renderer lost (${reason}); ending the session`);
+  void screenMode.finish({ discard: false }).catch((e) => {
+    appendMainLog(`[screen-mode] finish after renderer loss failed: ${e?.message || e}`);
+  });
 }
 
 function cancelRecordingStatusCapsuleTeardown() {
@@ -2269,7 +2464,9 @@ function startRecordingStateMonitor() {
             }
           }).catch(() => { });
         }
-        const silenceDetectionActive = isRec && cfg.enabled && !recordingStopInFlight;
+        // Screen mode is excluded: drawing in silence is the point of it,
+        // and a pause to draw must not end the take.
+        const silenceDetectionActive = isRec && cfg.enabled && !recordingStopInFlight && !screenMode.isActive();
         const pastWarmup = !recordingStartedAt || (now - recordingStartedAt) >= RECORDING_AUTOSTOP_WARMUP_MS;
         if (!silenceDetectionActive || !pastWarmup) {
           recordingSilenceStartedAt = 0;
@@ -2495,7 +2692,7 @@ function macMicrophoneAccessGranted() {
  * a 3-second fragment went to the clipboard. The block is correct — one
  * capsule at a time — but there was no work worth blocking for.
  */
-async function dispatchRendererTogglePress(allowStart) {
+async function dispatchRendererTogglePress(allowStart, startDetail = { mode: "voice" }) {
   return execRendererJsWithTimeout(
     `
     (() => {
@@ -2516,7 +2713,10 @@ async function dispatchRendererTogglePress(allowStart) {
       const state = { ok: true, uiReady, wasRecording: isRec, recording: isRec, dispatched: false, discarded: tooShort, auto, autoSendEnter, timerText, recordingId };
       if (!uiReady) return state;
       if (!isRec && !${allowStart ? "true" : "false"}) return state;
-      window.dispatchEvent(new Event('transcriptor-hotkey-toggle'));
+      // The detail is read only when this press STARTS a recording: it says
+      // which kind (voice or screen) and, for screen mode, the session id
+      // the renderer hands back to main when the take stops.
+      window.dispatchEvent(new CustomEvent('transcriptor-hotkey-toggle', { detail: ${JSON.stringify(startDetail)} }));
       state.dispatched = true;
       state.recording = !isRec;
       return state;
@@ -2527,9 +2727,16 @@ async function dispatchRendererTogglePress(allowStart) {
   );
 }
 
-async function toggleRecordingFromShortcut() {
+/**
+ * @param {"voice"|"screen"} mode  what a press that STARTS a recording
+ *   starts. A press during a recording stops it whatever its mode.
+ */
+async function toggleRecordingFromShortcut(mode = "voice") {
   if (shortcutToggleInFlight) return;
-  const trace = createTrace("toggle_hotkey", {});
+  const trace = createTrace("toggle_hotkey", { mode });
+  const startDetail = mode === "screen" && screenMode.isSupported()
+    ? { mode: "screen", screenSessionId: screenSessionId() }
+    : { mode: "voice" };
   shortcutToggleInFlight = true;
   let keepCapturedTarget = false;
   const frontAtHotkeyPromise = getFrontmostAppInfoWithTimeout(1200);
@@ -2551,14 +2758,14 @@ async function toggleRecordingFromShortcut() {
     // ``dispatchRendererTogglePress`` asks them together and a press
     // reaches ``startLive`` in one hop.
     const postStopActive = activePostStopAtPress || hasActivePostStopWork();
-    let result = await dispatchRendererTogglePress(!postStopActive && macMicrophoneAccessGranted());
+    let result = await dispatchRendererTogglePress(!postStopActive && macMicrophoneAccessGranted(), startDetail);
     if (result && result.uiReady === false) {
       // Cold renderer: fall back to the wait loop and ask once more when
       // it has finished booting.
       const ready = await waitForRendererUiReady();
       traceStep(trace, "renderer_ready_wait", { ready: !!ready });
       if (ready) {
-        result = await dispatchRendererTogglePress(!postStopActive && macMicrophoneAccessGranted());
+        result = await dispatchRendererTogglePress(!postStopActive && macMicrophoneAccessGranted(), startDetail);
       }
     }
     if (result === null) {
@@ -2638,7 +2845,7 @@ async function toggleRecordingFromShortcut() {
         traceEnd(trace, "failed", { reason: "mic-permission-denied" });
         return;
       }
-      result = await dispatchRendererTogglePress(true);
+      result = await dispatchRendererTogglePress(true, startDetail);
       if (!result?.dispatched) {
         traceStep(trace, "renderer_toggle_failed", { result: result || null });
         await setRecordingStatus("App Loading", RECORDING_STATUS_KIND.WARN);
@@ -2691,7 +2898,14 @@ async function toggleRecordingFromShortcut() {
         recordingId: Number(confirmedStart.recordingId || 0),
       });
       await beginRecordingStatusSession();
-      traceEnd(trace, "recording-started", {});
+      if (startDetail.mode === "screen") {
+        const started = await screenMode.start(startDetail.screenSessionId).catch((e) => ({
+          ok: false,
+          error: e?.message || String(e),
+        }));
+        traceStep(trace, "screen_mode_started", { ok: !!started?.ok, error: started?.error || "" });
+      }
+      traceEnd(trace, "recording-started", { mode: startDetail.mode });
       return;
     }
 
@@ -8214,6 +8428,8 @@ async function createWindow(options = {}) {
         action,
         record: String(payload?.record || "").trim().slice(0, 96),
         paste: String(payload?.paste || "").trim().slice(0, 96),
+        screen: String(payload?.screen || "").trim().slice(0, 96),
+        screenShot: String(payload?.screenShot || "").trim().slice(0, 96),
       };
       if (shortcutBridgeHandler) {
         shortcutBridgeHandler(message);
@@ -8483,10 +8699,16 @@ async function createWindow(options = {}) {
     // when the user is waiting for a transcript.
     for (const out of consoleMirrorLimiter(line, Date.now())) appendMainLog(out);
   });
+  // A reload of the main document is the other way to lose the renderer
+  // that owns a screen-mode take.
+  win.webContents.on("did-start-navigation", (details) => {
+    if (details?.isMainFrame && !details?.isSameDocument) endScreenModeForLostRenderer("navigation");
+  });
   win.webContents.on("render-process-gone", (_event, details) => {
     const reason = String(details?.reason || "unknown");
     const exitCode = details?.exitCode ?? "";
     appendMainLog(`[render-process-gone] reason=${reason} exitCode=${exitCode}`);
+    endScreenModeForLostRenderer(`render-process-gone:${reason}`);
     if (shortcutCaptureAbortHandler) {
       shortcutCaptureAbortHandler(`render-process-gone:${reason}`);
     }
@@ -9089,6 +9311,9 @@ function killBackendHard(reason, opts = {}) {
 
 app.on("before-quit", () => {
   isQuitting = true;
+  // The screen-mode mouse helper holds a CGEventTap: it must never
+  // outlive the app (it also exits on its own when its stdin closes).
+  try { screenMode.teardown(); } catch { }
   // Long-running runCommand children (the multi-GB engine pip install)
   // must die with the app, not orphan for their full timeout (BUG-61).
   killAllTrackedChildren();
@@ -9278,6 +9503,23 @@ app.whenReady().then(async () => {
   // this channel), and the payload must match the contract exactly —
   // validateRecordingFinalPayload inside slot.set() ignores anything
   // else rather than coercing it.
+  // Screen mode ends where every stop ends: in the renderer's stopLive,
+  // whichever path stopped the take (either hotkey, the capsule, the
+  // dead-pipeline fail-safe). Main owns the session; the renderer asks
+  // for it back and writes it into the transcript.
+  ipcMain.handle("screen-mode:finish", async (event, payload) => {
+    if (!win || win.isDestroyed() || event.sender !== win.webContents) return { ok: false, error: "sender" };
+    const p = payload && typeof payload === "object" ? payload : {};
+    try {
+      const id = String(p.id || "");
+      if (!isScreenSessionId(id)) return { ok: false, error: "bad-session-id" };
+      return await screenMode.finish({ id, discard: p.discard === true });
+    } catch (e) {
+      appendMainLog(`[screen-mode] finish failed: ${e?.message || e}`);
+      return { ok: false, error: "finish-failed" };
+    }
+  });
+
   ipcMain.on("recording-final", (event, payload) => {
     if (!win || win.isDestroyed() || event.sender !== win.webContents) return;
     const signal = recordingFinalSlot.set(payload);
@@ -9426,6 +9668,7 @@ app.whenReady().then(async () => {
   // ── Global Shortcuts (config-driven with live reload) ─────────────────────
   let registeredRecordHotkey = "";
   let registeredPasteHotkey = "";
+  let registeredScreenHotkey = "";
   let shortcutsSuspendedForCapture = false;
 
   function readShortcutsFromConfig() {
@@ -9439,6 +9682,12 @@ app.whenReady().then(async () => {
         const stored = {
           record: String(ui.shortcut_record || defaults.record).trim() || defaults.record,
           paste: String(ui.shortcut_paste || defaults.paste).trim() || defaults.paste,
+        };
+        // The screen-mode slots postdate every retired pair, so there is
+        // nothing to migrate: stored value, else the platform default.
+        const screenSlots = {
+          screen: String(ui.shortcut_screen || defaults.screen).trim() || defaults.screen,
+          screenShot: String(ui.shortcut_screen_shot || defaults.screenShot).trim() || defaults.screenShot,
         };
         // Retired accelerator pairs are rewritten to the platform default by
         // ONE rule, declared in desktop/shortcut-migration.js and driven by
@@ -9457,7 +9706,7 @@ app.whenReady().then(async () => {
         for (const step of migrated.applied) {
           appendMainLog(`[shortcuts] migrated stale ${step.from} → ${step.to} (${step.id}) on ${process.platform}`);
         }
-        return { record: migrated.record, paste: migrated.paste };
+        return { record: migrated.record, paste: migrated.paste, ...screenSlots };
       }
     } catch (e) {
       appendMainLog(`[shortcuts] config read error: ${e?.message || e}`);
@@ -9484,6 +9733,11 @@ app.whenReady().then(async () => {
   function unregisterRegisteredShortcuts(reason = "") {
     const previousRecord = registeredRecordHotkey;
     const previousPaste = registeredPasteHotkey;
+    if (registeredScreenHotkey) {
+      try { globalShortcut.unregister(registeredScreenHotkey); } catch { }
+    }
+    registeredScreenHotkey = "";
+    unbindScreenShotHotkey();
     if (registeredRecordHotkey) {
       try { globalShortcut.unregister(registeredRecordHotkey); } catch { }
     }
@@ -9566,9 +9820,12 @@ app.whenReady().then(async () => {
     let shortcuts;
     if (override && (override.record || override.paste)) {
       const fromDisk = (override.record && override.paste) ? null : readShortcutsFromConfig();
+      const screenFromDisk = (override.screen && override.screenShot) ? null : readShortcutsFromConfig();
       shortcuts = {
         record: String(override.record || (fromDisk && fromDisk.record) || "").trim(),
         paste: String(override.paste || (fromDisk && fromDisk.paste) || "").trim(),
+        screen: String(override.screen || (screenFromDisk && screenFromDisk.screen) || "").trim(),
+        screenShot: String(override.screenShot || (screenFromDisk && screenFromDisk.screenShot) || "").trim(),
       };
     } else {
       shortcuts = readShortcutsFromConfig();
@@ -9612,6 +9869,30 @@ app.whenReady().then(async () => {
         `[shortcuts] WARN: failed to register paste-last shortcut: ${shortcuts.paste} (${pasteResult.error})`,
       );
     }
+
+    // Screen mode: its toggle is bound whenever the platform supports it;
+    // the screenshot key is bound only while a screen-mode take runs.
+    const screenSupported = screenMode.isSupported();
+    let screenResult = { ok: false, accelerator: shortcuts.screen || "", error: "" };
+    if (screenSupported && shortcuts.screen) {
+      screenResult = safeRegisterShortcut(shortcuts.screen, () => {
+        toggleRecordingFromShortcut("screen").catch((e) => {
+          appendMainLog(`[shortcut] screen toggle failed: ${e?.message || e}`);
+          resetRecordingStatusState();
+        });
+      });
+      if (screenResult.ok) {
+        registeredScreenHotkey = screenResult.accelerator;
+      } else {
+        appendMainLog(
+          `[shortcuts] WARN: failed to register screen-mode shortcut: ${shortcuts.screen} (${screenResult.error})`,
+        );
+      }
+    } else if (!screenSupported) {
+      screenResult.error = "unsupported";
+    }
+    desiredScreenShotHotkey = screenSupported ? shortcuts.screenShot || "" : "";
+    if (screenMode.isActive()) bindScreenShotHotkey();
 
     // Surface registration status to the renderer so the Settings
     // panel can show a red indicator next to any shortcut that the
@@ -9660,6 +9941,19 @@ app.whenReady().then(async () => {
         active: pasteResult.ok ? pasteResult.accelerator : "",
         error: pasteResult.ok ? "" : pasteResult.error,
       },
+      screen: {
+        desired: screenResult.accelerator || shortcuts.screen || "",
+        active: screenResult.ok ? screenResult.accelerator : "",
+        error: screenResult.ok ? "" : screenResult.error,
+      },
+      // Bound only during screen mode, so "active" is not meaningful at
+      // rest; Settings shows the configured key.
+      screenShot: {
+        desired: shortcuts.screenShot || "",
+        active: "",
+        error: screenSupported ? "" : "unsupported",
+      },
+      screenModeSupported: screenSupported,
       // Renderer uses this to decide whether to show the "macOS is
       // intercepting F9/F10" hint. Only relevant on darwin and only
       // when the configured accelerator is an F-key.
@@ -9678,7 +9972,9 @@ app.whenReady().then(async () => {
 
     appendMainLog(
       `[shortcuts] registered: record=${registeredRecordHotkey || "FAILED"} ` +
-      `paste=${registeredPasteHotkey || "FAILED"}`,
+      `paste=${registeredPasteHotkey || "FAILED"} ` +
+      `screen=${registeredScreenHotkey || (screenSupported ? "FAILED" : "unsupported")} ` +
+      `screenShot=${desiredScreenShotHotkey || "-"}`,
     );
   }
 
@@ -9699,14 +9995,19 @@ app.whenReady().then(async () => {
     if (action === "update") {
       const record = String(message?.record || "").trim();
       const paste = String(message?.paste || "").trim();
+      const screen = String(message?.screen || "").trim();
+      const screenShot = String(message?.screenShot || "").trim();
       if (!record || !paste) {
         appendMainLog(`[shortcuts] bridge update rejected: record=${record || "-"} paste=${paste || "-"}`);
         return;
       }
       shortcutsSuspendedForCapture = false;
       clearShortcutCaptureFailsafe();
-      appendMainLog(`[shortcuts] bridge live reload: record=${record} paste=${paste}`);
-      registerGlobalShortcuts({ record, paste });
+      appendMainLog(
+        `[shortcuts] bridge live reload: record=${record} paste=${paste} ` +
+        `screen=${screen || "-"} screenShot=${screenShot || "-"}`,
+      );
+      registerGlobalShortcuts({ record, paste, screen, screenShot });
     }
   }
 

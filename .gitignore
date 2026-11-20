@@ -118,3 +118,6 @@ backend/.pytest_cache/
 # during ship; never committed to git. SHA-256 in INSTALL.txt is
 # the integrity contract.
 release-*/
+
+# Native helpers compiled by desktop/scripts/build-native.sh
+desktop/native/build/

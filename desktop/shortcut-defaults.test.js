@@ -29,11 +29,25 @@ const assert = require("node:assert/strict");
 
 const manifest = require("./shortcut-defaults.json");
 
-test("darwin defaults are unchanged (Alt+Left / Alt+Shift+V)", () => {
+test("darwin defaults are unchanged (Alt+Left / Alt+Shift+V) plus the screen-mode pair", () => {
   assert.deepEqual(manifest.platformDefaults.darwin, {
     record: "Alt+Left",
     paste: "Alt+Shift+V",
+    // Screen mode (macOS-only): Alt+Right toggles a screen-mode take,
+    // Alt+Down saves a screenshot — bound only while screen mode runs.
+    screen: "Alt+Right",
+    screenShot: "Alt+Down",
   });
+});
+
+test("the darwin defaults are four distinct accelerators", () => {
+  const values = Object.values(manifest.platformDefaults.darwin);
+  assert.equal(new Set(values).size, values.length);
+});
+
+test("screen mode has no default off macOS (it is not supported there)", () => {
+  assert.equal(manifest.platformDefaults.default.screen, undefined);
+  assert.equal(manifest.platformDefaults.default.screenShot, undefined);
 });
 
 test("no win32/linux default is a bare function key, in either slot", () => {

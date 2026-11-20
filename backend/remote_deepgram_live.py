@@ -261,7 +261,8 @@ def as_float(value: object, default: float = 0.0) -> float:
 
 
 def normalize_words(raw: object) -> list[dict]:
-    """Parse ``alternatives[0].words`` into ``{word, start, end}`` dicts.
+    """Parse ``alternatives[0].words`` into ``{word, start, end}`` dicts,
+    plus ``confidence`` / ``language`` when Deepgram sent them.
 
     The ONE place a Deepgram word list becomes internal word records —
     used for interim hypotheses and for finals alike (audit §3.1). The
@@ -283,7 +284,18 @@ def normalize_words(raw: object) -> list[dict]:
         end = as_float(item.get("end"))
         if end <= start:
             continue
-        out.append({"word": token, "start": round(start, 3), "end": round(end, 3)})
+        record: dict = {"word": token, "start": round(start, 3), "end": round(end, 3)}
+        # Deepgram's own evidence about the word, kept when it sent it:
+        # ``confidence`` on every model, ``language`` per word on
+        # ``language=multi``. The dual-stream merge decides which reading
+        # owns a stretch both heard differently from exactly these
+        # (``backend.deepgram_dual._language_disagreements``).
+        if isinstance(item.get("confidence"), (int, float)):
+            record["confidence"] = round(float(item["confidence"]), 3)
+        language = item.get("language")
+        if isinstance(language, str) and language.strip():
+            record["language"] = language.strip().lower()
+        out.append(record)
     return out
 
 

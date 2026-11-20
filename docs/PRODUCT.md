@@ -8,9 +8,13 @@ product
 
 People who need a reliable desktop transcription workstation: live microphone transcription, uploaded audio transcription, AI cleanup, local history, and fast reuse through global hotkeys, a single recording status capsule, and auto-paste.
 
+People who give feedback about what is on their screen — reviewing a site, an app or a design, or briefing an AI agent — and need what they say tied to what they point at.
+
 ## Product Purpose
 
 Transcriptor is a desktop voice transcription app for macOS, Windows, and Linux. It exists to turn speech and audio files into usable text with dependable local history, provider choice, clear runtime health, and packaging that can be rebuilt from a single source of truth.
+
+Screen mode (macOS) extends the same recording to the screen: while dictating, the user draws over anything on screen without losing the ability to click through it, and takes screenshots with the drawings. The transcript carries a mark at the moment in speech each line was drawn and each screenshot taken, with the screenshot's path, and the screenshots are kept with the recording itself — one archive entry, one retention rule, one place to find them.
 
 ## Brand Personality
 

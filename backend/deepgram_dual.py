@@ -38,7 +38,9 @@ What this module owns
    user already chose reads the same audio the same way and buys
    nothing for double the money.
 2. The MERGE (``merge_readings``): the rules the measurement validated,
-   with the one defect it found closed (see ``_pairs``).
+   with the one defect it found closed (see ``_pairs``), and one owner
+   for every stretch the two readings hear in different languages (see
+   ``_settle_contested_stretches``).
 3. The FACADE (``DualLiveSession``): two sessions behind the interface
    of one, so the WebSocket handler drives the same object either way.
 """
@@ -205,6 +207,10 @@ class MergedReading:
     filled_from_secondary: int = 0
     filled_from_primary: int = 0
     duplicates_removed: int = 0
+    # Contested stretches (``_settle_contested_stretches``) and which
+    # reading each one went to.
+    contested_to_secondary: int = 0
+    contested_to_primary: int = 0
 
     def covered_end_sec(self) -> float:
         return max((float(w["end"]) for w in self.words), default=0.0)
@@ -239,6 +245,12 @@ def flatten_words(segments: Iterable[dict], source: str) -> list[dict]:
                 "end": float(w.get("end") or 0.0),
                 "source": source,
             }
+            # Deepgram's evidence about the word (``normalize_words``):
+            # what the contested-stretch rule decides from.
+            if isinstance(w.get("confidence"), (int, float)):
+                record["confidence"] = float(w["confidence"])
+            if isinstance(w.get("language"), str) and w["language"]:
+                record["language"] = w["language"]
             if w.get(SPANLESS_WORD_FLAG):
                 record[SPANLESS_WORD_FLAG] = True
             out.append(record)
@@ -474,6 +486,130 @@ def _pairs(
     )
 
 
+def _mean_confidence(words: list[dict]) -> Optional[float]:
+    values = [float(w["confidence"]) for w in words if isinstance(w.get("confidence"), (int, float))]
+    return sum(values) / len(values) if values else None
+
+
+def _contested_runs(primary: list[dict], secondary_language: str) -> list[list[dict]]:
+    """Runs of primary words the primary itself attributes to a language
+    other than the secondary reading's. A word with no language tag, a
+    word in the secondary's language, a clause-level record, or a pause
+    longer than a clause break ends a run."""
+    runs: list[list[dict]] = []
+    run: list[dict] = []
+    for word in primary:
+        language = word.get("language")
+        contested = (
+            isinstance(language, str)
+            and language != secondary_language
+            and not word.get(SPANLESS_WORD_FLAG)
+        )
+        if contested and run and word["start"] - run[-1]["end"] > INTERIM_WORD_GAP_SPLIT_SEC:
+            runs.append(run)
+            run = []
+        if contested:
+            run.append(word)
+        elif run:
+            runs.append(run)
+            run = []
+    if run:
+        runs.append(run)
+    return runs
+
+
+def _settle_contested_stretches(
+    primary: list[dict], secondary: list[dict], secondary_language: str
+) -> tuple[list[dict], list[dict], list[dict], int, int]:
+    """One owner for every stretch the readings hear in different languages.
+
+    The word-by-word rules below (``_pairs`` + ``_resolve``) assume both
+    readings heard the same LANGUAGE and differ only in spelling. Where
+    the multilingual reading decides a stretch is in another language,
+    that assumption is gone, and pairing word by word interleaves two
+    transcripts of the same audio — measured 2026-11-20 on a screen-mode
+    take: ``multi`` heard Russian speech as Lithuanian ("Ir galgenas
+    žamanas tačiau kompiuterių net", tagged ``lt``), ``ru`` heard it
+    correctly, and the merge delivered "Ir galgenas я žamanas tačiau
+    kompiuterių у net" — the Latin rule kept every Lithuanian word and
+    the unpaired Russian ones fell in between.
+
+    A stretch is a run of primary words tagged with a language other than
+    the secondary's (``_contested_runs``). The evidence that decides it is
+    each reading's own confidence over that stretch — not a list of
+    languages: on this user's trilingual recording (2026-09-03 23:49:57)
+    ``multi`` also labelled Russian speech ``uk``, ``bg`` and ``de``, and
+    it labelled the genuinely English "Agents workflow" ``en``. Measured
+    mean confidences, primary vs secondary over the same stretch:
+
+    * Lithuanian hallucination  0.85 vs 0.89 → secondary
+    * German hallucination      0.64 vs 0.95 → secondary
+    * Bulgarian mix             0.80 vs 0.85 → secondary
+    * real English              0.98 vs 0.84 → primary
+
+    A reading cannot be confident about speech in a language it was not
+    reading, which is what makes the comparison the right question.
+
+    * The secondary has no words there → the primary keeps the stretch:
+      it is the only reading of it (the French clause ``ru`` skipped in
+      the September measurement).
+    * Either side carries no confidence at all → undecided, the stretch
+      is left to the word-by-word rules exactly as before.
+    * Otherwise the more confident reading owns the stretch (a tie goes
+      to the secondary — the language the user chose): the other
+      reading's words inside it are dropped, and the owner's words are
+      SETTLED — final, kept out of the word-by-word pairing, because that
+      pairing would otherwise match a settled word against a neighbour
+      just outside the stretch and drop the neighbour (measured: "Да,"
+      lost to "workflow." once ``ru``'s own "workflow." was gone).
+
+    Returns the unsettled remainder of each reading, the settled words,
+    and how many stretches went to each reading.
+    """
+    to_secondary = 0
+    to_primary = 0
+    removed_primary: set[int] = set()
+    removed_secondary: set[int] = set()
+    settled: list[dict] = []
+    for run in _contested_runs(primary, secondary_language):
+        start, end = run[0]["start"], run[-1]["end"]
+        # A word belongs to the stretch its midpoint falls in, half-open
+        # [start, end): no overlap threshold to tune, and a word that only
+        # grazes an edge (the "Да," after "Agents workflow.") stays out.
+        rivals = [
+            w for w in secondary
+            if not w.get(SPANLESS_WORD_FLAG) and start <= (w["start"] + w["end"]) / 2 < end
+        ]
+        if not rivals:
+            continue
+        primary_conf = _mean_confidence(run)
+        secondary_conf = _mean_confidence(rivals)
+        if primary_conf is None or secondary_conf is None:
+            continue
+        removed_primary.update(id(w) for w in run)
+        removed_secondary.update(id(w) for w in rivals)
+        if secondary_conf >= primary_conf:
+            settled.extend(rivals)
+            to_secondary += 1
+        else:
+            settled.extend(run)
+            to_primary += 1
+        logger.info(
+            "dual-stream contested %.2f-%.2fs %s(%s)=%.3f vs %s=%.3f → %s",
+            start, end,
+            run[0].get("source", "primary"), run[0].get("language", "?"), primary_conf,
+            secondary_language, secondary_conf,
+            secondary_language if secondary_conf >= primary_conf else run[0].get("source", "primary"),
+        )
+    return (
+        [w for w in primary if id(w) not in removed_primary],
+        [w for w in secondary if id(w) not in removed_secondary],
+        settled,
+        to_secondary,
+        to_primary,
+    )
+
+
 def _resolve(primary_word: dict, secondary_word: dict) -> dict:
     """Which spelling wins when both readings heard the same moment.
 
@@ -609,8 +745,12 @@ def merge_readings(
     # that arrived without word timings cannot be merged word by word,
     # so exactly one reading owns the ground it covers.
     primary, secondary = _reconcile_spanless(primary, secondary)
+    primary, secondary, settled, contested_to_secondary, contested_to_primary = (
+        _settle_contested_stretches(primary, secondary, secondary_source)
+    )
     paired, only_primary, only_secondary = _pairs(primary, secondary)
     merged = [_resolve(pw, sw) for pw, sw in paired]
+    merged.extend(dict(w) for w in settled)
     merged.extend(dict(w) for w in only_primary)
     merged.extend(dict(w) for w in only_secondary)
     merged.sort(key=lambda w: (w["start"], w["end"]))
@@ -624,6 +764,8 @@ def merge_readings(
         filled_from_secondary=len(only_secondary),
         filled_from_primary=len(only_primary),
         duplicates_removed=duplicates,
+        contested_to_secondary=contested_to_secondary,
+        contested_to_primary=contested_to_primary,
     )
 
 
@@ -1002,7 +1144,8 @@ class DualLiveSession:
         self._last_merged = merged
         logger.info(
             "dual-stream merge: %s=%d words %s=%d words merged=%d "
-            "filled_from_%s=%d filled_from_%s=%d dups_removed=%d",
+            "filled_from_%s=%d filled_from_%s=%d dups_removed=%d "
+            "contested_to_%s=%d contested_to_%s=%d",
             self._primary_language,
             merged.primary_word_count,
             self._secondary_language,
@@ -1013,6 +1156,10 @@ class DualLiveSession:
             self._primary_language,
             merged.filled_from_primary,
             merged.duplicates_removed,
+            self._secondary_language,
+            merged.contested_to_secondary,
+            self._primary_language,
+            merged.contested_to_primary,
         )
         streamed_sec = max(
             float(primary_result.get("streamedSec") or 0.0),
@@ -1063,6 +1210,8 @@ class DualLiveSession:
         stats["dual_filled_from_secondary"] = merged.filled_from_secondary
         stats["dual_filled_from_primary"] = merged.filled_from_primary
         stats["dual_duplicates_removed"] = merged.duplicates_removed
+        stats["dual_contested_to_secondary"] = merged.contested_to_secondary
+        stats["dual_contested_to_primary"] = merged.contested_to_primary
         envelope["stats"] = stats
         return envelope
 

@@ -97,6 +97,14 @@ import {
 } from "./cli-section";
 import { smartRecordingTitle } from "./recording-title";
 import {
+  annotateTranscript,
+  parseScreenManifest,
+  screenMarksFromManifest,
+  screenSessionDurationMs,
+  wordStartsFromSegments,
+  type ScreenMark,
+} from "./screen-annotations";
+import {
   UPLOAD_QUEUE_RESTORE_FAILED_STATUS,
   decideUploadQueueRestore,
   shouldDropLegacyUploadQueueSnapshot,
@@ -239,6 +247,8 @@ interface AppConfig {
       remote_model_deepgram?: string;
       shortcut_record?: string;
       shortcut_paste?: string;
+      shortcut_screen?: string;
+      shortcut_screen_shot?: string;
       /**
        * Live-tab speaker diarization. Its two neighbours in the same
        * popover (``auto_transcribe``, ``live_preview``) have always been
@@ -345,6 +355,12 @@ interface LatestSavedAudioState {
 interface SavedRecordingRef {
   name: string;
   archiveDir: string;
+  /**
+   * Screen mode: the take's manifest after the backend moved its
+   * screenshots beside the recording (paths point at their archive home).
+   * Absent for every other save.
+   */
+  screensManifest?: unknown;
 }
 
 interface LoadRecordingsOptions {
@@ -360,6 +376,9 @@ interface OpenRecordingOptions {
 const RECORDING_COLLECTIONS = {
   live: "live",
   uploads: "uploads",
+  // Screen-mode takes (drawing + screenshots); the backend keeps the
+  // audio of the newest five.
+  screen: "screen",
 } as const;
 type RecordingCollection = typeof RECORDING_COLLECTIONS[keyof typeof RECORDING_COLLECTIONS];
 
@@ -538,10 +557,20 @@ type LiveStatusSnapshot = {
 };
 type ShortcutBridgeAction = "capture-start" | "capture-cancel" | "update";
 type ShortcutPair = { record: string; paste: string };
+// Every hotkey slot. ``screen`` / ``screenShot`` are screen mode's
+// (macOS only) and are empty where the platform has no default.
+type ShortcutId = "record" | "paste" | "screen" | "screenShot";
+type ShortcutSet = Record<ShortcutId, string>;
+const SHORTCUT_SLOTS: ReadonlyArray<{ id: ShortcutId; buttonId: string; label: string }> = [
+  { id: "record", buttonId: "shortcutRecord", label: "Record" },
+  { id: "paste", buttonId: "shortcutPaste", label: "Paste" },
+  { id: "screen", buttonId: "shortcutScreen", label: "Screen mode" },
+  { id: "screenShot", buttonId: "shortcutScreenShot", label: "Screenshot" },
+];
 type ShortcutDefaultsManifest = {
   platformDefaults: {
-    darwin: ShortcutPair;
-    default: ShortcutPair;
+    darwin: ShortcutPair & { screen?: string; screenShot?: string };
+    default: ShortcutPair & { screen?: string; screenShot?: string };
   };
   legacy: {
     unpressablePaste: string;
@@ -634,6 +663,9 @@ declare global {
     __transcriptorShortcutStatus?: {
       record?: { active?: string; desired?: string; error?: string };
       paste?: { active?: string; desired?: string; error?: string };
+      screen?: { active?: string; desired?: string; error?: string };
+      screenShot?: { active?: string; desired?: string; error?: string };
+      screenModeSupported?: boolean;
       macFnState?: boolean | null;
       platform?: string;
     };
@@ -709,6 +741,16 @@ declare global {
         final: boolean;
         source: string;
       }) => boolean;
+      /**
+       * Screen mode: end the main-process side of a stopping take and
+       * get back its manifest (screenshots + stroke times). See
+       * desktop/preload.js.
+       */
+      screenFinish?: (payload: { id: string; discard: boolean }) => Promise<{
+        ok: boolean;
+        manifest?: unknown;
+        error?: string;
+      }>;
       /**
        * "The machine is going to sleep, or the screen is locking."
        *
@@ -6072,6 +6114,8 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
     remote_model_deepgram: (uiModelByGroup.deepgram || remoteModelByProvider.deepgram || "").trim() || DEFAULT_DEEPGRAM_AUDIO_MODEL,
     shortcut_record: currentShortcuts.record,
     shortcut_paste: currentShortcuts.paste,
+    shortcut_screen: currentShortcuts.screen,
+    shortcut_screen_shot: currentShortcuts.screenShot,
     // Upload tab — mirrors current DOM values. Optional-chained because
     // setupUploadView may not have run yet on a page that loaded
     // without the Upload section (defensive against future view splits).
@@ -6089,16 +6133,24 @@ const _isMacRenderer = (() => {
         || /Mac OS X/.test(navigator.userAgent || "");
   } catch { return false; }
 })();
-const DEFAULT_SHORTCUTS = _isMacRenderer
+const PLATFORM_SHORTCUT_DEFAULTS = _isMacRenderer
   ? __SHORTCUT_DEFAULTS__.platformDefaults.darwin
   : __SHORTCUT_DEFAULTS__.platformDefaults.default;
-let currentShortcuts = { ...DEFAULT_SHORTCUTS };
+const DEFAULT_SHORTCUTS: ShortcutSet = {
+  record: PLATFORM_SHORTCUT_DEFAULTS.record,
+  paste: PLATFORM_SHORTCUT_DEFAULTS.paste,
+  screen: PLATFORM_SHORTCUT_DEFAULTS.screen || "",
+  screenShot: PLATFORM_SHORTCUT_DEFAULTS.screenShot || "",
+};
+let currentShortcuts: ShortcutSet = { ...DEFAULT_SHORTCUTS };
 let activeShortcutBtn: HTMLButtonElement | null = null;
-function postShortcutBridgeMessage(action: ShortcutBridgeAction, shortcuts: ShortcutPair = currentShortcuts): void {
+function postShortcutBridgeMessage(action: ShortcutBridgeAction, shortcuts: ShortcutSet = currentShortcuts): void {
   const payload = encodeURIComponent(JSON.stringify({
     action,
     record: shortcuts.record,
     paste: shortcuts.paste,
+    screen: shortcuts.screen,
+    screenShot: shortcuts.screenShot,
     nonce: `${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
   }));
   postTitleBridgeMessage(TITLE_BRIDGE_PREFIX.shortcuts, payload);
@@ -6227,6 +6279,14 @@ function keyEventToAccelerator(e: KeyboardEvent): string | null {
   return parts.join("+");
 }
 
+function shortcutSlot(id: string | undefined): (typeof SHORTCUT_SLOTS)[number] | undefined {
+  return SHORTCUT_SLOTS.find((slot) => slot.id === id);
+}
+
+function updateAllShortcutDisplays(): void {
+  for (const slot of SHORTCUT_SLOTS) updateShortcutDisplay(slot.buttonId, currentShortcuts[slot.id]);
+}
+
 function updateShortcutDisplay(btnId: string, accelerator: string): void {
   const btn = document.getElementById(btnId) as HTMLButtonElement | null;
   if (!btn) return;
@@ -6244,6 +6304,12 @@ function updateShortcutDisplay(btnId: string, accelerator: string): void {
 function refreshShortcutConflictState(): void {
   const status = window.__transcriptorShortcutStatus;
   if (!status) return;
+  // The screen-mode rows exist only where the desktop shell supports it.
+  const screenSupported = status.screenModeSupported === true;
+  for (const fieldId of ["shortcutScreenField", "shortcutScreenShotField"]) {
+    const field = document.getElementById(fieldId);
+    if (field) field.hidden = !screenSupported;
+  }
   // On macOS, detect the "F-keys as media keys" mode. When fnState is
   // explicitly false AND the user kept an F-key accelerator, the OS
   // silently eats the press as Mission Control / Exposé — register
@@ -6251,12 +6317,15 @@ function refreshShortcutConflictState(): void {
   // button with a hint so the user can diagnose.
   const isMacFnCollision = status.platform === "darwin" && status.macFnState === false;
   const isFKeyAccel = (accel: string | undefined): boolean => !!accel && /^F([1-9]|1[0-2])$/.test(accel);
-  for (const id of ["record", "paste"] as const) {
+  for (const slot of SHORTCUT_SLOTS) {
+    const id = slot.id;
     const entry = status[id];
     if (!entry) continue;
-    const btn = document.getElementById(`shortcut${id[0].toUpperCase()}${id.slice(1)}`) as HTMLButtonElement | null;
+    const btn = document.getElementById(slot.buttonId) as HTMLButtonElement | null;
     if (!btn) continue;
-    const active = !!entry.active;
+    // The screenshot key is bound only while screen mode runs, so "not
+    // active" is its normal state at rest, not a conflict.
+    const active = id === "screenShot" ? !entry.error : !!entry.active;
     const desired = entry.desired || "";
     // A shortcut is "conflicted" if (a) registration failed OR (b)
     // registration succeeded but macOS is going to intercept it as a
@@ -6332,8 +6401,8 @@ function stopShortcutRecording(restoreDisplay: boolean, notifyMain = true): void
   if (!activeShortcutBtn) return;
   activeShortcutBtn.classList.remove("recording");
   if (restoreDisplay) {
-    const id = activeShortcutBtn.dataset.shortcutId;
-    const acc = id === "record" ? currentShortcuts.record : currentShortcuts.paste;
+    const slot = shortcutSlot(activeShortcutBtn.dataset.shortcutId);
+    const acc = slot ? currentShortcuts[slot.id] : "";
     const keysSpan = activeShortcutBtn.querySelector(".shortcut-keys");
     if (keysSpan) renderShortcutKeys(keysSpan, acc);
   }
@@ -6380,26 +6449,23 @@ function handleShortcutKeydown(e: KeyboardEvent): void {
   if (!accelerator) return; // Still pressing only modifiers
 
   if (!activeShortcutBtn) return;
-  const id = activeShortcutBtn.dataset.shortcutId;
-  const otherId = id === "record" ? "paste" : "record";
+  const slot = shortcutSlot(activeShortcutBtn.dataset.shortcutId);
+  if (!slot) return;
   // Reject duplicates: if the user rebinds one action to the SAME
-  // accelerator as the other, only one globalShortcut.register call
+  // accelerator as another, only one globalShortcut.register call
   // succeeds (the second overwrites/fails), leaving the first action
   // silently broken. Surface the conflict and revert instead.
-  if (accelerator === currentShortcuts[otherId as "record" | "paste"]) {
+  const taken = SHORTCUT_SLOTS.find((other) => other.id !== slot.id && currentShortcuts[other.id] === accelerator);
+  if (taken) {
     showRecordSessionNotice(
-      `That shortcut is already bound to "${otherId === "record" ? "Record" : "Paste"}". Pick a different combination.`,
+      `That shortcut is already bound to "${taken.label}". Pick a different combination.`,
       "warning",
       6000,
     );
     stopShortcutRecording(true);
     return;
   }
-  if (id === "record") {
-    currentShortcuts.record = accelerator;
-  } else if (id === "paste") {
-    currentShortcuts.paste = accelerator;
-  }
+  currentShortcuts[slot.id] = accelerator;
 
   // Update display
   const keysSpan = activeShortcutBtn.querySelector(".shortcut-keys");
@@ -7127,8 +7193,11 @@ async function loadCfg(): Promise<void> {
     }
     if (rawRecord) currentShortcuts.record = rawRecord;
     if (rawPaste) currentShortcuts.paste = rawPaste;
-    updateShortcutDisplay("shortcutRecord", currentShortcuts.record);
-    updateShortcutDisplay("shortcutPaste", currentShortcuts.paste);
+    // The screen-mode slots postdate every retired pair: nothing to
+    // migrate, the stored value or the platform default.
+    currentShortcuts.screen = String(ui.shortcut_screen || "").trim() || DEFAULT_SHORTCUTS.screen;
+    currentShortcuts.screenShot = String(ui.shortcut_screen_shot || "").trim() || DEFAULT_SHORTCUTS.screenShot;
+    updateAllShortcutDisplays();
     if (didMigrate) {
       // Persist + signal Electron to re-register globalShortcut with
       // the migrated accelerators immediately.
@@ -7513,18 +7582,15 @@ async function handleKeyAction(provider: RemoteProvider): Promise<void> {
 });
 
 // ── Shortcut picker click listeners ─────────────────────────────────────────
-$("shortcutRecord").addEventListener("click", (e) => {
-  e.preventDefault();
-  startShortcutRecording($("shortcutRecord") as HTMLButtonElement);
-});
-$("shortcutPaste").addEventListener("click", (e) => {
-  e.preventDefault();
-  startShortcutRecording($("shortcutPaste") as HTMLButtonElement);
-});
+for (const slot of SHORTCUT_SLOTS) {
+  $(slot.buttonId).addEventListener("click", (e) => {
+    e.preventDefault();
+    startShortcutRecording($(slot.buttonId) as HTMLButtonElement);
+  });
+}
 $("resetShortcutsBtn").addEventListener("click", () => {
   currentShortcuts = { ...DEFAULT_SHORTCUTS };
-  updateShortcutDisplay("shortcutRecord", currentShortcuts.record);
-  updateShortcutDisplay("shortcutPaste", currentShortcuts.paste);
+  updateAllShortcutDisplays();
   // Push to main process for live reload.
   publishShortcutUpdateToMain();
   queueUiPreferencesSave();
@@ -7739,7 +7805,69 @@ function updateRecordingCopyState(): void {
   btn.disabled = !hasText;
 }
 
+// Screen mode: the open recording's screenshots, as object URLs that are
+// revoked whenever the viewer shows something else.
+let recordingViewerScreenUrls: string[] = [];
+
+function clearRecordingViewerScreens(): void {
+  for (const url of recordingViewerScreenUrls) URL.revokeObjectURL(url);
+  recordingViewerScreenUrls = [];
+  const row = $("recordingScreensRow");
+  row.replaceChildren();
+  row.classList.remove("has-expanded");
+  row.hidden = true;
+}
+
+/**
+ * Fill the screenshot strip for an open recording. ``stillCurrent`` is the
+ * viewer's own staleness check: a slow fetch never paints into a viewer
+ * that has moved on to another recording.
+ */
+async function showRecordingViewerScreens(
+  name: string,
+  archiveDir: string,
+  screens: string[],
+  screensDir: string,
+  stillCurrent: () => boolean,
+): Promise<void> {
+  clearRecordingViewerScreens();
+  if (!screens.length) return;
+  const row = $("recordingScreensRow");
+  const params = new URLSearchParams();
+  if (archiveDir) params.set("archive_dir", archiveDir);
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  for (const file of screens) {
+    try {
+      const resp = await fetch(
+        `/api/recordings/${encodeURIComponent(name)}/screens/${encodeURIComponent(file)}${suffix}`,
+        { headers: authHeaders() },
+      );
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const url = URL.createObjectURL(await resp.blob());
+      if (!stillCurrent()) {
+        URL.revokeObjectURL(url);
+        return;
+      }
+      recordingViewerScreenUrls.push(url);
+      const img = document.createElement("img");
+      img.src = url;
+      img.alt = file;
+      img.title = screensDir ? `${screensDir}/${file}` : file;
+      img.setAttribute("role", "listitem");
+      img.addEventListener("click", () => {
+        const expanded = img.classList.toggle("expanded");
+        row.classList.toggle("has-expanded", expanded || !!row.querySelector("img.expanded"));
+      });
+      row.appendChild(img);
+      row.hidden = false;
+    } catch (e) {
+      console.warn(`Screenshot ${file} could not be loaded`, e);
+    }
+  }
+}
+
 function resetRecordingViewer(placeholder: string = UI_COPY.recordings.viewerPlaceholder): void {
+  clearRecordingViewerScreens();
   $("recordingTitleLabel").textContent = UI_COPY.recordings.viewerTitlePlaceholder;
   $("recordingMeta").textContent = "";
   $("recordingContent").setAttribute("aria-busy", "false");
@@ -7755,6 +7883,7 @@ function resetRecordingViewer(placeholder: string = UI_COPY.recordings.viewerPla
 }
 
 function setRecordingViewerLoading(displayName: string, willLoadAudio = false): void {
+  clearRecordingViewerScreens();
   $("recordingTitleLabel").textContent = displayName || "Loading recording";
   $("recordingMeta").textContent = "Loading…";
   $("recordingContent").setAttribute("aria-busy", "true");
@@ -8506,6 +8635,8 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
       has_audio?: boolean;
       audio_name?: string;
       audio_size_bytes?: number;
+      screens?: string[];
+      screens_dir?: string;
     }>(
       "/api/recordings/" + encodeURIComponent(name) + suffix
     );
@@ -8516,6 +8647,17 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
     $("recordingContent").setAttribute("aria-busy", "false");
     $("recordingContent").setAttribute("data-placeholder", UI_COPY.resultPlaceholder);
     $("recordingContent").textContent = r.display_text || r.content || "";
+    const isStillThisRecording = (): boolean =>
+      requestSeq === recordingOpenRequestSeq && selectedRecordingKey() === requestKey;
+    if (!(options.silent && previousSelectedKey === requestKey && recordingViewerScreenUrls.length)) {
+      void showRecordingViewerScreens(
+        name,
+        String(r.archive_dir || effectiveArchiveDir).trim(),
+        Array.isArray(r.screens) ? r.screens.filter((f) => typeof f === "string") : [],
+        String(r.screens_dir || ""),
+        isStillThisRecording,
+      );
+    }
     const player = $("recordingAudio") as HTMLAudioElement;
     if (r.has_audio) {
       const keepExistingAudio = options.silent && previousSelectedKey === requestKey && !!player.getAttribute("src");
@@ -8609,6 +8751,10 @@ async function saveRecordingText(opts: {
    *  closing the race window between a successful save and the
    *  separate discardLiveRecovery() call in the frontend. */
   liveSessionId?: string;
+  /** Screen mode: the staged session the backend adopts beside this recording. */
+  screenSessionId?: string;
+  /** Screen mode: epoch ms of the first audio sample, archived with the session. */
+  screenAudioStartedAt?: number;
   refreshList?: boolean;
 }): Promise<SavedRecordingRef> {
   const hasArchiveDirOption = Object.prototype.hasOwnProperty.call(opts, "archiveDir");
@@ -8633,6 +8779,7 @@ async function saveRecordingText(opts: {
   // transcripts are forever). The count comes back in every save
   // response; surface it so the deletion is never silent.
   let prunedAudioCount = 0;
+  let screensManifest: unknown = undefined;
   if (audioFile) {
     const fd = new FormData();
     fd.append("file", audioFile, audioFile.name || "recording.wav");
@@ -8647,12 +8794,19 @@ async function saveRecordingText(opts: {
     fd.set("model", opts.model);
     fd.set("language", opts.language);
     if (opts.liveSessionId) fd.set("live_session_id", opts.liveSessionId);
+    if (opts.screenSessionId) {
+      fd.set("screen_session_id", opts.screenSessionId);
+      if (opts.screenAudioStartedAt && opts.screenAudioStartedAt > 0) {
+        fd.set("screen_audio_started_at", String(opts.screenAudioStartedAt));
+      }
+    }
     const r = await fetch("/api/recordings/save-with-audio", { method: "POST", body: fd, headers: authHeaders() });
     if (!r.ok) throw new Error(await parseError(r));
-    const js = (await r.json()) as { name?: string; archive_dir?: string; pruned_audio_count?: number };
+    const js = (await r.json()) as { name?: string; archive_dir?: string; pruned_audio_count?: number; screens?: unknown };
     savedName = String(js.name || existingName || "").trim();
     savedArchiveDir = String(js.archive_dir || archiveDir || "").trim();
     prunedAudioCount = Math.max(0, Math.trunc(Number(js.pruned_audio_count) || 0));
+    screensManifest = js.screens ?? undefined;
   } else if (audioSourcePath) {
     const payload: Record<string, unknown> = {
       source_path: audioSourcePath,
@@ -8711,13 +8865,14 @@ async function saveRecordingText(opts: {
   // only when trying to re-listen to a previous take.
   if (prunedAudioCount > 0) {
     setStatus(
-      `Saved. Audio removed from ${prunedAudioCount} older recording${prunedAudioCount === 1 ? "" : "s"} (storage policy keeps audio for the latest recording only).`,
+      `Saved. The storage policy removed ${prunedAudioCount} older audio file${prunedAudioCount === 1 ? "" : "s"} or screenshot folder${prunedAudioCount === 1 ? "" : "s"}; transcripts are kept.`,
       "info",
     );
   }
   return {
     name: savedName,
     archiveDir: savedArchiveDir,
+    ...(screensManifest !== undefined ? { screensManifest } : {}),
   };
 }
 
@@ -8956,6 +9111,16 @@ $("retranscribeBtn").addEventListener("click", async () => {
     }
 
     if (text) {
+      // A screen-mode recording's transcript carries its marks, whichever
+      // pass produced it: placed from the archived manifest by share of
+      // the recording's duration (a re-transcription has no live
+      // segment timings). The upscale below still rewrites only the
+      // spoken text.
+      const spokenText = text;
+      const screen = await screenMarksForSavedRecording(audioState.savedName, audioState.archiveDir || "");
+      if (screen.marks.length) {
+        text = annotateTranscript(spokenText, screen.marks, { durationMs: screen.durationMs });
+      }
       // Session-gated writes: if the user started a new live recording
       // while we were transcribing, the new session owns `finalOutput`
       // and we must NOT overwrite it.
@@ -8972,8 +9137,8 @@ $("retranscribeBtn").addEventListener("click", async () => {
           name: audioState.savedName,
           archiveDir: audioState.archiveDir || "",
           requireExisting: true,
-          title: smartRecordingTitle(text, audioState.savedName || "Recording"),
-          sourceText: text,
+          title: smartRecordingTitle(spokenText, audioState.savedName || "Recording"),
+          sourceText: spokenText,
           transcriptText: text,
           provider: usedProvider,
           model: usedProvider === "deepgram"
@@ -8995,7 +9160,7 @@ $("retranscribeBtn").addEventListener("click", async () => {
       // status ownership here so a save warning is not overwritten by
       // the upscale helper's generic "Done" status.
       try {
-        await runUpscaleIfEnabled(text, capturedToken, { setDoneStatus: false });
+        await runUpscaleIfEnabled(spokenText, capturedToken, { setDoneStatus: false });
       } catch (upscaleErr) {
         // runUpscaleIfEnabled handles its own UI error states;
         // swallow here so retranscribe's overall success status is
@@ -9398,6 +9563,62 @@ let timer: number | null = null;
 let vuIntervalId: ReturnType<typeof setInterval> | null = null;
 let pipelineFailsafeId: ReturnType<typeof setTimeout> | null = null;
 let startAt = 0;
+// What the current take is: an ordinary voice recording, or a screen-mode
+// one (started by its own hotkey; main owns the overlays and screenshots
+// under ``liveScreenSessionId`` and hands them back at stop).
+type LiveRecordingMode = "voice" | "screen";
+let liveRecordingMode: LiveRecordingMode = "voice";
+let liveScreenSessionId = "";
+
+function liveRecordingCollection(mode: LiveRecordingMode): RecordingCollection {
+  return mode === "screen" ? RECORDING_COLLECTIONS.screen : RECORDING_COLLECTIONS.live;
+}
+
+/**
+ * Ask main to end the screen-mode session of the take that is stopping.
+ * Never throws: a failure means "no marks", not "no transcript".
+ */
+/**
+ * The screen marks of a recording already in the archive, from its
+ * archived manifest — empty for any recording that is not a screen-mode
+ * one. Every transcript produced for a saved recording goes through this
+ * (Re-transcribe today), so a transcript of a screen recording never
+ * loses its marks.
+ */
+async function screenMarksForSavedRecording(
+  name: string,
+  archiveDir: string,
+): Promise<{ marks: ScreenMark[]; durationMs: number }> {
+  const none = { marks: [], durationMs: 0 };
+  if (!name) return none;
+  try {
+    const params = new URLSearchParams();
+    if (archiveDir) params.set("archive_dir", archiveDir);
+    const suffix = params.toString() ? `?${params.toString()}` : "";
+    const r = await apiGet<{ screens_manifest?: unknown }>("/api/recordings/" + encodeURIComponent(name) + suffix);
+    const manifest = parseScreenManifest(r.screens_manifest);
+    if (!manifest) return none;
+    return { marks: screenMarksFromManifest(manifest), durationMs: screenSessionDurationMs(manifest) };
+  } catch (e) {
+    console.warn("[trace screen] archived marks unavailable", e);
+    return none;
+  }
+}
+
+async function finishScreenSession(id: string, discard: boolean): Promise<ReturnType<typeof parseScreenManifest>> {
+  if (!id || typeof window.transcriptor?.screenFinish !== "function") return null;
+  try {
+    const out = await window.transcriptor.screenFinish({ id, discard });
+    if (!out?.ok) {
+      console.warn(`[trace screen] finish not ok: ${out?.error || "unknown"}`);
+      return null;
+    }
+    return parseScreenManifest(out.manifest);
+  } catch (e) {
+    console.warn("[trace screen] finish failed", e);
+    return null;
+  }
+}
 /**
  * When the renderer was ASKED to record — the hotkey press or the
  * toggle, as received, before any device is opened.
@@ -11098,7 +11319,9 @@ function micErrorTag(e: unknown): string {
   return [name, msg].filter(Boolean).join(": ");
 }
 
-async function startLive(): Promise<void> {
+async function startLive(
+  request: { mode?: LiveRecordingMode; screenSessionId?: string } = {},
+): Promise<void> {
   // Single-flight guard. isBusy is only set AFTER the first await below
   // (ensureRecordingsArchiveReady), which means two concurrent startLive
   // calls — e.g. rapid hotkey double-press, hotkey + button click — could
@@ -11109,6 +11332,8 @@ async function startLive(): Promise<void> {
   // Set the in-flight flag synchronously BEFORE any await.
   if (isBusy || stopTransitionInFlight || startLiveInFlight) return;
   startLiveInFlight = true;
+  liveRecordingMode = request.mode === "screen" && request.screenSessionId ? "screen" : "voice";
+  liveScreenSessionId = liveRecordingMode === "screen" ? String(request.screenSessionId) : "";
   // The request clock (§4.9). Set before anything can await, so it is
   // the moment the renderer received the toggle, not the moment the
   // microphone answered.
@@ -11246,7 +11471,7 @@ async function startLive(): Promise<void> {
       language: activeLiveSessionSnapshot.language,
       session_id: activeLiveSessionId,
       archive_dir: activeLiveArchiveDir,
-      recording_collection: RECORDING_COLLECTIONS.live,
+      recording_collection: liveRecordingCollection(liveRecordingMode),
       diarize: readDiarizeEnabled() ? "true" : "false",
     });
     if (sessionWsMode === "deepgram-stream") {
@@ -11754,6 +11979,18 @@ async function stopLive(
   try {
   const recordingId = currentRecordingId;
   stoppedRecordingId = recordingId;
+  // Screen mode: fixed for this take now, before any await lets a new
+  // start overwrite the module state. The session is ended right away so
+  // the overlays leave the screen with the stop, not after transcription;
+  // its manifest is awaited only where the transcript is composed.
+  const recordingMode = liveRecordingMode;
+  const recordingCollection = liveRecordingCollection(recordingMode);
+  const recordingClockStartAt = startAt;
+  const screenSessionPromise = recordingMode === "screen"
+    ? finishScreenSession(liveScreenSessionId, discarding)
+    : Promise.resolve(null);
+  liveRecordingMode = "voice";
+  liveScreenSessionId = "";
   const liveSessionId = activeLiveSessionId;
   const sessionUiToken = liveSessionId;
   stoppedSessionToken = sessionUiToken;
@@ -12408,6 +12645,13 @@ async function stopLive(
 
   let persistedRecordingName = "";
   let persistedRecordingArchiveDir = "";
+  // Screen mode: the session is complete (main took the last screenshot
+  // and wrote events.json) before the audio is saved, because the save
+  // is what moves the screenshots beside the recording. The marks are
+  // then written from the archived manifest, so the paths in the
+  // transcript are the screenshots' permanent ones.
+  const stagedScreenManifest = await screenSessionPromise;
+  let screenManifest = stagedScreenManifest;
   const provisionalTitle = _smartTitle(sourceLiveText);
   if (savedAudioFile) {
     // Two-attempt save: first with the configured archive dir, then
@@ -12430,13 +12674,16 @@ async function stopLive(
           provider: metadataProvider,
           model: modelValue,
           language: languageValue,
-          recordingCollection: RECORDING_COLLECTIONS.live,
+          recordingCollection,
           audioFile: savedAudioFile,
           liveSessionId: liveSessionId,
+          screenSessionId: stagedScreenManifest?.id || undefined,
+          screenAudioStartedAt: stagedScreenManifest ? recordingClockStartAt : undefined,
           refreshList: false,
         });
         persistedRecordingName = persisted.name;
         persistedRecordingArchiveDir = persisted.archiveDir;
+        screenManifest = parseScreenManifest(persisted.screensManifest) || stagedScreenManifest;
         setCurrentRecordingAudio(savedAudioFile, persistedRecordingName, persistedRecordingArchiveDir, sessionUiToken);
         // 1.1.25: best-effort recovery discard. The save above ALREADY
         // succeeded; a 5xx from /api/live-recovery/discard does not
@@ -12544,7 +12791,7 @@ async function stopLive(
         provider: metadataProvider,
         model: modelValue,
         language: languageValue,
-        recordingCollection: RECORDING_COLLECTIONS.live,
+        recordingCollection,
       });
     } catch (e) {
       if (isArchiveMutationConflict(e)) {
@@ -12591,7 +12838,7 @@ async function stopLive(
         provider: metadataProvider,
         model: modelValue,
         language: languageValue,
-        recordingCollection: RECORDING_COLLECTIONS.live,
+        recordingCollection,
       });
     } catch (e) {
       if (isArchiveMutationConflict(e)) {
@@ -12637,7 +12884,7 @@ async function stopLive(
         provider: metadataProvider,
         model: modelValue,
         language: languageValue,
-        recordingCollection: RECORDING_COLLECTIONS.live,
+        recordingCollection,
       });
     } catch (e) {
       if (isArchiveMutationConflict(e)) {
@@ -12694,7 +12941,7 @@ async function stopLive(
         provider,
         model: modelValue,
         language: languageValue,
-        recordingCollection: RECORDING_COLLECTIONS.live,
+        recordingCollection,
       });
     } catch (e) {
       if (isArchiveMutationConflict(e)) {
@@ -13192,11 +13439,39 @@ async function stopLive(
       `source=${transcriptSource} wsFramesNeverSent=${wsFramesNeverSent} ` +
       `${describeLiveFinalStats(finalEnvelopeStats)}`,
     );
+    // Screen mode: the strokes and screenshots go into the transcript at
+    // the moments they happened in speech (./screen-annotations). The
+    // envelope's segments time the text they describe; any other source
+    // is placed by its share of the recording's duration.
+    const screenMarks: ScreenMark[] = screenManifest
+      ? screenMarksFromManifest(screenManifest, recordingClockStartAt)
+      : [];
+    const plainTranscriptRaw = transcriptRaw;
+    const screenWordStartsMs = transcriptSource === "envelope"
+      ? wordStartsFromSegments(liveFinalSlots.get(sessionUiToken)?.envelope?.segments || [])
+      : [];
+    const withScreenMarks = (text: string, timed: boolean): string => (
+      screenMarks.length
+        ? annotateTranscript(text, screenMarks, {
+          wordStartsMs: timed ? screenWordStartsMs : undefined,
+          durationMs: recordedMs,
+        })
+        : text
+    );
+    if (screenMarks.length) {
+      transcriptRaw = withScreenMarks(plainTranscriptRaw, true);
+      console.log(
+        `[trace screen] marks=${screenMarks.length} session=${screenManifest?.id || ""} ` +
+        `timed=${screenWordStartsMs.length > 0}`,
+      );
+    }
     const transcriptReadyLatencyMs = performance.now() - transcribeStartedAt;
     const noSpeechFinalStatus = "Recording completed, no speech detected.";
     const finalUiText = transcriptRaw || noSpeechFinalStatus;
     patchCurrentRecordingSummary({
-      title: transcriptRaw ? _smartTitle(transcriptRaw) : provisionalTitle,
+      // Titles come from what was SAID: a screen recording's transcript
+      // opens with its marks, which say nothing about the recording.
+      title: plainTranscriptRaw ? _smartTitle(plainTranscriptRaw) : provisionalTitle,
       status: transcriptRaw
         ? "Final transcript is ready. Saving audio and transcript."
         : noSpeechFinalStatus,
@@ -13222,12 +13497,19 @@ async function stopLive(
     }
     let pasteReadyText = "";
     if (transcriptRaw) {
-      transcriptForPaste = await runLivePasteUpscaleWithinSla(
-        transcriptRaw,
-        sessionUiToken,
-        { setDoneStatus: false },
-      );
-      pasteReadyText = transcriptForPaste || transcriptRaw;
+      // The upscale rewrites the spoken text only; the screen marks are
+      // put back into its result by the same placement rule, so they
+      // never pass through the model.
+      transcriptForPaste = plainTranscriptRaw
+        ? await runLivePasteUpscaleWithinSla(
+          plainTranscriptRaw,
+          sessionUiToken,
+          { setDoneStatus: false },
+        )
+        : "";
+      pasteReadyText = transcriptForPaste
+        ? withScreenMarks(transcriptForPaste, transcriptForPaste === plainTranscriptRaw)
+        : transcriptRaw;
       publishRecordingFinalSignal({
         recordingId,
         signalText: pasteReadyText,
@@ -13239,7 +13521,7 @@ async function stopLive(
     setStatusScoped(sessionUiToken, "Done");
     // saveRecordingText is non-blocking for recordings list reload.
     try {
-      title = _smartTitle(transcriptRaw);
+      title = plainTranscriptRaw ? _smartTitle(plainTranscriptRaw) : provisionalTitle;
       await saveRecordingText({
         name: persistedRecordingName,
         archiveDir: persistedRecordingArchiveDir,
@@ -13250,7 +13532,7 @@ async function stopLive(
         provider,
         model: modelValue,
         language: languageValue,
-        recordingCollection: RECORDING_COLLECTIONS.live,
+        recordingCollection,
       });
     } catch (e) {
       if (isArchiveMutationConflict(e)) {
@@ -13299,7 +13581,7 @@ async function stopLive(
         provider,
         model: modelValue,
         language: languageValue,
-        recordingCollection: RECORDING_COLLECTIONS.live,
+        recordingCollection,
       });
     } catch (saveError) {
       if (isArchiveMutationConflict(saveError)) {
@@ -13421,11 +13703,16 @@ document.getElementById("recordToggleBtn")?.addEventListener("click", () => {
   postTitleBridgeMessage(TITLE_BRIDGE_PREFIX.recordToggle, String(Date.now()));
 });
 
-window.addEventListener("transcriptor-hotkey-toggle", () => {
+window.addEventListener("transcriptor-hotkey-toggle", (ev) => {
   if (isRecording) {
     void stopLive(shouldAutoTranscribe(), { discard: recordingIsTooShortToKeep() });
   } else {
-    void startLive();
+    // Main says which kind of take this press starts (voice or screen).
+    const detail = (ev as CustomEvent<{ mode?: string; screenSessionId?: string }>).detail || {};
+    void startLive({
+      mode: detail.mode === "screen" ? "screen" : "voice",
+      screenSessionId: String(detail.screenSessionId || ""),
+    });
   }
 });
 

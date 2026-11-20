@@ -4300,3 +4300,30 @@ canvas {
   color: inherit;
   text-decoration: underline;
 }
+
+/* Screen mode: a recording's screenshots in History. Thumbnails in a row;
+   a click opens one at full width, a second click closes it. */
+.recording-screens {
+  display: flex;
+  gap: 8px;
+  padding: 8px 12px;
+  overflow-x: auto;
+  flex-wrap: nowrap;
+}
+.recording-screens img {
+  height: 72px;
+  width: auto;
+  flex: 0 0 auto;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--control-border);
+  cursor: zoom-in;
+}
+.recording-screens img.expanded {
+  height: auto;
+  max-width: 100%;
+  flex: 1 1 100%;
+  cursor: zoom-out;
+}
+.recording-screens.has-expanded {
+  flex-wrap: wrap;
+}

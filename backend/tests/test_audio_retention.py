@@ -136,6 +136,23 @@ class PolicyTableTests(AudioRetentionTestBase):
         self.assertEqual(policy.max_items, 0)
         self.assertTrue(policy.enabled)
 
+    def test_screen_sessions_keep_the_newest_five_and_have_no_age_limit(self) -> None:
+        policy = self.main.AUDIO_RETENTION_POLICIES[self.main.RECORDING_COLLECTION_SCREEN]
+        self.assertEqual(policy.max_items, 5)
+        self.assertEqual(policy.max_age_sec, 0)
+        self.assertEqual(
+            self.main._audio_retention_policy_for_dir(
+                self.root / self.main.RECORDING_COLLECTION_DIR_NAMES[
+                    self.main.RECORDING_COLLECTION_SCREEN
+                ]
+            ),
+            policy,
+        )
+        self.assertEqual(
+            self.main._normalize_recording_collection("screen"),
+            self.main.RECORDING_COLLECTION_SCREEN,
+        )
+
     def test_a_policy_with_no_limits_is_disabled(self) -> None:
         self.assertFalse(self.main.AudioRetentionPolicy().enabled)
 

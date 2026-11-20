@@ -1,0 +1,45 @@
+{
+  "_comment": "Screen mode's cross-process contract. The desktop shell (desktop/screen-mode.js) names sessions and screenshots and writes events.json; the backend (backend/screen_sessions.py) adopts, serves, keeps and deletes them; the renderer (frontend/src/screen-annotations.ts) reads the manifest. Each side's suite checks its constants against this file, so a rename on one side fails the build instead of silently orphaning screenshots.",
+  "stagingDirName": "screen-sessions",
+  "screensDirSuffix": ".screens",
+  "eventsFileName": "events.json",
+  "sessionIdPattern": "^screen-\\d{8}-\\d{6}-\\d{3}$",
+  "screenshotNamePattern": "^shot-\\d{2,}(-display\\d+)?\\.png$",
+  "exampleSessionId": "screen-20261120-100000-000",
+  "exampleScreenshotNames": [
+    "shot-01.png",
+    "shot-12-display2.png"
+  ],
+  "manifest": {
+    "version": 1,
+    "id": "screen-20261120-100000-000",
+    "dir": "/data/screen-sessions/screen-20261120-100000-000",
+    "startedAt": 1795165500000,
+    "events": [
+      {
+        "type": "stroke",
+        "at": 1795165512400,
+        "endedAt": 1795165513000,
+        "color": "#ff3b30",
+        "shot": 1,
+        "xPct": 82,
+        "yPct": 14
+      },
+      {
+        "type": "shot",
+        "at": 1795165515000,
+        "shot": 1,
+        "files": [
+          "/data/screen-sessions/screen-20261120-100000-000/shot-01.png"
+        ],
+        "strokes": 1,
+        "reason": "capsule"
+      }
+    ],
+    "endedAt": 1795165530000
+  },
+  "archivedManifest": {
+    "_comment": "What the backend adds when it adopts a session beside its recording: the epoch ms of the recording's first audio sample. Marks are placed from this, on every transcript of the recording.",
+    "audioStartedAt": 1795165500300
+  }
+}

@@ -121,6 +121,10 @@ On Wayland use `wtype` / `ydotool` instead of `xdotool`.
 |--------|-------|-----------------|
 | Record / stop | `Option`+`←` | `Ctrl`+`Alt`+`Shift`+`R` |
 | Paste the last transcript again | `Option`+`Shift`+`V` | `Ctrl`+`Alt`+`Shift`+`V` |
+| Screen mode (record with drawing and screenshots) | `Option`+`→` | — |
+| Screenshot in screen mode | `Option`+`↓` | — |
+
+**Screen mode** (macOS): a red frame around the screen, a colour palette above the capsule, and a screen button right of the capsule timer. Press and drag draws; a plain click still reaches the app underneath, so you can keep browsing while you talk. The screen button (or `Option`+`↓`) saves a screenshot with the drawings and clears the screen; the recording goes on. The transcript gets a mark — with the screenshot's path — at the moment in speech each line was drawn and each screenshot taken. A trackpad double-tap-and-drag draws too. Screenshots are saved beside the recording (`<name>.screens/`) and shown in History under the player; screen-mode recordings (`Screen Sessions` collection) keep audio and screenshots for the newest 5, transcripts always. Needs Accessibility (drawing) and Screen Recording (screenshots).
 
 Rebind them under **Settings → Shortcuts**. A red highlight means another
 application already owns that combination.

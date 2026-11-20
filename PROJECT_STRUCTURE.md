@@ -16,7 +16,7 @@ Voice Transcriptor/
 ├── requirements-gigaam.txt        # optional GigaAM engine stack (ENABLE_GIGAAM opt-in)
 ├── requirements.runtime-lock.txt  # release-runtime transitive wheel constraints
 ├── .python-version                # Python version the shipped runtime is built with (SSOT)
-├── contracts/                     # cross-domain wire fixtures: live-final-envelope.json, live-defaults.json (fail the build on drift)
+├── contracts/                     # cross-domain wire fixtures: live-final-envelope.json, live-defaults.json, screen-session.json (fail the build on drift)
 ├── BUGS_AUDIT.md                  # running audit ledger (2026-08-23 wave)
 ├── BUGS_AUDIT_2026-08-24.md       # dated audit waves + fix statuses (root per audit charter)
 ├── BUGS_AUDIT_2026-09-03.md       # dated audit waves + fix statuses (root per audit charter)
@@ -61,6 +61,7 @@ backend/
 ├── deepgram_dual.py           # dual-stream Auto SSOT: second Deepgram session + word-timestamp merge of the two readings
 ├── deepgram_language.py       # what a configured language means per Deepgram endpoint (live resolve vs REST detect_language)
 ├── deepgram_recovery.py       # re-decode of uncovered spans before the final envelope is sent (one owner of recovery)
+├── screen_sessions.py         # screen-mode screenshots SSOT: staging → `<stem>.screens` beside the recording, serving, orphan sweep (retention shares the audio rule)
 ├── live_envelope.py           # the `final` WebSocket envelope: one shape, one constructor
 ├── async_tasks.py             # ending started asyncio tasks without ending the awaiting coroutine (one owner of the pattern)
 ├── http_retry.py              # remote request retry handling
@@ -103,6 +104,7 @@ frontend/
     ├── capture-warm.ts               # warm-hold/pre-roll/reuse decision SSOT for held-microphone captures (pure)
     ├── deepgram-dual.ts              # dual-stream Auto preference-resolution SSOT (pure)
     ├── live-envelope.ts              # the `final` stop-envelope wire type: one reader, matches backend/live_envelope.py
+    ├── screen-annotations.ts         # screen-mode marks: manifest → bracketed marks placed in the transcript by their moment in speech (pure)
     ├── cli-section.ts                # Settings → Command line: parses /api/cli and decides what the section shows (the backend composes every command)
     ├── upload-queue-restore.ts       # upload-queue snapshot restore SSOT: a failed read leaves the latch down (pure)
     ├── settings-autosave.ts          # settings autosave gate SSOT: no write of a config that was never read (pure)
@@ -141,6 +143,9 @@ desktop/
 ├── paste-protocol.js               # paste wire protocol SSOT: marker strings the paste scripts print and parsers read (pure, node --test)
 ├── power-events.js                 # powerMonitor subscription SSOT: each handler subscribed exactly once at startup (pure, node --test)
 ├── recording-status.js             # recording-capsule status classification SSOT: one ladder both sides read (pure, node --test)
+├── screen-mode.js                  # screen-mode rules SSOT: session record, stroke position, manifest, shared names (pure, node --test)
+├── screen-mode-controller.js       # screen-mode I/O: overlays + red frame, palette (non-activating panels), native helper, display hot-plug, screencapture + compositing
+├── native/screen-input/            # CGEventTap helper (main.swift) + PressClassifier.swift, the one click-vs-stroke rule (built by scripts/build-native.sh)
 ├── child-io.js                     # child-process text-output decoding SSOT (UTF-16LE on win32) (pure, node --test)
 ├── python-version.js               # interpreter version reader: the ONE file that declares it is .python-version (pure, node --test)
 ├── shortcut-migration.js           # retired-hotkey migration rule SSOT, shared with the renderer (pure, node --test)

@@ -1,6 +1,6 @@
 {
   "name": "transcriptor",
-  "version": "1.6.5",
+  "version": "1.6.6",
   "description": "Voice-to-text transcription with auto-paste",
   "author": "Leo Erdman",
   "license": "MIT",
@@ -20,15 +20,15 @@
     "dev": "NODE_ENV=development electron .",
     "test": "node --test",
     "build:frontend": "npm --prefix ../frontend run build",
-    "dist": "node ./scripts/require-bash.js mac-arm64 && bash ./scripts/prepare-runtime.sh mac-arm64 && node ./unlockDist.js && npm run build:frontend && electron-builder --mac dmg --arm64",
-    "dist:dir": "node ./scripts/require-bash.js mac-arm64 && bash ./scripts/prepare-runtime.sh mac-arm64 && node ./unlockDist.js && npm run build:frontend && electron-builder --mac --dir --arm64",
-    "dist:adhoc": "node ./scripts/require-bash.js mac-arm64 && bash ./scripts/prepare-runtime.sh mac-arm64 && node ./unlockDist.js && npm run build:frontend && TRANSCRIPTOR_ALLOW_ADHOC_SIGN=1 electron-builder --mac dmg --arm64",
-    "dist:dir:adhoc": "node ./scripts/require-bash.js mac-arm64 && bash ./scripts/prepare-runtime.sh mac-arm64 && node ./unlockDist.js && npm run build:frontend && TRANSCRIPTOR_ALLOW_ADHOC_SIGN=1 electron-builder --mac --dir --arm64",
+    "dist": "node ./scripts/require-bash.js mac-arm64 && bash ./scripts/prepare-runtime.sh mac-arm64 && bash ./scripts/build-native.sh mac-arm64 && node ./unlockDist.js && npm run build:frontend && electron-builder --mac dmg --arm64",
+    "dist:dir": "node ./scripts/require-bash.js mac-arm64 && bash ./scripts/prepare-runtime.sh mac-arm64 && bash ./scripts/build-native.sh mac-arm64 && node ./unlockDist.js && npm run build:frontend && electron-builder --mac --dir --arm64",
+    "dist:adhoc": "node ./scripts/require-bash.js mac-arm64 && bash ./scripts/prepare-runtime.sh mac-arm64 && bash ./scripts/build-native.sh mac-arm64 && node ./unlockDist.js && npm run build:frontend && TRANSCRIPTOR_ALLOW_ADHOC_SIGN=1 electron-builder --mac dmg --arm64",
+    "dist:dir:adhoc": "node ./scripts/require-bash.js mac-arm64 && bash ./scripts/prepare-runtime.sh mac-arm64 && bash ./scripts/build-native.sh mac-arm64 && node ./unlockDist.js && npm run build:frontend && TRANSCRIPTOR_ALLOW_ADHOC_SIGN=1 electron-builder --mac --dir --arm64",
     "notarize:dmg": "node ./scripts/require-bash.js notarize-dmg && bash ./scripts/notarize-dmg.sh",
     "dist:mas": "node ./scripts/require-bash.js mas-arm64 && bash ./scripts/build-mas.sh",
     "testflight:upload": "node ./scripts/require-bash.js testflight-upload && bash ./scripts/upload-testflight.sh",
-    "dist:win": "node ./scripts/require-bash.js win-x64 && bash ./scripts/prepare-runtime.sh win-x64 && node ./unlockDist.js && npm run build:frontend && electron-builder --win --x64",
-    "dist:linux": "node ./scripts/require-bash.js linux-x64 && bash ./scripts/prepare-runtime.sh linux-x64 && node ./unlockDist.js && npm run build:frontend && electron-builder --linux AppImage --x64"
+    "dist:win": "node ./scripts/require-bash.js win-x64 && bash ./scripts/prepare-runtime.sh win-x64 && bash ./scripts/build-native.sh win-x64 && node ./unlockDist.js && npm run build:frontend && electron-builder --win --x64",
+    "dist:linux": "node ./scripts/require-bash.js linux-x64 && bash ./scripts/prepare-runtime.sh linux-x64 && bash ./scripts/build-native.sh linux-x64 && node ./unlockDist.js && npm run build:frontend && electron-builder --linux AppImage --x64"
   },
   "devDependencies": {
     "@electron/osx-sign": "2.4.0",
@@ -57,6 +57,8 @@
       "child-io.js",
       "paste-protocol.js",
       "recording-status.js",
+      "screen-mode.js",
+      "screen-mode-controller.js",
       "shortcut-migration.js",
       "linux-wm-class.js",
       "python-version.js",
@@ -129,6 +131,10 @@
             "!**/__pycache__/**",
             "!**/*.pyc"
           ]
+        },
+        {
+          "from": "native/build/mac-${arch}",
+          "to": "runtime/bin"
         }
       ],
       "target": [

@@ -1,4 +1,5 @@
 import json
+import math
 import logging
 import os
 import sys
@@ -13,6 +14,7 @@ import re
 import secrets
 import threading
 import time
+import shutil
 import subprocess
 import tempfile
 import unicodedata
@@ -88,6 +90,7 @@ from backend.cli_access import (
     cli_token_may_call,
 )
 from backend.config import APP_ROOT, DATA_DIR, load_config, redact_config, save_config
+from backend import screen_sessions
 from backend.storage import (
     TMP_ORPHAN_RE,
     atomic_promote_file,
@@ -1058,6 +1061,9 @@ def _cleanup_live_recovery_files() -> None:
                 p.unlink(missing_ok=True)
         except OSError as e:
             logger.debug("live recovery cleanup skipped for %s: %s", p, e)
+    # Screen-mode screenshots staged for a take whose save never happened
+    # are that take's recovery material too, and age out with it.
+    screen_sessions.sweep_orphan_sessions(DATA_DIR, LIVE_RECOVERY_RETENTION_SEC)
 
 
 def _normalize_live_session_id(value: str) -> str:
@@ -2222,6 +2228,17 @@ def _form_bool(value: Any, default: bool = False) -> bool:
     return _payload_bool({"value": raw}, "value", default)
 
 
+def _form_float(value: Any, default: float = 0.0) -> float:
+    """A multipart number: anything non-numeric, non-finite or absent is
+    ``default`` — a malformed optional field must not fail a save."""
+    raw = _form_default_value(value, default)
+    try:
+        number = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
 def _collect_ws_closed_exc_types() -> tuple:
     """Exception types that mean "the peer already went away".
 
@@ -3052,9 +3069,14 @@ def _resolve_recordings_target_dir(archive_dir: str = "", *, create: bool = True
 
 RECORDING_COLLECTION_LIVE = "live"
 RECORDING_COLLECTION_UPLOADS = "uploads"
+# Screen-mode recordings: dictated with drawings and screenshots over the
+# screen. Their screenshots live in the desktop shell's screen-session
+# store (desktop/screen-mode.js), which keeps the same newest-N count.
+RECORDING_COLLECTION_SCREEN = "screen"
 RECORDING_COLLECTION_DIR_NAMES: dict[str, str] = {
     RECORDING_COLLECTION_LIVE: "Live Capsule",
     RECORDING_COLLECTION_UPLOADS: "Uploaded Media",
+    RECORDING_COLLECTION_SCREEN: "Screen Sessions",
 }
 _RECORDING_COLLECTION_DIR_NAME_TO_KEY: dict[str, str] = {
     folder_name: key for key, folder_name in RECORDING_COLLECTION_DIR_NAMES.items()
@@ -3077,6 +3099,9 @@ _RECORDING_COLLECTION_DIR_NAME_TO_KEY: dict[str, str] = {
 #                    brought in. Worth keeping around while they are
 #                    still working with that material, but not forever,
 #                    so this is an *age* rule.
+#   Screen Sessions — screen-mode takes. The audio is kept for the
+#                    newest five, the same count the desktop shell keeps
+#                    for their screenshot batches.
 #
 # What this replaced: a single global "keep audio only for the newest
 # recording in the archive" rule, written twice (once for the per-save
@@ -3128,6 +3153,9 @@ AUDIO_RETENTION_POLICIES: dict[str, AudioRetentionPolicy] = {
             0, _env_int("TRANSCRIPTOR_UPLOAD_AUDIO_RETENTION_SEC", 7 * 24 * 3600)
         ),
     ),
+    RECORDING_COLLECTION_SCREEN: AudioRetentionPolicy(
+        max_items=max(0, _env_int("TRANSCRIPTOR_SCREEN_AUDIO_KEEP_COUNT", 5)),
+    ),
 }
 # The archive ROOT predates the collection subfolders: everything saved
 # before they existed landed there, and those were voice recordings.
@@ -3174,6 +3202,9 @@ def _normalize_recording_collection(value: object) -> str:
         "uploaded": RECORDING_COLLECTION_UPLOADS,
         "uploaded_media": RECORDING_COLLECTION_UPLOADS,
         "uploaded-media": RECORDING_COLLECTION_UPLOADS,
+        "screen": RECORDING_COLLECTION_SCREEN,
+        "screen_sessions": RECORDING_COLLECTION_SCREEN,
+        "screen-sessions": RECORDING_COLLECTION_SCREEN,
     }
     normalized = aliases.get(raw, raw)
     if normalized not in RECORDING_COLLECTION_DIR_NAMES:
@@ -3193,7 +3224,8 @@ def _resolve_recordings_collection_target_dir(
 ) -> Path:
     """Resolve the physical archive dir for a semantic recording source.
 
-    Callers pass a stable collection id (``live`` / ``uploads``), never a
+    Callers pass a stable collection id (``live`` / ``uploads`` /
+    ``screen``), never a
     folder name. The backend is the SSOT for the on-disk layout, and the
     helper is idempotent when an existing child archive_dir is supplied
     back during a later metadata update.
@@ -3439,33 +3471,85 @@ def _prune_recording_audio(
             candidates.append((entry.stat().st_mtime, entry.name, entry))
         except OSError as e:
             logger.debug("audio retention: skip %s: %s", entry, e)
-    if not candidates:
-        return 0
-
-    # Newest first. Name descending is only a deterministic tiebreak for
-    # files that share an mtime (same-second saves are common).
-    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
     exempt = {stem for stem in keep_stems if stem}
     stamp = time.time() if now is None else now
-    age_cutoff = stamp - effective.max_age_sec if effective.max_age_sec > 0 else None
 
     deleted = 0
-    for index, (mtime, _name, entry) in enumerate(candidates):
-        if entry.stem in exempt:
-            continue
-        over_count = effective.max_items > 0 and index >= effective.max_items
-        over_age = age_cutoff is not None and mtime <= age_cutoff
-        if not (over_count or over_age):
-            continue
-        reason = "beyond newest %d" % effective.max_items if over_count else (
-            "older than %d s" % effective.max_age_sec
-        )
+    for entry, reason in _beyond_retention_policy(candidates, effective, exempt=exempt, now=stamp):
         try:
             entry.unlink()
             deleted += 1
             logger.info("audio retention: removed %s (%s)", entry.name, reason)
         except OSError as e:
             logger.warning("audio retention: failed to remove %s: %s", entry, e)
+    deleted += _prune_recording_screens(entries, text_stems, effective, exempt=exempt, now=stamp)
+    return deleted
+
+
+def _beyond_retention_policy(
+    candidates: list[tuple[float, str, Path]],
+    policy: AudioRetentionPolicy,
+    *,
+    exempt: set[str],
+    now: float,
+) -> list[tuple[Path, str]]:
+    """The one ranking rule for a recording's media, whatever the kind.
+
+    ``candidates`` are ``(mtime, name, path)`` and are ranked newest
+    first (name descending breaks mtime ties). Returns the entries the
+    policy collects with the reason, skipping exempt stems while still
+    counting them toward ``max_items``.
+    """
+    ranked = sorted(candidates, key=lambda item: (item[0], item[1]), reverse=True)
+    age_cutoff = now - policy.max_age_sec if policy.max_age_sec > 0 else None
+    out: list[tuple[Path, str]] = []
+    for index, (mtime, _name, entry) in enumerate(ranked):
+        stem = screen_sessions.screens_stem(entry) if entry.name.endswith(
+            screen_sessions.SCREENS_DIR_SUFFIX
+        ) else entry.stem
+        if stem in exempt:
+            continue
+        over_count = policy.max_items > 0 and index >= policy.max_items
+        over_age = age_cutoff is not None and mtime <= age_cutoff
+        if not (over_count or over_age):
+            continue
+        out.append((
+            entry,
+            "beyond newest %d" % policy.max_items if over_count else "older than %d s" % policy.max_age_sec,
+        ))
+    return out
+
+
+def _prune_recording_screens(
+    entries: list[Path],
+    text_stems: set[str],
+    policy: AudioRetentionPolicy,
+    *,
+    exempt: set[str],
+    now: float,
+) -> int:
+    """Screen-mode screenshot folders (``<stem>.screens``) follow their
+    recording's audio rule exactly: same policy, same ranking, same
+    exemption — a recording's media is kept or collected as one kind of
+    thing, never by a second count. Transcripts stay forever."""
+    candidates: list[tuple[float, str, Path]] = []
+    for entry in entries:
+        try:
+            if not screen_sessions.is_screens_dir(entry):
+                continue
+            if screen_sessions.screens_stem(entry) not in text_stems:
+                continue
+            candidates.append((entry.stat().st_mtime, entry.name, entry))
+        except OSError as e:
+            logger.debug("screens retention: skip %s: %s", entry, e)
+    deleted = 0
+    for entry, reason in _beyond_retention_policy(candidates, policy, exempt=exempt, now=now):
+        try:
+            shutil.rmtree(entry)
+            deleted += 1
+            logger.info("screens retention: removed %s (%s)", entry.name, reason)
+        except OSError as e:
+            logger.warning("screens retention: failed to remove %s: %s", entry, e)
     return deleted
 
 
@@ -7531,6 +7615,10 @@ def _delete_all_recordings_sync() -> dict:
                 p.unlink()
                 if audio_backup is not None:
                     _best_effort_unlink(audio_backup, context="delete-all audio cleanup")
+                # A screen-mode recording's screenshots go with it.
+                screens = screen_sessions.screens_dir(d, p.stem)
+                if screen_sessions.is_screens_dir(screens):
+                    shutil.rmtree(screens, ignore_errors=True)
                 deleted += 1
             except Exception as exc:
                 if audio_backup is not None and audio_backup.exists():
@@ -7588,6 +7676,22 @@ def _read_recording_payload(p: "Path", target_dir: Optional["Path"] = None) -> d
         # ``_resolve_recordings_dir()`` and reporting has_audio=false
         # for every entry in custom archives.
         **_recording_audio_payload(p.name, target_dir=archive_dir),
+        # Screen mode: the screenshot file names, in shot order, served by
+        # GET /api/recordings/{name}/screens/{file}. Empty for any other
+        # recording.
+        "screens": screen_sessions.list_screenshots(archive_dir, p.stem),
+        # The archived manifest: what every transcript of this recording
+        # places its screen marks from (``frontend/src/screen-annotations.ts``).
+        "screens_manifest": (
+            screen_sessions.read_manifest(screen_sessions.screens_dir(archive_dir, p.stem))
+            if screen_sessions.is_screens_dir(screen_sessions.screens_dir(archive_dir, p.stem))
+            else None
+        ),
+        "screens_dir": (
+            str(screen_sessions.screens_dir(archive_dir, p.stem))
+            if screen_sessions.is_screens_dir(screen_sessions.screens_dir(archive_dir, p.stem))
+            else ""
+        ),
     }
 
 
@@ -7618,6 +7722,21 @@ def get_recording_audio(
         raise HTTPException(status_code=404, detail="recording audio not found")
     media_type = _audio_content_type(audio_path.name)
     return FileResponse(str(audio_path), media_type=media_type, filename=audio_path.name)
+
+
+@app.get("/api/recordings/{recording_name}/screens/{file_name}")
+def get_recording_screenshot(
+    recording_name: str,
+    file_name: str,
+    archive_dir: str = "",
+    _auth: None = Depends(_require_api_auth),
+):
+    target_dir = _resolve_recordings_target_dir(archive_dir, create=False) if str(archive_dir or "").strip() else None
+    p = _recording_path_or_404(recording_name, target_dir=target_dir)
+    shot = screen_sessions.screenshot_path(target_dir or p.parent, p.stem, file_name)
+    if shot is None:
+        raise HTTPException(status_code=404, detail="screenshot not found")
+    return FileResponse(str(shot), media_type="image/png", filename=shot.name)
 
 
 _stats_cache: Optional[dict] = None
@@ -7799,6 +7918,8 @@ async def _save_recording_audio_source(
     model: str = "",
     language: str = "",
     live_session_id: str = "",
+    screen_session_id: str = "",
+    screen_audio_started_at: float = 0.0,
 ) -> dict[str, Any]:
     raw_existing_name = str(name or "").strip()
     existing_name = _recording_text_name_leaf(raw_existing_name) if raw_existing_name else ""
@@ -7922,6 +8043,21 @@ async def _save_recording_audio_source(
             _best_effort_unlink(audio_backup, context="recording audio backup cleanup")
     if existing_audio is not None and existing_audio.resolve() != out_audio.resolve():
         _best_effort_unlink(existing_audio, context="recording superseded audio cleanup")
+    # Screen mode: the take's screenshots become part of this recording —
+    # moved beside it as ``<stem>.screens`` before retention runs, so the
+    # rule below already sees them as this (exempt) recording's media.
+    screens_manifest: Optional[dict[str, Any]] = None
+    if screen_session_id:
+        try:
+            screens_manifest = screen_sessions.adopt_session(
+                DATA_DIR,
+                screen_session_id,
+                target_dir,
+                stem,
+                audio_started_at=screen_audio_started_at,
+            )
+        except OSError as e:
+            logger.warning("screen session %s adoption failed: %s", screen_session_id, e)
     # Persist this dir only after transcript + audio are durable so startup
     # retroactive retention does not learn failed/empty archive targets.
     _register_archive_dir(target_dir)
@@ -7952,6 +8088,7 @@ async def _save_recording_audio_source(
         "audio_name": out_audio.name,
         "archive_dir": str(target_dir),
         "pruned_audio_count": pruned,
+        "screens": screens_manifest,
     }
 
 
@@ -7970,6 +8107,8 @@ async def save_recording_with_audio(
     model: str = Form(""),
     language: str = Form(""),
     live_session_id: str = Form(""),
+    screen_session_id: str = Form(""),
+    screen_audio_started_at: str = Form(""),
 ):
     orig_name = _normalize_filename(file.filename or "recording.wav")
     return await _save_recording_audio_source(
@@ -7986,6 +8125,8 @@ async def save_recording_with_audio(
         model=_form_text(model, ""),
         language=_form_text(language, ""),
         live_session_id=_form_text(live_session_id, ""),
+        screen_session_id=_form_text(screen_session_id, ""),
+        screen_audio_started_at=_form_float(screen_audio_started_at),
     )
 
 

@@ -51,9 +51,16 @@ npm --prefix desktop test             # node --test — every desktop suite
 node --check desktop/main.js && node --check desktop/preload.js
 ```
 
-The desktop job runs on macOS in CI so that the two suites which hand the
-shipped AppleScript to `osacompile` (`applescript.test.js`,
-`paste-script.test.js`) actually execute; they skip themselves elsewhere.
+The desktop job runs on macOS in CI so that the suites which need macOS
+tooling actually execute: the two that hand the shipped AppleScript to
+`osacompile` (`applescript.test.js`, `paste-script.test.js`) and the one
+that compiles screen mode's click-vs-stroke rule with `swiftc`
+(`screen-input.test.js`). They skip themselves elsewhere.
+
+Screen mode's native mouse helper is built by
+`desktop/scripts/build-native.sh` (part of every `dist` script); for a dev
+run of the desktop shell, build it once with
+`bash desktop/scripts/build-native.sh mac-arm64`.
 
 A change is committable only when the suites covering it pass. Push `main`
 after committing — work left only on a local branch is considered lost.

@@ -572,6 +572,8 @@
             <div class="pane-footer current-audio-row" id="recordingAudioRow" hidden>
               <audio id="recordingAudio" controls preload="metadata"></audio>
             </div>
+            <!-- Screen mode: the recording's screenshots, in shot order. -->
+            <div class="recording-screens" id="recordingScreensRow" role="list" aria-label="Screenshots" hidden></div>
             <pre class="out" id="recordingContent"></pre>
           </div>
         </div>
@@ -789,6 +791,30 @@
                     <span class="shortcut-key">Option</span>
                     <span class="shortcut-key">Shift</span>
                     <span class="shortcut-key">V</span>
+                  </span>
+                </button>
+              </label>
+              <!--
+                Screen mode (macOS only): a recording during which you draw
+                on the screen (press and drag; a plain click still reaches
+                the app underneath) and take screenshots. Hidden until the
+                desktop shell reports screen mode as supported.
+              -->
+              <label class="field" id="shortcutScreenField" hidden>
+                <span class="lbl">Screen mode — record with drawing and screenshots</span>
+                <button class="shortcut-btn" id="shortcutScreen" type="button" data-shortcut-id="screen">
+                  <span class="shortcut-keys" aria-label="Option →">
+                    <span class="shortcut-key">Option</span>
+                    <span class="shortcut-key">→</span>
+                  </span>
+                </button>
+              </label>
+              <label class="field" id="shortcutScreenShotField" hidden>
+                <span class="lbl">Screenshot in screen mode (also the screen button on the capsule)</span>
+                <button class="shortcut-btn" id="shortcutScreenShot" type="button" data-shortcut-id="screenShot">
+                  <span class="shortcut-keys" aria-label="Option ↓">
+                    <span class="shortcut-key">Option</span>
+                    <span class="shortcut-key">↓</span>
                   </span>
                 </button>
               </label>

@@ -123,4 +123,21 @@ contextBridge.exposeInMainWorld("transcriptor", {
       return false;
     }
   },
+  /**
+   * End the screen-mode side of a recording that is stopping:
+   *
+   *   const { ok, manifest } = await window.transcriptor.screenFinish({ id, discard })
+   *
+   * Main takes a last screenshot if strokes are still on screen, removes
+   * the overlays and returns the session manifest (screenshots + stroke
+   * events with epoch times) the renderer turns into transcript marks.
+   * `discard` drops the session's files — the take itself was discarded.
+   */
+  screenFinish: (payload) => {
+    const p = payload && typeof payload === "object" ? payload : {};
+    return ipcRenderer.invoke("screen-mode:finish", {
+      id: String(p.id || ""),
+      discard: p.discard === true,
+    });
+  },
 });

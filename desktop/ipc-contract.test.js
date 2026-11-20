@@ -185,3 +185,12 @@ function exposeCalls(source) {
     if (from <= at) return out;
   }
 }
+
+test("screen-mode:finish is invoked by the renderer bridge and handled by main", () => {
+  // Screen mode's session (screenshots + stroke times) is owned by main;
+  // the renderer's stopLive asks for it back on every stop path.
+  assert.match(preloadSource, /ipcRenderer\.invoke\("screen-mode:finish"/);
+  assert.match(mainSource, /ipcMain\.handle\("screen-mode:finish"/);
+  // Only the main window may end a session.
+  assert.match(mainSource, /"screen-mode:finish", async \(event, payload\) => \{\n    if \(!win \|\| win\.isDestroyed\(\) \|\| event\.sender !== win\.webContents\)/);
+});
