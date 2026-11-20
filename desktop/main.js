@@ -151,6 +151,9 @@ const {
 const { createClipboardLeases } = require("./clipboard-lease");
 // The one rule for where this shell keeps its data (DM-07, DM-11, S-12).
 const { MAIN_LOG_FILE, resolveDataDir, oneDriveMigrationEntries } = require("./data-dir");
+// main.log is created 0600 and an older world-readable one tightened (BL-02).
+const { createPrivateAppender } = require("./private-log");
+const appendPrivateLog = createPrivateAppender();
 
 // SSOT for "which system power events the app reacts to, and what each
 // one means" — subscribed exactly once from app.whenReady below.
@@ -854,7 +857,7 @@ function appendMainLog(message) {
     if ((++mainLogCheckCounter & 0xff) === 0) {
       rotateMainLogIfNeeded();
     }
-    // appendFileSync (not appendFile): the async form buffers the
+    // Synchronous append (not appendFile): the async form buffers the
     // write and can race with a synchronous renameSync inside
     // rotateMainLogIfNeeded — on POSIX the pending write lands in
     // the NOW-RENAMED inode (the .rotating / .1 file), then the
@@ -862,7 +865,7 @@ function appendMainLog(message) {
     // appends cost ~0.5-1ms per line on local SSD; trace logging
     // peaks at ~20 lines/second which is still well under 2% of
     // main-process time. Acceptable cost for log durability.
-    fs.appendFileSync(mainLogFilePath(), line, "utf8");
+    appendPrivateLog(mainLogFilePath(), line);
   } catch (e) {
     // Last-resort: the logger itself failed. Fall back to stderr so
     // we never silently lose signal.

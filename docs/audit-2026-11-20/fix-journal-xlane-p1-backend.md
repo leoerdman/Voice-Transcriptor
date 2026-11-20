@@ -90,3 +90,31 @@ page saw `T:secret123` — the sync IPC from a sandboxed preload works and
 launched.
 
 Suites: backend 992 OK; desktop 432 pass; vitest 604; typecheck, lint, build clean.
+
+## C3 — BL-02 remainder (privacy): main.log is owner-only
+
+Backend half was already on main: `_MutedPollingAccessFilter` reduces the
+`<name>` segment of every `/api/recordings/<name>/…` route (audio included)
+to `<timestamp>#<digest>` and drops recording-route query strings
+(d5d9e6b, `backend/tests/test_access_log_filter.py` covers `…/audio`);
+retention logs `_log_safe_recording_name`. No backend change needed.
+
+Desktop half: `desktop/private-log.js` (new, pure with injected fs) +
+`desktop/private-log.test.js`; `desktop/main.js` `appendMainLog` appends
+through it; `desktop/package.json` build.files; `PROJECT_STRUCTURE.md`.
+The file is created with mode 0600 (`appendFileSync` `mode`, which applies
+only on creation — so every file a rotation starts is private) and a
+pre-existing world-readable main.log from an older version is `chmod`ed
+0600 once per process. A filesystem refusing chmod does not lose the line.
+Existing rotated archives keep their old mode (not touched: log files are
+the user's call per AGENTS.md rule 3; they age out by the existing sweep).
+
+Check (module with `mode` and `chmod` removed = old behaviour):
+```
+before:  ✖ a log the appender creates is readable by its owner only
+         ✖ a log left world-readable by an older version is tightened on first append
+         ✖ the file a rotation starts afresh is created private too
+         ✖ a filesystem that refuses chmod does not lose the line
+after:   ℹ pass 4  ℹ fail 0
+```
+Suites: backend 992 OK; desktop 436 pass; vitest 604; typecheck, lint, build clean.
