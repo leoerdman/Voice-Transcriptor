@@ -80,3 +80,40 @@ Branch `worktree-agent-ac1b88dd03eb0f9b9`, cut from `main` at 54b8770. Items lef
 - Files: `frontend/src/{saved-recording-decode.ts,main.tsx}`, `frontend/tests/saved-recording-decode.test.ts`.
 - Suites: backend `Ran 1028 tests OK`; desktop `tests 477 · pass 477 · fail 0`; `node --check` OK; typecheck,
   lint clean; vitest `Test Files 52 passed · Tests 666 passed`; build OK.
+
+## Commit 3 · S-15 — the History player streams `<audio src>` on a single-recording capability
+
+- **Before.** `openRecording` called `fetchSavedAudioFromBackend` (GET with `X-API-Token`, `await blob()`) and
+  played a Blob URL: an uploaded video's audio — hundreds of MB — in renderer memory before the first sample, on
+  every open. A media element cannot send the header, and the API token must never travel in a URL (BM-01).
+- **Design (as briefed, one narrow capability).** `backend/media_tokens.py` `MediaTokens`:
+  `v1.<expires_at>.<b64url HMAC-SHA256(secret, "v1\n<exp>\n<resolved audio path>")>`, secret = 32 random bytes
+  per process (never stored — every token dies with the backend), TTL `MEDIA_TOKEN_TTL_SEC` = 600 s, expiry inside
+  the signed message, constant-time compare, a token claiming more lifetime than the process grants is refused.
+  The scope is the RESOLVED file, so a token opens one recording and nothing else. The threat model (what a URL
+  leaks to that a header does not, what is out of scope) is the module docstring.
+  Routes (`backend/main.py`): `POST /api/recordings/{name}/audio/stream-url` (API token, renderer only — not on
+  `cli_access._CLI_ROUTES`, so the CLI token gets 403) returns `{url, expires_at}`;
+  `GET /api/recordings/{name}/audio/stream?media_token=…` accepts ONLY a token minted for that file (not the API
+  token, in a header or the query), answers 401 for anything else — including a missing file or a refused folder,
+  so a tokenless caller learns nothing about the archive —, applies the same per-client rate limit, serves through
+  `FileResponse` (Range → 206) with `Cache-Control: no-store` and an inline disposition. The existing header-auth
+  audio route is unchanged (re-transcribe, download, the Live player) and shares the resolver
+  `_recording_audio_file_or_404`. The access log already strips the query of every recording route
+  (`_log_safe_access_path`), so the token never reaches `main.log` — pinned by a test.
+  Renderer: `frontend/src/media-url.ts` (`parseMintedMediaUrl`: same-origin recording URL + expiry or throw;
+  `mediaErrorRecovery`: an error at/after the expiry (5 s slack) re-mints, any other is a real failure — no loop).
+  `openRecording` mints and sets `player.src`; an `error` listener on `#recordingAudio` re-mints after an expiry
+  (a seek after a long pause) and resumes at the same position and play state. `recordingViewerAudioObjectUrl` /
+  `revokeRecordingViewerAudioUrl` are replaced by `recordingViewerStream` / `clearRecordingViewerStream`.
+  Considered and rejected: an HttpOnly path-scoped cookie (keeps the token out of the URL entirely, but cookie
+  `Path` matching against percent-encoded recording names is fragile and it makes the capability ambient).
+- Check — before: `backend.tests.test_media_tokens` route tests against HEAD's `main.py`: `FAILED (failures=4,
+  errors=4)` (routes absent); `media-url.test.ts` cannot load on HEAD (module absent). After: 18 + 4 new tests
+  pass; `renderer-main-contract.test.ts` pins that `openRecording` mints and never builds a Blob.
+- Files: `backend/{media_tokens.py,main.py}`, `backend/tests/test_media_tokens.py`,
+  `frontend/src/{media-url.ts,main.tsx}`, `frontend/tests/{media-url.test.ts,renderer-main-contract.test.ts}`.
+- Suites: backend `Ran 1046 tests OK`; desktop `tests 477 · pass 477 · fail 0`; `node --check` OK; typecheck,
+  lint clean; vitest `Test Files 53 passed · Tests 671 passed`; build OK.
+- Not verified live: Chromium's media element against the 401-after-expiry path (re-mint and resume) was not
+  exercised in the packaged app; Range/206 is verified with Starlette's TestClient.

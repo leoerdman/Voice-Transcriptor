@@ -140,6 +140,7 @@ import { keepaliveFor } from "./keepalive";
 import { customPresetLimitReached, parseRuntimeLimits, smallAudioUiTimeoutMs, type RuntimeLimits } from "./runtime-limits";
 import { screenThumbLabel, screensStripNote } from "./screens-strip";
 import { fallbackSourceKey, isCurrentPlayerSource } from "./player-source";
+import { mediaErrorRecovery, parseMintedMediaUrl, type MintedMediaUrl } from "./media-url";
 import {
   parseRecordingSaveResponse,
   parseScreensError,
@@ -2480,7 +2481,8 @@ let hasStoredUpscaleModelPreference = false;
 let currentRecordingAudioObjectUrl = "";
 let currentRecordingAudioSourceKey = "";
 let currentRecordingAudioRenderSeq = 0;
-let recordingViewerAudioObjectUrl = "";
+/** What the History player streams: the recording and its minted URL (./media-url). */
+let recordingViewerStream: { name: string; archiveDir: string; minted: MintedMediaUrl } | null = null;
 let activeLiveSessionId = "";
 let activeLiveArchiveDir = "";
 let activeLiveSessionSnapshot: LiveSessionSnapshot | null = null;
@@ -2589,10 +2591,50 @@ function revokeCurrentRecordingAudioUrl(): void {
   currentRecordingAudioSourceKey = "";
 }
 
-function revokeRecordingViewerAudioUrl(): void {
-  if (!recordingViewerAudioObjectUrl) return;
-  URL.revokeObjectURL(recordingViewerAudioObjectUrl);
-  recordingViewerAudioObjectUrl = "";
+function clearRecordingViewerStream(): void {
+  recordingViewerStream = null;
+}
+
+/**
+ * A URL the History player can stream this recording from (S-15): the
+ * backend mints a short-lived capability for this one file, because a
+ * media element cannot send the API token header and the token must never
+ * be put in a URL.
+ */
+async function mintRecordingStreamUrl(name: string, archiveDir: string): Promise<MintedMediaUrl> {
+  return parseMintedMediaUrl(await apiPost<unknown>(
+    `/api/recordings/${encodeURIComponent(name)}/audio/stream-url`,
+    { archive_dir: archiveDir },
+  ));
+}
+
+/**
+ * The History player's URL expired while the recording stayed open (a
+ * seek after a long pause is answered 401): mint again and resume where it
+ * was. A fresh URL that fails is a real failure — the opening flow reports
+ * that one — so nothing here loops.
+ */
+async function recoverRecordingViewerStream(player: HTMLAudioElement): Promise<void> {
+  const stream = recordingViewerStream;
+  if (!stream || player.getAttribute("src") !== stream.minted.url) return;
+  if (mediaErrorRecovery(stream.minted, Date.now()) !== "remint") return;
+  const resumeAt = player.currentTime;
+  const resumePlaying = !player.paused;
+  let fresh: MintedMediaUrl;
+  try {
+    fresh = await mintRecordingStreamUrl(stream.name, stream.archiveDir);
+  } catch (e) {
+    console.warn("Recording audio stream re-mint failed", e);
+    return;
+  }
+  if (recordingViewerStream !== stream) return;
+  recordingViewerStream = { ...stream, minted: fresh };
+  player.src = fresh.url;
+  player.addEventListener("loadedmetadata", () => {
+    player.currentTime = resumeAt;
+    if (resumePlaying) void player.play().catch((err) => console.debug("resume after re-mint refused", err));
+  }, { once: true });
+  player.load();
 }
 
 function setRecordingViewerAudioRowVisible(visible: boolean, hydrating = false): void {
@@ -3112,6 +3154,12 @@ function setCurrentRecordingAudio(file: File | null, savedName = "", archiveDir 
     }
   });
 })();
+
+// The History player streams from a URL that expires (S-15); an error
+// after the expiry re-mints and resumes (recoverRecordingViewerStream).
+($("recordingAudio") as HTMLAudioElement).addEventListener("error", (ev) => {
+  void recoverRecordingViewerStream(ev.currentTarget as HTMLAudioElement);
+});
 
 // Audio element error handler — Windows users reported playback fails
 // on the just-recorded clip: the in-memory fallback can be an OPFS-lazy
@@ -8003,7 +8051,7 @@ function resetRecordingViewer(placeholder: string = UI_COPY.recordings.viewerPla
   $("recordingContent").textContent = "";
   const player = $("recordingAudio") as HTMLAudioElement;
   player.pause();
-  revokeRecordingViewerAudioUrl();
+  clearRecordingViewerStream();
   player.removeAttribute("src");
   player.load();
   setRecordingViewerAudioRowVisible(false);
@@ -8019,7 +8067,7 @@ function setRecordingViewerLoading(displayName: string, willLoadAudio = false): 
   $("recordingContent").textContent = "";
   const player = $("recordingAudio") as HTMLAudioElement;
   player.pause();
-  revokeRecordingViewerAudioUrl();
+  clearRecordingViewerStream();
   player.removeAttribute("src");
   player.load();
   setRecordingViewerAudioRowVisible(willLoadAudio, willLoadAudio);
@@ -8793,12 +8841,14 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
         setRecordingViewerAudioRowVisible(true);
       } else {
         try {
-          const audioFile = await fetchSavedAudioFromBackend(name, String(r.archive_dir || effectiveArchiveDir).trim());
+          // Streamed, not fetched whole (S-15): playback starts on the
+          // first bytes and a seek reads only what it needs.
+          const audioArchiveDir = String(r.archive_dir || effectiveArchiveDir).trim();
+          const minted = await mintRecordingStreamUrl(name, audioArchiveDir);
           if (requestSeq !== recordingOpenRequestSeq || selectedRecordingKey() !== requestKey) return;
           player.pause();
-          revokeRecordingViewerAudioUrl();
-          recordingViewerAudioObjectUrl = URL.createObjectURL(audioFile);
-          player.src = recordingViewerAudioObjectUrl;
+          recordingViewerStream = { name, archiveDir: audioArchiveDir, minted };
+          player.src = minted.url;
           setRecordingViewerAudioRowVisible(true, true);
           player.load();
           await waitForRecordingViewerAudioReady(player);
@@ -8808,7 +8858,7 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
           if (requestSeq !== recordingOpenRequestSeq || selectedRecordingKey() !== requestKey) return;
           console.warn("Recording audio playback fetch failed", audioErr);
           player.pause();
-          revokeRecordingViewerAudioUrl();
+          clearRecordingViewerStream();
           player.removeAttribute("src");
           player.load();
           setRecordingViewerAudioRowVisible(false);
@@ -8821,7 +8871,7 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
       }
     } else {
       player.pause();
-      revokeRecordingViewerAudioUrl();
+      clearRecordingViewerStream();
       player.removeAttribute("src");
       player.load();
       setRecordingViewerAudioRowVisible(false);
@@ -8852,7 +8902,7 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
     $("recordingContent").textContent = "";
     const player = $("recordingAudio") as HTMLAudioElement;
     player.pause();
-    revokeRecordingViewerAudioUrl();
+    clearRecordingViewerStream();
     player.removeAttribute("src");
     player.load();
     setRecordingViewerAudioRowVisible(false);

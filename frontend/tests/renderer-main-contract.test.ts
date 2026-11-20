@@ -568,6 +568,16 @@ describe("live socket close handler (FL-03)", () => {
   });
 });
 
+describe("S-15: the History player streams instead of fetching the whole file", () => {
+  it("openRecording plays a minted stream URL and never builds a Blob of the audio", () => {
+    const open = mainTsxSlice("async function openRecording(", "\n}\n");
+    expect(open).toContain("mintRecordingStreamUrl(name, audioArchiveDir)");
+    expect(open).toContain("player.src = minted.url;");
+    expect(open).not.toContain("fetchSavedAudioFromBackend(");
+    expect(open).not.toContain("createObjectURL(");
+  });
+});
+
 /** Slice one top-level function of main.tsx, from its header to the next marker. */
 function mainTsxSlice(header: string, next: string): string {
   const start = mainTsx.indexOf(header);
