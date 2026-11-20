@@ -11,16 +11,17 @@ this app's own saved Russian recordings, Deepgram nova-3's
 ``backend.remote_deepgram_live`` — silently dropped whole clauses and
 was non-deterministic between repeat runs on the SAME audio.
 ``language=ru`` on the same files kept every clause, byte-identical
-across repeat runs. That is why a monolingual language, not ``multi``,
-belongs on the live config for Russian dictation.
+across repeat runs. What the product does about it — Auto runs ``multi``
+AND a monolingual second reading, merged at stop — is owned by
+``backend.deepgram_dual``; this module only serves the monolingual
+readings that measurement made part of every Auto recording.
 
-The cost of forcing a monolingual language is that Deepgram
+The cost of a monolingual reading is that Deepgram
 transliterates English product names phonetically instead of keeping
 them in Latin script — "Sonnet" comes back "санет", "Opus" comes back
 "опус", instead of the brand name. Nova-3 Keyterm Prompting
 (``keyterm=<term>``, repeated once per term) is Deepgram's documented
-mechanism for biasing recognition toward a vocabulary list without
-switching language back to the lossy multilingual mode. This module is
+mechanism for biasing recognition toward a vocabulary list on that reading. This module is
 the one place both Deepgram paths build that list from, so a term added
 once — in the user's config — reaches live streaming and prerecorded
 REST identically instead of drifting into two independent

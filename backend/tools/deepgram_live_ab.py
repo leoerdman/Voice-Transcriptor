@@ -29,33 +29,33 @@ Usage::
 
 The Deepgram API key is read from the app's own config
 (``backend.config.load_config()``) under ``providers.deepgram.key`` —
-never printed or logged. Set ``TRANSCRIPTOR_DATA_DIR`` to point at a
-different profile; it defaults to this app's macOS userData directory.
+never printed or logged. The profile is the app's own
+(``backend.data_dir.default_data_dir``); set ``TRANSCRIPTOR_DATA_DIR`` to
+point at a different one.
+
+``--dump-readings DIR`` (with ``--dual``) writes both readings each run
+merged, exactly as the two sessions delivered them, to one JSON file per
+run; ``python -m backend.tools.dual_replay FILE.json`` re-merges such a
+file offline with the merge rules in the working tree. A change to the
+merge is then compared against real readings for free instead of paying
+Deepgram once per variant.
 
 Exit codes: 0 all runs succeeded, 1 at least one run errored (see the
 per-row ``ERROR:`` text), 2 no Deepgram API key configured, 3 an input
-WAV was missing or not 16 kHz mono.
+WAV was missing or not 16 kHz mono, or ``--dual`` was asked for a
+language that does not run the app's dual reading.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
-import os
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-
-# Set BEFORE importing backend.config, which resolves config.json off
-# this env var at first use. Only supplies a default — an operator
-# pointing at a different profile via an already-exported
-# TRANSCRIPTOR_DATA_DIR is respected.
-os.environ.setdefault(
-    "TRANSCRIPTOR_DATA_DIR",
-    os.path.expanduser("~/Library/Application Support/transcriptor"),
-)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -63,6 +63,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import soundfile as sf  # noqa: E402
 
+from backend.async_tasks import cancel_and_await  # noqa: E402
 from backend.audio_constants import LIVE_SAMPLE_RATE_HZ  # noqa: E402
 from backend.config import load_config  # noqa: E402
 from backend.deepgram_keyterms import normalize_keyterms  # noqa: E402
@@ -70,6 +71,7 @@ from backend.model_catalog import DEFAULT_DEEPGRAM_AUDIO_MODEL  # noqa: E402
 from backend.deepgram_dual import (  # noqa: E402
     DUAL_SECONDARY_LANGUAGE_DEFAULT,
     DualLiveSession,
+    dual_applies,
     secondary_config,
 )
 from backend.deepgram_recovery import (  # noqa: E402
@@ -80,6 +82,7 @@ from backend.deepgram_warm import DeepgramWarmPool  # noqa: E402
 from backend.remote_deepgram_live import (  # noqa: E402
     DeepgramLiveError,
     live_config,
+    resolve_live_language,
 )
 
 # One code path for opening a live session, in the app and here alike:
@@ -164,6 +167,7 @@ async def _run_one(
     file_label: str,
     run_index: int,
     dual_language: str = "",
+    dump_dir: "Path | None" = None,
 ) -> RunResult:
     # The app's own builder. Constructing a ``DeepgramLiveConfig``
     # directly here meant this tool measured a socket opened with
@@ -182,7 +186,9 @@ async def _run_one(
                 primary=session,
                 secondary=secondary,
                 secondary_language=dual_language,
-                primary_language=language,
+                # The label the app passes (``backend.main``): the
+                # language actually on the wire, never "auto".
+                primary_language=resolve_live_language(language),
             )
     except DeepgramLiveError as e:
         return RunResult(
@@ -213,6 +219,10 @@ async def _run_one(
         # only the half of the stop that happens before the envelope is
         # completed, and the envelope is what the user receives.
         result = await session.drain_transcript()
+        if dump_dir is not None and isinstance(session, DualLiveSession):
+            _dump_readings(
+                dump_dir, file_label, run_index, session, language, dual_language,
+            )
         evidence = evidence_from_session(session)
         stream_death_sec = session.stream_death_sec
         result = await run_recovery(
@@ -223,12 +233,14 @@ async def _run_one(
             cfg=cfg,
             api_key=api_key,
         )
-        await session.shutdown()
     finally:
+        # In the ``finally`` so a run that raised mid-stream still closes
+        # its socket(s) — the same teardown the WS handler guarantees.
+        await session.shutdown()
         try:
             await asyncio.wait_for(drain_task, timeout=5.0)
-        except Exception:
-            drain_task.cancel()
+        except asyncio.TimeoutError:
+            await cancel_and_await(drain_task, what="ab-tool event drain", log=logging.getLogger(__name__))
 
     stats = result.get("stats") or {}
     recovery = stats.get("recovery") or {}
@@ -260,6 +272,32 @@ async def _run_one(
     )
 
 
+def _dump_readings(
+    dump_dir: Path,
+    file_label: str,
+    run_index: int,
+    session: DualLiveSession,
+    language: str,
+    dual_language: str,
+) -> None:
+    """Write the two readings this run merged, for ``dual_replay``."""
+    readings = session.last_readings
+    if readings is None:
+        return
+    primary_result, secondary_result = readings
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    path = dump_dir / f"{Path(file_label).stem}.{language}+{dual_language}.run{run_index}.json"
+    payload = {
+        "file": file_label,
+        "primary_language": resolve_live_language(language),
+        "secondary_language": dual_language,
+        "primary_segments": primary_result.get("segments") or [],
+        "secondary_segments": (secondary_result or {}).get("segments") or [],
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(f"readings: {path}", file=sys.stderr)
+
+
 def _format_words(r: RunResult) -> str:
     """One line per delivered word: time, Deepgram's confidence and
     language, which reading it came from (dual), and the word."""
@@ -288,6 +326,18 @@ def _format_row(r: RunResult, *, full: bool) -> str:
 
 
 async def _main_async(args: argparse.Namespace) -> int:
+    if args.dual:
+        not_multi = [lang for lang in args.language if not dual_applies(lang)]
+        if not_multi:
+            # The app opens a second reading only for a multilingual
+            # recording (``dual_stream_enabled``); measuring any other
+            # configuration measures something no user ever runs.
+            print(
+                f"error: --dual applies only to a multilingual recording; "
+                f"not for --language {', '.join(not_multi)}",
+                file=sys.stderr,
+            )
+            return 3
     api_key = _load_api_key()
     if not api_key:
         print(
@@ -311,6 +361,8 @@ async def _main_async(args: argparse.Namespace) -> int:
             print(f"error: {e}", file=sys.stderr)
             return 3
 
+    dump_dir = Path(args.dump_readings) if args.dump_readings else None
+
     tasks = []
     labels: list[tuple[str, str, int]] = []
     for p in paths:
@@ -329,6 +381,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                         file_label=p.name,
                         run_index=run_index,
                         dual_language=args.dual or "",
+                        dump_dir=dump_dir,
                     )
                 )
 
@@ -388,6 +441,12 @@ def build_parser() -> argparse.ArgumentParser:
              f"'{DUAL_SECONDARY_LANGUAGE_DEFAULT}') on the same audio, "
              "merged by word timestamps through the same DualLiveSession "
              "the app uses. Doubles the Deepgram seconds billed.",
+    )
+    parser.add_argument(
+        "--dump-readings", default="", metavar="DIR",
+        help="With --dual: write both readings each run merged to a JSON "
+             "file in DIR, for offline re-merging with "
+             "`python -m backend.tools.dual_replay`.",
     )
     parser.add_argument(
         "--keyterms", default="",

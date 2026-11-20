@@ -289,7 +289,7 @@ def normalize_words(raw: object) -> list[dict]:
         # ``confidence`` on every model, ``language`` per word on
         # ``language=multi``. The dual-stream merge decides which reading
         # owns a stretch both heard differently from exactly these
-        # (``backend.deepgram_dual._language_disagreements``).
+        # (``backend.deepgram_dual._settle_contested_stretches``).
         if isinstance(item.get("confidence"), (int, float)):
             record["confidence"] = round(float(item["confidence"]), 3)
         language = item.get("language")
@@ -615,6 +615,37 @@ def _looks_like_severed_pair(core_a: str, core_b: str) -> bool:
     return _has_vowel(core_a) != _has_vowel(core_b)
 
 
+def _fuse_word_records(head: dict, tail: dict) -> dict:
+    """One word record from the two halves a final boundary severed.
+
+    Keeps the evidence ``normalize_words`` attaches to every word: the
+    dual-stream merge decides contested stretches from exactly these
+    (``backend.deepgram_dual._settle_contested_stretches``), and a fused
+    word without a ``language`` ends a contested run in the middle,
+    sending that one word through word-by-word pairing — the
+    interleaving the rule exists to stop. Confidence is the halves'
+    duration-weighted mean (each half is evidence about its own share of
+    the word); the language is the longer half's.
+    """
+    fused: dict = {
+        "word": str(head.get("word") or "") + str(tail.get("word") or ""),
+        "start": head.get("start"),
+        "end": tail.get("end"),
+    }
+    halves = [w for w in (head, tail) if isinstance(w.get("confidence"), (int, float))]
+    if halves:
+        # ``word_duration`` is strictly positive, so the weight is too.
+        fused["confidence"] = round(
+            sum(float(w["confidence"]) * word_duration(w) for w in halves)
+            / sum(word_duration(w) for w in halves),
+            3,
+        )
+    tagged = [w for w in (head, tail) if isinstance(w.get("language"), str) and w["language"]]
+    if tagged:
+        fused["language"] = max(tagged, key=word_duration)["language"]
+    return fused
+
+
 def merge_seam_fragments(
     segments: list[dict],
 ) -> list[dict]:
@@ -675,13 +706,7 @@ def merge_seam_fragments(
         p_words = segment_words(prev)
         n_words = segment_words(nxt)
         if p_words and n_words:
-            fused = {
-                "word": str(p_words[-1].get("word") or "")
-                + str(n_words[0].get("word") or ""),
-                "start": p_words[-1].get("start"),
-                "end": n_words[0].get("end"),
-            }
-            prev["words"] = [*p_words[:-1], fused]
+            prev["words"] = [*p_words[:-1], _fuse_word_records(p_words[-1], n_words[0])]
             n_words = n_words[1:]
         nxt_rest = " ".join(n_tokens[1:])
         if nxt_rest:
@@ -1191,29 +1216,10 @@ class DeepgramLiveConfig:
         # same question ("is this recording running multilingual?") and
         # must not be able to answer it differently.
         #
-        # Nova-3 multilingual mode ("multi") — the model auto-detects the
-        # active language per utterance across 10 supported
-        # languages including Russian, Spanish, French, German,
-        # Hindi, Portuguese, Italian, Dutch, Japanese, English.
-        #
-        # 2026-09-03 measurement (BUGS_AUDIT_2026-09-03.md §1;
-        # reproducible with ``backend/tools/deepgram_live_ab.py``):
-        # on this app's own saved Russian recordings, ``multi``
-        # dropped ~35% of a 99 s dictation and whole clauses in two
-        # short ones (8.6 s, 12 s), and was non-deterministic
-        # between repeat runs on the SAME audio. ``language=ru`` on
-        # the identical files kept every clause, byte-identical
-        # across repeats. Lowering the level by 14 dB to match the
-        # clean June recording did not change the result. A 173 s
-        # June recording, made without clipping, showed no
-        # difference between the two modes — the failure
-        # is specific to this kind of content, not universal. This
-        # does NOT change what "auto" maps to here — that mapping
-        # is a UI-level choice (see ``frontend``) — it only records
-        # the measured fact where the mapping lives, and points at
-        # Keyterm Prompting (``keyterms`` above) as the mitigation
-        # for the transliteration cost of choosing a monolingual
-        # language instead.
+        # What ``multi`` measurably does to this user's Russian speech,
+        # and why Auto therefore runs a second, monolingual reading, is
+        # owned by ``backend.deepgram_dual``'s module docstring — the
+        # module that acts on it — not restated here.
         params.append(("language", resolve_live_language(self.language)))
         params.extend(keyterm_query_pairs(self.keyterms, model))
         return urlencode(params)

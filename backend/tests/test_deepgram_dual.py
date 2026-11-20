@@ -336,6 +336,49 @@ class MergeReadingsTests(unittest.TestCase):
         self.assertEqual(merged.text, "a b")
 
 
+class DiarizedMergeTests(unittest.TestCase):
+    """BE-03: Auto + diarize runs the dual merge, and the merge used to
+    rebuild segments with no ``speaker`` at all — diarization silently
+    did nothing on the default path."""
+
+    def _diarized(self, words, speaker):
+        seg = _segment(words)
+        seg["speaker"] = speaker
+        return seg
+
+    def test_segments_carry_the_primarys_speakers_and_split_at_a_turn(self):
+        primary = [
+            self._diarized([_w("hello", 0.0, 0.4), _w("there", 0.4, 0.8)], 0),
+            self._diarized([_w("hi", 0.9, 1.2), _w("back", 1.2, 1.5)], 1),
+        ]
+        secondary = [
+            _segment([_w("hello", 0.0, 0.4), _w("there", 0.4, 0.8),
+                      _w("hi", 0.9, 1.2), _w("back", 1.2, 1.5)])
+        ]
+        merged = merge_readings(primary, secondary)
+        self.assertEqual(
+            [(seg["text"], seg.get("speaker")) for seg in merged.segments],
+            [("hello there", 0), ("hi back", 1)],
+        )
+
+    def test_a_word_only_the_secondary_heard_takes_the_nearest_turn(self):
+        primary = [
+            self._diarized([_w("one", 0.0, 0.4)], 0),
+            self._diarized([_w("three", 3.0, 3.4)], 1),
+        ]
+        secondary = [_segment([_w("one", 0.0, 0.4), _w("два", 2.5, 2.9), _w("three", 3.0, 3.4)])]
+        merged = merge_readings(primary, secondary)
+        speakers = {w["word"]: w.get("speaker") for w in merged.words}
+        self.assertEqual(speakers, {"one": 0, "два": 1, "three": 1})
+
+    def test_without_diarization_no_speaker_appears(self):
+        merged = merge_readings(
+            [_segment([_w("hello", 0.0, 0.4)])], [_segment([_w("hello", 0.0, 0.4)])]
+        )
+        self.assertNotIn("speaker", merged.segments[0])
+        self.assertNotIn("speaker", merged.words[0])
+
+
 class ForwardedSegmentWireShapeTests(unittest.TestCase):
     """Pin the wire shape a final ``segments`` frame sends the renderer.
 
@@ -845,6 +888,56 @@ class ContestedStretchTests(unittest.TestCase):
         merged = merge_readings([_segment(multi)], [_segment(ru)])
         self.assertEqual((merged.contested_to_secondary, merged.contested_to_primary), (0, 0))
 
+    def test_a_single_partner_fragment_does_not_take_a_stretch(self):
+        """BE-01: ``ru`` skipped the French clause but emitted one word
+        inside it. One confident word is no reading of six seconds."""
+        multi = [_ev(f"mot{i}", 30.0 + i * 0.75, 30.7 + i * 0.75, 0.6, "fr") for i in range(8)]
+        ru = [_ev("да", 33.0, 33.3, 0.97)]
+        merged = merge_readings([_segment(multi)], [_segment(ru)])
+        self.assertEqual(merged.text, " ".join(f"mot{i}" for i in range(8)))
+        self.assertEqual((merged.contested_to_secondary, merged.contested_to_primary), (0, 1))
+
+    def test_partner_ground_includes_words_whose_midpoint_lies_outside(self):
+        """Measured 2026-11-20 on the 2026-09-03 trilingual take: ``ru``'s
+        "слушай." runs 1.52-4.48 s, past the ``uk``-tagged stretch, yet it
+        is ground the partner read — the stretch is fully covered and the
+        more confident reading takes it."""
+        multi = [_ev("Так,", 1.20, 1.84, 0.716, "uk"), _ev("слушай", 1.84, 2.24, 0.801, "uk")]
+        ru = [_ev("Так,", 1.12, 1.52, 0.9), _ev("слушай.", 1.52, 4.48, 0.859)]
+        merged = merge_readings([_segment(multi)], [_segment(ru)])
+        self.assertEqual((merged.contested_to_secondary, merged.contested_to_primary), (1, 0))
+        self.assertEqual(merged.text, "Так, слушай.")
+
+    def test_a_tie_goes_to_the_secondary(self):
+        multi = [_ev("Ir", 1.0, 1.4, 0.8, "lt"), _ev("net", 1.4, 1.8, 0.8, "lt")]
+        ru = [_ev("Когда", 1.0, 1.4, 0.8), _ev("я", 1.4, 1.8, 0.8)]
+        merged = merge_readings([_segment(multi)], [_segment(ru)])
+        self.assertEqual(merged.text, "Когда я")
+
+    def test_an_english_partner_leaves_russian_speech_to_the_multilingual_reading(self):
+        """BE-02, measured 2026-11-20 with ``--dual en`` on the trilingual
+        take: over ``multi``'s Russian 5.80-12.37 s the English reading
+        heard two words, and over its German hallucination 32.95-36.83 s a
+        handful — neither is a reading of that speech."""
+        multi = [
+            _ev("если", 5.80, 6.12, 0.994, "ru"), _ev("тебе", 6.12, 6.52, 1.0, "ru"),
+            _ev("нужно,", 6.52, 6.76, 0.973, "ru"), _ev("я", 6.76, 7.00, 1.0, "ru"),
+            _ev("вот", 7.00, 7.16, 0.984, "ru"), _ev("сейчас", 7.16, 7.48, 1.0, "ru"),
+            _ev("записываю", 7.48, 8.12, 0.912, "ru"), _ev("прямо", 8.12, 8.36, 0.854, "ru"),
+            _ev("сейчас", 8.36, 8.68, 0.999, "ru"), _ev("голосовое", 8.68, 9.32, 0.98, "ru"),
+            _ev("сообщение.", 9.32, 9.64, 0.792, "ru"), _ev("На", 10.05, 10.29, 0.993, "ru"),
+            _ev("останется.", 10.29, 10.85, 0.76, "ru"),
+            _ev("Hello.", 10.85, 11.89, 0.399, "ru"), _ev("Hello,", 11.89, 12.29, 0.828, "ru"),
+        ]
+        en = [_ev("Hello.", 10.93, 11.49, 0.583), _ev("Hello,", 11.81, 12.37, 0.963)]
+        merged = merge_readings(
+            [_segment(multi)], [_segment(en)], secondary_language="en",
+        )
+        self.assertTrue(merged.text.startswith("если тебе нужно, я вот сейчас записываю"))
+        self.assertIn("На останется. Hello. Hello,", merged.text)
+        self.assertEqual((merged.contested_to_secondary, merged.contested_to_primary), (0, 1))
+        self.assertTrue(all(w["source"] in ("multi", "en") for w in merged.words))
+
     def test_flatten_keeps_the_evidence(self):
         words = flatten_words([_segment([_ev("Hi", 0.0, 0.5, 0.9, "en")])], "multi")
         self.assertEqual(words[0]["confidence"], 0.9)
@@ -962,6 +1055,31 @@ class MergeCostTests(unittest.TestCase):
             f"750x750 cost {small:.1f} ms, 3000x3000 cost {large:.1f} ms",
         )
 
+
+    @staticmethod
+    def _contested_cpu_ms(stretches: int) -> tuple[float, int]:
+        primary, secondary = [], []
+        for i in range(stretches):
+            t = i * 2.0
+            primary.append(_ev(f"f{i}", t, t + 0.3, 0.6, "fr"))
+            primary.append(_ev(f"r{i}", t + 1.4, t + 1.7, 0.9, "ru"))
+            secondary.append(_ev(f"a{i}", t, t + 0.3, 0.9))
+            secondary.append(_ev(f"b{i}", t + 1.4, t + 1.7, 0.9))
+        started = time.process_time()
+        merged = merge_readings([_segment(primary)], [_segment(secondary)])
+        return (time.process_time() - started) * 1000.0, merged.contested_to_secondary
+
+    def test_contested_stretches_do_not_rescan_the_partner_per_stretch(self):
+        """BE-12: every contested stretch used to rescan the whole partner
+        reading for its rivals — O(stretches x words) on the stop path.
+        Same property as above: 4x the stretches must cost well under 16x."""
+        small, small_count = min(self._contested_cpu_ms(750) for _ in range(3))
+        large, large_count = min(self._contested_cpu_ms(3000) for _ in range(3))
+        self.assertEqual((small_count, large_count), (750, 3000))
+        self.assertLess(
+            large, max(small, 0.5) * 8.0,
+            f"750 stretches cost {small:.1f} ms, 3000 cost {large:.1f} ms",
+        )
 
 
 class DualDefaultsSsotTests(unittest.TestCase):

@@ -48,6 +48,7 @@ What this module owns
 from __future__ import annotations
 
 import asyncio
+import bisect
 import heapq
 import logging
 from dataclasses import dataclass, field, replace
@@ -80,7 +81,6 @@ from backend.remote_deepgram_live import (
     DeepgramLiveSession,
     DeepgramLiveStats,
     SPANLESS_WORD_FLAG,
-    intersect_spans,
     resolve_live_language,
     segment_word_records,
     segment_words,
@@ -113,11 +113,6 @@ logger = logging.getLogger(__name__)
 # under any real inter-word pause.
 ADJACENT_SAME_STEM_MAX_GAP_SEC = 0.3
 
-# Merged words further apart than ``INTERIM_WORD_GAP_SPLIT_SEC`` start a
-# new segment — deliberately the same number the single-stream splice
-# uses to group recovered words into fallback segments, so "these words
-# belong to one clause" means one thing in this product.
-
 _LATIN = set("abcdefghijklmnopqrstuvwxyz")
 
 
@@ -136,6 +131,18 @@ def _deepgram_prefs(cfg: Any) -> dict:
     return dg if isinstance(dg, dict) else {}
 
 
+def dual_applies(language: str) -> bool:
+    """Is a second reading meaningful for a recording in ``language``?
+
+    Only when the recording resolves to Deepgram's multilingual mode
+    (``resolve_live_language`` — the same function that decides what
+    goes on the wire). The preference half of the decision is
+    ``dual_stream_enabled``'s; this half is shared with the A/B tool,
+    which must not measure a configuration the app never runs.
+    """
+    return resolve_live_language(language) == "multi"
+
+
 def dual_stream_enabled(cfg: Any, language: str) -> bool:
     """Should this recording open a second Deepgram reading?
 
@@ -151,7 +158,7 @@ def dual_stream_enabled(cfg: Any, language: str) -> bool:
     ``ru`` is already getting the reading the merge would add; running
     it twice would double the bill for an identical transcript.
     """
-    if resolve_live_language(language) != "multi":
+    if not dual_applies(language):
         return False
     value = _deepgram_prefs(cfg).get("dual_stream")
     if value is None:
@@ -325,15 +332,10 @@ def _drop_shadowed_spanless(
         if not word.get(SPANLESS_WORD_FLAG):
             kept.append(word)
             continue
-        span = max(0.0, word["end"] - word["start"])
-        if span <= 0.0:
+        if word["end"] <= word["start"]:
             kept.append(word)
             continue
-        overlap = sum(
-            end - start
-            for start, end in intersect_spans([(word["start"], word["end"])], covered)
-        )
-        if overlap / span < SPANLESS_SHADOW_MIN_FRACTION:
+        if _covered_fraction(covered, word["start"], word["end"]) < SPANLESS_SHADOW_MIN_FRACTION:
             kept.append(word)
     return kept
 
@@ -491,6 +493,36 @@ def _mean_confidence(words: list[dict]) -> Optional[float]:
     return sum(values) / len(values) if values else None
 
 
+def _covered_fraction(
+    covered: list[tuple[float, float]], start: float, end: float
+) -> float:
+    """How much of ``[start, end)`` the (unioned) ``covered`` spans cover.
+
+    The one measure behind both "does the other reading actually read
+    this ground?" questions in this module — a clause blob against real
+    words (``_drop_shadowed_spanless``) and a contested stretch against
+    its rivals (``_settle_contested_stretches``) — both judged against
+    ``SPANLESS_SHADOW_MIN_FRACTION``.
+    """
+    span = end - start
+    if span <= 0.0:
+        return 0.0
+    # ``covered`` is unioned — sorted and disjoint, so its ends are sorted
+    # too — and the first block that can reach ``start`` is found by
+    # bisection: asked once per contested stretch, a scan from the first
+    # block would be O(stretches x words) on the stop path.
+    total = 0.0
+    for a, b in covered[bisect.bisect_right(covered, start, key=lambda blk: blk[1]):]:
+        if a >= end:
+            break
+        total += min(b, end) - max(a, start)
+    return total / span
+
+
+def _word_spans(words: Iterable[dict]) -> list[tuple[float, float]]:
+    return union_spans((w["start"], w["end"]) for w in words)
+
+
 def _contested_runs(primary: list[dict], secondary_language: str) -> list[list[dict]]:
     """Runs of primary words the primary itself attributes to a language
     other than the secondary reading's. A word with no language tag, a
@@ -548,13 +580,31 @@ def _settle_contested_stretches(
     * real English              0.98 vs 0.84 → primary
 
     A reading cannot be confident about speech in a language it was not
-    reading, which is what makes the comparison the right question.
+    reading, which is what makes the comparison the right question. It
+    holds for the other partner the picker offers too: with ``en`` as
+    the secondary (``--dual en`` on the same trilingual take, 2026-11-20)
+    the contested stretches are ``multi``'s Russian ones, and over the
+    four of them ``en`` reached 0.39 / 0.77 / 0.36 / 0.67 against
+    ``multi``'s 0.76 / 0.85 / 0.68 / 0.70 while covering 92 / 17 / 86 /
+    12 % of their ground — every one stayed with ``multi``. Replay any
+    such measurement offline with ``backend.tools.dual_replay``.
 
     * The secondary has no words there → the primary keeps the stretch:
       it is the only reading of it (the French clause ``ru`` skipped in
       the September measurement).
     * Either side carries no confidence at all → undecided, the stretch
       is left to the word-by-word rules exactly as before.
+    * The secondary's words (all of them, not only those whose midpoint
+      falls inside) cover less than
+      ``SPANLESS_SHADOW_MIN_FRACTION`` of the stretch → the primary owns
+      it, and those few words are dropped. This is the limit case above
+      seen from one word further: a reading that skipped a clause but
+      emitted one fragment inside it has still not READ that clause, and
+      the mean confidence of one word is no evidence about six seconds
+      of speech. The same fraction ``_drop_shadowed_spanless`` already
+      requires before one reading's words may stand in for the other's
+      clause — "the other reading actually covers this ground" means
+      one thing in this module.
     * Otherwise the more confident reading owns the stretch (a tie goes
       to the secondary — the language the user chose): the other
       reading's words inside it are dropped, and the owner's words are
@@ -571,35 +621,57 @@ def _settle_contested_stretches(
     removed_primary: set[int] = set()
     removed_secondary: set[int] = set()
     settled: list[dict] = []
+    # Candidate rivals, ordered by midpoint once, so each stretch finds its
+    # own by bisection instead of rescanning the whole secondary reading
+    # — the O(runs x words) shape B-002 removed from ``_pairs``.
+    by_mid = sorted(
+        ((w["start"] + w["end"]) / 2, i)
+        for i, w in enumerate(secondary)
+        if not w.get(SPANLESS_WORD_FLAG)
+    )
+    mids = [mid for mid, _i in by_mid]
+    # What the secondary reading's words cover at all — the ground it
+    # actually READ. Every word counts here, not only the midpoint
+    # rivals: a long secondary word that starts inside the stretch and
+    # ends after it (measured: ``ru``'s "слушай." 1.52-4.48 s against
+    # ``multi``'s ``uk``-tagged "Так, слушай" 1.20-2.24 s) is ground the
+    # partner heard, even though its midpoint lies outside.
+    secondary_ground = _word_spans(
+        w for w in secondary if not w.get(SPANLESS_WORD_FLAG)
+    )
     for run in _contested_runs(primary, secondary_language):
         start, end = run[0]["start"], run[-1]["end"]
         # A word belongs to the stretch its midpoint falls in, half-open
         # [start, end): no overlap threshold to tune, and a word that only
         # grazes an edge (the "Да," after "Agents workflow.") stays out.
-        rivals = [
-            w for w in secondary
-            if not w.get(SPANLESS_WORD_FLAG) and start <= (w["start"] + w["end"]) / 2 < end
-        ]
+        lo = bisect.bisect_left(mids, start)
+        hi = bisect.bisect_left(mids, end)
+        rivals = [secondary[i] for _mid, i in sorted(by_mid[lo:hi], key=lambda t: t[1])]
         if not rivals:
             continue
         primary_conf = _mean_confidence(run)
         secondary_conf = _mean_confidence(rivals)
         if primary_conf is None or secondary_conf is None:
             continue
+        coverage = _covered_fraction(secondary_ground, start, end)
         removed_primary.update(id(w) for w in run)
         removed_secondary.update(id(w) for w in rivals)
-        if secondary_conf >= primary_conf:
+        to_secondary_here = (
+            coverage >= SPANLESS_SHADOW_MIN_FRACTION and secondary_conf >= primary_conf
+        )
+        if to_secondary_here:
             settled.extend(rivals)
             to_secondary += 1
         else:
             settled.extend(run)
             to_primary += 1
         logger.info(
-            "dual-stream contested %.2f-%.2fs %s(%s)=%.3f vs %s=%.3f → %s",
+            "dual-stream contested %.2f-%.2fs %s(%s)=%.3f vs %s=%.3f "
+            "coverage=%.2f → %s",
             start, end,
             run[0].get("source", "primary"), run[0].get("language", "?"), primary_conf,
-            secondary_language, secondary_conf,
-            secondary_language if secondary_conf >= primary_conf else run[0].get("source", "primary"),
+            secondary_language, secondary_conf, coverage,
+            secondary_language if to_secondary_here else run[0].get("source", "primary"),
         )
     return (
         [w for w in primary if id(w) not in removed_primary],
@@ -682,27 +754,82 @@ def _drop_duplicate_runs(words: list[dict]) -> tuple[list[dict], int]:
     return out, dropped
 
 
+def _speaker_turns(segments: list[dict]) -> list[tuple[float, float, int]]:
+    """``(start, end, speaker)`` for every primary segment that has one.
+
+    The PRIMARY's diarization is the only one this product shows: it is
+    the reading whose interims and finals the live preview rendered, and
+    the two readings are two independent Deepgram sessions, so their
+    speaker indices are numbered independently — the secondary's
+    "speaker 0" is not the primary's. One owner of who-spoke-when, read
+    by time, is the only labelling that cannot contradict itself.
+    """
+    turns: list[tuple[float, float, int]] = []
+    for seg in segments:
+        speaker = seg.get("speaker")
+        if isinstance(speaker, bool) or not isinstance(speaker, int):
+            continue
+        turns.append((float(seg.get("start") or 0.0), float(seg.get("end") or 0.0), speaker))
+    turns.sort()
+    return turns
+
+
+def _label_speakers(words: list[dict], turns: list[tuple[float, float, int]]) -> None:
+    """Give every merged word the speaker of the primary turn it falls in.
+
+    A word inside a turn (by its midpoint) takes that turn's speaker; a
+    word in no turn — a stretch only the secondary heard — takes the
+    nearest turn's. Nothing is labelled when the primary carried no
+    speakers (diarization off), so the merged envelope keeps exactly the
+    shape a single reading would have.
+    """
+    if not turns:
+        return
+    starts = [t[0] for t in turns]
+    for word in words:
+        mid = (word["start"] + word["end"]) / 2.0
+        i = bisect.bisect_right(starts, mid) - 1
+        candidates = [turns[j] for j in (i, i + 1) if 0 <= j < len(turns)]
+
+        def _distance(turn: tuple[float, float, int]) -> float:
+            if turn[0] <= mid <= turn[1]:
+                return 0.0
+            return min(abs(mid - turn[0]), abs(mid - turn[1]))
+
+        word["speaker"] = min(candidates, key=_distance)[2]
+
+
 def _segments_from_words(words: list[dict]) -> list[dict]:
-    """Group merged words into segments at clause-length silences."""
+    """Group merged words into segments at clause-length silences
+    (``INTERIM_WORD_GAP_SPLIT_SEC`` — the number the single-stream splice
+    groups recovered words by, so "these words belong to one clause"
+    means one thing in this product) and,
+    when the words carry speakers, at every change of speaker — the same
+    per-segment ``speaker`` the single-reading path delivers."""
     segments: list[dict] = []
     for word in words:
-        if segments and word["start"] - segments[-1]["end"] <= INTERIM_WORD_GAP_SPLIT_SEC:
+        if (
+            segments
+            and word["start"] - segments[-1]["end"] <= INTERIM_WORD_GAP_SPLIT_SEC
+            and word.get("speaker") == segments[-1].get("speaker")
+        ):
             segment = segments[-1]
             segment["end"] = round(max(segment["end"], word["end"]), 3)
             segment["words"].append(word)
             continue
-        segments.append(
-            {
-                "start": round(word["start"], 3),
-                "end": round(word["end"], 3),
-                "text": "",
-                "confidence": 0.0,
-                "is_final": True,
-                "speech_final": False,
-                "words": [word],
-                "source": "dual-merge",
-            }
-        )
+        segment = {
+            "start": round(word["start"], 3),
+            "end": round(word["end"], 3),
+            "text": "",
+            "confidence": 0.0,
+            "is_final": True,
+            "speech_final": False,
+            "words": [word],
+            "source": "dual-merge",
+        }
+        if "speaker" in word:
+            segment["speaker"] = word["speaker"]
+        segments.append(segment)
     for segment in segments:
         segment["text"] = " ".join(w["word"] for w in segment["words"])
         segment["words"] = [dict(w) for w in segment["words"]]
@@ -713,21 +840,31 @@ def merge_readings(
     primary_segments: Iterable[dict],
     secondary_segments: Iterable[dict],
     *,
-    primary_source: str = "multi",
-    secondary_source: str = "ru",
+    primary_language: str = "multi",
+    secondary_language: str = DUAL_SECONDARY_LANGUAGE_DEFAULT,
 ) -> MergedReading:
     """Merge two readings of one recording into one transcript.
 
     Pure: takes the two finalized segment lists, returns the merged
     words (each carrying the ``source`` it came from), the segments they
     group into, and the counts the stop line reports.
+
+    ``primary_language`` / ``secondary_language`` are the Deepgram
+    language codes each reading ran in. They are what the contested-
+    stretch rule compares per-word language tags against, and they are
+    also the ``source`` label each word carries — named for the first
+    job so a caller cannot pass a free-form provenance string and
+    silently change which stretches count as contested.
     """
-    primary = flatten_words(primary_segments, primary_source)
-    secondary = flatten_words(secondary_segments, secondary_source)
+    primary_segments = list(primary_segments or [])
+    turns = _speaker_turns(primary_segments)
+    primary = flatten_words(primary_segments, primary_language)
+    secondary = flatten_words(secondary_segments, secondary_language)
     if not secondary:
         # Single-stream degradation, and the common case when the
         # secondary socket failed: the primary reading, untouched.
         merged = [dict(w) for w in primary]
+        _label_speakers(merged, turns)
         return MergedReading(
             words=merged,
             segments=_segments_from_words(merged),
@@ -746,7 +883,7 @@ def merge_readings(
     # so exactly one reading owns the ground it covers.
     primary, secondary = _reconcile_spanless(primary, secondary)
     primary, secondary, settled, contested_to_secondary, contested_to_primary = (
-        _settle_contested_stretches(primary, secondary, secondary_source)
+        _settle_contested_stretches(primary, secondary, secondary_language)
     )
     paired, only_primary, only_secondary = _pairs(primary, secondary)
     merged = [_resolve(pw, sw) for pw, sw in paired]
@@ -755,6 +892,7 @@ def merge_readings(
     merged.extend(dict(w) for w in only_secondary)
     merged.sort(key=lambda w: (w["start"], w["end"]))
     merged, duplicates = _drop_duplicate_runs(merged)
+    _label_speakers(merged, turns)
     return MergedReading(
         words=merged,
         segments=_segments_from_words(merged),
@@ -820,6 +958,12 @@ class DualLiveSession:
         # reading alone — a hole the primary reported is not a hole in
         # what the user receives if the secondary's words went into it.
         self._last_merged: Optional[MergedReading] = None
+        # The two readings that merge was built from, exactly as each
+        # session delivered them. Read by ``backend.tools.deepgram_live_ab
+        # --dump-readings`` so a change to the merge rules can be replayed
+        # against a real recording's readings offline, instead of paying
+        # Deepgram again for every variant of the rule.
+        self.last_readings: Optional[tuple[dict, Optional[dict]]] = None
 
     # ----- The single-session interface --------------------------------
 
@@ -1047,9 +1191,11 @@ class DualLiveSession:
 
         Mirrors ``DeepgramLiveSession.finalize`` (see its docstring) —
         the same "one interface either way" promise this class exists
-        for means a caller that only knows the single-session API (the
-        A/B tool; any future non-WS caller) must not have to special
-        case a dual recording to get its transcript and clean up.
+        for means a caller that only knows the single-session API must
+        not have to special case a dual recording to get its transcript
+        and clean up. The WS handler and the A/B tool both drive
+        ``drain_transcript`` + recovery + ``shutdown`` instead; this is
+        the convenience the session tests drive.
         """
         result = await self.drain_transcript(on_budget=on_budget)
         await self.shutdown(wait_timeout=wait_timeout)
@@ -1138,10 +1284,11 @@ class DualLiveSession:
         merged = merge_readings(
             primary_result.get("segments") or [],
             secondary_segments,
-            primary_source=self._primary_language,
-            secondary_source=self._secondary_language,
+            primary_language=self._primary_language,
+            secondary_language=self._secondary_language,
         )
         self._last_merged = merged
+        self.last_readings = (primary_result, secondary_result)
         logger.info(
             "dual-stream merge: %s=%d words %s=%d words merged=%d "
             "filled_from_%s=%d filled_from_%s=%d dups_removed=%d "
@@ -1251,6 +1398,7 @@ __all__ = [
     "DUAL_STREAM_DEFAULT",
     "DualLiveSession",
     "MergedReading",
+    "dual_applies",
     "dual_secondary_language",
     "dual_stream_enabled",
     "flatten_words",
