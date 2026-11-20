@@ -70,6 +70,16 @@ test("pwsh fallback: ok + any OK: marker succeeds", () => {
   assert.equal(isPwshPasteFallbackSuccess({ ok: false, stdout: "OK:pwsh-paste" }), false);
 });
 
+test("windows: the verdict is the last line, as on macOS — a marker inside other text is not an OK", () => {
+  // An error text that happens to contain "OK:" is not the script's
+  // success line; the macOS parser never accepted it and neither may
+  // the Windows ones.
+  assert.equal(isPwshPasteFallbackSuccess({ ok: true, stdout: "SendKeys failed: NOT OK: target gone" }), false);
+  assert.equal(isPwshPasteFallbackSuccess({ ok: true, stdout: "OK:pwsh-paste\r\nERR:activate" }), false);
+  assert.equal(isVbsPasteSuccess({ ok: true, stdout: "OK:vbs-paste\r\nERR:activate" }), false);
+  assert.equal(isVbsPasteSuccess({ ok: true, stdout: "SENT:vbs-paste\r\nOK:vbs-paste\r\n" }), true);
+});
+
 test("linux: exit code is the only signal (no protocol string)", () => {
   assert.equal(isLinuxPasteSuccess({ ok: true }), true);
   assert.equal(isLinuxPasteSuccess({ ok: false }), false);
