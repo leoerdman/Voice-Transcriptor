@@ -111,6 +111,17 @@ const {
 // post-stop task waits on (BUGS_AUDIT 2026-09-03 §6.7/§6.8/§6.9) —
 // unit-tested by desktop/recording-final-slot.test.js.
 const { createRecordingFinalSlot } = require("./recording-final-slot");
+// What a hand-off signal means (paste / keep waiting / terminal status),
+// decided from the renderer's explicit fields — never from the words the
+// user dictated (Ultra-Audit 2026-11-20 DM-01).
+const {
+  NO_SPEECH_STATUS,
+  SIGNAL_OUTCOME,
+  normalizeTranscriptText,
+  isNoSpeechPlaceholder,
+  isPasteableTranscript,
+  classifyRecordingSignal,
+} = require("./transcript-signal");
 
 // SSOT for "which system power events the app reacts to, and what each
 // one means" — subscribed exactly once from app.whenReady below.
@@ -822,23 +833,6 @@ function compactLogText(value, max = 180) {
   return `${s.slice(0, max)}...`;
 }
 
-function normalizeTranscriptText(value) {
-  return String(value || "").replace(/\s+/g, " ").trim();
-}
-
-function isNoSpeechFinalStatusText(value) {
-  const txt = normalizeTranscriptText(value);
-  if (!txt) return false;
-  const lower = txt.toLowerCase();
-  return (
-    lower.includes("no speech detected") ||
-    lower.includes("no speech captured") ||
-    lower.includes("silence detected") ||
-    lower === "[silence]" ||
-    lower === "[ silence ]"
-  );
-}
-
 function textDigest(input) {
   const str = String(input || "");
   let h = 2166136261;
@@ -847,17 +841,6 @@ function textDigest(input) {
     h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24);
   }
   return (h >>> 0).toString(16).padStart(8, "0");
-}
-
-function isMeaningfulTranscriptText(value) {
-  const txt = normalizeTranscriptText(value);
-  if (!txt) return false;
-  const lower = txt.toLowerCase();
-  const compact = lower.replace(/\s+/g, "");
-  if (isNoSpeechFinalStatusText(txt)) return false;
-  if (lower === "error" || lower === "[websocket error]" || compact === "[silence]") return false;
-  if (lower.startsWith("http ") || lower.startsWith("network error")) return false;
-  return true;
 }
 
 function createTrace(scope, seed = {}) {
@@ -6141,48 +6124,32 @@ async function processPostStopTask(task) {
   const consumeIpcSignal = (signal) => {
     handledSignalSeq = signal.seq;
     heardIpcSignal = true;
-    const text = normalizeTranscriptText(signal.text);
-    const elapsedMs = Date.now() - stopRequestedAt;
-    if (signal.final) {
-      // §6.8: finality is stated, never inferred. This is the only
-      // thing on the IPC path that may be pasted.
-      transcript = text;
-      traceStep(trace, "ipc_final", {
-        elapsedMs,
-        recordingId: signal.recordingId,
-        source: signal.source,
-        textLen: text.length,
-      });
-      if (isMeaningfulTranscriptText(text)) return "final";
-      // The renderer called this final, but it is a no-speech/error
-      // string rather than something to paste — same outcome the poll
-      // reaches through uiFinalTerminalWithoutPaste.
-      transcript = "";
-      terminalWithoutPasteStatus = isNoSpeechFinalStatusText(text)
-        ? "Recording completed, no speech detected."
-        : text;
-      return "terminal";
-    }
-    const meaningful = isMeaningfulTranscriptText(text);
-    traceStep(trace, "ipc_provisional", {
-      elapsedMs,
+    // §6.8: finality is stated, never inferred — and so is everything
+    // else. The renderer's ``final`` flag and its "<kind>:<phase>" source
+    // label decide; the text is never read for clues (DM-01: a dictation
+    // that starts with "HTTP " or mentions "silence detected" is still a
+    // dictation). ./transcript-signal owns the rule.
+    const verdict = classifyRecordingSignal(signal);
+    traceStep(trace, signal.final ? "ipc_final" : "ipc_signal", {
+      elapsedMs: Date.now() - stopRequestedAt,
       recordingId: signal.recordingId,
       source: signal.source,
-      textLen: text.length,
-      meaningful,
+      textLen: normalizeTranscriptText(signal.text).length,
+      outcome: verdict.outcome,
     });
-    if (meaningful) {
+    if (verdict.outcome === SIGNAL_OUTCOME.FINAL) {
+      // The only thing on the IPC path that may be pasted.
+      transcript = verdict.text;
+    } else if (verdict.outcome === SIGNAL_OUTCOME.PROVISIONAL) {
       // Best-known text only (§6.8/§6.9) — keep waiting for the final.
-      bestKnownText = text;
-      return "provisional";
+      bestKnownText = verdict.text;
+    } else {
+      // A publish with nothing to paste (no speech, error, auto-transcribe
+      // off): the recording is over and there will be no final.
+      transcript = "";
+      terminalWithoutPasteStatus = verdict.status;
     }
-    // A status-only publish with nothing to paste (no speech, error):
-    // the recording is over and there will be no final. Reporting it
-    // now is what the poll's terminal branches do today.
-    terminalWithoutPasteStatus = isNoSpeechFinalStatusText(text)
-      ? "Recording completed, no speech detected."
-      : text;
-    return "terminal";
+    return verdict.outcome;
   };
 
   // How the transcript arrives, in one loop with two sources and a
@@ -6222,7 +6189,7 @@ async function processPostStopTask(task) {
     const known = recordingFinalSlot.peek(task.recordingId);
     if (known?.last && known.last.seq > handledSignalSeq) {
       // "provisional" is not an answer — keep waiting for the final.
-      if (consumeIpcSignal(known.last) !== "provisional") break;
+      if (consumeIpcSignal(known.last) !== SIGNAL_OUTCOME.PROVISIONAL) break;
       continue;
     }
 
@@ -6290,7 +6257,7 @@ async function processPostStopTask(task) {
     const uiFinalStatusHasTranscript =
       uiFinalKind === "status" &&
       uiFinalBelongsToTask &&
-      isMeaningfulTranscriptText(uiFinalText);
+      isPasteableTranscript(uiFinalText);
     const uiFinalTerminalWithoutPaste =
       uiFinalBelongsToTask &&
       (uiFinalKind === "status" || uiFinalKind === "error") &&
@@ -6298,12 +6265,12 @@ async function processPostStopTask(task) {
       !uiFinalStatusHasTranscript;
     const uiFinalReadyByRecording =
       uiFinalKind === "transcript" &&
-      isMeaningfulTranscriptText(uiFinalText) &&
+      isPasteableTranscript(uiFinalText) &&
       task.recordingId > 0 &&
       Number(state.uiFinalRecordingId || 0) === task.recordingId;
     const uiFinalReadyByTime =
       uiFinalKind === "transcript" &&
-      isMeaningfulTranscriptText(uiFinalText) &&
+      isPasteableTranscript(uiFinalText) &&
       task.recordingId <= 0 &&
       Number(state.uiFinalAt || 0) > stopRequestedAt;
     const readyByRecording = !!byRecording || (task.recordingId > 0 && Number(state.finishedRecordingId || 0) === task.recordingId);
@@ -6312,8 +6279,8 @@ async function processPostStopTask(task) {
       transcript = normalizeTranscriptText(
         byRecording?.text || byTime?.text || state.finishedText || uiFinalText || ""
       );
-      if (!isMeaningfulTranscriptText(transcript)) {
-        const terminalReason = isNoSpeechFinalStatusText(transcript)
+      if (!isPasteableTranscript(transcript)) {
+        const terminalReason = isNoSpeechPlaceholder(transcript)
           ? "no-speech-ready-signal"
           : !transcript && (byRecording || byTime || Number(state.finishedRecordingId || 0) === task.recordingId)
             ? "empty-finished-record"
@@ -6321,8 +6288,8 @@ async function processPostStopTask(task) {
               ? "ui-final-status"
               : "";
         if (terminalReason) {
-          terminalWithoutPasteStatus = isNoSpeechFinalStatusText(transcript) || terminalReason === "empty-finished-record"
-            ? "Recording completed, no speech detected."
+          terminalWithoutPasteStatus = isNoSpeechPlaceholder(transcript) || terminalReason === "empty-finished-record"
+            ? NO_SPEECH_STATUS
             : uiFinalText;
           traceStep(trace, "signal_ready_terminal_without_paste", {
             pollCount,
@@ -6367,8 +6334,8 @@ async function processPostStopTask(task) {
       bestKnownText = uiFinalText;
     }
     if (uiFinalTerminalWithoutPaste) {
-      terminalWithoutPasteStatus = isNoSpeechFinalStatusText(uiFinalText)
-        ? "Recording completed, no speech detected."
+      terminalWithoutPasteStatus = isNoSpeechPlaceholder(uiFinalText)
+        ? NO_SPEECH_STATUS
         : uiFinalText;
       traceStep(trace, "terminal_without_paste", {
         pollCount,
@@ -6377,7 +6344,7 @@ async function processPostStopTask(task) {
         uiFinalKind,
         status: compactLogText(state.status || "", 80),
         statusKind: compactLogText(state.statusKind || "", 40),
-        reason: isNoSpeechFinalStatusText(uiFinalText) ? "no-speech" : "ui-final-status",
+        reason: isNoSpeechPlaceholder(uiFinalText) ? "no-speech" : "ui-final-status",
       });
       break;
     }
@@ -6406,8 +6373,8 @@ async function processPostStopTask(task) {
       continue;
     }
     if (doneLike) {
-      terminalWithoutPasteStatus = isNoSpeechFinalStatusText(uiFinalText)
-        ? "Recording completed, no speech detected."
+      terminalWithoutPasteStatus = isNoSpeechPlaceholder(uiFinalText)
+        ? NO_SPEECH_STATUS
         : "";
       traceStep(trace, "terminal_done_without_transcript", {
         pollCount,
@@ -6606,10 +6573,10 @@ async function processPostStopTask(task) {
  */
 async function handlePostStopTranscriptTimeout(trace, bestKnownText = "") {
   const best = normalizeTranscriptText(bestKnownText);
-  const fromBestKnown = isMeaningfulTranscriptText(best);
+  const fromBestKnown = isPasteableTranscript(best);
   const recovered = fromBestKnown ? best : await getLatestTranscriptText();
   const pasteAccel = lastShortcutStatus?.paste?.active || lastShortcutStatus?.paste?.desired || "";
-  if (isMeaningfulTranscriptText(recovered)) {
+  if (isPasteableTranscript(recovered)) {
     // getLatestTranscriptText already persists what it returns; the
     // best-known path has to do it here so the paste-last hotkey (and
     // the next launch) find the same text this status points at.
@@ -6641,14 +6608,14 @@ async function handlePostStopTranscriptTimeout(trace, bestKnownText = "") {
 async function getLatestTranscriptText() {
   const s = await queryRendererState();
   const finished = normalizeTranscriptText(s?.finishedText || "");
-  if (isMeaningfulTranscriptText(finished)) {
+  if (isPasteableTranscript(finished)) {
     lastTranscriptText = finished;
     saveLastTranscriptToDisk(finished);
     return finished;
   }
   const uiFinalKind = String(s?.uiFinalKind || "").trim().toLowerCase();
   const uiFinalText = normalizeTranscriptText(s?.uiFinalText || "");
-  if (uiFinalKind === "transcript" && isMeaningfulTranscriptText(uiFinalText)) {
+  if (uiFinalKind === "transcript" && isPasteableTranscript(uiFinalText)) {
     lastTranscriptText = uiFinalText;
     saveLastTranscriptToDisk(uiFinalText);
     return uiFinalText;
