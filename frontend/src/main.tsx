@@ -26,9 +26,10 @@ import {
   type StopTranscriptSource,
 } from "./envelope-deadline";
 import {
-  attemptFinalSave,
+  createSessionMetadataSaver,
   decideDrainedSilence,
   resolveFailedStopSummary,
+  resolveSessionTitle,
   resolveTranscriptStopSummary,
   runStopEpilogue,
   type FinalSaveOutcome,
@@ -12048,7 +12049,6 @@ async function stopLive(
     }
     return latestSourceLiveText;
   };
-  const latestSourceTitle = (): string => _smartTitle(latestSourceForSave());
   const captureSilenceSnapshot = (liveText: string): {
     hardSilence: boolean;
     likelySilenceWithoutPreview: boolean;
@@ -12557,26 +12557,25 @@ async function stopLive(
   // the no-transcript exits, the failure catch and the success path
   // cannot disagree about what is saved or how a failed save is
   // reported (FL-02: only the archive-moved conflict used to be caught;
-  // every other failure was dropped and the stop reported success).
-  const saveSessionMetadata = (transcriptText: string, providerName: string): Promise<FinalSaveOutcome> =>
-    attemptFinalSave(
-      () => saveRecordingText({
-        name: persistedRecordingName,
-        archiveDir: persistedRecordingArchiveDir,
-        requireExisting: !!persistedRecordingName,
-        title: latestSourceTitle(),
-        sourceText: latestSourceForSave(),
-        transcriptText,
-        provider: providerName,
-        model: modelValue,
-        language: languageValue,
-        recordingCollection,
-      }),
-      {
-        isConflict: isArchiveMutationConflict,
-        describe: (e) => sanitizeUiErrorMessage(e, "History save failed."),
-      },
-    );
+  // every other failure was dropped and the stop reported success). The
+  // title it writes comes from the transcript it is handed (what was
+  // SAID), the live text only when there is none (./stop-epilogue).
+  const defaultTitle = title;
+  const saveSessionMetadata = createSessionMetadataSaver({
+    target: () => ({ name: persistedRecordingName, archiveDir: persistedRecordingArchiveDir }),
+    liveSourceText: latestSourceForSave,
+    fallbackTitle: defaultTitle,
+    save: (request) => saveRecordingText({
+      ...request,
+      model: modelValue,
+      language: languageValue,
+      recordingCollection,
+    }),
+    classify: {
+      isConflict: isArchiveMutationConflict,
+      describe: (e) => sanitizeUiErrorMessage(e, "History save failed."),
+    },
+  });
   // The no-transcript exits (D-13): each states WHAT it ends with; how
   // it ends — signal, progress row, status, metadata save, release,
   // summary — is ``runStopEpilogue`` (./stop-epilogue), one for all.
@@ -12597,7 +12596,11 @@ async function stopLive(
       }
     },
     setStatus: (label) => setStatusScoped(sessionUiToken, label),
-    save: () => saveSessionMetadata(metadata.transcriptText, metadata.provider),
+    save: () => saveSessionMetadata({
+      spokenTranscript: "",
+      transcriptText: metadata.transcriptText,
+      provider: metadata.provider,
+    }),
     release: releaseStopEpilogueBookkeeping,
     patchSummary: (summary) => patchCurrentRecordingSummary({
       title: provisionalTitle,
@@ -13380,8 +13383,13 @@ async function stopLive(
       });
     }
     setStatusScoped(sessionUiToken, "Done");
-    title = plainTranscriptRaw ? _smartTitle(plainTranscriptRaw) : provisionalTitle;
-    const finalSave = await saveSessionMetadata(transcriptRaw, provider);
+    // The summary names the entry by the same rule the save does.
+    title = resolveSessionTitle(plainTranscriptRaw, latestSourceForSave(), defaultTitle);
+    const finalSave = await saveSessionMetadata({
+      spokenTranscript: plainTranscriptRaw,
+      transcriptText: transcriptRaw,
+      provider,
+    });
     patchCurrentRecordingSummary({
       title,
       ...resolveTranscriptStopSummary({
@@ -13406,7 +13414,7 @@ async function stopLive(
       $("progressRow").hidden = true;
     }
     setStatusScoped(sessionUiToken, "Error");
-    const fallbackSave = await saveSessionMetadata("", provider);
+    const fallbackSave = await saveSessionMetadata({ spokenTranscript: "", transcriptText: "", provider });
     patchCurrentRecordingSummary({
       title: provisionalTitle,
       ...resolveFailedStopSummary({

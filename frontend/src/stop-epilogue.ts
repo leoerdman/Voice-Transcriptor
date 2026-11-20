@@ -17,6 +17,8 @@
  * overrule the evidence that the session held speech.
  */
 
+import { smartRecordingTitle } from "./recording-title";
+
 export interface DrainedSilenceInput {
   /** ``captureSilenceSnapshot(...).silentCapture`` — the session's own
    *  measured verdict (digital silence, or nothing above its noise floor
@@ -112,6 +114,88 @@ export async function attemptFinalSave(
     console.warn("[stop] final History save failed", error);
     return { kind: "failed", message: classify.describe(error) };
   }
+}
+
+/**
+ * ── What the final History save writes (``createSessionMetadataSaver``) ──
+ *
+ * Every exit of a stop writes the session metadata through this one
+ * saver. It owns the two decisions the History entry is made of:
+ *
+ *  - the TITLE comes from what was SAID: the final transcript without its
+ *    screen marks when the stop has one, else the live text streamed
+ *    during the session, else the caller's default ("Recording <date>").
+ *    The final transcript is what History stores, so it is what names the
+ *    entry — the live text can be empty (local provider) or differ from
+ *    it (Deepgram REST recovery, upscale, re-decode), and screen marks
+ *    say nothing about the recording;
+ *  - the save failure is classified (``attemptFinalSave``), never thrown.
+ *
+ * It used to read its title from the live text on every path, so the
+ * success path archived a transcribed recording under the live text's
+ * title (often the date default) while the summary showed the
+ * transcript's — the save and the summary disagreed about one name.
+ */
+
+/** The fields of the final save this module decides. */
+export interface SessionSaveRequest {
+  name: string;
+  archiveDir: string;
+  requireExisting: boolean;
+  title: string;
+  sourceText: string;
+  transcriptText: string;
+  provider: string;
+}
+
+export interface SessionMetadataInput {
+  /** The final transcript as SPOKEN — without screen marks. Empty when
+   *  the stop has no transcript. */
+  spokenTranscript: string;
+  /** What History stores as the transcript: screen marks included; a
+   *  status line ("[ Silence ]") on an empty session; "" otherwise. */
+  transcriptText: string;
+  provider: string;
+}
+
+export interface SessionMetadataSaverDeps {
+  /** The History entry the provisional save created (empty: none yet). */
+  target(): { name: string; archiveDir: string };
+  /** The live source text at the moment of the save — read late, since
+   *  final events can still land while the socket drains. */
+  liveSourceText(): string;
+  /** The name when neither the transcript nor the live text has a word. */
+  fallbackTitle: string;
+  save(request: SessionSaveRequest): Promise<unknown>;
+  classify: FinalSaveErrorClassifier;
+}
+
+/** The title a session is archived under (rule above). */
+export function resolveSessionTitle(
+  spokenTranscript: string,
+  liveSourceText: string,
+  fallbackTitle: string,
+): string {
+  const spoken = String(spokenTranscript || "");
+  return smartRecordingTitle(spoken.trim() ? spoken : liveSourceText, fallbackTitle);
+}
+
+export function createSessionMetadataSaver(
+  deps: SessionMetadataSaverDeps,
+): (input: SessionMetadataInput) => Promise<FinalSaveOutcome> {
+  return (input) => attemptFinalSave(() => {
+    const { name, archiveDir } = deps.target();
+    const sourceText = deps.liveSourceText();
+    return deps.save({
+      name,
+      archiveDir,
+      requireExisting: !!name,
+      title: resolveSessionTitle(input.spokenTranscript, sourceText, deps.fallbackTitle),
+      sourceText,
+      transcriptText: input.transcriptText,
+      provider: input.provider,
+    });
+  }, deps.classify);
 }
 
 export interface StopEpiloguePlan {

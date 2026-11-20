@@ -1,14 +1,18 @@
 import { describe, expect, it } from "vitest";
 
+import { annotateTranscript } from "../src/screen-annotations";
 import {
   attemptFinalSave,
+  createSessionMetadataSaver,
   decideDrainedSilence,
   resolveEpilogueSummary,
   resolveFailedStopSummary,
+  resolveSessionTitle,
   resolveTranscriptStopSummary,
   runStopEpilogue,
   type DrainedSilenceInput,
   type FinalSaveOutcome,
+  type SessionSaveRequest,
   type StopEpilogueEffects,
   type StopEpiloguePlan,
 } from "../src/stop-epilogue";
@@ -221,5 +225,92 @@ describe("decideDrainedSilence — FL-01: mic health explains an empty session, 
 
   it("a healthy, non-silent session is never empty", () => {
     expect(decideDrainedSilence(base)).toEqual({ silent: false, micFault: false });
+  });
+});
+
+describe("createSessionMetadataSaver — the History entry a stop writes", () => {
+  function saverWith(opts: { liveSourceText: string; target?: { name: string; archiveDir: string }; fail?: Error }) {
+    const requests: SessionSaveRequest[] = [];
+    const save = createSessionMetadataSaver({
+      target: () => opts.target || { name: "rec-1", archiveDir: "/archive" },
+      liveSourceText: () => opts.liveSourceText,
+      fallbackTitle: "Recording 20.11.2026",
+      save: async (request) => {
+        requests.push(request);
+        if (opts.fail) throw opts.fail;
+        return { name: request.name };
+      },
+      classify,
+    });
+    return { save, requests };
+  }
+
+  it("names the entry after the final transcript when it differs from the live text", async () => {
+    const { save, requests } = saverWith({ liveSourceText: "draft words the live stream heard" });
+    expect(await save({
+      spokenTranscript: "The final transcript the recovery pass produced",
+      transcriptText: "The final transcript the recovery pass produced",
+      provider: "deepgram",
+    })).toEqual({ kind: "saved" });
+    expect(requests).toHaveLength(1);
+    expect(requests[0].title).toBe("The final transcript the recovery pass produced");
+    // The live text is still archived as the source it is.
+    expect(requests[0].sourceText).toBe("draft words the live stream heard");
+    expect(requests[0].transcriptText).toBe("The final transcript the recovery pass produced");
+  });
+
+  it("names the entry after the final transcript when the live stream said nothing (local provider)", async () => {
+    const { save, requests } = saverWith({ liveSourceText: "" });
+    await save({
+      spokenTranscript: "Привет это локальная расшифровка",
+      transcriptText: "Привет это локальная расшифровка",
+      provider: "local",
+    });
+    expect(requests[0].title).toBe("Привет это локальная расшифровка");
+  });
+
+  it("names a screen recording after what was said, while History keeps the marks", async () => {
+    const spoken = "one two three four";
+    const marked = annotateTranscript(spoken, [{ atMs: 0, text: "[Screenshot 0:00]" }], { durationMs: 10_000 });
+    expect(marked.startsWith("[Screenshot 0:00]")).toBe(true);
+    const { save, requests } = saverWith({ liveSourceText: "" });
+    await save({ spokenTranscript: spoken, transcriptText: marked, provider: "deepgram" });
+    expect(requests[0].title).toBe("one two three four");
+    expect(requests[0].transcriptText).toBe(marked);
+  });
+
+  it("without a transcript falls back to the live text, then to the default name", async () => {
+    const live = saverWith({ liveSourceText: "what the live stream heard" });
+    await live.save({ spokenTranscript: "", transcriptText: "[ Silence ]", provider: "deepgram" });
+    expect(live.requests[0].title).toBe("what the live stream heard");
+    expect(live.requests[0].transcriptText).toBe("[ Silence ]");
+    const none = saverWith({ liveSourceText: "  " });
+    await none.save({ spokenTranscript: "   ", transcriptText: "", provider: "" });
+    expect(none.requests[0].title).toBe("Recording 20.11.2026");
+  });
+
+  it("updates the provisional entry when there is one and creates none otherwise", async () => {
+    const existing = saverWith({ liveSourceText: "x" });
+    await existing.save({ spokenTranscript: "x", transcriptText: "x", provider: "p" });
+    expect(existing.requests[0]).toMatchObject({ name: "rec-1", archiveDir: "/archive", requireExisting: true, provider: "p" });
+    const fresh = saverWith({ liveSourceText: "x", target: { name: "", archiveDir: "" } });
+    await fresh.save({ spokenTranscript: "x", transcriptText: "x", provider: "p" });
+    expect(fresh.requests[0].requireExisting).toBe(false);
+  });
+
+  it("a failing save is a classified outcome, never a throw", async () => {
+    const conflict = saverWith({ liveSourceText: "", fail: new Error("Recording no longer exists in the target archive") });
+    expect(await conflict.save({ spokenTranscript: "a", transcriptText: "a", provider: "p" })).toEqual({ kind: "conflict" });
+    const failed = saverWith({ liveSourceText: "", fail: new Error("disk full") });
+    expect(await failed.save({ spokenTranscript: "a", transcriptText: "a", provider: "p" }))
+      .toEqual({ kind: "failed", message: "disk full" });
+  });
+});
+
+describe("resolveSessionTitle — titles come from what was SAID", () => {
+  it("prefers the spoken transcript, then the live text, then the default", () => {
+    expect(resolveSessionTitle("final words", "live words", "D")).toBe("final words");
+    expect(resolveSessionTitle("", "live words", "D")).toBe("live words");
+    expect(resolveSessionTitle(" \n", "", "D")).toBe("D");
   });
 });

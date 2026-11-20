@@ -215,13 +215,15 @@ describe("stopLive has exactly one transcript delivery site (F/7 / U-022)", () =
     expect(stopLiveBody.match(/releaseStopEpilogueBookkeeping\(\);/g) || []).toHaveLength(0);
   });
 
-  it("FL-02: exactly two saves in stopLive — the provisional audio save and the one classified metadata save", () => {
-    // A third inline saveRecordingText is how a save whose failure nobody
-    // reads comes back.
-    expect(stopLiveBody.match(/saveRecordingText\(\{/g) || []).toHaveLength(2);
-    expect(stopLiveBody).toMatch(/const saveSessionMetadata = [\s\S]{0,200}attemptFinalSave\(/);
-    // The conflict test lives only in the classifier handed to attemptFinalSave.
-    expect(stopLiveBody.match(/isArchiveMutationConflict/g) || []).toHaveLength(1);
+  it("FL-02 wiring: the metadata save is the module's saver, and the success path hands it the spoken transcript", () => {
+    // What the saver writes — the title rule, the classified outcome — is
+    // behaviour-tested in stop-epilogue.test.ts. What only the source can
+    // show is that stopLive uses it and what it hands it.
+    expect(stopLiveBody).toMatch(/const saveSessionMetadata = createSessionMetadataSaver\(\{/);
+    const finalSave = /const finalSave = await saveSessionMetadata\(\{([\s\S]*?)\}\);/.exec(stopLiveBody)?.[1];
+    expect(finalSave, "the success-path save not found").toBeTruthy();
+    expect(String(finalSave)).toMatch(/spokenTranscript:\s*plainTranscriptRaw,/);
+    expect(String(finalSave)).toMatch(/transcriptText:\s*transcriptRaw,/);
   });
 
   it("FL-04: every exit ends the mic-health session through the one session-ending step", () => {
