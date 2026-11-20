@@ -205,13 +205,34 @@ describe("stopLive has exactly one transcript delivery site (F/7 / U-022)", () =
     expect(stopLiveBody).not.toMatch(/\(!!provider && micHealthBad\)/);
   });
 
-  it("the seven no-transcript epilogues share one bookkeeping helper, not a copy each", () => {
-    const helperCalls = stopLiveBody.match(/releaseStopEpilogueBookkeeping\(\);/g) || [];
-    // Six early returns extracted; the seventh (finalization-failed
-    // catch) shares the success path's own `finally` instead — see the
-    // helper's doc comment for why that one is deliberately left alone.
-    expect(helperCalls.length).toBe(6);
-    expect(stopLiveBody).toContain("const releaseStopEpilogueBookkeeping = (): void =>");
+  it("the six no-transcript exits end through one epilogue, not a copy each (D-13)", () => {
+    // Each early return states its plan; runStopEpilogue (./stop-epilogue,
+    // behaviour-tested in stop-epilogue.test.ts) does the ending.
+    const exits = stopLiveBody.match(/await endWithoutTranscript\(\{/g) || [];
+    expect(exits.length).toBe(6);
+    expect(stopLiveBody).toContain("runStopEpilogue(plan, {");
+    // The bookkeeping is handed to the epilogue, never called inline by an exit.
+    expect(stopLiveBody).toContain("release: releaseStopEpilogueBookkeeping,");
+    expect(stopLiveBody.match(/releaseStopEpilogueBookkeeping\(\);/g) || []).toHaveLength(0);
+  });
+
+  it("FL-02: exactly two saves in stopLive — the provisional audio save and the one classified metadata save", () => {
+    // A third inline saveRecordingText is how a save whose failure nobody
+    // reads comes back.
+    expect(stopLiveBody.match(/saveRecordingText\(\{/g) || []).toHaveLength(2);
+    expect(stopLiveBody).toMatch(/const saveSessionMetadata = [\s\S]{0,200}attemptFinalSave\(/);
+    // The conflict test lives only in the classifier handed to attemptFinalSave.
+    expect(stopLiveBody.match(/isArchiveMutationConflict/g) || []).toHaveLength(1);
+  });
+
+  it("FL-04: every exit ends the mic-health session through the one session-ending step", () => {
+    const endBlock = /const endStopSession = \(\): void => \{([\s\S]*?)\n {2}\};/.exec(stopLiveBody)?.[1];
+    expect(endBlock, "endStopSession not found in stopLive").toBeTruthy();
+    expect(String(endBlock)).toContain('micHealth.observe({ kind: "session-stop" });');
+    const bookkeeping = /const releaseStopEpilogueBookkeeping = \(\): void => \{([\s\S]*?)\n {2}\};/.exec(stopLiveBody)?.[1];
+    expect(String(bookkeeping)).toContain("endStopSession();");
+    // The observation exists once: in endStopSession, not per exit.
+    expect(stopLiveBody.match(/kind: "session-stop"/g) || []).toHaveLength(1);
   });
 });
 

@@ -24,7 +24,15 @@ import {
   type FinalizeBudgetAnnouncement,
   type StopTranscriptSource,
 } from "./envelope-deadline";
-import { decideDrainedSilence } from "./stop-epilogue";
+import {
+  attemptFinalSave,
+  decideDrainedSilence,
+  resolveFailedStopSummary,
+  resolveTranscriptStopSummary,
+  runStopEpilogue,
+  type FinalSaveOutcome,
+  type StopEpiloguePlan,
+} from "./stop-epilogue";
 import {
   captureElapsedMs,
   decidePreRoll,
@@ -12004,31 +12012,23 @@ async function stopLive(
     }
   };
   /**
-   * The one piece every "stop without a transcript" epilogue shares
-   * (F/7): release the live draft, drop the busy flag, and let the next
-   * capture start.
-   *
-   * F/7 found seven near-identical ~20-line epilogues below (discarded
-   * take, aborted startup, silence, transcription skipped, no provider,
-   * missing key, and the finalization-failed catch). This triplet —
-   * ``clearLiveDraft``, ``setBusy(false)``, ``releaseStopTransition
-   * AfterCaptureDetach`` — is the only part that is byte-for-byte
-   * identical across all six of the early returns below (the seventh,
-   * the finalization-failed catch, releases through the shared
-   * ``finally`` it has with the success path instead, and is left
-   * alone). Everything AROUND this triplet is not: whether
-   * ``#progressRow`` is hidden, whether ``saveRecordingText`` runs first
-   * or the summary patch does, and the exact status/tone text differ
-   * per site in ways that are not safe to normalize without live-
-   * recording verification this environment cannot perform — see the
-   * backend-fix-journal "Швы" entry for the scoping decision. Extracting
-   * only this order-independent, argument-independent triplet is a pure
-   * mechanical de-duplication with no behaviour change.
+   * Ends this stop's session: the live draft, the mic-health session
+   * (``session-stop`` hides the topbar pill — FL-04: the early exits used
+   * to skip it, so "Mic live" outlived every take with Auto transcribe
+   * off), and the stop transition. Every exit runs it exactly once: the
+   * no-transcript exits through ``runStopEpilogue``'s ``release``, the
+   * transcription path in its ``finally``.
    */
-  const releaseStopEpilogueBookkeeping = (): void => {
+  const endStopSession = (): void => {
     clearLiveDraft(sessionUiToken);
-    setBusy(false, sessionUiToken);
+    micHealth.observe({ kind: "session-stop" });
     releaseStopTransitionAfterCaptureDetach();
+  };
+  /** The no-transcript exits also drop the busy flag right away; the
+   *  transcription path keeps it until the outer ``finally``. */
+  const releaseStopEpilogueBookkeeping = (): void => {
+    endStopSession();
+    setBusy(false, sessionUiToken);
   };
   // ── Trailing capture ────────────────────────────────────────────────
   // The microphone stays open a moment past the press so the last word
@@ -12607,6 +12607,65 @@ async function stopLive(
   setRecordButton(false);
   resetVU();
 
+  // ── How every stop ends ─────────────────────────────────────────────
+  let persistedRecordingName = "";
+  let persistedRecordingArchiveDir = "";
+  const provisionalTitle = _smartTitle(sourceLiveText);
+  // The session-metadata write every exit makes (bar the discarded take
+  // and the aborted start, which have nothing to record). One call, so
+  // the no-transcript exits, the failure catch and the success path
+  // cannot disagree about what is saved or how a failed save is
+  // reported (FL-02: only the archive-moved conflict used to be caught;
+  // every other failure was dropped and the stop reported success).
+  const saveSessionMetadata = (transcriptText: string, providerName: string): Promise<FinalSaveOutcome> =>
+    attemptFinalSave(
+      () => saveRecordingText({
+        name: persistedRecordingName,
+        archiveDir: persistedRecordingArchiveDir,
+        requireExisting: !!persistedRecordingName,
+        title: latestSourceTitle(),
+        sourceText: latestSourceForSave(),
+        transcriptText,
+        provider: providerName,
+        model: modelValue,
+        language: languageValue,
+        recordingCollection,
+      }),
+      {
+        isConflict: isArchiveMutationConflict,
+        describe: (e) => sanitizeUiErrorMessage(e, "History save failed."),
+      },
+    );
+  // The no-transcript exits (D-13): each states WHAT it ends with; how
+  // it ends — signal, progress row, status, metadata save, release,
+  // summary — is ``runStopEpilogue`` (./stop-epilogue), one for all.
+  const endWithoutTranscript = (
+    plan: StopEpiloguePlan,
+    metadata: { transcriptText: string; provider: string } = { transcriptText: "", provider: metadataProvider },
+  ): Promise<FinalSaveOutcome> => runStopEpilogue(plan, {
+    publish: (signal) => publishRecordingFinalSignal({
+      recordingId,
+      signalText: "",
+      domText: signal.domText,
+      kind: signal.kind,
+      sessionToken: sessionUiToken,
+    }),
+    hideProgress: () => {
+      if (isCurrentUiSession(sessionUiToken)) {
+        $("progressRow").hidden = true;
+      }
+    },
+    setStatus: (label) => setStatusScoped(sessionUiToken, label),
+    save: () => saveSessionMetadata(metadata.transcriptText, metadata.provider),
+    release: releaseStopEpilogueBookkeeping,
+    patchSummary: (summary) => patchCurrentRecordingSummary({
+      title: provisionalTitle,
+      status: summary.status,
+      tone: summary.tone,
+      transcribeLatencyMs: performance.now() - transcribeStartedAt,
+    }, sessionUiToken),
+  });
+
   if (discarding) {
     // Everything is torn down; nothing is written. No transcript, no
     // history entry, no audio on disk, and no post-stop work for the
@@ -12616,13 +12675,6 @@ async function stopLive(
       `[trace stopLive] discarded ${recordedMs.toFixed(0)}ms recording ` +
       `(below the ${UI_TOKENS.capture.minRecordingMs}ms floor) rec=${recordingId}`,
     );
-    publishRecordingFinalSignal({
-      recordingId,
-      signalText: "",
-      domText: "",
-      kind: "status",
-      sessionToken: sessionUiToken,
-    });
     if (liveSessionId) {
       void discardLiveRecovery(liveSessionId).catch((e) => {
         console.warn("discardLiveRecovery failed for a discarded recording", e);
@@ -12631,11 +12683,12 @@ async function stopLive(
     if (deferredSinkDestroy) {
       void deferredSinkDestroy.destroy();
     }
-    releaseStopEpilogueBookkeeping();
-    setStatusScoped(sessionUiToken, "Idle");
-    if (isCurrentUiSession(sessionUiToken)) {
-      $("progressRow").hidden = true;
-    }
+    await endWithoutTranscript({
+      signal: { domText: "", kind: "status" },
+      statusLabel: "Idle",
+      save: false,
+      summary: null,
+    });
     return;
   }
 
@@ -12644,8 +12697,6 @@ async function stopLive(
   }
   releaseStopTransitionAfterCaptureDetach();
 
-  let persistedRecordingName = "";
-  let persistedRecordingArchiveDir = "";
   // Screen mode: the session is complete (main took the last screenshot
   // and wrote events.json) before the audio is saved, because the save
   // is what moves the screenshots beside the recording. The marks are
@@ -12653,7 +12704,6 @@ async function stopLive(
   // transcript are the screenshots' permanent ones.
   const stagedScreenManifest = await screenSessionPromise;
   let screenManifest = stagedScreenManifest;
-  const provisionalTitle = _smartTitle(sourceLiveText);
   if (savedAudioFile) {
     // Two-attempt save: first with the configured archive dir, then
     // with the DEFAULT dir. The most common cause of "initial save
@@ -12746,24 +12796,12 @@ async function stopLive(
   }
 
   if (startupAbortReason && !savedAudioFile && !transcribeInputFile && captureLevel.frames === 0) {
-    publishRecordingFinalSignal({
-      recordingId,
-      signalText: "",
-      domText: startupAbortReason,
-      kind: "error",
-      sessionToken: sessionUiToken,
+    await endWithoutTranscript({
+      signal: { domText: startupAbortReason, kind: "error" },
+      statusLabel: "Error",
+      save: false,
+      summary: { status: startupAbortReason, tone: "error" },
     });
-    if (isCurrentUiSession(sessionUiToken)) {
-      $("progressRow").hidden = true;
-    }
-    releaseStopEpilogueBookkeeping();
-    setStatusScoped(sessionUiToken, "Error");
-    patchCurrentRecordingSummary({
-      title: provisionalTitle,
-      status: startupAbortReason,
-      tone: "error",
-      transcribeLatencyMs: performance.now() - transcribeStartedAt,
-    }, sessionUiToken);
     return;
   }
 
@@ -12781,137 +12819,47 @@ async function stopLive(
   });
   if (drained.silent) {
     const drainedDomText = drained.micFault ? "[ Mic not delivering audio ]" : "[ Silence ]";
-    publishRecordingFinalSignal({
-      recordingId,
-      signalText: "",
-      domText: drainedDomText,
-      kind: drained.micFault ? "error" : "status",
-      sessionToken: sessionUiToken,
-    });
-    setStatusScoped(sessionUiToken, "Done");
-    try {
-      await saveRecordingText({
-        name: persistedRecordingName,
-        archiveDir: persistedRecordingArchiveDir,
-        requireExisting: !!persistedRecordingName,
-        title: latestSourceTitle(),
-        sourceText: latestSourceForSave(),
-        transcriptText: drainedDomText,
-        provider: metadataProvider,
-        model: modelValue,
-        language: languageValue,
-        recordingCollection,
-      });
-    } catch (e) {
-      if (isArchiveMutationConflict(e)) {
-        patchCurrentRecordingSummary({
-          title: provisionalTitle,
-          status: drainedFailureReason?.notice ||
-            "Silence was detected, but the original archive changed before the session could be finalized. The entry was not recreated elsewhere.",
-          tone: "warning",
-        }, sessionUiToken);
-      }
-    }
-    releaseStopEpilogueBookkeeping();
-    patchCurrentRecordingSummary({
-      title: provisionalTitle,
-      status: drainedFailureReason?.status || "Silence detected. Audio remains available for review.",
-      tone: drainedFailureReason?.tone || "success",
-      transcribeLatencyMs: performance.now() - transcribeStartedAt,
-    }, sessionUiToken);
+    await endWithoutTranscript({
+      signal: { domText: drainedDomText, kind: drained.micFault ? "error" : "status" },
+      statusLabel: "Done",
+      save: true,
+      summary: {
+        status: drainedFailureReason?.status || "Silence detected. Audio remains available for review.",
+        tone: drainedFailureReason?.tone === "neutral" ? "info" : drainedFailureReason?.tone || "success",
+      },
+      conflictStatus: drainedFailureReason?.notice ||
+        "Silence was detected, but the original archive changed before the session could be finalized. The entry was not recreated elsewhere.",
+    }, { transcriptText: drainedDomText, provider: metadataProvider });
     return;
   }
 
   if (!enhance || !transcribeInputFile) {
     const skippedBySetting = !enhance;
-    publishRecordingFinalSignal({
-      recordingId,
-      signalText: "",
-      domText: skippedBySetting
-        ? "Auto transcribe is off. Audio was saved locally and is ready to review."
-        : "Audio was saved locally, but the canonical transcription input is unavailable for this session.",
-      kind: skippedBySetting ? "status" : "error",
-      sessionToken: sessionUiToken,
+    await endWithoutTranscript({
+      signal: {
+        domText: skippedBySetting
+          ? "Auto transcribe is off. Audio was saved locally and is ready to review."
+          : "Audio was saved locally, but the canonical transcription input is unavailable for this session.",
+        kind: skippedBySetting ? "status" : "error",
+      },
+      statusLabel: skippedBySetting ? "Idle" : "Error",
+      save: true,
+      summary: skippedBySetting
+        ? { status: "Audio saved. Final transcription was skipped for this session.", tone: "success" }
+        : { status: "Audio saved, but the canonical transcription input is unavailable for this session.", tone: "warning" },
+      conflictStatus: "Audio is available, but the original archive changed before the session metadata could be finalized.",
     });
-    if (isCurrentUiSession(sessionUiToken)) {
-      $("progressRow").hidden = true;
-    }
-    try {
-      await saveRecordingText({
-        name: persistedRecordingName,
-        archiveDir: persistedRecordingArchiveDir,
-        requireExisting: !!persistedRecordingName,
-        title: latestSourceTitle(),
-        sourceText: latestSourceForSave(),
-        transcriptText: "",
-        provider: metadataProvider,
-        model: modelValue,
-        language: languageValue,
-        recordingCollection,
-      });
-    } catch (e) {
-      if (isArchiveMutationConflict(e)) {
-        patchCurrentRecordingSummary({
-          title: provisionalTitle,
-          status: "Audio is available, but the original archive changed before the session metadata could be finalized.",
-          tone: "warning",
-        }, sessionUiToken);
-      }
-    }
-    releaseStopEpilogueBookkeeping();
-    setStatusScoped(sessionUiToken, skippedBySetting ? "Idle" : "Error");
-    patchCurrentRecordingSummary({
-      title: provisionalTitle,
-      status: skippedBySetting
-        ? "Audio saved. Final transcription was skipped for this session."
-        : "Audio saved, but the canonical transcription input is unavailable for this session.",
-      tone: skippedBySetting ? "success" : "warning",
-      transcribeLatencyMs: performance.now() - transcribeStartedAt,
-    }, sessionUiToken);
     return;
   }
 
   if (!provider) {
-    publishRecordingFinalSignal({
-      recordingId,
-      signalText: "",
-      domText: "No transcription provider is selected. Audio was saved locally.",
-      kind: "status",
-      sessionToken: sessionUiToken,
+    await endWithoutTranscript({
+      signal: { domText: "No transcription provider is selected. Audio was saved locally.", kind: "status" },
+      statusLabel: "Idle",
+      save: true,
+      summary: { status: "Audio saved. No transcription provider is selected.", tone: "warning" },
+      conflictStatus: "No provider is selected, and the original archive changed before the session metadata could be finalized.",
     });
-    if (isCurrentUiSession(sessionUiToken)) {
-      $("progressRow").hidden = true;
-    }
-    try {
-      await saveRecordingText({
-        name: persistedRecordingName,
-        archiveDir: persistedRecordingArchiveDir,
-        requireExisting: !!persistedRecordingName,
-        title: latestSourceTitle(),
-        sourceText: latestSourceForSave(),
-        transcriptText: "",
-        provider: metadataProvider,
-        model: modelValue,
-        language: languageValue,
-        recordingCollection,
-      });
-    } catch (e) {
-      if (isArchiveMutationConflict(e)) {
-        patchCurrentRecordingSummary({
-          title: provisionalTitle,
-          status: "No provider is selected, and the original archive changed before the session metadata could be finalized.",
-          tone: "warning",
-        }, sessionUiToken);
-      }
-    }
-    releaseStopEpilogueBookkeeping();
-    setStatusScoped(sessionUiToken, "Idle");
-    patchCurrentRecordingSummary({
-      title: provisionalTitle,
-      status: "Audio saved. No transcription provider is selected.",
-      tone: "warning",
-      transcribeLatencyMs: performance.now() - transcribeStartedAt,
-    }, sessionUiToken);
     return;
   }
 
@@ -12922,47 +12870,13 @@ async function stopLive(
   }
   if (provider !== "local" && !isProviderKeyConfigured(provider)) {
     const msg = providerKeyErrorMessage(provider);
-    publishRecordingFinalSignal({
-      recordingId,
-      signalText: "",
-      domText: msg,
-      kind: "error",
-      sessionToken: sessionUiToken,
-    });
-    if (isCurrentUiSession(sessionUiToken)) {
-      $("progressRow").hidden = true;
-    }
-    setStatusScoped(sessionUiToken, "Error");
-    patchCurrentRecordingSummary({
-      title: provisionalTitle,
-      status: `${msg} Audio is still saved locally.`,
-      tone: "error",
-      transcribeLatencyMs: performance.now() - transcribeStartedAt,
-    }, sessionUiToken);
-    try {
-      await saveRecordingText({
-        name: persistedRecordingName,
-        archiveDir: persistedRecordingArchiveDir,
-        requireExisting: !!persistedRecordingName,
-        title: latestSourceTitle(),
-        sourceText: latestSourceForSave(),
-        transcriptText: "",
-        provider,
-        model: modelValue,
-        language: languageValue,
-        recordingCollection,
-      });
-    } catch (e) {
-      if (isArchiveMutationConflict(e)) {
-        patchCurrentRecordingSummary({
-          title: provisionalTitle,
-          status: `${msg} The original archive changed before the session metadata could be finalized.`,
-          tone: "warning",
-          transcribeLatencyMs: performance.now() - transcribeStartedAt,
-        }, sessionUiToken);
-      }
-    }
-    releaseStopEpilogueBookkeeping();
+    await endWithoutTranscript({
+      signal: { domText: msg, kind: "error" },
+      statusLabel: "Error",
+      save: true,
+      summary: { status: `${msg} Audio is still saved locally.`, tone: "error" },
+      conflictStatus: `${msg} The original archive changed before the session metadata could be finalized.`,
+    }, { transcriptText: "", provider });
     return;
   }
   // (``transcribeStartedAt`` is captured at the top of ``stopLive``)
@@ -13205,7 +13119,6 @@ async function stopLive(
     };
     let transcriptRaw = "";
     let transcriptForPaste = "";
-    let finalSaveConflict = false;
     // Provenance of ``transcriptRaw`` for the ``[trace stopLive] FINAL``
     // line. On the Deepgram path there are exactly two possible values —
     // ``envelope`` or ``ondisk-fallback`` — and which one a stop printed
@@ -13528,41 +13441,17 @@ async function stopLive(
       });
     }
     setStatusScoped(sessionUiToken, "Done");
-    // saveRecordingText is non-blocking for recordings list reload.
-    try {
-      title = plainTranscriptRaw ? _smartTitle(plainTranscriptRaw) : provisionalTitle;
-      await saveRecordingText({
-        name: persistedRecordingName,
-        archiveDir: persistedRecordingArchiveDir,
-        requireExisting: !!persistedRecordingName,
-        title,
-        sourceText: latestSourceForSave(),
-        transcriptText: transcriptRaw,
-        provider,
-        model: modelValue,
-        language: languageValue,
-        recordingCollection,
-      });
-    } catch (e) {
-      if (isArchiveMutationConflict(e)) {
-        finalSaveConflict = true;
-        patchCurrentRecordingSummary({
-          title,
-          status: "Transcript finished, but the original archive changed before final save. The session was not recreated in a different archive.",
-          tone: "warning",
-        }, sessionUiToken);
-      }
-    }
+    title = plainTranscriptRaw ? _smartTitle(plainTranscriptRaw) : provisionalTitle;
+    const finalSave = await saveSessionMetadata(transcriptRaw, provider);
     patchCurrentRecordingSummary({
       title,
-      status: finalSaveConflict
-        ? "Transcript is ready in memory, but the original archive changed before the final save completed."
-        : transcriptRaw
-          ? "Final transcript is ready. Audio and transcript are both available."
-          : noSpeechFinalStatus,
-      tone: finalSaveConflict ? "warning" : "success",
+      ...resolveTranscriptStopSummary({
+        transcriptReady: !!transcriptRaw,
+        noSpeechStatus: noSpeechFinalStatus,
+        persistedName: persistedRecordingName,
+        outcome: finalSave,
+      }),
       transcribeLatencyMs: transcriptReadyLatencyMs,
-      ...(persistedRecordingName && !finalSaveConflict ? { savedName: persistedRecordingName } : { savedName: "" }),
     }, sessionUiToken);
   } catch (e) {
     console.error("Live transcription finalization failed", e);
@@ -13578,45 +13467,18 @@ async function stopLive(
       $("progressRow").hidden = true;
     }
     setStatusScoped(sessionUiToken, "Error");
-    let fallbackSaveConflict = false;
-    try {
-      await saveRecordingText({
-        name: persistedRecordingName,
-        archiveDir: persistedRecordingArchiveDir,
-        requireExisting: !!persistedRecordingName,
-        title: latestSourceTitle(),
-        sourceText: latestSourceForSave(),
-        transcriptText: "",
-        provider,
-        model: modelValue,
-        language: languageValue,
-        recordingCollection,
-      });
-    } catch (saveError) {
-      if (isArchiveMutationConflict(saveError)) {
-        fallbackSaveConflict = true;
-        patchCurrentRecordingSummary({
-          title: provisionalTitle,
-          status: `${safeMessage} The original archive changed before fallback save completed.`,
-          tone: "warning",
-          transcribeLatencyMs: performance.now() - transcribeStartedAt,
-        }, sessionUiToken);
-      }
-    }
-    const latencyMs = performance.now() - transcribeStartedAt;
+    const fallbackSave = await saveSessionMetadata("", provider);
     patchCurrentRecordingSummary({
       title: provisionalTitle,
-      status: fallbackSaveConflict
-        ? `${safeMessage} The original archive changed before fallback save completed.`
-        : `${safeMessage} Audio is still available.`,
-      tone: fallbackSaveConflict ? "warning" : "error",
-      transcribeLatencyMs: latencyMs,
-      ...(persistedRecordingName && !fallbackSaveConflict ? { savedName: persistedRecordingName } : { savedName: "" }),
+      ...resolveFailedStopSummary({
+        failureMessage: safeMessage,
+        persistedName: persistedRecordingName,
+        outcome: fallbackSave,
+      }),
+      transcribeLatencyMs: performance.now() - transcribeStartedAt,
     }, sessionUiToken);
   } finally {
-    clearLiveDraft(sessionUiToken);
-    micHealth.observe({ kind: "session-stop" });
-    releaseStopTransitionAfterCaptureDetach();
+    endStopSession();
     mark("stopLive:done");
     // The hold runs before this timer starts, so it is added back: the
     // number that matters is the whole distance from the press.
