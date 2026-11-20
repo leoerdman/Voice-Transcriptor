@@ -63,7 +63,9 @@ JSONData = Any
 # required so a real file named "backup.tmp-x.wav" never matches. The
 # trailing extension groups repeat, because a target with more than one
 # dot ("Recovered 2026-09-04T19_37_12.123456.wav", which is what every
-# live-recovery promote produces) yields TWO of them; one optional group
+# live-recovery promote produced before recordings were named after their
+# time alone — such files are still in users' archives) yields TWO of
+# them; one optional group
 # matched single-suffix names only and left the rest to accumulate
 # forever. Anchored to ``$`` so a user file with ".tmp-" in the middle
 # is not matched.

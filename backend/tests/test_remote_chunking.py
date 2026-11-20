@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -211,18 +212,18 @@ class RemoteChunkingTests(unittest.TestCase):
         # was dead in production and kept alive only by this test.
         target = Path(self._tmp.name) / "recordings"
         target.mkdir()
+        same_second = datetime(2026, 11, 21, 3, 46, 11)
         first, first_out = self.main._claim_recording_text_path(
-            target, self.main._recording_stem_candidates("same title")
+            target, recorded_at=same_second
         )
         first_out.write_text("existing", encoding="utf-8")
 
-        with mock.patch.object(self.main, "_recording_stem", return_value=first):
-            second, _second_out = self.main._claim_recording_text_path(
-                target, self.main._recording_stem_candidates("same title")
-            )
+        second, _second_out = self.main._claim_recording_text_path(
+            target, recorded_at=same_second
+        )
 
-        self.assertNotEqual(second, first)
-        self.assertTrue(second.startswith(first + "-"))
+        self.assertEqual(first, "20261121-034611")
+        self.assertRegex(second, r"^20261121-034611-[0-9a-f]{4}$")
         self.assertFalse((target / f"{second}.txt").exists())
 
 

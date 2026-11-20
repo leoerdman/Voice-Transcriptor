@@ -180,14 +180,16 @@ class OneNormalisationTests(_MainCase):
 
     def test_both_save_routes_normalise_through_one_function(self) -> None:
         fields = self.main._normalize_save_fields(
-            title="a/b", source_text="", transcript_text="  hi  ",
+            title=" a/b:\n c\x00 ", source_text="", transcript_text="  hi  ",
             provider=" deepgram ", model=None, language=" ru ",
         )
         self.assertEqual(fields.transcript_text, "hi")
         self.assertEqual(fields.provider, "deepgram")
         self.assertEqual(fields.model, "")
         self.assertEqual(fields.language, "ru")
-        self.assertNotIn("/", fields.title)
+        # The title is metadata, not a file name: punctuation stays, and
+        # only what would break the one-line ``Title:`` header goes.
+        self.assertEqual(fields.title, "a/b: c")
 
 
 class UploadCeilingBeforeTheBodyTests(_MainCase):

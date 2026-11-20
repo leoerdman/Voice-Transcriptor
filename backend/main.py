@@ -94,7 +94,7 @@ from backend.cli_access import (
     cli_token_may_call,
 )
 from backend.config import APP_ROOT, DATA_DIR, load_config, redact_config, save_config
-from backend import screen_sessions
+from backend import recording_names, screen_sessions
 from backend.storage import (
     TMP_ORPHAN_RE,
     atomic_promote_file,
@@ -261,10 +261,13 @@ _ACCESS_LOG_POLLED_PATH_RE = re.compile(r"^/api/jobs/[^/]+$")
 
 # ── Dictated text stays out of the log (BL-02) ──────────────────────────────
 #
-# A recording's file name is ``<timestamp>__<title>``, and the title is the
-# first words of what was dictated. main.log is the artefact users attach
-# for support, so a name is logged as its timestamp plus a short digest:
-# still unique and greppable against the archive, no longer the words.
+# A recording's file name is its time (``backend/recording_names.py``) and
+# carries no words, so it is logged as it is. A LEGACY name is
+# ``<timestamp>__<title>``, and that title is the first words of what was
+# dictated; any other name in an archive folder may be the user's own file
+# name. main.log is the artefact users attach for support, so those are
+# logged as their timestamp (or "recording") plus a short digest: still
+# unique and greppable against the archive, no longer the words.
 def _log_safe_recording_name(name: str) -> str:
     leaf = Path(str(name or "")).name
     # Only a suffix this app gives a recording's files is kept: a title
@@ -273,7 +276,10 @@ def _log_safe_recording_name(name: str) -> str:
     raw_suffix = Path(leaf).suffix
     suffix = raw_suffix if raw_suffix.lower() in known_suffixes else ""
     stem = leaf[: len(leaf) - len(suffix)] if suffix else leaf
-    stamp = stem.split("__", 1)[0] if "__" in stem else "recording"
+    if recording_names.is_recording_stem(stem):
+        return f"{stem}{suffix}"
+    legacy = recording_names.legacy_stem_parts(stem)
+    stamp = legacy[0] if legacy is not None else "recording"
     digest = hashlib.sha1(leaf.encode("utf-8", errors="replace")).hexdigest()[:8]
     return f"{stamp}#{digest}{suffix}"
 
@@ -1715,8 +1721,14 @@ def _promote_live_recovery(
             # existed and was applied on the neighbouring path. Two
             # answers to "is this name free", one of them able to lose a
             # race with the other and overwrite the .txt/.wav it picked.
+            # Named after when the take STARTED (the spool's own clock),
+            # not when it was recovered — days may separate the two.
+            try:
+                recorded_at = datetime.fromisoformat(started_at) if started_at else None
+            except ValueError:
+                recorded_at = None
             stem, text_out = _claim_recording_text_path(
-                target_dir, _recording_stem_candidates(title)
+                target_dir, recorded_at=recorded_at
             )
             audio_out = target_dir / f"{stem}.wav"
             tmp_audio = _atomic_temp_path(audio_out)
@@ -3238,18 +3250,6 @@ def _resolve_recordings_dir(cfg: Optional[dict] = None) -> Path:
     return default_dir
 
 
-def _sanitize_name(value: str) -> str:
-    return _safe_user_filename_part(value, fallback="recording", max_len=120)
-
-
-def _recording_stem(name_or_title: str) -> str:
-    raw = os.path.basename(str(name_or_title or "").replace("\\", "/")).strip()
-    if raw.lower().endswith(".txt"):
-        return _sanitize_name(Path(raw).stem)
-    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
-    return f"{ts}__{_sanitize_name(raw or 'recording')}"
-
-
 def _recording_stem_available(target_dir: Path, stem: str) -> bool:
     """Is this stem free in ``target_dir``?
 
@@ -3273,29 +3273,6 @@ def _recording_stem_available(target_dir: Path, stem: str) -> bool:
             detail=f"recordings folder is not readable: {target_dir}",
         ) from exc
     return True
-
-
-# The names a recording may be given, in order of preference. Three
-# "pick a free name" functions used to sit beside these generators —
-# check the directory, then use the winner — and every production caller
-# now goes through ``_claim_recording_text_path``, which RESERVES the
-# name with O_EXCL instead. They were kept alive only by the tests that
-# covered them, while the path the app actually takes was not.
-def _recording_stem_candidates_from_base(base: str, *, collision_suffix: str = "timestamp") -> Iterable[str]:
-    safe_base = _sanitize_name(base)
-    yield safe_base
-    if collision_suffix == "timestamp":
-        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
-        yield f"{safe_base}__{ts}"
-    for _ in range(128):
-        yield f"{safe_base}-{uuid.uuid4().hex[:8]}"
-
-
-def _recording_stem_candidates(title: str) -> Iterable[str]:
-    base = _recording_stem(title)
-    yield base
-    for _ in range(128):
-        yield f"{base}-{uuid.uuid4().hex[:8]}"
 
 
 def _recording_text_claim_path(out: Path) -> Path:
@@ -3334,15 +3311,26 @@ def _release_recording_text_claim(out: Path, context: str) -> None:
     which covers every path that reaches it. A save that fails BEFORE
     it — an oversized upload, a broken connection, a full disk while
     writing the audio — never does, and the reservation is a real file
-    with a deterministic name, so it also redirects every later attempt
-    at the same title to a timestamped one.
+    with a deterministic name, so it also pushes every later save in
+    the same second to a suffixed name.
     """
     _best_effort_unlink(_recording_text_claim_path(out), context=context)
 
 
-def _claim_recording_text_path(target_dir: Path, candidates: Iterable[str]) -> tuple[str, Path]:
+def _claim_recording_text_path(
+    target_dir: Path, *, recorded_at: Optional[datetime] = None
+) -> tuple[str, Path]:
+    """Reserve a new recording's name in ``target_dir``: ``(stem, <stem>.txt)``.
+
+    The one way a recording is named — every save, upload and recovery
+    comes through here, and the names come from ONE rule
+    (``recording_names.recording_stem_candidates``: the local time of the
+    recording, ``YYYYMMDD-HHMMSS``, plus a random suffix on a collision).
+    The title never takes part. The first free candidate is RESERVED with
+    an ``O_EXCL`` marker, so two parallel saves cannot pick the same name.
+    """
     target_dir.mkdir(parents=True, exist_ok=True)
-    for stem in candidates:
+    for stem in recording_names.recording_stem_candidates(recorded_at):
         if not _recording_stem_available(target_dir, stem):
             continue
         out = target_dir / f"{stem}.txt"
@@ -3371,13 +3359,6 @@ def _source_recording_display_name(filename: str) -> str:
     if not normalized or _is_generic_capture_filename(normalized):
         return ""
     return normalized
-
-
-def _recording_stem_candidates_for_source_file(filename: str, fallback_title: str) -> Iterable[str]:
-    source_name = _source_recording_display_name(filename)
-    if source_name:
-        return _recording_stem_candidates_from_base(Path(source_name).stem, collision_suffix="timestamp")
-    return _recording_stem_candidates(fallback_title)
 
 
 def _atomic_temp_path(final_path: Path) -> Path:
@@ -4337,6 +4318,17 @@ def _recording_source_file(content: str) -> str:
 
 
 def _recording_display_name_from_content(content: str, fallback_stem: str) -> str:
+    """What History calls a recording — always from the transcript itself
+    (its header and its words), never from its file name while the
+    transcript says anything: the source file it came from, else its first
+    words, else its ``Title:``.
+
+    The stem is the last resort for a transcript with none of the three.
+    A current stem is only the recording's time (``recording_names``), so
+    even a generic title ("recording") is a better name than
+    ``20261121-034611``; a legacy ``<timestamp>__<title>`` stem carried
+    the title in it and stays the fallback it always was.
+    """
     source_file = _recording_source_file(content)
     if source_file:
         return source_file
@@ -4345,6 +4337,8 @@ def _recording_display_name_from_content(content: str, fallback_stem: str) -> st
         return first
     title = _extract_meta_field(content, "Title")
     if title and title.lower() not in {"recording", "uploaded file"}:
+        return title
+    if title and recording_names.is_recording_stem(fallback_stem):
         return title
     return fallback_stem
 
@@ -8514,6 +8508,10 @@ def _read_recording_payload(p: "Path", target_dir: Optional["Path"] = None) -> d
     screens_folder = screen_sessions.recording_screens_dir(archive_dir, p.stem)
     return {
         "name": p.name,
+        # The same name History's list gives this recording: the viewer
+        # opened from a path the list has not seen yet (a fresh save, a
+        # deep link) shows it instead of the file name.
+        "display_name": _recording_display_name_from_content(raw, p.stem),
         "source_file": source_file,
         "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
         "size_bytes": st.st_size,
@@ -8780,6 +8778,31 @@ class _SaveFields:
     language: str
 
 
+# The longest title the ``Title:`` header keeps. A title is the first
+# words of the transcript (``frontend/src/recording-title.ts`` caps those
+# at 80) or a source file's name; this bounds what an API caller may send.
+RECORDING_TITLE_MAX_CHARS = 120
+_RECORDING_TITLE_FALLBACK = "recording"
+
+
+def _normalize_recording_title(value: object) -> str:
+    """The title as the transcript header stores it: ONE line of text.
+
+    A title is metadata only — the file name is the recording's time
+    (``backend/recording_names.py``) — so it keeps its punctuation and
+    script as typed. What it may not have is a line break or a control
+    character: the header is line-based (``_APP_RECORDING_HEADER_RE``),
+    and a newline in the title would end the ``Title:`` line early and
+    make the app stop recognising its own transcript.
+    """
+    raw = unicodedata.normalize("NFC", str(value or ""))
+    visible = "".join(
+        " " if unicodedata.category(ch) in {"Cc", "Zl", "Zp"} else ch for ch in raw
+    )
+    title = re.sub(r"\s+", " ", visible).strip()[:RECORDING_TITLE_MAX_CHARS].strip()
+    return title or _RECORDING_TITLE_FALLBACK
+
+
 def _normalize_save_fields(
     *,
     title: object,
@@ -8790,12 +8813,12 @@ def _normalize_save_fields(
     language: object,
 ) -> _SaveFields:
     """The text fields of a recording save, normalised ONCE for both save
-    routes (BM-16): the title made a safe file-name part, the rest
-    stripped, and the placeholder source rule (B-031/B-032) applied."""
+    routes (BM-16): the title made one header line, the rest stripped,
+    and the placeholder source rule (B-031/B-032) applied."""
     safe_transcript = str(transcript_text or "").strip()
     safe_provider = str(provider or "").strip()
     return _SaveFields(
-        title=_sanitize_name(str(title or "recording")),
+        title=_normalize_recording_title(title),
         source_text=_placeholder_source_text(str(source_text or "").strip(), safe_transcript, safe_provider),
         transcript_text=safe_transcript,
         provider=safe_provider,
@@ -8838,7 +8861,7 @@ def save_recording(
     else:
         if require_existing:
             raise HTTPException(status_code=400, detail="require_existing needs an existing recording name")
-        _stem, out = _claim_recording_text_path(target_dir, _recording_stem_candidates(title))
+        _stem, out = _claim_recording_text_path(target_dir)
         claimed_new_text = True
     try:
         _write_recording_text_file(
@@ -8912,10 +8935,7 @@ async def _save_recording_audio_source(
     else:
         if require_existing:
             raise HTTPException(status_code=400, detail="require_existing needs an existing recording name")
-        stem, out_text = _claim_recording_text_path(
-            target_dir,
-            _recording_stem_candidates_for_source_file(safe_orig_name, safe_title),
-        )
+        stem, out_text = _claim_recording_text_path(target_dir)
         text_name = out_text.name
         claimed_new_text = True
 
@@ -8997,7 +9017,7 @@ async def _save_recording_audio_source(
             # Left behind it costs the user twice: an undeletable file in
             # their recordings folder (the archive is only registered
             # after a SUCCESSFUL save, so the sweeper never looks there),
-            # and every retry of the same title pushed to a timestamped
+            # and every retry in the same second pushed to a suffixed
             # name because ``_claim_recording_text_path`` sees the marker.
             _release_recording_text_claim(
                 out_text, "recording text claim rollback"

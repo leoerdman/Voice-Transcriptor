@@ -64,6 +64,7 @@ backend/
 ├── deepgram_dual.py           # dual-stream Auto SSOT: second Deepgram session + word-timestamp merge of the two readings
 ├── deepgram_language.py       # what a configured language means per Deepgram endpoint (live resolve vs REST detect_language); Nova-3 language hints (options, default ru+en)
 ├── deepgram_recovery.py       # re-decode of uncovered spans before the final envelope is sent (one owner of recovery)
+├── recording_names.py         # recording file-name SSOT: `YYYYMMDD-HHMMSS[-xxxx]` from the recording's local time; recognises legacy `<timestamp>__<title>` stems
 ├── screen_sessions.py         # screen-mode screenshots SSOT: staging → `<stem>.screens` beside the recording, serving, orphan sweep (retention shares the audio rule)
 ├── live_envelope.py           # the `final` WebSocket envelope: one shape, one constructor
 ├── async_tasks.py             # ending started asyncio tasks without ending the awaiting coroutine (one owner of the pattern)

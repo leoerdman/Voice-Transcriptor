@@ -213,6 +213,11 @@ TVan3h93wZKeHt4Na4zsU3mVHnjpbKoghE
 ## Storage & privacy
 
 Recordings are stored locally in your chosen archive folder as `.txt` transcripts.
+Each recording's files are named by when it was recorded (local time), `YYYYMMDD-HHMMSS`
+— `20261121-034611.txt`, the audio beside it, and `.screens/` for screen mode — with `-`
+and four hex digits added if two recordings land in the same second. The title (the first
+words) lives only inside the transcript (`Title:`), never in the file name. Recordings
+saved under the older `<date>_<time>__<title>` names keep working as they are.
 **Audio retention policy:** the app keeps the audio file of the most recent recording only;
 on every new save the audio of older recordings is deleted automatically to bound disk
 usage. Transcripts are kept forever. The status line shows how many older audio files were

@@ -20,9 +20,10 @@ export const SMART_TITLE_MAX_WORDS = 8;
  * Character ceiling, ellipsis included.
  *
  * The list renders one line per recording, and a title that outruns it
- * is truncated by CSS anyway — but the stored title is also what search
- * matches and what the archive filename is derived from, so it is capped
- * at the source rather than only in the view.
+ * is truncated by CSS anyway — but the stored title (the transcript's
+ * `Title:` line) is also what search matches, so it is capped at the
+ * source rather than only in the view. It is metadata only: the archive
+ * file name is the recording's time (`backend/recording_names.py`).
  */
 export const SMART_TITLE_MAX_CHARS = 80;
 

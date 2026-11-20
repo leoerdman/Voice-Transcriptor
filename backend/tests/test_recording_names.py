@@ -3,11 +3,13 @@ import asyncio
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -19,6 +21,18 @@ TEST_WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 _RENDERER_REQUEST = SimpleNamespace(state=SimpleNamespace(api_caller="renderer"))
 
 
+def _frozen_recording_clock(main, moment: datetime):
+    """Hold the naming rule's "now" at *moment*: every new recording asks
+    for the same ``YYYYMMDD-HHMMSS`` name."""
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return moment if tz is None else moment.astimezone(tz)
+
+    return mock.patch.object(main.recording_names, "datetime", _Frozen)
+
+
 def _fresh_main_module(data_dir: str):
     os.environ["TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG"] = "1"
     os.environ["TRANSCRIPTOR_DATA_DIR"] = data_dir
@@ -27,7 +41,9 @@ def _fresh_main_module(data_dir: str):
     return importlib.import_module("backend.main")
 
 
-class RecordingNameTests(unittest.TestCase):
+class _IsolatedMainCase(unittest.TestCase):
+    """A fresh backend.main with HOME and its data dir in throwaway folders."""
+
     def setUp(self):
         self._old_home = os.environ.get("HOME")
         self._old_userprofile = os.environ.get("USERPROFILE")
@@ -61,24 +77,19 @@ class RecordingNameTests(unittest.TestCase):
         else:
             os.environ["USERPROFILE"] = self._old_userprofile
 
-    def test_upload_source_filename_is_unicode_safe_display_ssot(self):
+
+class RecordingNameTests(_IsolatedMainCase):
+    def test_upload_is_named_by_time_and_keeps_its_source_name_as_metadata(self):
         target = Path(self._tmp.name) / "recordings"
         target.mkdir()
 
         source_name = self.main._normalize_filename(r"C:\input\2 Эфир - Часть 2.mp4")
         self.assertEqual(source_name, "2 Эфир - Часть 2.mp4")
 
-        # Through the path the app actually takes: the candidates
-        # generator plus the O_EXCL reservation. The check-then-use
-        # helper these tests used to call was dead in production and
-        # kept alive only by them.
-        stem, _out = self.main._claim_recording_text_path(
-            target,
-            self.main._recording_stem_candidates_for_source_file(
-                source_name, "fallback title"
-            ),
-        )
-        self.assertEqual(stem, "2 Эфир - Часть 2")
+        # Through the path the app actually takes: the O_EXCL reservation,
+        # which names every new recording by the one rule.
+        stem, _out = self.main._claim_recording_text_path(target)
+        self.assertRegex(stem, r"^\d{8}-\d{6}$")
 
         out = target / f"{stem}.txt"
         self.main._write_recording_text_file(
@@ -95,36 +106,9 @@ class RecordingNameTests(unittest.TestCase):
         payload = self.main._build_recordings_list_payload(target)
         self.assertEqual(len(payload["items"]), 1)
         item = payload["items"][0]
-        self.assertEqual(item["name"], "2 Эфир - Часть 2.txt")
+        self.assertEqual(item["name"], f"{stem}.txt")
         self.assertEqual(item["display_name"], source_name)
         self.assertEqual(item["source_file"], source_name)
-
-    def test_upload_source_filename_collision_appends_metadata_after_original_name(self):
-        target = Path(self._tmp.name) / "recordings"
-        target.mkdir()
-        (target / "demo.txt").write_text("existing", encoding="utf-8")
-
-        stem, _out = self.main._claim_recording_text_path(
-            target,
-            self.main._recording_stem_candidates_for_source_file(
-                "demo.mp4", "fallback title"
-            ),
-        )
-
-        self.assertRegex(stem, r"^demo__\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-\d{6}$")
-
-    def test_generic_live_capture_filename_keeps_title_based_recording_stem(self):
-        target = Path(self._tmp.name) / "recordings"
-        target.mkdir()
-
-        stem, _out = self.main._claim_recording_text_path(
-            target,
-            self.main._recording_stem_candidates_for_source_file(
-                "live-1780752285796.webm", "spoken title"
-            ),
-        )
-
-        self.assertRegex(stem, r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-\d{6}__spoken title$")
 
     def test_recording_stem_availability_is_case_insensitive(self):
         target = Path(self._tmp.name) / "recordings"
@@ -136,10 +120,8 @@ class RecordingNameTests(unittest.TestCase):
         self.assertFalse(self.main._recording_stem_available(target, "AUDIO"))
         self.assertTrue(self.main._recording_stem_available(target, "Another"))
 
-    def test_txt_recording_stem_cannot_bypass_windows_reserved_names(self):
+    def test_user_filename_part_cannot_bypass_windows_reserved_names(self):
         self.assertEqual(self.main._safe_user_filename_part("con.txt"), "_con.txt")
-        self.assertEqual(self.main._recording_stem("con.txt"), "_con")
-        self.assertEqual(self.main._recording_stem(r"C:\notes\aux.txt"), "_aux")
 
     def test_existing_recording_leaf_rejects_windows_reserved_names(self):
         for raw_name in ("CON.txt", "aux.TXT", r"C:\notes\nul.txt"):
@@ -397,11 +379,13 @@ class RecordingNameTests(unittest.TestCase):
         self.assertEqual(Path(upload["archive_dir"]), uploads_dir)
 
         payload = self.main._build_recordings_list_payload(root)
-        by_name = {item["name"]: item for item in payload["items"]}
-        self.assertEqual(by_name[live["name"]]["recording_collection"], "live")
-        self.assertEqual(by_name[upload["name"]]["recording_collection"], "uploads")
-        self.assertEqual(Path(by_name[live["name"]]["archive_dir"]), live_dir)
-        self.assertEqual(Path(by_name[upload["name"]]["archive_dir"]), uploads_dir)
+        # A name is unique within its folder only — two saves in the same
+        # second into two collections are both ``YYYYMMDD-HHMMSS.txt`` —
+        # so an entry is identified by folder AND name, as the renderer
+        # does (``recordingItemKey``).
+        by_key = {(Path(item["archive_dir"]), item["name"]): item for item in payload["items"]}
+        self.assertEqual(by_key[(live_dir, live["name"])]["recording_collection"], "live")
+        self.assertEqual(by_key[(uploads_dir, upload["name"])]["recording_collection"], "uploads")
 
         stats = self.main._build_recordings_stats_payload(root)
         self.assertEqual(stats["total_recordings"], 2)
@@ -926,9 +910,10 @@ class RecordingNameTests(unittest.TestCase):
         def claim() -> None:
             try:
                 barrier.wait(timeout=2)
+                # The same second for both: one takes the plain name, the
+                # other a collision suffix — never the same name.
                 _stem, out = self.main._claim_recording_text_path(
-                    target,
-                    self.main._recording_stem_candidates_from_base("lecture", collision_suffix="timestamp"),
+                    target, recorded_at=datetime(2026, 11, 21, 3, 46, 11)
                 )
                 results.append(out.name)
             except BaseException as exc:
@@ -1215,8 +1200,10 @@ class RecordingNameTests(unittest.TestCase):
         # never created, because ``write_tmp_audio`` raises first. The
         # marker survived, so the folder kept a file the sweeper never
         # visits (the archive is registered only after a SUCCESSFUL
-        # save) and every retry of the same title was pushed to a
-        # timestamped name.
+        # save) and every retry in the same second was pushed to a
+        # suffixed name. The clock is held in one second throughout, so
+        # every attempt below asks for the same name.
+        self.enterContext(_frozen_recording_clock(self.main, datetime(2026, 11, 21, 3, 46, 11)))
         target = Path(self._tmp.name) / "recordings"
         target.mkdir()
 
@@ -1264,7 +1251,7 @@ class RecordingNameTests(unittest.TestCase):
             live_session_id="",
         ))
         saved = [p.name for p in target.glob("*.txt")]
-        self.assertEqual(saved, ["lecture.txt"], saved)
+        self.assertEqual(saved, ["20261121-034611.txt"], saved)
 
 
     def test_the_empty_recognition_placeholder_is_one_rule(self):
@@ -1333,8 +1320,8 @@ class RecordingNameTests(unittest.TestCase):
         seen: list = []
         real = self.main._claim_recording_text_path
 
-        def spy(target_dir, candidates):
-            out = real(target_dir, candidates)
+        def spy(target_dir, **kwargs):
+            out = real(target_dir, **kwargs)
             seen.append(out[0])
             return out
 
@@ -1361,10 +1348,182 @@ class RecordingNameTests(unittest.TestCase):
             )
 
         self.assertEqual(len(seen), 1, "the promote did not reserve its name")
+        # Named by the one rule, after when the take STARTED.
+        self.assertEqual(seen[0], "20260904-193712")
+        self.assertEqual(result["name"], "20260904-193712.txt")
+        self.assertEqual(result["audio_name"], "20260904-193712.wav")
         promoted_dir = Path(result["archive_dir"])
         self.assertTrue((promoted_dir / result["name"]).exists())
         self.assertTrue((promoted_dir / result["audio_name"]).exists())
         self.assertEqual(list(promoted_dir.glob("*.claim")), [])
+        # The title lives in the header only.
+        self.assertIn(
+            "Title: Recovered 2026-09-04T19:37:12.123456",
+            (promoted_dir / result["name"]).read_text(encoding="utf-8"),
+        )
+
+
+class ShortRecordingNameTests(_IsolatedMainCase):
+    """Every save path names a recording by the one rule
+    (``backend/recording_names.py``), the title stays in the header, and
+    recordings saved under the legacy ``<timestamp>__<title>`` form keep
+    working beside the new ones."""
+
+    NEW_NAME = re.compile(r"^\d{8}-\d{6}(-[0-9a-f]{4})?\.txt$")
+    TITLE = "Первые слова диктовки: план на завтра, v2.1"
+
+    def _root(self) -> Path:
+        return (Path(self._tmp.name) / "recordings").resolve()
+
+    def test_every_collection_saves_under_the_time_name(self):
+        for collection in ("live", "uploads", "screen"):
+            with self.subTest(collection=collection):
+                result = self.main.save_recording({
+                    "title": self.TITLE,
+                    "source_text": "source",
+                    "transcript_text": "transcript",
+                    "provider": "deepgram",
+                    "model": "nova-3",
+                    "language": "ru",
+                    "recording_collection": collection,
+                })
+                self.assertRegex(result["name"], self.NEW_NAME)
+                text = (Path(result["archive_dir"]) / result["name"]).read_text(encoding="utf-8")
+                self.assertTrue(text.startswith(f"Title: {self.TITLE}\nSaved at: "), text[:200])
+
+    def test_a_save_with_audio_names_text_and_audio_by_time_not_by_the_file(self):
+        upload_file = self.main.UploadFile(
+            io.BytesIO(b"tiny mp4 payload"),
+            filename="Team meeting - итоги.mp4",
+            size=len(b"tiny mp4 payload"),
+        )
+        result = asyncio.run(self.main.save_recording_with_audio(
+            file=upload_file,
+            name="",
+            archive_dir="",
+            require_existing=False,
+            title="Team meeting - итоги",
+            source_text="source",
+            transcript_text="transcript",
+            provider="deepgram",
+            model="nova-3",
+            language="ru",
+            recording_collection="uploads",
+            live_session_id="",
+        ))
+        self.assertRegex(result["name"], self.NEW_NAME)
+        target_dir = Path(result["archive_dir"])
+        stem = Path(result["name"]).stem
+        self.assertTrue((target_dir / f"{stem}.mp4").is_file())
+        # The source file's own name is metadata: History shows it.
+        text = (target_dir / result["name"]).read_text(encoding="utf-8")
+        self.assertIn("Source file: Team meeting - итоги.mp4", text)
+        item = self.main._build_recordings_list_payload(target_dir)["items"][0]
+        self.assertEqual(item["display_name"], "Team meeting - итоги.mp4")
+        self.assertEqual(item["audio_name"], f"{stem}.mp4")
+
+    def test_saves_in_the_same_second_get_a_collision_suffix(self):
+        self.enterContext(_frozen_recording_clock(self.main, datetime(2026, 11, 21, 3, 46, 11)))
+        names = [
+            self.main.save_recording({
+                "title": self.TITLE,
+                "source_text": "s",
+                "transcript_text": f"take {i}",
+                "provider": "local",
+                "recording_collection": "live",
+            })["name"]
+            for i in range(3)
+        ]
+        self.assertEqual(names[0], "20261121-034611.txt")
+        for name in names[1:]:
+            self.assertRegex(name, r"^20261121-034611-[0-9a-f]{4}\.txt$")
+        self.assertEqual(len(set(names)), 3)
+
+    def test_history_names_a_new_recording_from_its_header_not_its_file_name(self):
+        root = self._root()
+        root.mkdir(parents=True)
+        # No words in the transcript and a generic title: the header is
+        # still a better name than ``20261121-034611``.
+        (root / "20261121-034611.txt").write_text(
+            "Title: recording\nSaved at: 2026-11-21 03:46:11\nLanguage: ru\n\n", encoding="utf-8",
+        )
+        (root / "20261121-034612.txt").write_text(
+            f"Title: {self.TITLE}\nSaved at: 2026-11-21 03:46:12\nLanguage: ru\n\n", encoding="utf-8",
+        )
+        by_name = {i["name"]: i for i in self.main._build_recordings_list_payload(root)["items"]}
+        self.assertEqual(by_name["20261121-034611.txt"]["display_name"], "recording")
+        self.assertEqual(by_name["20261121-034612.txt"]["display_name"], self.TITLE)
+        # And the viewer's own payload names it the same way.
+        payload = self.main._read_recording_payload(root / "20261121-034612.txt", root)
+        self.assertEqual(payload["display_name"], self.TITLE)
+
+    def test_a_legacy_recording_without_a_title_keeps_its_stem_as_the_fallback(self):
+        root = self._root()
+        root.mkdir(parents=True)
+        legacy = "2026-11-21_03-46-11-851314__первые слова"
+        (root / f"{legacy}.txt").write_text("no header at all\n", encoding="utf-8")
+        item = self.main._build_recordings_list_payload(root)["items"][0]
+        # ``_first_words`` finds nothing outside an Original/Transcription
+        # section, so the stem is what it showed before.
+        self.assertEqual(item["display_name"], legacy)
+
+    def test_legacy_and_new_names_list_read_serve_and_delete_side_by_side(self):
+        root = self._root()
+        live_dir = root / self.main.RECORDING_COLLECTION_DIR_NAMES[self.main.RECORDING_COLLECTION_SCREEN]
+        live_dir.mkdir(parents=True)
+        stems = {
+            "legacy": "2026-11-21_03-46-11-851314__первые слова диктовки",
+            "new": "20261121-034611",
+        }
+        for kind, stem in stems.items():
+            (live_dir / f"{stem}.txt").write_text(
+                f"Title: {kind} title\nSaved at: 2026-11-21 03:46:11\nLanguage: ru\n"
+                f"Provider: deepgram\nModel: nova-3\n\nTranscription:\n{kind} words\n",
+                encoding="utf-8",
+            )
+            (live_dir / f"{stem}.wav").write_bytes(b"RIFF" + kind.encode())
+            screens = live_dir / f"{stem}.screens"
+            screens.mkdir()
+            (screens / "shot-01.png").write_bytes(b"\x89PNG" + kind.encode())
+
+        items = self.main._build_recordings_list_payload(root)["items"]
+        by_name = {i["name"]: i for i in items}
+        self.assertEqual(set(by_name), {f"{s}.txt" for s in stems.values()})
+        for kind, stem in stems.items():
+            with self.subTest(kind=kind):
+                name = f"{stem}.txt"
+                item = by_name[name]
+                self.assertEqual(item["display_name"], f"{kind} words")
+                self.assertTrue(item["has_audio"])
+                self.assertEqual(item["audio_name"], f"{stem}.wav")
+                self.assertEqual(item["recording_collection"], "screen")
+
+                read = asyncio.run(self.main.get_recording(name, archive_dir=str(live_dir), _auth=None))
+                self.assertEqual(read["display_text"], f"{kind} words")
+                self.assertEqual(read["display_name"], f"{kind} words")
+                self.assertEqual(read["screens"], ["shot-01.png"])
+
+                audio = self.main._recording_audio_file_or_404(name, str(live_dir))
+                self.assertEqual(audio.read_bytes(), b"RIFF" + kind.encode())
+                shot = self.main.get_recording_screenshot(
+                    name, "shot-01.png", archive_dir=str(live_dir), _auth=None
+                )
+                self.assertTrue(str(shot.path).endswith(f"{stem}.screens/shot-01.png"))
+
+        self.main._register_archive_dir(live_dir)
+        result = self.main._delete_all_recordings_sync()
+        self.assertEqual(result["deleted"], 2)
+        self.assertEqual(sorted(p.name for p in live_dir.iterdir()), [])
+
+    def test_the_log_shows_a_new_name_as_is_and_hides_a_legacy_title(self):
+        safe = self.main._log_safe_recording_name
+        self.assertEqual(safe("20261121-034611.txt"), "20261121-034611.txt")
+        self.assertEqual(safe("20261121-034611-a3f9.screens"), "20261121-034611-a3f9.screens")
+        legacy = safe("2026-11-21_03-46-11-851314__секретный план.wav")
+        self.assertTrue(legacy.startswith("2026-11-21_03-46-11-851314#"), legacy)
+        self.assertTrue(legacy.endswith(".wav"))
+        self.assertNotIn("секретный", legacy)
+
 
 if __name__ == "__main__":
     unittest.main()
