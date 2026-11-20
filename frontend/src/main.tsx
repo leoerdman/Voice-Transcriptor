@@ -103,6 +103,8 @@ import { recoverySummary } from "./recovery-summary";
 import { networkVerdict, type NetworkProbeOutcome } from "./network-probe";
 import { keyEventToAccelerator } from "./shortcut-capture";
 import { keyAction, performKeyAction, type KeyAction } from "./key-action";
+import { keepaliveFor } from "./keepalive";
+import { parseRuntimeLimits } from "./runtime-limits";
 import { waitForJob } from "./job-poll";
 import {
   LIVE_DRAFT_SCHEMA_VERSION,
@@ -2290,19 +2292,15 @@ function applyKeytermBudgetNote(budget: number): void {
   note.textContent = base + sentence;
 }
 
+/** The backend owns these numbers (./runtime-limits); a rejected one is logged. */
 function applyRuntimeLimits(limits: unknown): void {
-  if (!limits || typeof limits !== "object") return;
-  const root = limits as {
-    upload_queue_max_parallel?: unknown;
-    upload_queue_max_persisted_items?: unknown;
-  };
-  const uploadParallel = Number(root.upload_queue_max_parallel);
-  if (Number.isFinite(uploadParallel) && uploadParallel >= 1 && uploadParallel <= 8) {
-    uploadQueueMaxParallel = Math.trunc(uploadParallel);
+  const parsed = parseRuntimeLimits(limits);
+  if (parsed.uploadQueueMaxParallel !== undefined) uploadQueueMaxParallel = parsed.uploadQueueMaxParallel;
+  if (parsed.uploadQueueMaxPersistedItems !== undefined) {
+    uploadQueueMaxPersistedItems = parsed.uploadQueueMaxPersistedItems;
   }
-  const persistedItems = Number(root.upload_queue_max_persisted_items);
-  if (Number.isFinite(persistedItems) && persistedItems >= 1 && persistedItems <= 1000) {
-    uploadQueueMaxPersistedItems = Math.trunc(persistedItems);
+  if (parsed.rejected.length) {
+    console.warn(`runtime_limits: ignored ${parsed.rejected.join(", ")} (not a positive integer)`);
   }
 }
 
@@ -3959,24 +3957,21 @@ async function apiGet<T>(url: string, signal?: AbortSignal): Promise<T> {
   return (await r.json()) as T;
 }
 
-async function apiPost<T>(url: string, body: unknown): Promise<T> {
+async function apiPost<T>(
+  url: string,
+  body: unknown,
+  options: { keepalive?: boolean } = {},
+): Promise<T> {
+  const payload = JSON.stringify(body);
   const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeaders() },
-    body: JSON.stringify(body),
+    body: payload,
+    keepalive: keepaliveFor(payload, !!options.keepalive),
   });
   if (!r.ok) throw new Error(await parseError(r));
   return (await r.json()) as T;
 }
-
-/**
- * Browsers cap the body of a ``keepalive`` request at 64 KiB across all
- * in-flight keepalive requests; over that the fetch rejects outright.
- * A queue snapshot carrying two hundred transcripts can exceed it, and
- * a rejected save is worse than an interrupted one, so the flag is
- * dropped for a payload that would not fit.
- */
-const KEEPALIVE_MAX_BODY_BYTES = 60_000;
 
 async function apiPut<T>(
   url: string,
@@ -3984,13 +3979,11 @@ async function apiPut<T>(
   options: { keepalive?: boolean } = {},
 ): Promise<T> {
   const payload = JSON.stringify(body);
-  const keepalive = !!options.keepalive
-    && new TextEncoder().encode(payload).length <= KEEPALIVE_MAX_BODY_BYTES;
   const r = await fetch(url, {
     method: "PUT",
     headers: { "Content-Type": "application/json", ...authHeaders() },
     body: payload,
-    keepalive,
+    keepalive: keepaliveFor(payload, !!options.keepalive),
   });
   if (!r.ok) throw new Error(await parseError(r));
   return (await r.json()) as T;
@@ -6825,7 +6818,10 @@ function buildUiPreferencesSavePlan() {
   };
 }
 
-function enqueueUiPreferencesSave(plan: ReturnType<typeof buildUiPreferencesSavePlan>): Promise<void> {
+function enqueueUiPreferencesSave(
+  plan: ReturnType<typeof buildUiPreferencesSavePlan>,
+  options: { keepalive?: boolean } = {},
+): Promise<void> {
   // Chain each save after the previous one's completion (success
   // or failure — we don't want one transient 500 to block all
   // future saves). The ``Promise.resolve()`` tail guarantees the
@@ -6834,7 +6830,7 @@ function enqueueUiPreferencesSave(plan: ReturnType<typeof buildUiPreferencesSave
     .catch(() => { })
     .then(async () => {
       try {
-        await apiPost<{ ok: boolean }>("/api/config", plan.payload);
+        await apiPost<{ ok: boolean }>("/api/config", plan.payload, options);
         configuredRecordingsDir = plan.nextRecordingsDir;
         if (!plan.shouldRefreshRecordingsArchive) return;
         setSettingsArchiveStatus("Archive folder saved.", "success");
@@ -6888,7 +6884,7 @@ function queueUiPreferencesSave(): void {
   }, UI_TOKENS.settings.saveDebounceMs);
 }
 
-function flushUiPreferencesSaveNow(): Promise<void> {
+function flushUiPreferencesSaveNow(options: { keepalive?: boolean } = {}): Promise<void> {
   if (uiPrefSaveTimer) {
     clearTimeout(uiPrefSaveTimer);
     uiPrefSaveTimer = null;
@@ -6897,11 +6893,16 @@ function flushUiPreferencesSaveNow(): Promise<void> {
     return uiPrefInFlightChain.catch(() => { });
   }
   uiPrefPendingSave = false;
-  return enqueueUiPreferencesSave(buildUiPreferencesSavePlan());
+  return enqueueUiPreferencesSave(buildUiPreferencesSavePlan(), options);
 }
 
+/**
+ * On the way out (``pagehide``/``beforeunload``): a setting changed less
+ * than the debounce before quitting is sent as a keepalive request, which
+ * the page's teardown does not cancel (./keepalive).
+ */
 function flushUiPreferencesSaveBestEffort(): void {
-  void flushUiPreferencesSaveNow();
+  void flushUiPreferencesSaveNow({ keepalive: true });
 }
 
 window.addEventListener("pagehide", flushUiPreferencesSaveBestEffort, { capture: true });
