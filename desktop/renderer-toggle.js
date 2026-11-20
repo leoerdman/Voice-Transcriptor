@@ -61,10 +61,13 @@ function toggleDispatchScript({ allowStart, startDetail = { mode: "voice" }, not
       state.recording = !isRec;
       // The take this press left starting, read after the (synchronous)
       // dispatch: this press's own, or one an earlier press already began
-      // that this press joined. Main opens the screen session under ITS id.
+      // that this press joined. Main opens the screen session under ITS id,
+      // with the take's "record clicks" setting.
       if (!isRec) {
         const take = typeof window.__transcriptorLiveTake === 'function' ? window.__transcriptorLiveTake() : null;
-        state.take = take ? { mode: String(take.mode || ''), screenSessionId: String(take.screenSessionId || '') } : null;
+        state.take = take
+          ? { mode: String(take.mode || ''), screenSessionId: String(take.screenSessionId || ''), screenClicks: take.screenClicks === true }
+          : null;
       }
       return state;
     })();

@@ -15,7 +15,10 @@
     // pure CommonJS, zero Node dependencies) instead of re-deriving it
     // (D-015). Does not enable checkJs, so no .js file's contents are
     // type-checked — only import resolution is affected.
-    "allowJs": true
+    "allowJs": true,
+    // Lets screen-annotations.ts read contracts/screen-session.json (the
+    // file-name forms it states to the reader) instead of retyping them.
+    "resolveJsonModule": true
   },
   "include": ["src", "tests", "vite.config.ts", "vitest.config.ts"]
 }

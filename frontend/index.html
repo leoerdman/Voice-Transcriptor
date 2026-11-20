@@ -830,6 +830,15 @@
                   <span class="shortcut-keys"></span>
                 </button>
               </label>
+              <!--
+                Screen mode records plain clicks: a ring where you clicked on
+                the next screenshot and a [🖱 клик …] mark in the text. On by
+                default; written to preferences.ui.screen_clicks and read by
+                a screen take when it starts. Hidden with the rows above.
+              -->
+              <label class="toggle-inline settings-toggle" id="screenClicksField" hidden><span>Record clicks in screen
+                  mode (a ring on the screenshot, a mark in the text)</span><input type="checkbox"
+                  id="screenClicksToggle" checked /></label>
               <div class="btn-row">
                 <button class="btn btn-ghost" id="resetShortcutsBtn" type="button">Reset to Default</button>
               </div>

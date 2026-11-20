@@ -17,9 +17,11 @@ const {
   fitWithin,
   isScreenSessionId,
   numberBadgeCenter,
+  pendingClicks,
   pendingStrokes,
   planShot,
   previewFileName,
+  recordClick,
   recordShot,
   screenSessionId,
   screenSessionManifest,
@@ -135,10 +137,11 @@ test("the manifest lists strokes and shots in time order with their shot number"
   const m = screenSessionManifest(s);
   assert.equal(m.id, "screen-1");
   assert.equal(m.dir, "/d");
-  assert.equal(m.version, 2);
+  assert.equal(m.version, 3);
   assert.deepEqual(m.events.map((e) => [e.type, e.at, e.shot]), [["stroke", 1000, 1], ["shot", 2000, 1]]);
   assert.deepEqual([m.events[0].xPct, m.events[0].yPct], [10, 0]);
-  assert.deepEqual([m.events[0].n, m.events[0].tool, m.events[0].shape], [1, "rect", "rect"]);
+  // A rectangle dragged flat (200 × 0) is a line.
+  assert.deepEqual([m.events[0].n, m.events[0].tool, m.events[0].shape], [1, "rect", "line"]);
   assert.equal(m.events[1].area, "display");
   assert.deepEqual(m.events[1].files, ["/d/shot-01.png"]);
 });
@@ -165,9 +168,18 @@ test("names shared with the backend match contracts/screen-session.json", () => 
   assert.ok(!derivedName.test(shotFileName(1, 1, 1)));
 });
 
-test("the manifest has the contract's shape (v2)", () => {
-  const s = createScreenSession({ id: contract.exampleSessionId, dir: "/d", startedAt: 1 });
+test("the file names the transcript's header states are this side's names (contract fileNameForms)", () => {
+  const form = (template, nn, k) => template.replace("NN", nn).replace("K", String(k));
+  assert.equal(shotFileName(7, 1, 1), form(contract.fileNameForms.shot, "07"));
+  assert.equal(shotFileName(12, 1, 1), form(contract.fileNameForms.shot, "12"));
+  assert.equal(previewFileName(7), form(contract.fileNameForms.preview, "07"));
+  assert.equal(cropFileName(7, 3), form(contract.fileNameForms.crop, "07", 3));
+});
+
+test("the manifest has the contract's shape (v3)", () => {
+  const s = createScreenSession({ id: contract.exampleSessionId, dir: "/d", startedAt: 1, recordClicks: true });
   drawLine(s, [0, 0], [10, 10], 2);
+  recordClick(s, { x: 40, y: 62, at: 200 });
   recordShot(s, {
     at: 300,
     files: ["/d/shot-01.png"],
@@ -177,17 +189,23 @@ test("the manifest has the contract's shape (v2)", () => {
     preview: "/d/shot-01-preview.jpg",
     regions: { 1: { x: 0, y: 0, width: 100, height: 100 } },
     crops: { 1: "/d/shot-01-n1.jpg" },
+    clicks: { 1: { x: 0, y: 0, width: 100, height: 100 } },
   });
   s.endedAt = 400; // the take stopped (the controller's finish)
   const m = screenSessionManifest(s);
   const keys = (o) => Object.keys(o).sort();
+  const ofType = (events, type) => events.find((e) => e.type === type);
   assert.equal(m.version, contract.manifest.version);
+  assert.equal(m.version, SCREEN_MODE.manifestVersion);
   assert.deepEqual(keys(m), keys(contract.manifest));
-  assert.deepEqual(keys(m.events[0]), keys(contract.manifest.events[0]));
+  assert.deepEqual(m.events.map((e) => e.type), contract.manifest.events.map((e) => e.type));
+  for (const type of ["stroke", "click", "shot"]) {
+    assert.deepEqual(keys(ofType(m.events, type)), keys(ofType(contract.manifest.events, type)), type);
+  }
   assert.deepEqual(keys(m.events[0].box), keys(contract.manifest.events[0].box));
-  assert.deepEqual(keys(m.events[1]), keys(contract.manifest.events[1]));
+  assert.deepEqual([ofType(m.events, "click").xPct, ofType(m.events, "click").yPct], [40, 62]);
   assert.ok(SCREEN_MODE.tools.includes(contract.manifest.events[0].tool));
-  assert.ok(Object.values(SHOT_AREA).includes(contract.manifest.events[1].area));
+  assert.ok(Object.values(SHOT_AREA).includes(ofType(contract.manifest.events, "shot").area));
   // The v1 example the readers still accept is a subset of v2.
   const v1Stroke = contract.manifestV1.events.find((e) => e.type === "stroke");
   for (const key of Object.keys(v1Stroke)) assert.ok(key in m.events[0], key);
@@ -244,6 +262,20 @@ test("every take starts with the rectangle; a rectangle is its two corners, stre
   assert.equal(rect.tool, "rect");
   assert.deepEqual(rect.points, [[500, 500], [350, 250]]);
   assert.equal(strokeShape(rect), "rect");
+});
+
+test("a rectangle with one side no thicker than the pen's straightness tolerance is a line; with both, a dot", () => {
+  const rect = (x1, y1, x2, y2) => {
+    const s = createScreenSession({ id: "x", dir: "/d" });
+    beginStroke(s, { x: x1, y: y1, at: 1, displayId: 1, displayBounds: DISPLAY_1 });
+    return strokeShape(endStroke(s, { x: x2, y: y2, at: 2 }));
+  };
+  const tol = SCREEN_MODE.shape.lineMinDeviation;
+  assert.equal(rect(100, 100, 400, 100 + tol), "line", "flat, any length");
+  assert.equal(rect(100, 100, 100 + tol - 1, 500), "line", "upright");
+  assert.equal(rect(100, 100, 400, 100 + tol + 1), "rect", "just thicker: a box");
+  assert.equal(rect(100, 100, 600, 140), "rect", "a long flat box around one line of text is a box");
+  assert.equal(rect(100, 100, 100 + tol, 100 + tol), "dot");
 });
 
 test("strokes are numbered 1, 2, 3 in each shot, and the next shot starts at 1 again", () => {
@@ -433,4 +465,47 @@ test("strokes drawn in the same millisecond keep their order in the manifest", (
   }
   shoot(s, { at: 1000, files: ["/d/shot-01.png"] });
   assert.deepEqual(screenSessionManifest(s).events.map((e) => e.n ?? e.type), [1, 2, 3, 4, 5, "shot"]);
+});
+
+// ── clicks ─────────────────────────────────────────────────────────────
+test("a click is recorded only when the take's setting is on", () => {
+  const off = createScreenSession({ id: "x", dir: "/d" });
+  assert.equal(recordClick(off, { x: 10, y: 10, at: 5 }), null);
+  assert.equal(off.clicks.length, 0);
+  shoot(off, { at: 10, files: ["/d/shot-01.png"] });
+  assert.equal(screenSessionManifest(off).events.some((e) => e.type === "click"), false);
+  const on = createScreenSession({ id: "x", dir: "/d", recordClicks: true });
+  assert.ok(recordClick(on, { x: 10, y: 10, at: 5 }));
+  assert.deepEqual(pendingClicks(on).map((c) => c.at), [5]);
+});
+
+test("a click belongs to the next shot, placed in percent of the captured area that holds it", () => {
+  const s = createScreenSession({ id: "x", dir: "/d", startedAt: 1, recordClicks: true });
+  const win = { x: 100, y: 100, width: 400, height: 200 };
+  recordClick(s, { x: 300, y: 150, at: 10 }); // inside the window
+  recordClick(s, { x: 900, y: 900, at: 20 }); // outside every captured area
+  recordShot(s, { at: 30, files: ["/d/shot-01.png"], strokeIds: [], reason: "hotkey", area: SHOT_AREA.WINDOW, clicks: { 1: win, 2: null } });
+  recordClick(s, { x: 5, y: 5, at: 40 }); // after the last shot
+  const clicks = screenSessionManifest(s).events.filter((e) => e.type === "click");
+  assert.deepEqual(clicks, [
+    { type: "click", at: 10, shot: 1, xPct: 50, yPct: 25 },
+    { type: "click", at: 20, shot: 1 },
+    { type: "click", at: 40 },
+  ]);
+  assert.deepEqual(pendingClicks(s).map((c) => c.at), [40]);
+});
+
+test("a click the shot did not take (made while it was captured) stays pending", () => {
+  const s = createScreenSession({ id: "x", dir: "/d", recordClicks: true });
+  recordClick(s, { x: 1, y: 1, at: 10 });
+  recordClick(s, { x: 2, y: 2, at: 20 });
+  recordShot(s, { at: 15, files: ["/d/shot-01.png"], strokeIds: [], reason: "hotkey", clicks: { 1: DISPLAY_1 } });
+  assert.deepEqual(pendingClicks(s).map((c) => c.id), [2]);
+});
+
+test("in the manifest a click comes before the shot taken at the same moment", () => {
+  const s = createScreenSession({ id: "x", dir: "/d", recordClicks: true });
+  recordClick(s, { x: 1, y: 1, at: 10 });
+  recordShot(s, { at: 10, files: ["/d/shot-01.png"], strokeIds: [], reason: "hotkey", clicks: { 1: DISPLAY_1 } });
+  assert.deepEqual(screenSessionManifest(s).events.map((e) => e.type), ["click", "shot"]);
 });

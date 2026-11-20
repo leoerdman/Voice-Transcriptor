@@ -5,7 +5,7 @@
  *
  * Screen mode is a recording during which the user can draw on the screen
  * and take screenshots. Everything here is data and rules: the session
- * record (strokes, screenshots, their wall-clock times), the names of the
+ * record (strokes, clicks, screenshots, their wall-clock times), the names of the
  * session folder and its images, what a shot captures (the front window
  * or the display), each stroke's number, shape and place, and the
  * manifest (`events.json`) handed to the renderer at stop. No Electron,
@@ -60,9 +60,16 @@ const SCREEN_MODE = Object.freeze({
   // (the preview already shows that stroke at that scale).
   preview: Object.freeze({ maxSide: 1568, maxPixels: 1150000, quality: 0.8 }),
   crop: Object.freeze({ marginRatio: 0.15, minMargin: 40, maxSide: 1024, maxAreaShare: 0.5, quality: 0.8 }),
-  // Pen shapes (DIP, see strokeShape).
+  // Stroke shapes (DIP, see strokeShape).
   shape: Object.freeze({ dotMaxSize: 12, loopGapRatio: 0.35, loopMinAspect: 0.2, loopMinLength: 2, lineDeviationRatio: 0.08, lineMinDeviation: 6 }),
-  manifestVersion: 2,
+  // A plain click, painted into the screenshot that follows it (when the
+  // "record clicks" setting is on): a small ring with no number, in two
+  // neutral tones — a dark ring inside a light halo — so it reads on any
+  // background and is never taken for a stroke, which is one palette
+  // colour (DIP).
+  clickMark: Object.freeze({ radius: 7, ring: 1.75, halo: 4, ringColor: "#000000", haloColor: "rgba(255,255,255,0.9)" }),
+  // 3: click events (`type: "click"`) and a thin rectangle read as a line.
+  manifestVersion: 3,
   // Shared with the backend — contracts/screen-session.json.
   stagingDirName: "screen-sessions",
   sessionDirPrefix: "screen-",
@@ -86,18 +93,26 @@ function isScreenSessionId(name) {
   return /^screen-\d{8}-\d{6}-\d{3}$/.test(String(name || ""));
 }
 
-function createScreenSession({ id, dir, startedAt = Date.now(), color = SCREEN_MODE.colors[0], tool = SCREEN_MODE.tools[0] }) {
+/**
+ * `recordClicks` is the take's "record clicks" setting, read once when the
+ * take started (the renderer reports it with the take — Settings owns it):
+ * off, a click leaves no trace anywhere.
+ */
+function createScreenSession({ id, dir, startedAt = Date.now(), color = SCREEN_MODE.colors[0], tool = SCREEN_MODE.tools[0], recordClicks = false }) {
   return {
     id,
     dir,
     startedAt,
     color,
     tool,
+    recordClicks: recordClicks === true,
     endedAt: 0,
     strokes: [],
+    clicks: [],
     shots: [],
     activeStrokeId: 0,
     nextStrokeId: 1,
+    nextClickId: 1,
   };
 }
 
@@ -163,6 +178,30 @@ function endStroke(session, { x, y, at = Date.now() }) {
   return stroke;
 }
 
+/**
+ * A plain click — the helper's `click`: a press that never moved past the
+ * drag threshold and was replayed to the app underneath (a press on our
+ * own palette or capsule is a tap and never gets here). Recorded only
+ * when the take's setting says so; null otherwise. Like a stroke, it
+ * belongs to the next screenshot.
+ */
+function recordClick(session, { x, y, at = Date.now() }) {
+  if (!session.recordClicks) return null;
+  const click = { id: session.nextClickId++, at, x, y, shot: 0, region: null };
+  session.clicks.push(click);
+  return click;
+}
+
+/** Clicks not in any shot yet. */
+function pendingClicks(session) {
+  return session.clicks.filter((c) => c.shot === 0);
+}
+
+/** The first of `regions` (global DIP) that holds the point, or null. */
+function regionHolding(regions, x, y) {
+  return regions.find((r) => r && x >= r.x && x <= r.x + r.width && y >= r.y && y <= r.y + r.height) || null;
+}
+
 function strokeBounds(stroke) {
   let minX = Infinity;
   let minY = Infinity;
@@ -178,18 +217,31 @@ function strokeBounds(stroke) {
 }
 
 /**
- * What a stroke is, decided once, here, from its points: `rect` for the
- * rectangle tool; for the pen — `dot` (tiny), `loop` (a closed ring: it
- * ends near where it began, relative to its size, and goes round), `line`
- * (every point close to its main axis), otherwise `curve`.
+ * What a stroke is, decided once, here, from its points. For the
+ * rectangle tool — `rect`, but `line` when one side is no thicker than
+ * `lineMinDeviation` and `dot` when both are. For the pen — `dot` (tiny),
+ * `loop` (a closed ring: it ends near where it began, relative to its
+ * size, and goes round), `line` (every point close to its main axis),
+ * otherwise `curve`.
+ *
+ * The rectangle's line threshold is the pen's own absolute tolerance for
+ * "straight" (6 DIP), not a share of the captured area: at 6 DIP the
+ * rectangle's two long edges (each `strokeWidth` wide) nearly touch and it
+ * looks — and was dragged — as a line, whatever the area; a share of a 5K
+ * display (1.5 % ≈ 40 DIP) would call a real box around one line of small
+ * text a line. The pen's ratio rule is not used: a long flat box (500×40)
+ * around a text line is a box.
  */
 function strokeShape(stroke) {
-  if (stroke.tool === "rect") return "rect";
   const rule = SCREEN_MODE.shape;
-  const pts = stroke.points;
   const b = strokeBounds(stroke);
   const size = Math.max(b.width, b.height);
+  if (stroke.tool === "rect") {
+    if (size <= rule.lineMinDeviation) return "dot";
+    return Math.min(b.width, b.height) <= rule.lineMinDeviation ? "line" : "rect";
+  }
   if (size <= rule.dotMaxSize) return "dot";
+  const pts = stroke.points;
   let length = 0;
   for (let i = 1; i < pts.length; i += 1) length += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
   const [x0, y0] = pts[0];
@@ -441,13 +493,16 @@ function pendingStrokes(session) {
  * (`SHOT_AREA`), `regions` the captured region (global DIP) each stroke
  * is placed in, `crops` each stroke's close-up file and `preview` the
  * downscaled copy of the first image (absent ones are left out).
+ * `clicks` maps each click the shot takes (those pending when the capture
+ * began) to the captured region it lies in — null for a click outside
+ * every captured area: it is still this shot's, with no place.
  *
  * The screen is clean after a shot, so the strokes still on it (finished
  * after the capture began, or kept from a display that failed) are
  * numbered again from 1: the next image starts at 1 too. Returns the shot
  * record.
  */
-function recordShot(session, { at = Date.now(), files, strokeIds, reason, area = SHOT_AREA.DISPLAY, preview = "", regions = {}, crops = {} }) {
+function recordShot(session, { at = Date.now(), files, strokeIds, reason, area = SHOT_AREA.DISPLAY, preview = "", regions = {}, crops = {}, clicks = {} }) {
   const index = session.shots.length + 1;
   const wanted = new Set(strokeIds);
   const taken = [];
@@ -459,6 +514,11 @@ function recordShot(session, { at = Date.now(), files, strokeIds, reason, area =
     taken.push(stroke.id);
   }
   unshotStrokes(session).forEach((stroke, i) => { stroke.n = i + 1; });
+  for (const click of pendingClicks(session)) {
+    if (!Object.prototype.hasOwnProperty.call(clicks, click.id)) continue;
+    click.shot = index;
+    click.region = clicks[click.id] ? { ...clicks[click.id] } : null;
+  }
   const shot = { index, at, files: files.slice(), strokeIds: taken, reason, area, preview };
   session.shots.push(shot);
   return shot;
@@ -483,7 +543,9 @@ function cropFileName(index, n) {
  * The manifest the renderer turns into transcript marks, and the
  * `events.json` written beside the screenshots. One shape for both;
  * contracts/screen-session.json holds an example of it. Strokes are never
- * merged: each one has its own number.
+ * merged: each one has its own number. A click carries its shot and its
+ * point in whole percent of that shot's captured area — no shot when no
+ * screenshot followed it, no point when it lay outside the captured area.
  */
 function screenSessionManifest(session) {
   const events = [];
@@ -505,6 +567,18 @@ function screenSessionManifest(session) {
       ...(stroke.crop ? { crop: stroke.crop } : {}),
     });
   }
+  for (const click of session.clicks) {
+    const r = click.region;
+    const pct = (v) => Math.max(0, Math.min(100, Math.round(v * 100)));
+    events.push({
+      type: "click",
+      at: click.at,
+      ...(click.shot ? { shot: click.shot } : {}),
+      ...(r && r.width > 0 && r.height > 0
+        ? { xPct: pct((click.x - r.x) / r.width), yPct: pct((click.y - r.y) / r.height) }
+        : {}),
+    });
+  }
   for (const shot of session.shots) {
     events.push({
       type: "shot",
@@ -517,10 +591,11 @@ function screenSessionManifest(session) {
       reason: shot.reason,
     });
   }
-  // In time order; at the same moment a stroke comes before its shot, and
-  // events of one kind keep their order (strokes by number). The sort is
-  // stable, so a tie between two strokes must answer 0, never "first".
-  const rank = (e) => (e.type === "stroke" ? 0 : 1);
+  // In time order; at the same moment a stroke or a click comes before
+  // its shot, and events of one kind keep their order (strokes by number).
+  // The sort is stable, so a tie between two strokes must answer 0, never
+  // "first".
+  const rank = (e) => (e.type === "shot" ? 1 : 0);
   events.sort((a, b) => a.at - b.at || rank(a) - rank(b));
   return {
     version: SCREEN_MODE.manifestVersion,
@@ -545,10 +620,13 @@ module.exports = {
   fitWithin,
   isScreenSessionId,
   numberBadgeCenter,
+  pendingClicks,
   pendingStrokes,
   planShot,
   previewFileName,
+  recordClick,
   recordShot,
+  regionHolding,
   screenSessionId,
   screenSessionManifest,
   shotFileName,

@@ -66,8 +66,8 @@ const noProviderPlan: StopEpiloguePlan = {
 };
 
 
-/** Inline marks with no header or summary — what these suites place. */
-const marksOnlyAnnotation = (marks: ScreenMark[]): ScreenAnnotation => ({ marks, header: "", summary: "" });
+/** Inline marks with no header or sections — what these suites place. */
+const marksOnlyAnnotation = (marks: ScreenMark[]): ScreenAnnotation => ({ marks, header: "", sections: [] });
 
 describe("attemptFinalSave — FL-02: every save failure is an outcome, not silence", () => {
   it("a successful save is 'saved'", async () => {
@@ -356,7 +356,10 @@ describe("keepLiveTranscript — a take without a final transcript keeps its liv
 
   it("a screen take drawn without speaking keeps its marks alone", () => {
     const kept = keepLiveTranscript("  ", marks, 10_000);
-    expect(kept.text).toBe([marks.header, marks.marks.map((m) => m.text).join("\n"), marks.summary].join("\n\n"));
+    expect(kept.text).toBe([
+      marks.header,
+      "### Скрин 1 · 00:00–00:09 · shot-01.png\nШтрихи: 1 — 70–78% × 50–56%\n[✏️1 красный обвод, справа]",
+    ].join("\n\n"));
     expect(kept.note).toBe("The screen marks are kept as the transcript.");
   });
 
@@ -462,7 +465,7 @@ describe("runStopEpilogue — a failed stop keeps the live text with marks in th
 });
 
 describe("a screen take with no speech keeps its header first", () => {
-  it("the reason heads the body: header, reason, marks one per line, summary", () => {
+  it("the reason heads the body: header, reason, then each screenshot's section with its marks", () => {
     const screen = screenAnnotationFromManifest(parseScreenManifest({
       version: 2,
       dir: "/rec/take.screens",
@@ -477,8 +480,7 @@ describe("a screen take with no speech keeps its header first", () => {
     expect(keptTranscriptText(kept, "[ Silence ]")).toBe([
       screen.header,
       "[ Silence ]",
-      "[✏️1 скрин 1: жёлтый обвод, вверху слева]\n[📸 00:03 скрин 1]",
-      screen.summary,
+      "### Скрин 1 · 00:00–00:03 · shot-01.png\nШтрихи: 1 — 10–20% × 10–20%\n[✏️1 жёлтый обвод, вверху слева]",
     ].join("\n\n"));
   });
 });

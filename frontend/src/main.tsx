@@ -357,6 +357,12 @@ interface AppConfig {
       shortcut_screen?: string;
       shortcut_screen_shot?: string;
       /**
+       * Screen mode records plain clicks: a ring on the next screenshot and
+       * a `[🖱 клик …]` mark in the text. Absent means on (the shipped
+       * default, user 2026-11-21); only an explicit `false` turns it off.
+       */
+      screen_clicks?: boolean;
+      /**
        * Live-tab speaker diarization. Its two neighbours in the same
        * popover (``auto_transcribe``, ``live_preview``) have always been
        * persisted and its Upload twin (``upload_diarize``) has too; this
@@ -761,7 +767,7 @@ declare global {
     __transcriptorLastUiFinalKind?: RecordingFinalSignalKind;
     __transcriptorLiveStatusSnapshot?: () => LiveStatusSnapshot;
     __transcriptorRecordingTooShort?: () => boolean;
-    __transcriptorLiveTake?: () => { mode: LiveRecordingMode; screenSessionId: string };
+    __transcriptorLiveTake?: () => { mode: LiveRecordingMode; screenSessionId: string; screenClicks: boolean };
     __transcriptorSetMainStatus?: (status: string, kind?: StatusKind) => boolean;
     __setBackendBootStatus?: (msg: string) => void;
     __setBackendBootError?: (failure: BootFailure) => void;
@@ -6303,6 +6309,7 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
     shortcut_paste: currentShortcuts.paste,
     shortcut_screen: currentShortcuts.screen,
     shortcut_screen_shot: currentShortcuts.screenShot,
+    screen_clicks: readScreenClicksEnabled(),
     // Upload tab — mirrors current DOM values. Optional-chained because
     // setupUploadView may not have run yet on a page that loaded
     // without the Upload section (defensive against future view splits).
@@ -6407,7 +6414,7 @@ updateAllShortcutDisplays();
 function refreshShortcutConflictState(status: ShortcutStatusPayload): void {
   // The screen-mode rows exist only where the desktop shell supports it.
   const screenSupported = status.screenModeSupported === true;
-  for (const fieldId of ["shortcutScreenField", "shortcutScreenShotField"]) {
+  for (const fieldId of ["shortcutScreenField", "shortcutScreenShotField", "screenClicksField"]) {
     const field = document.getElementById(fieldId);
     if (field) field.hidden = !screenSupported;
   }
@@ -6560,6 +6567,11 @@ function handleShortcutKeydown(e: KeyboardEvent): void {
 
 function shouldUpscale(): boolean {
   return !!($("upscaleToggle") as HTMLInputElement).checked;
+}
+
+/** Settings' "record clicks in screen mode" — read by a screen take when it starts. */
+function readScreenClicksEnabled(): boolean {
+  return !!(document.getElementById("screenClicksToggle") as HTMLInputElement | null)?.checked;
 }
 
 function readAutoSendEnterEnabled(): boolean {
@@ -7213,6 +7225,7 @@ async function loadCfg(): Promise<void> {
     const autoStopSecondsEl = $("autoStopSilenceSeconds") as HTMLInputElement;
     const autoStopDbEl = $("autoStopSilenceDb") as HTMLInputElement;
     autoStopEnabledEl.checked = ui.auto_stop_silence_enabled === true;
+    ($("screenClicksToggle") as HTMLInputElement).checked = ui.screen_clicks !== false;
     autoStopSecondsEl.value = String(clampAutoStopSeconds(Number(ui.auto_stop_silence_seconds)));
     autoStopDbEl.value = String(clampAutoStopThresholdDb(Number(ui.auto_stop_silence_db)));
     const upscaleToggle = $("upscaleToggle") as HTMLInputElement;
@@ -7520,6 +7533,7 @@ async function handleKeyAction(provider: RemoteProvider): Promise<void> {
     });
   });
 });
+($("screenClicksToggle") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
 ($("settingsAutoSendEnterToggle") as HTMLInputElement).addEventListener("change", () => {
   setAutoSendEnterEnabled(($("settingsAutoSendEnterToggle") as HTMLInputElement).checked);
   queueUiPreferencesSave();
@@ -9593,9 +9607,17 @@ let startAt = 0;
 // under ``liveScreenSessionId`` and hands them back at stop).
 let liveRecordingMode: LiveRecordingMode = "voice";
 let liveScreenSessionId = "";
+// The take's "record clicks" setting, read once when it starts: a change
+// in Settings mid-take applies to the next take.
+let liveScreenClicks = false;
 // Main reads the take a hotkey press left starting from here
-// (desktop/renderer-toggle.js) and opens the screen session under its id.
-window.__transcriptorLiveTake = () => ({ mode: liveRecordingMode, screenSessionId: liveScreenSessionId });
+// (desktop/renderer-toggle.js) and opens the screen session under its id,
+// with its "record clicks" setting.
+window.__transcriptorLiveTake = () => ({
+  mode: liveRecordingMode,
+  screenSessionId: liveScreenSessionId,
+  screenClicks: liveScreenClicks,
+});
 
 // Holds the unsubscribe ``onScreenVoiceTake`` returns, so a second run of
 // the subscription (a Vite HMR re-run of top-level code) retires the first.
@@ -11220,6 +11242,7 @@ async function startLive(
   const take = liveTakeFromRequest(request);
   liveRecordingMode = take.mode;
   liveScreenSessionId = take.screenSessionId;
+  liveScreenClicks = take.mode === "screen" && readScreenClicksEnabled();
   // The request clock (§4.9). Set before anything can await, so it is
   // the moment the renderer received the toggle, not the moment the
   // microphone answered.
@@ -11889,6 +11912,7 @@ async function stopLive(
   );
   liveRecordingMode = "voice";
   liveScreenSessionId = "";
+  liveScreenClicks = false;
   const liveSessionId = activeLiveSessionId;
   const sessionUiToken = liveSessionId;
   stoppedSessionToken = sessionUiToken;

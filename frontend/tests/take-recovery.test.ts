@@ -83,8 +83,10 @@ describe("recoveredTakeTranscript", () => {
     );
     // 5 s of 20 s → a quarter in; 15 s → three quarters in. Not all at the end.
     const out = recoveredTakeTranscript(spoken, screenTake.screens);
-    expect(out.indexOf("[✏️")).toBeLessThan(out.indexOf("съехала"));
-    expect(out.indexOf("[📸")).toBeLessThan(out.indexOf("тоже"));
+    expect(out.indexOf("[✏️1 штрих")).toBeLessThan(out.indexOf("съехала"));
+    // 8 words, the shot three quarters in: «здесь тоже» came after it.
+    expect(out.indexOf("съехала")).toBeLessThan(out.indexOf("### После последнего скрина"));
+    expect(out.indexOf("### После последнего скрина")).toBeLessThan(out.indexOf("здесь тоже"));
   });
 
   it("a voice take's transcript is its words", () => {
@@ -102,11 +104,10 @@ describe("planTakeRecovery — after a crash mid-take", () => {
     expect(w.name).toBe(screenTake.name);
     expect(w.archiveDir).toBe(screenTake.archiveDir);
     expect(w.transcriptText).toContain("кнопка");
-    expect(w.transcriptText).toContain("[✏️1 скрин 1: штрих, справа]");
-    expect(w.transcriptText).toContain("[📸 00:15 скрин 1]");
-    expect(w.transcriptText).toContain("Скрин 1 · shot-01.png · 00:00–00:15");
+    expect(w.transcriptText).toContain("[✏️1 штрих, справа]");
+    expect(w.transcriptText).toContain("### Скрин 1 · 00:00–00:15 · shot-01.png");
     expect(w.transcriptText.match(/Диктовка с рисованием по экрану/g)).toHaveLength(1);
-    expect(w.transcriptText.match(/Сводка по скринам/g)).toHaveLength(1);
+    expect(w.transcriptText.match(/^### Скрин /gm)).toHaveLength(1);
     expect(w.sourceText).toBe("вот тут кнопка съехала и вот здесь тоже");
     // The draft knows what the take was recorded with; the promotion does not.
     expect(w.provider).toBe("deepgram");
@@ -125,10 +126,10 @@ describe("planTakeRecovery — after a crash mid-take", () => {
   it("a screen take drawn without speaking keeps its marks alone", () => {
     const plan = planTakeRecovery(draft({ source_text: "" }), [screenTake]);
     expect(plan.writes).toHaveLength(1);
-    // Header, the two marks one per line, the summary.
+    // The header, then the screenshot's section with its one mark.
     const text = plan.writes[0].transcriptText;
-    expect(text.split("\n\n")).toHaveLength(3);
-    expect(text.split("\n\n")[1]).toBe("[✏️1 скрин 1: штрих, справа]\n[📸 00:15 скрин 1]");
+    expect(text.split("\n\n")).toHaveLength(2);
+    expect(text.split("\n\n")[1]).toBe("### Скрин 1 · 00:00–00:15 · shot-01.png\nШтрихи: 1 — центр 74%, 53%\n[✏️1 штрих, справа]");
     expect(plan.writes[0].title).toBe(screenTake.title);
     expect(plan.writes[0].sourceText).toBe(screenTake.sourceText);
   });

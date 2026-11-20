@@ -24,6 +24,11 @@
 //   stdout: {"t":"ready"}
 //           {"t":"start","x":..,"y":..} {"t":"move","x":..,"y":..} {"t":"end","x":..,"y":..}
 //           {"t":"tap","x":..,"y":..}                  a press-and-release on a control
+//           {"t":"click","x":..,"y":..}                a plain click, replayed to the
+//                                                      app underneath; the point is
+//                                                      where it was pressed (a press
+//                                                      on a control is a tap, never
+//                                                      a click)
 //           {"t":"press","outcome":"click|stroke|tap|controlDrag|orphanStroke|handedOver",
 //            "clicks":n,"drags":n,"echoes":n,"by":name} one line per finished
 //                                                      press; `echoes`: replayed
@@ -173,8 +178,10 @@ let callback: CGEventTapCallBack = { _, type, event, _ in
     return nil
   case .replayClick:
     // A click: hand the app underneath the press it never saw, then the
-    // release, in order, both marked so this tap lets them through.
+    // release, in order, both marked so this tap lets them through. The
+    // shell is told where it was pressed (screen mode's click record).
     if let held = state.heldDown { repost(held) }
+    emitPoint("click", state.heldDown?.location ?? p)
     state.heldDown = nil
     if let up = event.copy() { repost(up) }
     return nil

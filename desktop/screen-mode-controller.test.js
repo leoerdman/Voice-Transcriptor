@@ -740,6 +740,7 @@ test("every stdout line main.swift documents is understood by the controller", a
     move: { line: { t: "move", x: 150, y: 100 }, seen: () => true },
     end: { line: { t: "end", x: 200, y: 100 }, seen: () => true },
     tap: { line: { t: "tap", x: 5, y: 5 }, seen: (w) => w.capsule.webContents.scripts.length === 1 },
+    click: { line: { t: "click", x: 300, y: 300 }, seen: () => true },
     press: { line: { t: "press", outcome: "stroke", clicks: 1, drags: 9 }, seen: (w) => w.logs.some((l) => l.includes("press outcome=stroke clicks=1 drags=9")) },
     "tap-disabled": { line: { t: "tap-disabled", reason: "timeout", abandoned: "stroke" }, seen: (w) => w.logs.some((l) => l.includes("tap disabled reason=timeout abandoned=stroke")) },
     // An answer nobody asked for (a request that already timed out) is
@@ -757,14 +758,15 @@ test("every stdout line main.swift documents is understood by the controller", a
     webContents: { scripts: [], executeJavaScript(js) { this.scripts.push(js); return Promise.resolve(true); } },
   };
   try {
-    await world.controller.start(ID);
-    for (const kind of ["ready", "start", "move", "end", "tap", "press", "tap-disabled", "front-window", "error"]) {
+    await world.controller.start(ID, { recordClicks: true });
+    for (const kind of ["ready", "start", "move", "end", "tap", "click", "press", "tap-disabled", "front-window", "error"]) {
       world.say(samples[kind].line);
       assert.ok(samples[kind].seen(world), `line ${kind} had no effect`);
     }
     await world.controller.takeShot("hotkey");
     const manifest = (await world.controller.finish({ id: ID })).manifest;
     assert.equal(manifest.events.filter((e) => e.type === "stroke").length, 1, "start/move/end drew one stroke");
+    assert.equal(manifest.events.filter((e) => e.type === "click").length, 1, "click recorded a click");
   } finally {
     world.cleanup();
   }
@@ -915,7 +917,7 @@ test("a shot is the front window when every stroke touches it: placed, numbered 
     assert.deepEqual(request.exclude, [process.pid]);
     assert.equal(request.minSide, SCREEN_MODE.minWindowSide);
     const manifest = (await world.controller.finish({ id: ID })).manifest;
-    assert.equal(manifest.version, 2);
+    assert.equal(manifest.version, require("./screen-mode").SCREEN_MODE.manifestVersion);
     const shotEvent = manifest.events.find((e) => e.type === "shot");
     const strokes = manifest.events.filter((e) => e.type === "stroke");
     assert.equal(shotEvent.area, "window");
@@ -1059,4 +1061,47 @@ test("screen mode draws no frame around the screen: the overlay is the strokes' 
   const html = overlayHtml();
   assert.doesNotMatch(html, /id="frame"|#frame|border:/);
   assert.match(html, /<canvas id="cv"><\/canvas>/);
+});
+
+// ── clicks (the "record clicks" setting) ───────────────────────────────
+const CLICK_RING_RADIUS = require("./screen-mode").SCREEN_MODE.clickMark.radius;
+const ringsIn = (file, scale) => painted(file).calls.filter((c) => c[0] === "arc" && c[3] === CLICK_RING_RADIUS * scale);
+
+test("with the setting on, a plain click is a ring in the next shot and a placed click in the manifest", async () => {
+  const world = createWorld();
+  world.frontWindow = { x: 100, y: 50, width: 600, height: 400 };
+  try {
+    await world.controller.start(ID, { recordClicks: true });
+    world.say({ t: "click", x: 400, y: 250 }); // inside the front window
+    const shot = await world.controller.takeShot("hotkey");
+    // The capture is the window at 2x: the ring is at the click, in window pixels.
+    const rings = ringsIn(shot.files[0], 2);
+    assert.equal(rings.length, 1, "one ring, no number");
+    assert.deepEqual(rings[0].slice(1, 3), [(400 - 100) * 2, (250 - 50) * 2]);
+    assert.equal(painted(shot.files[0]).calls.some((c) => c[0] === "fillText"), false, "a click carries no number");
+    world.say({ t: "click", x: 10, y: 10 }); // after the last shot
+    const manifest = (await world.controller.finish({ id: ID })).manifest;
+    assert.deepEqual(manifest.events.filter((e) => e.type === "click").map(({ at, ...rest }) => rest), [
+      { type: "click", shot: 1, xPct: 50, yPct: 50 },
+      { type: "click" },
+    ]);
+    assert.ok(world.logs.some((l) => / clicks=on$/.test(l)));
+  } finally {
+    world.cleanup();
+  }
+});
+
+test("with the setting off, a click leaves no trace: no ring, no event", async () => {
+  const world = createWorld();
+  world.frontWindow = { x: 100, y: 50, width: 600, height: 400 };
+  try {
+    await world.controller.start(ID);
+    world.say({ t: "click", x: 400, y: 250 });
+    const shot = await world.controller.takeShot("hotkey");
+    assert.equal(painted(shot.files[0]).raw, true, "the capture as taken");
+    const manifest = (await world.controller.finish({ id: ID })).manifest;
+    assert.equal(manifest.events.some((e) => e.type === "click"), false);
+  } finally {
+    world.cleanup();
+  }
 });

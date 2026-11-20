@@ -87,17 +87,26 @@ class ContractTests(unittest.TestCase):
         folder = Path("/archive/take.screens")
         out = screen_sessions._rehome_manifest(CONTRACT["manifest"], folder)
         self.assertEqual(out["dir"], str(folder))
-        self.assertEqual(out["events"][1]["files"], [str(folder / "shot-01.png")])
-        self.assertEqual(out["events"][1]["preview"], str(folder / "shot-01-preview.jpg"))
-        self.assertEqual(out["events"][0]["crop"], str(folder / "shot-01-n1.jpg"))
+
+        def of_type(events: list, kind: str) -> dict:
+            return next(e for e in events if e["type"] == kind)
+
+        src_events = CONTRACT["manifest"]["events"]
+        stroke, shot = of_type(out["events"], "stroke"), of_type(out["events"], "shot")
+        self.assertEqual(shot["files"], [str(folder / "shot-01.png")])
+        self.assertEqual(shot["preview"], str(folder / "shot-01-preview.jpg"))
+        self.assertEqual(stroke["crop"], str(folder / "shot-01-n1.jpg"))
         self.assertEqual(
-            {k: v for k, v in out["events"][0].items() if k != "crop"},
-            {k: v for k, v in CONTRACT["manifest"]["events"][0].items() if k != "crop"},
+            {k: v for k, v in stroke.items() if k != "crop"},
+            {k: v for k, v in of_type(src_events, "stroke").items() if k != "crop"},
         )
         self.assertEqual(
-            {k: v for k, v in out["events"][1].items() if k not in ("files", "preview")},
-            {k: v for k, v in CONTRACT["manifest"]["events"][1].items() if k not in ("files", "preview")},
+            {k: v for k, v in shot.items() if k not in ("files", "preview")},
+            {k: v for k, v in of_type(src_events, "shot").items() if k not in ("files", "preview")},
         )
+        # Manifest v3's click (no image path) passes through as written.
+        self.assertEqual(of_type(out["events"], "click"), of_type(src_events, "click"))
+        self.assertEqual([e["type"] for e in out["events"]], [e["type"] for e in src_events])
 
     def test_a_version_1_manifest_is_still_rehomed_as_it_was(self) -> None:
         folder = Path("/archive/take.screens")

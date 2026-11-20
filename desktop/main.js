@@ -2479,10 +2479,10 @@ function retireScreenTake(id) {
  * behind the microphone confirmation, the frontmost-app lookup or the
  * capsule session (S-02 / DM-31, and the "everything at once" showing).
  */
-function startScreenTake(id, pressedAt) {
+function startScreenTake(id, pressedAt, recordClicks) {
   screenTakeId = id;
   holdCapsuleForScreenTake();
-  return screenMode.start(id, { pressedAt });
+  return screenMode.start(id, { pressedAt, recordClicks });
 }
 
 const screenMode = createScreenModeController({
@@ -3036,7 +3036,9 @@ async function toggleRecordingFromShortcut(mode = "voice") {
         appendMainLog(`[screen-mode] press joined the take already starting: ${take.screenSessionId} (press id ${startDetail.screenSessionId || "none"})`);
       }
       screenStartId = take.screenSessionId;
-      screenStart = startScreenTake(screenStartId, pressedAt);
+      // The take's "record clicks" setting comes with it: Settings (the
+      // renderer) owns it, and the take keeps what it was when it started.
+      screenStart = startScreenTake(screenStartId, pressedAt, take.screenClicks === true);
     };
     beginScreenTake();
 

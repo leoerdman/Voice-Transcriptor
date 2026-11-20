@@ -15,7 +15,9 @@
  *     rectangle (every take starts with it) and the pen, then the colours;
  *   * the native mouse helper (`runtime/bin/screen-input`, source
  *     desktop/native/screen-input/) — a CGEventTap that passes a
- *     plain click through and turns a press-and-drag into a stroke;
+ *     plain click through (and reports where it was: with the take's
+ *     "record clicks" setting on, the next screenshot shows a ring there)
+ *     and turns a press-and-drag into a stroke;
  *   * the session's staging directory, where every screenshot and
  *     `events.json` are written. Nothing here deletes a session except a
  *     discarded take's: on save the backend moves the folder beside the
@@ -68,10 +70,13 @@ const {
   extendStroke,
   fitWithin,
   numberBadgeCenter,
+  pendingClicks,
   pendingStrokes,
   planShot,
   previewFileName,
+  recordClick,
   recordShot,
+  regionHolding,
   screenSessionManifest,
   shotFileName,
   strokeCropRect,
@@ -190,6 +195,7 @@ function overlayHtml() {
   // Clear of the stroke's line: the gap plus half the line's width.
   const BADGE_GAP = ${badge.gap + SCREEN_MODE.strokeWidth / 2};
   const BADGE_FONT = (scale) => ${JSON.stringify(`${badge.fontWeight} `)} + (${badge.fontSize} * scale) + ${JSON.stringify(`px ${badge.fontFamily}`)};
+  const CLICK = ${JSON.stringify(SCREEN_MODE.clickMark)};
   // One rule for where a number goes and how big a copy is, shared with
   // desktop/screen-mode.js (embedded from there, not retyped).
   const numberBadgeCenter = ${numberBadgeCenter.toString()};
@@ -262,6 +268,22 @@ function overlayHtml() {
     c.textBaseline = "middle";
     // "middle" centres the em box; digits sit half a point below it.
     c.fillText(String(s.n), x, y + 0.5 * scale);
+    c.restore();
+  }
+  // A click's ring, no number: a dark ring inside a light halo (p in
+  // display points).
+  function drawClick(c, p, scale, ox, oy) {
+    const x = (p.x - ox) * scale;
+    const y = (p.y - oy) * scale;
+    c.save();
+    c.beginPath();
+    c.arc(x, y, CLICK.radius * scale, 0, Math.PI * 2);
+    c.lineWidth = CLICK.halo * scale;
+    c.strokeStyle = CLICK.haloColor;
+    c.stroke();
+    c.lineWidth = CLICK.ring * scale;
+    c.strokeStyle = CLICK.ringColor;
+    c.stroke();
     c.restore();
   }
   function redraw() {
@@ -346,7 +368,8 @@ function overlayHtml() {
   }
   // A capture of \`region\` (display points, relative to this display) at
   // the capture's own pixel scale: the strokes \`ids\` and their numbers
-  // are painted in (numbers kept inside the captured area), then the
+  // are painted in (numbers kept inside the captured area), and a ring at
+  // each of \`opts.clicks\` (display points), then the
   // agent's cheap copies are cut from that picture — the downscaled
   // preview (when \`opts.preview\`) and one close-up per \`crops\` entry
   // ({id, x, y, width, height}: points relative to the region).
@@ -363,7 +386,10 @@ function overlayHtml() {
       const painted = ids.map((id) => detached.get(id) || strokes.get(id)).filter(Boolean);
       for (const s of painted) drawStroke(c, s, scale, region.x, region.y);
       for (const s of painted) drawBadge(c, s, scale, region, region.x, region.y);
-      const result = { image: painted.length ? out.toDataURL("image/png") : null, preview: null, crops: {} };
+      const clicks = opts.clicks || [];
+      for (const p of clicks) drawClick(c, p, scale, region.x, region.y);
+      const drawn = painted.length > 0 || clicks.length > 0;
+      const result = { image: drawn ? out.toDataURL("image/png") : null, preview: null, crops: {} };
       if (opts.preview) {
         const size = fitWithin(out.width, out.height, opts.preview.maxSide, opts.preview.maxPixels);
         result.preview = jpeg(out, 0, 0, out.width, out.height, size, opts.preview.quality);
@@ -993,6 +1019,8 @@ function createScreenModeController(deps) {
     if (!Number.isFinite(x) || !Number.isFinite(y)) return;
     if (t === "tap") {
       deliverTap(x, y);
+    } else if (t === "click") {
+      recordClick(session, { x, y });
     } else if (t === "start") {
       const display = screen.getDisplayNearestPoint({ x: Math.round(x), y: Math.round(y) });
       const stroke = beginStroke(session, { x, y, displayId: display.id, displayBounds: display.bounds });
@@ -1076,6 +1104,7 @@ function createScreenModeController(deps) {
     // arriving while the images are made, and a stroke that finishes
     // during the awaits below is in none of them.
     const pending = pendingStrokes(session);
+    const clicksPending = pendingClicks(session);
     const at = Date.now();
     // What the shot captures — the front window, or whole displays — is
     // decided once too (./screen-mode.js, planShot).
@@ -1139,12 +1168,14 @@ function createScreenModeController(deps) {
     const regions = {};
     const crops = {};
     let preview = "";
+    const capturedRegions = [];
     for (const target of grabbed) {
       const wantPreview = target === targets[0];
       const entry = overlays.get(target.displayId);
       const strokesHere = pending.filter((s) => target.strokeIds.includes(s.id));
+      const clicksHere = clicksPending.filter((c) => regionHolding([target.region], c.x, c.y));
       try {
-        if (strokesHere.length || (wantPreview && entry)) {
+        if (strokesHere.length || clicksHere.length || (wantPreview && entry)) {
           const origin = entry ? entry.bounds : target.display.bounds;
           const region = {
             x: target.region.x - origin.x,
@@ -1163,18 +1194,25 @@ function createScreenModeController(deps) {
               entry,
               `window.__render(${JSON.stringify(`${PNG_DATA_URL_PREFIX}${png}`)}, ${JSON.stringify(target.strokeIds)}, ` +
               `${JSON.stringify(region)}, ${JSON.stringify(cropRects)}, ` +
-              `${JSON.stringify({ preview: wantPreview ? SCREEN_MODE.preview : null, crop: SCREEN_MODE.crop })})`,
+              `${JSON.stringify({
+                preview: wantPreview ? SCREEN_MODE.preview : null,
+                crop: SCREEN_MODE.crop,
+                clicks: clicksHere.map((c) => ({ x: c.x - origin.x, y: c.y - origin.y })),
+              })})`,
             );
           } catch (e) {
             // The strokes are part of the image: without them painted in,
             // this file is not the shot the strokes are said to be in. A
-            // shot with nothing drawn keeps its capture, without a preview.
+            // shot with no strokes keeps its capture, without a preview
+            // (and without its click rings: a click is context, not a mark).
             if (strokesHere.length) throw e;
             log(`[screen-mode] preview of shot ${index} failed: ${e?.message || e}`);
             rendered = null;
           }
           if (rendered) {
-            if (strokesHere.length) fs.writeFileSync(target.file, decodeDataUrl(rendered.image, PNG_DATA_URL_PREFIX, "image"));
+            if (strokesHere.length || clicksHere.length) {
+              fs.writeFileSync(target.file, decodeDataUrl(rendered.image, PNG_DATA_URL_PREFIX, "image"));
+            }
             if (wantPreview) {
               try {
                 const file = path.join(session.dir, previewFileName(index));
@@ -1197,6 +1235,7 @@ function createScreenModeController(deps) {
           }
         }
         for (const s of strokesHere) regions[s.id] = target.region;
+        capturedRegions.push(target.region);
         files.push(target.file);
       } catch (e) {
         failures.push(`display ${target.displayId}: ${e?.message || e}`);
@@ -1236,13 +1275,16 @@ function createScreenModeController(deps) {
       if (preview) fs.rmSync(preview, { force: true });
       return null;
     }
-    const shot = recordShot(session, { at, files, strokeIds: taken, reason, area, preview, regions, crops });
+    // Every click pending when the capture began is this shot's; it is
+    // placed in the captured area that holds it, if any.
+    const clicks = Object.fromEntries(clicksPending.map((c) => [c.id, regionHolding(capturedRegions, c.x, c.y)]));
+    const shot = recordShot(session, { at, files, strokeIds: taken, reason, area, preview, regions, crops, clicks });
     // The screen is clean: what is still on it is numbered from 1 again.
     for (const s of unshotStrokes(session)) queueOp(["n", s.id, s.n]);
     writeEvents();
     log(
       `[screen-mode] shot ${shot.index} reason=${reason} area=${area} files=${files.length} ` +
-      `strokes=${shot.strokeIds.length} preview=${preview ? 1 : 0} closeups=${Object.keys(crops).length}`,
+      `strokes=${shot.strokeIds.length} clicks=${clicksPending.length} preview=${preview ? 1 : 0} closeups=${Object.keys(crops).length}`,
     );
     return { index: shot.index, files };
   }
@@ -1264,7 +1306,7 @@ function createScreenModeController(deps) {
     return { ok: false, outcome: SCREEN_START_OUTCOME.FAILED, error };
   }
 
-  async function startNow(id, pressedAt) {
+  async function startNow(id, pressedAt, recordClicks) {
     if (endedIds.has(id)) {
       // Its stop got here first (the renderer finished the take while main
       // was still on its way to start it): nobody will ever finish it.
@@ -1286,7 +1328,7 @@ function createScreenModeController(deps) {
     let expiry = null;
     try {
       fs.mkdirSync(dir, { recursive: true });
-      session = createScreenSession({ id, dir });
+      session = createScreenSession({ id, dir, recordClicks });
       lastManifest = null;
       watchDisplays();
       // The surfaces and the helper come up side by side. The surfaces are
@@ -1353,7 +1395,7 @@ function createScreenModeController(deps) {
     }
     refreshLayout();
     writeEvents();
-    log(`[screen-mode] started ${id} displays=${overlays.size}`);
+    log(`[screen-mode] started ${id} displays=${overlays.size} clicks=${session.recordClicks ? "on" : "off"}`);
     return { ok: true, outcome: SCREEN_START_OUTCOME.STARTED, id };
   }
 
@@ -1423,13 +1465,15 @@ function createScreenModeController(deps) {
   // user has been warned about, so main has one answer to read.
   /**
    * @param {string} id  the take's screen session id
-   * @param {{pressedAt?: number}} [opts]  when the user pressed the key: the
-   *   "surfaces visible" log line measures press → everything on screen
+   * @param {{pressedAt?: number, recordClicks?: boolean}} [opts]  `pressedAt`:
+   *   when the user pressed the key — the "surfaces visible" log line
+   *   measures press → everything on screen; `recordClicks`: the take's
+   *   "record clicks" setting, as the renderer reported it with the take
    */
   const start = (id, opts = {}) => serialize(async () => {
     const pressedAt = Number(opts?.pressedAt) > 0 ? Number(opts.pressedAt) : Date.now();
     try {
-      return await startNow(id, pressedAt);
+      return await startNow(id, pressedAt, opts?.recordClicks === true);
     } catch (e) {
       teardown();
       return startFailed(id, e?.message || String(e));

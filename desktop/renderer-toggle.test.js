@@ -70,16 +70,17 @@ test("a starting press reports the take it left starting — its own, or one alr
   const press = { mode: "screen", screenSessionId: "screen-20261121-024210-646" };
   const script = toggleDispatchScript({ allowStart: true, startDetail: press, notAfter: 10_000 });
   // Its own: startLive takes the press's id synchronously inside the dispatch.
-  let live = { mode: "voice", screenSessionId: "" };
+  let live = { mode: "voice", screenSessionId: "", screenClicks: false };
   const own = runInFakeRenderer(script, {
     now: 9_000,
     take: () => live,
-    onToggle: (e) => { live = { mode: e.detail.mode, screenSessionId: e.detail.screenSessionId }; },
+    onToggle: (e) => { live = { mode: e.detail.mode, screenSessionId: e.detail.screenSessionId, screenClicks: true }; },
   });
-  assert.deepEqual({ ...own.result.take }, press);
+  // With the take's "record clicks" setting, read by startLive.
+  assert.deepEqual({ ...own.result.take }, { ...press, screenClicks: true });
   // Joined (2026-11-21): a take an earlier, timed-out press began is still
   // starting; startLive ignores this press and the take keeps its id.
-  const earlier = { mode: "screen", screenSessionId: "screen-20261121-024206-102" };
+  const earlier = { mode: "screen", screenSessionId: "screen-20261121-024206-102", screenClicks: false };
   const joined = runInFakeRenderer(script, { now: 9_000, take: () => earlier });
   assert.deepEqual({ ...joined.result.take }, earlier);
   // A stopping press reports no take.
@@ -89,7 +90,7 @@ test("a starting press reports the take it left starting — its own, or one alr
 
 test("main opens the screen session under the take the renderer reports, and the stop ends a session no take owns", () => {
   const toggle = topLevelFunctionSource("toggleRecordingFromShortcut");
-  assert.match(toggle, /screenStart = startScreenTake\(screenStartId, pressedAt\)/);
+  assert.match(toggle, /screenStart = startScreenTake\(screenStartId, pressedAt, take\.screenClicks === true\)/);
   assert.match(toggle, /screenStartId = take\.screenSessionId/);
   assert.doesNotMatch(toggle, /startScreenTake\(startDetail\.screenSessionId/);
   assert.doesNotMatch(toggle, /retireScreenTake\(startDetail\.screenSessionId\)/);

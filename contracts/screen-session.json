@@ -17,9 +17,11 @@
     "shot-01-n1.jpg",
     "shot-12-n10.jpg"
   ],
-  "_manifestComment": "version 2. A stroke: `n` is its number on the picture (1, 2, 3… in each shot); `tool` rect|pen; `shape` rect|loop|line|curve|dot; `box` (x, y, w, h) and the centre `xPct`/`yPct` are whole percent (0..100) of the captured area (the shot's `area`: the front window, or the display), the stroke cut to that area; `crop` is the absolute path of its close-up and is absent when none was made. A shot: `files` are the original PNGs; `preview` is the absolute path of the downscaled copy of files[0], absent when none was made; `area` is window|display. Version 1 manifests (no n/tool/shape/box/crop/preview/area; xPct/yPct of the whole display) are still read.",
+  "_fileNameFormsComment": "The file names as the transcript's header states them to its reader, once (frontend/src/screen-annotations.ts): NN is the shot's number (two digits or more), K a stroke's number. Each side's suite checks its own names against these forms.",
+  "fileNameForms": { "shot": "shot-NN.png", "preview": "shot-NN-preview.jpg", "crop": "shot-NN-nK.jpg" },
+  "_manifestComment": "version 3. A stroke: `n` is its number on the picture (1, 2, 3… in each shot); `tool` rect|pen; `shape` rect|loop|line|curve|dot (a rectangle one of whose sides is no thicker than the pen's straightness tolerance is a `line`, a `dot` when both are — desktop/screen-mode.js strokeShape); `box` (x, y, w, h) and the centre `xPct`/`yPct` are whole percent (0..100) of the captured area (the shot's `area`: the front window, or the display), the stroke cut to that area; `crop` is the absolute path of its close-up and is absent when none was made. A click (only when the take's \"record clicks\" setting was on; none otherwise): a plain click that reached the app underneath (never one on Transcriptor's own palette or capsule); `shot` is the screenshot that followed it, absent when none did; `xPct`/`yPct` are its point in whole percent of that shot's captured area, absent when it lay outside it; the screenshot shows a ring there. A shot: `files` are the original PNGs; `preview` is the absolute path of the downscaled copy of files[0], absent when none was made; `area` is window|display. Version 2 manifests (no click events) and version 1 manifests (no n/tool/shape/box/crop/preview/area; xPct/yPct of the whole display) are still read.",
   "manifest": {
-    "version": 2,
+    "version": 3,
     "id": "screen-20261120-100000-000",
     "dir": "/data/screen-sessions/screen-20261120-100000-000",
     "startedAt": 1795165500000,
@@ -38,6 +40,7 @@
         "yPct": 14,
         "crop": "/data/screen-sessions/screen-20261120-100000-000/shot-01-n1.jpg"
       },
+      { "type": "click", "at": 1795165514200, "shot": 1, "xPct": 40, "yPct": 62 },
       {
         "type": "shot",
         "at": 1795165515000,

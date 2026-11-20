@@ -724,3 +724,26 @@ describe("upload queue wiring for a failed History save (FQ-01/FQ-05/FQ-18)", ()
     expect(mainTsx).toContain('stopBtn.disabled = item.cancelRequested === true || item.stage === "saving";');
   });
 });
+
+/**
+ * Screen mode's "record clicks" setting (2026-11-21): one stored value
+ * (preferences.ui.screen_clicks, on unless explicitly false), read by a
+ * screen take when it starts and handed to main with the take
+ * (desktop/renderer-toggle.js reads `screenClicks`).
+ */
+describe("screen mode's record-clicks setting", () => {
+  it("is a Settings toggle beside the screen-mode hotkeys, hidden with them", () => {
+    expect(html).toMatch(/id="screenClicksField" hidden>[\s\S]*?id="screenClicksToggle" checked/);
+    expect(mainTsx).toContain('["shortcutScreenField", "shortcutScreenShotField", "screenClicksField"]');
+  });
+
+  it("is saved with the preferences and loads on unless explicitly off", () => {
+    expect(mainTsxSlice("function collectUiPreferences(", "\n}\n")).toContain("screen_clicks: readScreenClicksEnabled(),");
+    expect(mainTsx).toContain('($("screenClicksToggle") as HTMLInputElement).checked = ui.screen_clicks !== false;');
+  });
+
+  it("a screen take reads it once at start and reports it with the take", () => {
+    expect(mainTsxSlice("async function startLive(", "\n}\n")).toContain('liveScreenClicks = take.mode === "screen" && readScreenClicksEnabled();');
+    expect(mainTsx).toMatch(/window\.__transcriptorLiveTake = \(\) => \(\{[\s\S]*?screenClicks: liveScreenClicks,/);
+  });
+});
