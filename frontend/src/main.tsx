@@ -88,7 +88,7 @@ import {
 } from "./transcript-merge";
 import { mergeInterim } from "./live-source";
 import { checkForUpdate, shouldAutoCheck } from "./update-check";
-import { mayAutosaveUiPreferences } from "./settings-autosave";
+import { catalogChoiceForSave, mayAutosaveUiPreferences } from "./settings-autosave";
 import {
   CLI_ACCESS_OFF,
   cliSectionView,
@@ -6520,7 +6520,10 @@ function setAutoSendEnterEnabled(enabled: boolean): void {
 }
 
 function upscalePresetId(): string {
-  return (($("upscalePresetSelect") as HTMLSelectElement).value || "").trim();
+  return catalogChoiceForSave(
+    ($("upscalePresetSelect") as HTMLSelectElement).value,
+    pendingUpscalePresetId,
+  );
 }
 
 function selectedUpscalePreset(): UpscalePresetItem | undefined {

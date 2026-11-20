@@ -36,3 +36,21 @@ export function mayAutosaveUiPreferences(state: UiPreferencesAutosaveState): boo
   if (state.suppressed) return false;
   return state.loaded;
 }
+
+/**
+ * The value a catalog-backed preference (the upscale preset) holds right
+ * now, given what its select shows and the id parked while the catalog
+ * could not be read.
+ *
+ * When the catalog request fails the select is rebuilt with one disabled
+ * "unavailable" row and an empty value, and the user's id is parked until
+ * the next successful load. An unloaded catalog means "unknown", not
+ * "none": the preference block is saved whole, so reading the empty
+ * select would write a blank over the user's choice — the rule above,
+ * for the one key it did not cover.
+ */
+export function catalogChoiceForSave(selected: string, parked: string): string {
+  const chosen = String(selected || "").trim();
+  if (chosen) return chosen;
+  return String(parked || "").trim();
+}
