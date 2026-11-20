@@ -175,6 +175,7 @@ desktop/
 ├── backend-auth.js                 # the backend API token: minted per launch, passed in the backend's env, handed only to the main window over IPC (pure, node --test)
 ├── private-log.js                  # main.log appends: the file is created 0600, an older world-readable one tightened once (pure, node --test)
 ├── single-flight.js                # at most one run of an operation at a time; check and claim in one step (engine install) (pure, node --test)
+├── ipc-sender-guard.js             # the one registrar for a window's IPC channels: the sender check runs before every handler (main window, capsule) (pure, node --test)
 ├── renderer-epoch.js               # which renderer a recording id belongs to, so a reloaded renderer's ids are never confused (pure, node --test)
 ├── shortcut-runtime.js             # the accelerators bound right now and how a Settings update changes them (pure, node --test)
 ├── capsule-geometry.js             # the recording capsule's window size and placement (pure, node --test)

@@ -34,11 +34,10 @@ test("the capsule preload sends exactly the three verbs and exposes no raw ipcRe
   assert.doesNotMatch(capsulePreload, /ipcRenderer\.on\(|ipcRenderer\.invoke\(/);
 });
 
-test("main listens on each verb, only from the capsule window, and the window loads the preload", () => {
-  const ipc = topLevelFunctionSource("installRecordingStatusCapsuleIpc");
-  for (const verb of VERBS) {
-    assert.match(ipc, new RegExp(`ipcMain\\.on\\("${verb}", \\(event\\) => \\{\\s*if \\(!fromCapsule\\(event\\)\\) return;`));
-  }
+// That main accepts each verb only from the capsule window is tested in
+// ipc-sender.test.js (the guarded registrar, and that the three verbs go
+// through it).
+test("the capsule window loads the preload, and the preload is packaged", () => {
   assert.match(topLevelFunctionSource("ensureRecordingStatusCapsuleWindow"), /preload: path\.join\(__dirname, "capsule-preload\.js"\)/);
   assert.ok(pkg.build.files.includes("capsule-preload.js"), "the preload must be packaged");
 });

@@ -63,6 +63,7 @@
       "data-dir.js",
       "backend-exit.js",
       "single-flight.js",
+      "ipc-sender-guard.js",
       "log-retention.js",
       "backend-auth.js",
       "private-log.js",

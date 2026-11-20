@@ -151,6 +151,9 @@ const {
   parseShortcutMessage,
   resolveRevealTarget,
 } = require("./renderer-requests");
+// Each window's IPC channels are registered through one sender-guarded
+// registrar (DM-28).
+const { createSenderGuardedIpc } = require("./ipc-sender-guard");
 // The capsule window's size (one flag) and when it is placed (DM-13, DM-25).
 const { capsuleWindowSize, capsuleBoundsIn, capsuleNeedsPlacement } = require("./capsule-geometry");
 // What to do once screenMode.start() answered for a take (DM-31).
@@ -2053,22 +2056,24 @@ let recordingStatusCapsuleIpcInstalled = false;
 function installRecordingStatusCapsuleIpc() {
   if (recordingStatusCapsuleIpcInstalled) return;
   recordingStatusCapsuleIpcInstalled = true;
-  const fromCapsule = (event) =>
-    !!recordingStatusWindow && !recordingStatusWindow.isDestroyed()
-    && event?.sender === recordingStatusWindow.webContents;
-  ipcMain.on("capsule:pointer", (event) => {
-    if (!fromCapsule(event)) return;
+  const capsuleIpc = createSenderGuardedIpc(ipcMain, {
+    isAllowedSender: (event) =>
+      !!recordingStatusWindow && !recordingStatusWindow.isDestroyed()
+      && event?.sender === recordingStatusWindow.webContents,
+    // Dropped without a log line, as before: the pointer verb fires on
+    // every hover.
+    onRefused: () => { },
+  });
+  capsuleIpc.on("capsule:pointer", () => {
     noteRecordingStatusCapsuleInteraction();
   });
-  ipcMain.on("capsule:shot", (event) => {
-    if (!fromCapsule(event)) return;
+  capsuleIpc.on("capsule:shot", () => {
     noteRecordingStatusCapsuleInteraction();
     void screenMode.takeShot("capsule").catch((e) => {
       appendMainLog(`[screen-mode] capsule shot failed: ${e?.message || e}`);
     });
   });
-  ipcMain.on("capsule:stop", (event) => {
-    if (!fromCapsule(event)) return;
+  capsuleIpc.on("capsule:stop", () => {
     noteRecordingStatusCapsuleInteraction();
     recordingStopInFlight = true;
     // The capsule stops the recording. It does NOT touch the main
@@ -9195,14 +9200,19 @@ app.whenReady().then(async () => {
   // Every channel the preload exposes answers only the main window's own
   // webContents (DM-28). Only that window has the preload today, so
   // nothing else can reach these channels — but the rule once lived in
-  // two handlers only, spelled inline; every handler now asks this one
-  // predicate.
+  // two handlers only, spelled inline. Each channel is now registered
+  // through mainWindowIpc (./ipc-sender-guard), which runs the check
+  // before the handler, so no handler can leave it out.
   const isFromMainWindow = (event) =>
     !!win && !win.isDestroyed() && event?.sender === win.webContents;
   const refusedSender = (channel) => {
     appendMainLog(`[ipc] ${channel} refused: sender is not the main window`);
     return { ok: false, error: "sender" };
   };
+  const mainWindowIpc = createSenderGuardedIpc(ipcMain, {
+    isAllowedSender: isFromMainWindow,
+    onRefused: refusedSender,
+  });
 
   // The backend's API token for the main window's page (BM-01, see
   // ./backend-auth). Synchronous because the renderer reads it at load,
@@ -9219,10 +9229,8 @@ app.whenReady().then(async () => {
     event.returnValue = token;
   });
 
-  ipcMain.handle("engine:get-status", (event) =>
-    (isFromMainWindow(event) ? engineInstallSnapshot() : refusedSender("engine:get-status")));
-  ipcMain.handle("engine:install", async (event) => {
-    if (!isFromMainWindow(event)) return refusedSender("engine:install");
+  mainWindowIpc.handle("engine:get-status", () => engineInstallSnapshot());
+  mainWindowIpc.handle("engine:install", async () => {
     // Every return carries the phase snapshot the renderer branches on.
     // Two of these three paths used to return an object WITHOUT `phase`
     // — so an install that failed because there was no usable Python, or
@@ -9267,8 +9275,7 @@ app.whenReady().then(async () => {
   // asks right after `probePasteCapability("boot")` already ran gets the
   // cached answer for free; the very first ask of a session pays for one
   // probe so the badge is never a beat behind the first recording.
-  ipcMain.handle("paste-capability:get-status", async (event) => {
-    if (!isFromMainWindow(event)) return refusedSender("paste-capability:get-status");
+  mainWindowIpc.handle("paste-capability:get-status", async () => {
     const cap = await ensurePasteCapabilityFresh("renderer-query");
     const context = pasteCapabilityMessageContext();
     return {
@@ -9289,8 +9296,7 @@ app.whenReady().then(async () => {
   // (desktop/paste-capability.js builds it, including the refusal to run
   // it against anything that is not this app's own bundle id); the
   // renderer owns nothing but the click.
-  ipcMain.handle("permissions:repair", async (event) => {
-    if (!isFromMainWindow(event)) return refusedSender("permissions:repair");
+  mainWindowIpc.handle("permissions:repair", async () => {
     try {
       return await repairPastePermissionsOnRequest();
     } catch (e) {
@@ -9319,8 +9325,7 @@ app.whenReady().then(async () => {
   // whichever path stopped the take (either hotkey, the capsule, the
   // dead-pipeline fail-safe). Main owns the session; the renderer asks
   // for it back and writes it into the transcript.
-  ipcMain.handle("screen-mode:finish", async (event, payload) => {
-    if (!isFromMainWindow(event)) return refusedSender("screen-mode:finish");
+  mainWindowIpc.handle("screen-mode:finish", async (_event, payload) => {
     const p = payload && typeof payload === "object" ? payload : {};
     try {
       const id = String(p.id || "");
@@ -9333,8 +9338,7 @@ app.whenReady().then(async () => {
     }
   });
 
-  ipcMain.on("recording-final", (event, payload) => {
-    if (!isFromMainWindow(event)) { refusedSender("recording-final"); return; }
+  mainWindowIpc.on("recording-final", (_event, payload) => {
     const signal = recordingFinalSlot.set(payload);
     if (!signal) {
       appendMainLog(
@@ -9356,8 +9360,7 @@ app.whenReady().then(async () => {
   // channels with the same sender rule as every channel above; what each
   // request may do is decided in ./renderer-requests from the payload
   // alone, so a renderer cannot name a verb or a path main did not allow.
-  ipcMain.on(RENDERER_REQUEST_CHANNELS.SHORTCUTS, (event, payload) => {
-    if (!isFromMainWindow(event)) { refusedSender(RENDERER_REQUEST_CHANNELS.SHORTCUTS); return; }
+  mainWindowIpc.on(RENDERER_REQUEST_CHANNELS.SHORTCUTS, (_event, payload) => {
     const parsed = parseShortcutMessage(payload);
     if (!parsed.message) {
       appendMainLog(`[shortcuts-bridge] ${compactLogText(parsed.error, 60)}`);
@@ -9370,8 +9373,7 @@ app.whenReady().then(async () => {
       pendingShortcutBridgeMessages = pendingShortcutBridgeMessages.slice(-8);
     }
   });
-  ipcMain.on(RENDERER_REQUEST_CHANNELS.RECORD_TOGGLE, (event) => {
-    if (!isFromMainWindow(event)) { refusedSender(RENDERER_REQUEST_CHANNELS.RECORD_TOGGLE); return; }
+  mainWindowIpc.on(RENDERER_REQUEST_CHANNELS.RECORD_TOGGLE, () => {
     // Routed to the very same function the global hotkey calls so there
     // is one recording toggle, not two: same microphone-permission
     // prompt, same frontmost-window capture for auto-paste, same capsule,
@@ -9382,8 +9384,7 @@ app.whenReady().then(async () => {
       appendMainLog(`[record-toggle] failed: ${e?.message || e}`);
     });
   });
-  ipcMain.on(RENDERER_REQUEST_CHANNELS.REVEAL_RECORDING, (event, payload) => {
-    if (!isFromMainWindow(event)) { refusedSender(RENDERER_REQUEST_CHANNELS.REVEAL_RECORDING); return; }
+  mainWindowIpc.on(RENDERER_REQUEST_CHANNELS.REVEAL_RECORDING, (_event, payload) => {
     const appDataDir = dataDir();
     const recordingsRoot = path.resolve(appDataDir, "recordings");
     const allowedRoots = [recordingsRoot];

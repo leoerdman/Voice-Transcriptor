@@ -237,7 +237,7 @@ function matchAll(source, pattern) {
 test("preload sends, and main listens on, the same one channel", () => {
   const sent = matchAll(PRELOAD_SRC, /ipcRenderer\.send\(\s*"([^"]+)"/g);
   assert.equal(sent.filter((c) => c === "recording-final").length, 1, "the hand-off is sent on one channel, once");
-  const listened = matchAll(MAIN_SRC, /ipcMain\.on\(\s*"([^"]+)"/g);
+  const listened = matchAll(MAIN_SRC, /mainWindowIpc\.on\(\s*"([^"]+)"/g);
   assert.ok(
     listened.includes("recording-final"),
     `main.js must listen on "recording-final" (listens on: ${listened.join(", ") || "nothing"})`,
