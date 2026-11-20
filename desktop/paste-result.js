@@ -36,7 +36,10 @@ const {
   PASTE_OK_PREFIX,
   PASTE_ERR_PREFIX,
   PASTE_SENT_RECEIPT_RE,
+  VBS_PASTE_METHOD,
 } = require("./paste-protocol");
+
+const VBS_PASTE_OK = `${PASTE_OK_PREFIX}${VBS_PASTE_METHOD}`;
 
 function outcomeOf(stdout) {
   return String(stdout == null ? "" : stdout).trim();
@@ -77,9 +80,13 @@ function pasteSentReceipt({ stdout, stderr } = {}) {
   return m ? m[2] : "";
 }
 
-/** Windows VBS SendKeys paste (method: "vbs_paste"). */
+/**
+ * Windows VBS SendKeys paste (method: "vbs_paste"). The verdict is the
+ * last line, the same rule as every other script here: the marker
+ * appearing somewhere inside other output is not the script saying OK.
+ */
 function isVbsPasteSuccess({ ok, stdout }) {
-  return !!ok && outcomeOf(stdout).includes("OK:vbs-paste");
+  return !!ok && lastLineOf(stdout) === VBS_PASTE_OK;
 }
 
 /**
@@ -97,7 +104,7 @@ function isVbsPasteSuccess({ ok, stdout }) {
 function parseVbsPasteOutcome({ ok, stdout, stderr }) {
   const receipt = pasteSentReceipt({ stdout, stderr });
   if (isVbsPasteSuccess({ ok, stdout })) {
-    return { success: true, verified: false, sent: !!receipt, reason: lastLineOf(stdout) || "OK:vbs-paste" };
+    return { success: true, verified: false, sent: !!receipt, reason: lastLineOf(stdout) };
   }
   if (receipt) {
     // Cut short AFTER the paste was dispatched: the text is in the
@@ -111,7 +118,7 @@ function parseVbsPasteOutcome({ ok, stdout, stderr }) {
 
 /** Windows PowerShell SendKeys fallback (method: "pwsh_paste_fallback"). */
 function isPwshPasteFallbackSuccess({ ok, stdout }) {
-  return !!ok && outcomeOf(stdout).includes("OK:");
+  return !!ok && lastLineOf(stdout).startsWith(PASTE_OK_PREFIX);
 }
 
 /**

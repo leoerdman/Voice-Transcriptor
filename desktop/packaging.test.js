@@ -227,6 +227,9 @@ test("CI runs the desktop suite where its osacompile tests can execute", () => {
   );
   const desktopJob = workflow.slice(workflow.indexOf("\n  desktop:"));
   assert.match(desktopJob, /runs-on:\s*macos-latest/);
+  // A count of the suites in prose went stale at the next added suite
+  // ("seventeen" while there were 23); the directory is the count.
+  assert.doesNotMatch(workflow, /\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty[- \w]*) suites are\b/i);
 
   // ...and those two suites must still be the darwin-gated ones, or the
   // reason for the macOS runner has quietly moved somewhere else.
@@ -254,9 +257,17 @@ test("no extraResource is copied to the same destination twice", () => {
   // ../requirements-gigaam.txt and ../ENABLE_GIGAAM were each copied to the
   // same path twice on mac, win and linux, and all six had to be edited
   // together to change one path.
-  for (const platform of ["mac", "mas", "win", "linux"]) {
-    const platformCfg = pkg.build[platform] || {};
-    const combined = [...pkg.build.extraResources, ...(platformCfg.extraResources || [])];
+  // The mas target is built from build.mac MERGED with build.mas
+  // (macPackager getPlatformConfig → deepAssign, which concatenates
+  // arrays), so its list is base + mac + mas.
+  const ownLists = {
+    mac: [pkg.build.mac],
+    mas: [pkg.build.mac, pkg.build.mas],
+    win: [pkg.build.win],
+    linux: [pkg.build.linux],
+  };
+  for (const [platform, cfgs] of Object.entries(ownLists)) {
+    const combined = [...pkg.build.extraResources, ...cfgs.flatMap((cfg) => (cfg && cfg.extraResources) || [])];
     const destinations = combined.map((entry) => entry.to);
     const duplicated = destinations.filter((to, i) => destinations.indexOf(to) !== i);
     assert.deepEqual(duplicated, [], `${platform}: duplicate extraResources destinations`);
@@ -441,4 +452,167 @@ test("the READMEs do not promise a signing mode the default build no longer uses
       `${name} still describes the default build as ad-hoc signed`,
     );
   }
+});
+
+test("every mac dist script builds screen mode's helper before electron-builder; the App Store one leaves it out", () => {
+  // Without the helper the screen hotkey is silently not offered
+  // (controller isSupported() is an existsSync), so a script that packs a
+  // mac build without build-native.sh ships a DMG that fails no check.
+  const macDist = Object.entries(pkg.scripts).filter(([, body]) => /electron-builder --mac(?! mas)/.test(body));
+  assert.ok(macDist.length >= 4, "the mac dist scripts are found");
+  for (const [name, body] of macDist) {
+    const native = body.indexOf("build-native.sh mac-arm64");
+    assert.ok(native >= 0 && native < body.indexOf("electron-builder"), `${name} packs a mac build without building the helper first`);
+  }
+  // dist:mas: build-mas.sh empties the helper directory build.mac's
+  // extraResources hand to the merged mas config, before packing.
+  const mas = fs.readFileSync(path.join(DESKTOP_DIR, "scripts", "build-mas.sh"), "utf8");
+  const emptied = mas.indexOf("rm -rf ./native/build/mac-arm64");
+  assert.ok(emptied >= 0 && emptied < mas.indexOf("npx electron-builder --mac mas"));
+  assert.doesNotMatch(mas, /^\s*bash \S*build-native\.sh/m);
+});
+
+// INSTALL_ON_OTHER_MAC.command defines its functions when sourced; these
+// drive them one at a time in a bash of their own.
+function installerBash(body) {
+  const { spawnSync } = require("node:child_process");
+  const installer = path.join(DESKTOP_DIR, "..", "INSTALL_ON_OTHER_MAC.command");
+  return spawnSync("bash", ["-c", `source "$1"\n${body}`, "bash", installer], { encoding: "utf8" });
+}
+
+const hasCodesign = fs.existsSync("/usr/bin/codesign") && fs.existsSync("/System/Applications/Calculator.app");
+
+test("the other-Mac installer refuses a build whose signature would strand the user's permissions", {
+  skip: hasCodesign ? false : "needs macOS codesign and its system apps",
+}, () => {
+  const os = require("node:os");
+  const { execFileSync } = require("node:child_process");
+  const calculator = "/System/Applications/Calculator.app";
+  const chess = "/System/Applications/Chess.app";
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "installer-identity-"));
+  try {
+    const adhoc = path.join(work, "X.app");
+    fs.mkdirSync(path.join(adhoc, "Contents", "MacOS"), { recursive: true });
+    fs.copyFileSync("/usr/bin/true", path.join(adhoc, "Contents", "MacOS", "X"));
+    fs.writeFileSync(
+      path.join(adhoc, "Contents", "Info.plist"),
+      '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>local.x</string><key>CFBundleExecutable</key><string>X</string></dict></plist>',
+    );
+    execFileSync("/usr/bin/codesign", ["-s", "-", "-f", adhoc], { stdio: "ignore" });
+
+    const check = (newApp, installed) => installerBash(`verify_identity_continuity "${newApp}" "${installed}"`);
+    assert.equal(check(calculator, calculator).status, 0, "same signer: install");
+    assert.equal(check(calculator, path.join(work, "missing.app")).status, 0, "nothing installed: install");
+    assert.equal(check(calculator, adhoc).status, 0, "over an ad-hoc copy: nothing to strand");
+    const other = check(calculator, chess);
+    assert.equal(other.status, 1, "another signer: refused");
+    assert.match(other.stderr, /different certificate/);
+    const adhocNew = check(adhoc, calculator);
+    assert.equal(adhocNew.status, 1, "an ad-hoc build: refused");
+    assert.match(adhocNew.stderr, /ad-hoc signed/);
+  } finally {
+    fs.rmSync(work, { recursive: true, force: true });
+  }
+});
+
+test("the other-Mac installer never replaces the bundle under a process that would not quit", () => {
+  // pgrep always finds it, pkill does nothing, the clock runs on sleep.
+  const run = installerBash(`
+    pgrep() { return 0; }
+    pkill() { return 0; }
+    osascript() { return 0; }
+    sleep() { SECONDS=$((SECONDS + 1)); }
+    quit_existing_app
+    echo "returned"
+  `);
+  assert.equal(run.status, 1, run.stdout);
+  assert.doesNotMatch(run.stdout, /returned/);
+  assert.match(run.stderr, /still running/);
+});
+
+test("the other-Mac installer's privileged helpers work before main() decides on sudo (set -u)", () => {
+  const run = installerBash("run_privileged true && echo ran");
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stdout, /ran/);
+});
+
+test("BUILD.command quits a running duplicate bundle before deleting it", () => {
+  const build = fs.readFileSync(path.join(DESKTOP_DIR, "..", "BUILD.command"), "utf8");
+  const start = build.indexOf("retire_duplicate_app_bundle() {");
+  const body = build.slice(start, build.indexOf("\n}\n", start));
+  const quit = body.indexOf('quit_running_app "$duplicate_app"');
+  assert.ok(quit > 0, "the duplicate is quit");
+  assert.ok(quit < body.indexOf('cleanup_path "$duplicate_app"'), "before it is deleted");
+});
+
+test("prepare-runtime never installs a native runtime with the release host's pip", () => {
+  // pip_runner_python is lifted out of prepare-runtime.sh as written and
+  // run against three bundled interpreters.
+  const os = require("node:os");
+  const { spawnSync } = require("node:child_process");
+  const script = fs.readFileSync(path.join(DESKTOP_DIR, "scripts", "prepare-runtime.sh"), "utf8");
+  const start = script.indexOf("pip_runner_python() {");
+  const fn = script.slice(start, script.indexOf("\n}\n", start) + 2);
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "pip-runner-"));
+  const interpreter = (name, body, mode) => {
+    const dir = path.join(work, name, "python", "bin");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "python3"), body, { mode });
+    return path.join(work, name);
+  };
+  const run = (outDir) => spawnSync("bash", ["-c", `set -euo pipefail
+ROOT_DIR=/
+log() { echo "$*" >&2; }
+warn() { echo "$*" >&2; }
+die() { echo "$*" >&2; exit 1; }
+${fn}
+pip_runner_python "$1"`, "bash", outDir], { encoding: "utf8" });
+  try {
+    // Native, with pip: its own interpreter.
+    const good = interpreter("good", "#!/bin/sh\nexit 0\n", 0o755);
+    assert.equal(run(good).stdout.trim(), path.join(good, "python", "bin", "python3"));
+    // Native, without pip: an error — not the host's pip.
+    const nopip = interpreter("nopip", '#!/bin/sh\n[ "$1" = "-m" ] && exit 1\nexit 0\n', 0o755);
+    const broken = run(nopip);
+    assert.equal(broken.status, 1, broken.stdout);
+    assert.match(broken.stderr, /has no pip/);
+    // Cross (cannot run here): the host's python3, said in the log.
+    const cross = interpreter("cross", "MZ not a script", 0o644);
+    const crossRun = run(cross);
+    assert.equal(crossRun.stdout.trim(), "python3");
+    assert.match(crossRun.stderr, /cross build/);
+  } finally {
+    fs.rmSync(work, { recursive: true, force: true });
+  }
+});
+
+test("the TestFlight upload keeps the app-specific password off the command line", () => {
+  // A value in argv is readable by every local user through `ps` for the
+  // whole upload; altool reads `@env:<name>` from its own environment.
+  const upload = fs.readFileSync(path.join(DESKTOP_DIR, "scripts", "upload-testflight.sh"), "utf8");
+  assert.doesNotMatch(upload, /-p\s+"\$ASC_APP_SPECIFIC_PASSWORD"/);
+  assert.match(upload, /-p\s+"@env:ASC_APP_SPECIFIC_PASSWORD"/);
+});
+
+test("every module the desktop bundle ships is named in PROJECT_STRUCTURE.md", () => {
+  // The structure map is where a reader looks first; a shipped module
+  // missing from it (user-data-dir.js was, from the commit that added it)
+  // is a module nobody is told exists.
+  const structure = fs.readFileSync(path.join(DESKTOP_DIR, "..", "PROJECT_STRUCTURE.md"), "utf8");
+  const shipped = pkg.build.files.filter((f) => /^[\w.-]+\.js$/.test(f));
+  const missing = shipped.filter((f) => !new RegExp(`[├└]── ${f.replace(/\./g, "\\.")}\\s`).test(structure));
+  assert.deepEqual(missing, []);
+});
+
+test("the helper's place in the bundle is one fact across build-native.sh, package.json, main.js and afterPack", () => {
+  const { SCREEN_INPUT_HELPER_IN_BUNDLE } = require("./scripts/macos-signing-utils");
+  const [dirInBundle, name] = [path.dirname(SCREEN_INPUT_HELPER_IN_BUNDLE), path.basename(SCREEN_INPUT_HELPER_IN_BUNDLE)];
+  const buildNative = fs.readFileSync(path.join(DESKTOP_DIR, "scripts", "build-native.sh"), "utf8");
+  assert.match(buildNative, new RegExp(`-o "\\$OUT_DIR/${name}"`));
+  const entry = pkg.build.mac.extraResources.find((e) => e.from === "native/build/mac-${arch}");
+  assert.ok(entry, "build.mac.extraResources copies the helper directory");
+  assert.equal(path.join("Contents", "Resources", entry.to), dirInBundle);
+  const main = fs.readFileSync(path.join(DESKTOP_DIR, "main.js"), "utf8");
+  const segments = entry.to.split("/").concat(name).map((s) => `"${s}"`).join(", ");
+  assert.ok(main.includes(`path.join(process.resourcesPath, ${segments})`), "main.js runs the helper from where the bundle has it");
 });

@@ -42,6 +42,8 @@ backend/
 ├── main.py                    # FastAPI app, REST/WS routes, jobs, recordings, config endpoints;
 │                              #   audio-retention policy table + recordings-scan caches
 ├── config.py                  # config loading, migration, encrypted provider keys
+├── model_catalog.py           # provider/model catalog SSOT: model ids that affect provider calls (bootstrap + /api/health)
+├── audio_mime.py              # canonical audio/video upload Content-Type mapping (serving + provider uploads)
 ├── data_dir.py                # where this installation keeps its data — one rule, dependency-free (config.py and cli.py both read it)
 ├── cli_access.py              # command-line access SSOT: the CLI token, connection file, wrapper script, and what that token may call
 ├── cli.py                     # the command-line client itself (stdlib only) — `transcriptor transcribe|submit|status|result|cancel|info`
@@ -55,6 +57,7 @@ backend/
 ├── remote_deepgram_live.py    # Deepgram live WebSocket provider
 ├── remote_openrouter.py       # OpenRouter audio transcription and text upscale
 ├── deepgram_endpoints.py      # Deepgram endpoint SSOT
+├── deepgram_format.py         # Deepgram formatting options both transcription paths send (live + REST) SSOT
 ├── deepgram_words.py          # Deepgram word-spelling SSOT (punctuated vs raw)
 ├── deepgram_keyterms.py       # Deepgram Nova-3 Keyterm Prompting SSOT (parse/limit/query pairs)
 ├── deepgram_warm.py           # warm Deepgram live-socket pool SSOT (KeepAlive cadence, liveness probe, replay ring)
@@ -103,8 +106,12 @@ frontend/
     ├── audio-levels.ts               # capture-level SSOT: session noise floor, relative speech threshold (pure)
     ├── capture-warm.ts               # warm-hold/pre-roll/reuse decision SSOT for held-microphone captures (pure)
     ├── deepgram-dual.ts              # dual-stream Auto preference-resolution SSOT (pure)
+    ├── live-source.ts                # live-source composition SSOT: committed + interim → preview text and draft autosave (pure)
+    ├── live-pane.ts                  # Live Preview pane display contract: preview on/off, status line (pure)
     ├── live-envelope.ts              # the `final` stop-envelope wire type: one reader, matches backend/live_envelope.py
     ├── screen-annotations.ts         # screen-mode marks: manifest → bracketed marks placed in the transcript by their moment in speech (pure)
+    ├── transcription-catalog.ts      # transcription catalog + selection SSOT for every model picker (pure)
+    ├── shortcut-display.ts           # Electron accelerator → Settings keycap labels, per platform (pure)
     ├── cli-section.ts                # Settings → Command line: parses /api/cli and decides what the section shows (the backend composes every command)
     ├── upload-queue-restore.ts       # upload-queue snapshot restore SSOT: a failed read leaves the latch down (pure)
     ├── settings-autosave.ts          # settings autosave gate SSOT: no write of a config that was never read (pure)
@@ -144,12 +151,13 @@ desktop/
 ├── power-events.js                 # powerMonitor subscription SSOT: each handler subscribed exactly once at startup (pure, node --test)
 ├── recording-status.js             # recording-capsule status classification SSOT: one ladder both sides read (pure, node --test)
 ├── screen-mode.js                  # screen-mode rules SSOT: session record, stroke position, manifest, shared names (pure, node --test)
-├── screen-mode-controller.js       # screen-mode I/O: overlays + red frame, palette (non-activating panels), native helper, display hot-plug, screencapture + compositing
+├── screen-mode-controller.js       # screen-mode I/O: overlays + red frame, palette, native helper (its taps on our controls delivered in-process), display hot-plug, screencapture + compositing
 ├── native/screen-input/            # CGEventTap helper (main.swift) + PressClassifier.swift, the one click-vs-stroke rule (built by scripts/build-native.sh)
 ├── child-io.js                     # child-process text-output decoding SSOT (UTF-16LE on win32) (pure, node --test)
 ├── python-version.js               # interpreter version reader: the ONE file that declares it is .python-version (pure, node --test)
 ├── shortcut-migration.js           # retired-hotkey migration rule SSOT, shared with the renderer (pure, node --test)
 ├── linux-wm-class.js               # WM_CLASS split from `wmctrl -lpGx` for Linux window activation (pure, node --test)
+├── user-data-dir.js                # one spelling for the app's data directory, shared with backend/data_dir.py (pure, node --test)
 ├── window-lifecycle.js             # main-window lifecycle SSOT: activate/close/minimise/quit/second-instance/capsule decisions and where the window opens (pure, node --test)
 ├── ipc-contract.test.js            # main.js/preload.js IPC channel-name contract test (node --test)
 ├── preload.js                      # safe renderer bridge (path-for-file, engine lifecycle invoke-only, recordingFinal send-only, system-suspend receive-only)
@@ -167,7 +175,11 @@ desktop/
 ├── icon.png / icon.ico             # package icons
 └── scripts/
     ├── prepare-runtime.sh          # macOS arm64 / Windows x64 / Linux x64 runtime builder
-    ├── build-mas.sh                # Mac App Store package build entrypoint
+    ├── build-native.sh             # screen mode's native helper (native/screen-input) → native/build/<target>; macOS arm64 only
+    ├── notarize-dmg.sh             # Developer ID DMG notarization + stapling
+    ├── check-designated-requirement.js # refuses an install whose signature would strand the TCC grants (BUILD.command)
+    ├── generate-dmg-background.py  # DMG background artwork generator
+    ├── build-mas.sh                # Mac App Store package build entrypoint (ships no screen-mode helper)
     ├── sign-mas.js                 # Mac App Store signing and provisioning preflight
     ├── upload-testflight.sh        # App Store Connect/TestFlight upload entrypoint
     ├── macos-signing-utils.js      # shared macOS signing/provisioning helpers

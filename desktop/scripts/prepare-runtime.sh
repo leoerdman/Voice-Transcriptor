@@ -176,7 +176,7 @@ python_sha256_for_triple() {
 install_python() {
   local out_dir="$1" triple="$2"
   local tarball="cpython-${PBS_PYVER}+${PBS_TAG}-${triple}-install_only_stripped.tar.gz"
-  local url="https://github.com/indygreg/python-build-standalone/releases/download/${PBS_TAG}/${tarball}"
+  local url="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/${tarball}"
   local cached="${CACHE_DIR}/${tarball}"
   fetch "${url}" "${cached}" "$(python_sha256_for_triple "${triple}")"
   remove_tree "${out_dir}"
@@ -189,13 +189,23 @@ install_python() {
   [ -d "${out_dir}/python" ] || die "expected ${out_dir}/python after extract"
 }
 
+# Which interpreter runs pip for this target. A bundled interpreter that
+# runs on this host is the target itself (a native build): its own pip is
+# the one the lock was resolved for, and if it has none the runtime is
+# broken — that is an error, not a reason to use whatever pip the release
+# host has. Only a bundled interpreter that cannot run here (a cross
+# build: Windows or Linux from macOS) hands the job to the host's python3,
+# and the log says so.
 pip_runner_python() {
   local out_dir="$1"
   local candidate="${out_dir}/python/bin/python3"
-  if [ -x "${candidate}" ] && "${candidate}" -m pip --version >/dev/null 2>&1; then
+  if [ -x "${candidate}" ] && "${candidate}" -c "pass" >/dev/null 2>&1; then
+    "${candidate}" -m pip --version >/dev/null 2>&1 \
+      || die "the bundled interpreter ${candidate#${ROOT_DIR}/} has no pip; refusing to install the runtime with the host's pip"
     printf '%s\n' "${candidate}"
     return 0
   fi
+  warn "cross build: the bundled interpreter does not run on this host; pip runs on the host's python3"
   printf '%s\n' "python3"
 }
 

@@ -20,8 +20,13 @@
 //   stdout: {"t":"ready"}
 //           {"t":"start","x":..,"y":..} {"t":"move","x":..,"y":..} {"t":"end","x":..,"y":..}
 //           {"t":"tap","x":..,"y":..}                  a press-and-release on a control
-//           {"t":"press","outcome":"click|stroke|tap|controlDrag|orphanStroke",
+//           {"t":"press","outcome":"click|stroke|tap|controlDrag|orphanStroke|handedOver",
 //            "clicks":n,"drags":n}                     one line per finished press
+//           {"t":"tap-disabled","reason":"timeout|user-input",
+//            "abandoned":"none|stroke|held|control"}   macOS switched the tap
+//                                                      off; it is back on and
+//                                                      the press it cut is
+//                                                      abandoned (see below)
 //           {"t":"error","code":"tap-unavailable"}            then exit 2
 //
 // Output is written from a serial queue, never from the tap callback
@@ -67,9 +72,44 @@ func repost(_ event: CGEvent) {
   event.post(tap: .cgSessionEventTap)
 }
 
+// macOS switched the tap off (a late callback, Secure Input) and it is back
+// on. Every event while it was off went past the classifier, so the press
+// it was in the middle of cannot continue: it is abandoned the one way the
+// rule names (PressClassifier.interrupt) and the outcome is reported, so a
+// gesture that did not draw is explained in the app's log.
+func recoverFromTapDisable(reason: String) {
+  if let tap = state.tap { CGEvent.tapEnable(tap: tap, enable: true) }
+  let buttonDown = CGEventSource.buttonState(.combinedSessionState, button: .left)
+  state.lock.lock()
+  let abandoned = state.classifier.interrupt(buttonDown: buttonDown)
+  state.lock.unlock()
+  let held = state.heldDown
+  state.heldDown = nil
+  emit(["t": "tap-disabled", "reason": reason, "abandoned": abandoned.name])
+  switch abandoned {
+  case .none, .controlPress:
+    break
+  case .stroke(let at):
+    emitPoint("end", at)
+  case .heldPress(let down):
+    // The app never got this press: hand it over. With the button still
+    // down the rest of the press passes through to it; with the button up
+    // its release already went past the tap, so complete the click.
+    guard let held = held else { break }
+    repost(held)
+    if !down, let up = CGEvent(
+      mouseEventSource: nil, mouseType: .leftMouseUp,
+      mouseCursorPosition: held.location, mouseButton: .left
+    ) {
+      up.setIntegerValueField(.mouseEventClickState, value: held.getIntegerValueField(.mouseEventClickState))
+      repost(up)
+    }
+  }
+}
+
 let callback: CGEventTapCallBack = { _, type, event, _ in
   if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-    if let tap = state.tap { CGEvent.tapEnable(tap: tap, enable: true) }
+    recoverFromTapDisable(reason: type == .tapDisabledByTimeout ? "timeout" : "user-input")
     return Unmanaged.passUnretained(event)
   }
   if event.getIntegerValueField(.eventSourceUserData) == syntheticMarker {
@@ -145,7 +185,7 @@ guard let tap = CGEvent.tapCreate(
 }
 state.tap = tap
 
-// stdin reader: exclusion rectangles and quit. EOF (the app died or
+// stdin reader: our controls' rectangles and quit. EOF (the app died or
 // closed the pipe) is a quit too — the tap must never outlive its owner,
 // or the user's mouse would stay captured.
 Thread.detachNewThread {

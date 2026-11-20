@@ -74,7 +74,7 @@
       "linux-wm-class.js",
       "python-version.js",
       "window-lifecycle.js",
-    "user-data-dir.js",
+      "user-data-dir.js",
       "preload.js",
       "capsule-preload.js",
       "shortcut-defaults.json",
@@ -190,17 +190,6 @@
         "NSMicrophoneUsageDescription": "Transcriptor records microphone audio when you start a live transcription.",
         "NSAppleEventsUsageDescription": "Transcriptor uses Apple Events to paste transcripts into the app you are working in."
       },
-      "extraResources": [
-        {
-          "from": "runtime/mac-${arch}",
-          "to": "runtime",
-          "filter": [
-            "**/*",
-            "!**/__pycache__/**",
-            "!**/*.pyc"
-          ]
-        }
-      ],
       "target": [
         {
           "target": "mas",

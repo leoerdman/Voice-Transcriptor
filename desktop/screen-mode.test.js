@@ -25,10 +25,17 @@ const contract = JSON.parse(
   fs.readFileSync(path.join(__dirname, "..", "contracts", "screen-session.json"), "utf8"),
 );
 
-function drawLine(session, from, to, at) {
-  beginStroke(session, { x: from[0], y: from[1], at, displayId: 1 });
+const DISPLAY_1 = { x: 0, y: 0, width: 1000, height: 1000 };
+
+function drawLine(session, from, to, at, displayBounds = DISPLAY_1) {
+  beginStroke(session, { x: from[0], y: from[1], at, displayId: 1, displayBounds });
   extendStroke(session, { x: (from[0] + to[0]) / 2, y: (from[1] + to[1]) / 2, at: at + 50 });
   return endStroke(session, { x: to[0], y: to[1], at: at + 100 });
+}
+
+// A shot of everything pending when it began — what the controller does.
+function shoot(session, { at, files = [], reason = "capsule" }) {
+  return recordShot(session, { at, files, reason, strokeIds: pendingStrokes(session).map((s) => s.id) });
 }
 
 test("session ids sort chronologically and are recognised", () => {
@@ -57,12 +64,12 @@ test("a screenshot takes every finished stroke and leaves nothing pending", () =
   drawLine(s, [0, 0], [100, 0], 1000);
   drawLine(s, [10, 10], [12, 11], 2000);
   assert.equal(pendingStrokes(s).length, 2);
-  const shot = recordShot(s, { at: 3000, files: ["/tmp/x/shot-01.png"] });
+  const shot = shoot(s, { at: 3000, files: ["/tmp/x/shot-01.png"] });
   assert.equal(shot.index, 1);
   assert.deepEqual(shot.strokeIds, [1, 2]);
   assert.equal(pendingStrokes(s).length, 0);
   drawLine(s, [0, 0], [0, 200], 4000);
-  const second = recordShot(s, { at: 5000, files: [] });
+  const second = shoot(s, { at: 5000 });
   assert.equal(second.index, 2);
   assert.deepEqual(second.strokeIds, [3]);
 });
@@ -72,7 +79,7 @@ test("a stroke still being drawn is not taken by a screenshot", () => {
   beginStroke(s, { x: 0, y: 0, at: 1, displayId: 1 });
   extendStroke(s, { x: 300, y: 0, at: 2 });
   assert.equal(pendingStrokes(s).length, 0);
-  const shot = recordShot(s, { at: 3 });
+  const shot = shoot(s, { at: 3 });
   assert.deepEqual(shot.strokeIds, []);
   assert.equal(s.strokes.length, 1, "the active stroke survives the shot");
 });
@@ -87,8 +94,8 @@ test("a stroke's position is its centre in percent of its own display", () => {
 test("the manifest lists strokes and shots in time order with their shot number", () => {
   const s = createScreenSession({ id: "screen-1", dir: "/d", startedAt: 500 });
   drawLine(s, [0, 0], [200, 0], 1000);
-  recordShot(s, { at: 2000, files: ["/d/shot-01.png"] });
-  const m = screenSessionManifest(s, { displayBoundsById: { 1: { x: 0, y: 0, width: 1000, height: 1000 } } });
+  shoot(s, { at: 2000, files: ["/d/shot-01.png"] });
+  const m = screenSessionManifest(s);
   assert.equal(m.id, "screen-1");
   assert.equal(m.dir, "/d");
   assert.deepEqual(m.events.map((e) => [e.type, e.at, e.shot]), [["stroke", 1000, 1], ["shot", 2000, 1]]);
@@ -114,7 +121,7 @@ test("names shared with the backend match contracts/screen-session.json", () => 
 test("the manifest has the contract's shape", () => {
   const s = createScreenSession({ id: contract.exampleSessionId, dir: "/d", startedAt: 1 });
   drawLine(s, [0, 0], [10, 10], 2);
-  recordShot(s, { at: 300, files: ["/d/shot-01.png"], reason: "capsule" });
+  shoot(s, { at: 300, files: ["/d/shot-01.png"], reason: "capsule" });
   s.endedAt = 400; // the take stopped (the controller's finish)
   const m = screenSessionManifest(s);
   const keys = (o) => Object.keys(o).sort();
@@ -128,4 +135,27 @@ test("a running session's manifest has no end yet; a finished one does", () => {
   assert.equal("endedAt" in screenSessionManifest(s), false);
   s.endedAt = 99;
   assert.equal(screenSessionManifest(s).endedAt, 99);
+});
+
+test("a shot takes only the strokes it was made with; one finished meanwhile stays pending", () => {
+  const s = createScreenSession({ id: "x", dir: "/d", startedAt: 1 });
+  drawLine(s, [0, 0], [100, 0], 10);
+  const capturedWith = pendingStrokes(s).map((st) => st.id);
+  // While the screenshot is being taken, another stroke finishes.
+  drawLine(s, [0, 50], [100, 50], 20);
+  const shot = recordShot(s, { at: 30, files: ["/d/shot-01.png"], strokeIds: capturedWith, reason: "hotkey" });
+  assert.deepEqual(shot.strokeIds, [1]);
+  assert.deepEqual(pendingStrokes(s).map((st) => st.id), [2]);
+});
+
+test("a stroke's position comes from its display as it was when drawn, not as it is now", () => {
+  const s = createScreenSession({ id: "x", dir: "/d", startedAt: 1 });
+  const external = { x: 1000, y: 0, width: 1000, height: 1000 };
+  drawLine(s, [1100, 100], [1300, 100], 10, external);
+  shoot(s, { at: 50, files: ["/d/shot-01.png"] });
+  // The display is unplugged / rearranged afterwards: nothing moves.
+  external.x = 0;
+  external.width = 1;
+  const m = screenSessionManifest(s);
+  assert.deepEqual([m.events[0].xPct, m.events[0].yPct], [20, 10]);
 });

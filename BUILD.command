@@ -357,6 +357,9 @@ retire_duplicate_app_bundle() {
   duplicate_id="$(bundle_identifier "$duplicate_app")"
   canonical_id="$(bundle_identifier "$canonical_app")"
   if [ -n "$duplicate_id" ] && [ "$duplicate_id" = "$canonical_id" ]; then
+    # The duplicate may be the copy that is running: deleting a bundle under
+    # a live process is the hazard quit_running_app exists for.
+    quit_running_app "$duplicate_app"
     cleanup_path "$duplicate_app"
     echo "Removed duplicate $duplicate_app (same bundle id as $canonical_app)"
     return 0

@@ -87,6 +87,36 @@ function shouldIgnoreOsxSignPath(filePath, appPath, runtimeRoot) {
   return kind === "non-macho" || kind === "macho-other";
 }
 
+// Screen mode's native mouse helper, as it sits in a mac bundle:
+// build-native.sh writes `screen-input` into native/build/mac-<arch>,
+// package.json build.mac.extraResources copies that directory to
+// runtime/bin, and main.js screenModeHelperPath() runs it from there.
+// packaging.test.js holds those four statements together.
+const SCREEN_INPUT_HELPER_IN_BUNDLE = path.join("Contents", "Resources", "runtime", "bin", "screen-input");
+
+/**
+ * A Developer-ID/internal mac build must carry the helper (without it the
+ * screen hotkey is silently not offered); an App Store build must not (an
+ * active CGEventTap cannot run in the App Sandbox). Throws when the bundle
+ * says otherwise; returns the helper's path when it is expected and there.
+ */
+function assertScreenInputHelper(appPath, { expected }) {
+  const helper = path.join(appPath, SCREEN_INPUT_HELPER_IN_BUNDLE);
+  const kind = classifyMacho(helper);
+  if (expected && kind !== "executable") {
+    throw new Error(
+      `screen mode's helper is missing from the bundle (${helper}: ${kind}). ` +
+        "Run `bash desktop/scripts/build-native.sh mac-arm64` before electron-builder — every mac dist script does.",
+    );
+  }
+  if (!expected && existsSync(helper)) {
+    throw new Error(
+      `screen mode's helper must not ship in this build (${helper}): its CGEventTap cannot run in the App Sandbox.`,
+    );
+  }
+  return expected ? helper : null;
+}
+
 function assertNoBundledBytecode(appPath) {
   const offenders = [];
   for (const relRoot of PYTHON_IMPORT_TREES) {
@@ -534,7 +564,9 @@ function preSignRuntimeBinaries({ appPath, identity, entitlements, timestampArg 
 
 module.exports = {
   REQUIRED_USAGE_DESCRIPTION_KEYS,
+  SCREEN_INPUT_HELPER_IN_BUNDLE,
   assertNoBundledBytecode,
+  assertScreenInputHelper,
   classifyMacho,
   designatedRequirementIsStable,
   hardenAppTransportSecurity,
