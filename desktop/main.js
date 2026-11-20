@@ -154,6 +154,8 @@ const {
 // Each window's IPC channels are registered through one sender-guarded
 // registrar (DM-28).
 const { createSenderGuardedIpc } = require("./ipc-sender-guard");
+// The one way a normal shutdown starts, and the signal handlers (DM-19).
+const { createQuitApp, installSignalQuitHandlers } = require("./quit-path");
 // The capsule window's size (one flag) and when it is placed (DM-13, DM-25).
 const { capsuleWindowSize, capsuleBoundsIn, capsuleNeedsPlacement } = require("./capsule-geometry");
 // What to do once screenMode.start() answered for a take (DM-31).
@@ -1266,18 +1268,13 @@ async function resolveMainWindowClose() {
 }
 
 /**
- * The one call site that asks Electron to start a normal shutdown.
- * `before-quit` (registered once, below) does the actual teardown —
- * this only starts it, so there is exactly one place in the app that
- * decides "we are quitting now": the lifecycle table's `quit` action
- * above, the paste-capability self-heal relaunch, the tray's Quit item
- * and the SIGINT/SIGTERM/SIGHUP handlers all go through here instead of
- * each calling `app.quit()` on its own (DM-19).
+ * The one call site that asks Electron to start a normal shutdown
+ * (./quit-path, DM-19). `before-quit` (registered once, below) does the
+ * actual teardown — this only starts it: the lifecycle table's `quit`
+ * action above, the paste-capability self-heal relaunch, the tray's Quit
+ * item and the SIGINT/SIGTERM/SIGHUP handlers all go through here.
  */
-function quitApp(reason = "") {
-  appendMainLog(`[main-window] quit requested reason=${normalizeLifecycleReason(reason)}`);
-  app.quit();
-}
+const quitApp = createQuitApp({ app, log: appendMainLog, normalizeReason: normalizeLifecycleReason });
 
 function getRepoRoot() {
   if (app.isPackaged) return process.resourcesPath;
@@ -9162,27 +9159,18 @@ process.on("exit", () => {
   isQuitting = true;
   killBackendHard("process-exit", { force: true, synchronous: true });
 });
-const SIGNAL_EXIT_CODES = Object.freeze({
-  SIGHUP: 129,
-  SIGINT: 130,
-  SIGTERM: 143,
+// SIGINT/SIGTERM/SIGHUP quit through quitApp, with a bounded forced exit
+// (./quit-path).
+installSignalQuitHandlers({
+  proc: process,
+  log: appendMainLog,
+  markQuitting: () => { isQuitting = true; },
+  killBackend: killBackendHard,
+  quitApp,
+  exit: (code) => {
+    try { app.exit(code); } catch { process.exit(code); }
+  },
 });
-for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
-  process.on(sig, () => {
-    appendMainLog(`[signal] ${sig}`);
-    isQuitting = true;
-    killBackendHard(`signal-${sig}`, { escalateAfterMs: 250 });
-    try {
-      quitApp(`signal-${sig}`);
-    } catch {
-      try { app.exit(SIGNAL_EXIT_CODES[sig] || 0); } catch { process.exit(SIGNAL_EXIT_CODES[sig] || 0); }
-    }
-    const exitTimer = setTimeout(() => {
-      try { app.exit(SIGNAL_EXIT_CODES[sig] || 0); } catch { process.exit(SIGNAL_EXIT_CODES[sig] || 0); }
-    }, 1500);
-    if (typeof exitTimer.unref === "function") exitTimer.unref();
-  });
-}
 
 app.whenReady().then(async () => {
   // Process-level uncaughtException / unhandledRejection handlers are

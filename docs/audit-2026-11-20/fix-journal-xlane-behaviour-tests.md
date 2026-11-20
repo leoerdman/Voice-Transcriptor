@@ -53,3 +53,35 @@ Cut from `main` at 8e8f0a6.
     passed this one); restored → 8/8.
 - Suites: desktop 490/490, frontend 649/649 (51 files), typecheck, lint,
   build, `node --check` main/preload: green.
+
+## 2. Quit path (DM-19)
+
+- New `desktop/quit-path.js`: `createQuitApp({ app, log, normalizeReason })`
+  (main.js: `const quitApp = createQuitApp(...)`, so main.js itself calls
+  `app.quit()` nowhere) and `installSignalQuitHandlers({ proc, log,
+  markQuitting, killBackend, quitApp, exit, setTimer })`, which replaces
+  main.js's `for (const sig of [...]) process.on(sig, ...)` loop. The
+  250 ms escalation and 1500 ms forced-exit grace are now named
+  (`SIGNAL_BACKEND_ESCALATE_AFTER_MS`, `SIGNAL_QUIT_GRACE_MS`) next to
+  `SIGNAL_EXIT_CODES`. Behaviour unchanged.
+- `desktop/quit-path.test.js` rewritten. Removed: the vacuous
+  `assert.ok(calls.length >= 1)`, the "one `app.quit()` inside
+  `topLevelFunctionSource("quitApp")`" count, and the regex for the signal
+  handler's `quitApp(`signal-${sig}`)` text. Replaced by behaviour tests
+  with fakes: quitApp logs the normalised reason, then calls `app.quit`
+  once per call; each of SIGINT/SIGTERM/SIGHUP runs log → markQuitting →
+  killBackend(escalate 250 ms) → quitApp(`signal-X`) and arms an unref'd
+  forced exit with 128+n; a throwing quitApp exits at once.
+  Kept textual (wiring): no non-comment line of main.js calls `app.quit(`
+  (an absence claim — the comment-line filter can only make it stricter,
+  a line starting with `//` or `*` is not code); main.js builds quitApp
+  with createQuitApp and installs the handlers with `proc: process`, with
+  no `process.on("SIG…")` of its own; the tray item's
+  `click: () => quitApp("tray-quit")` (line-anchored).
+- Break-it evidence: signal handler without the quitApp call → 2 tests
+  fail; quitApp without `app.quit()` → "quitApp logs the reason, then asks
+  Electron to quit" fails; the tray item changed to `app.quit()` in
+  main.js → the wiring test fails; forced-exit timer removed → "each
+  signal…" fails. Restored → 5/5.
+- Suites: desktop 493/493, frontend 649/649, typecheck, lint, build,
+  `node --check`: green.

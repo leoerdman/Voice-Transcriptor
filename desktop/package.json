@@ -64,6 +64,7 @@
       "backend-exit.js",
       "single-flight.js",
       "ipc-sender-guard.js",
+      "quit-path.js",
       "log-retention.js",
       "backend-auth.js",
       "private-log.js",
