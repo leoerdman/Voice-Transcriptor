@@ -64,6 +64,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional, Sequence
 
 from backend.audio_constants import LIVE_SAMPLE_RATE_HZ, pcm16_bytes_per_sec
+from backend.deepgram_dual import merge_readings
 from backend.live_envelope import envelope_from_result, live_final_stats
 from backend.model_catalog import DEFAULT_DEEPGRAM_AUDIO_MODEL
 from backend.remote_deepgram import deepgram_transcribe
@@ -404,14 +405,21 @@ def _words_from_rest_result(result: Any, offset_sec: float) -> list[dict]:
     words = normalize_words(raw.get("words"))
     out: list[dict] = []
     for word in words:
-        out.append(
-            {
-                "word": word["word"],
-                "start": round(word["start"] + offset_sec, 3),
-                "end": round(word["end"] + offset_sec, 3),
-                "source": RECOVERY_SOURCE,
-            }
-        )
+        record = {
+            "word": word["word"],
+            "start": round(word["start"] + offset_sec, 3),
+            "end": round(word["end"] + offset_sec, 3),
+            "source": RECOVERY_SOURCE,
+        }
+        # Deepgram's evidence about the word, kept exactly as the live
+        # path keeps it: a re-decode in ``multi`` is the same reading
+        # that hears Russian as Telugu or Hebrew, and the rule that
+        # catches that (``merge_readings``' contested stretches) decides
+        # from these two fields (BE-11).
+        for key in ("confidence", "language"):
+            if key in word:
+                record[key] = word[key]
+        out.append(record)
     return out
 
 
@@ -424,8 +432,19 @@ async def recover_spans(
     sample_rate: int = LIVE_SAMPLE_RATE_HZ,
     budget_sec: Optional[float] = None,
     transcribe: Optional[Callable[..., dict]] = None,
+    secondary_language: str = "",
 ) -> list[dict]:
     """Re-decode ``spans`` of the spool and return the words, time-shifted.
+
+    ``secondary_language`` non-empty — a dual-stream recording, whose
+    live transcript is a merge of ``multi`` and that language — decodes
+    every span in BOTH and merges the two by the same rules the live
+    readings were merged by (``backend.deepgram_dual.merge_readings``).
+    A ``multi``-only re-decode let back in exactly what the merge exists
+    to keep out: logged recoveries of a Russian/English speaker returned
+    Devanagari, Telugu and Hebrew words (BL-10). Both decodes of a span
+    run concurrently under the same deadline, so this costs REST seconds,
+    not stop time.
 
     The REST call is made with the SAME language decision the live
     stream made — ``resolve_live_language``, so "auto" reaches the
@@ -451,21 +470,40 @@ async def recover_spans(
     keyterms = tuple(cfg.keyterms or ())
     deadline = budget_sec if budget_sec is not None else recovery_budget_sec(spans)
 
-    def _decode(index: int, start: float, end: float) -> list[dict]:
+    languages = [language]
+    if secondary_language and language == "multi" and secondary_language != language:
+        languages.append(secondary_language)
+
+    def _decode(index: int, start: float, end: float, lang: str) -> list[dict]:
         wav = pcm_span_wav(pcm_bytes, start, end, sample_rate)
         result = call(
             api_key=api_key,
             audio_bytes=wav,
             filename=f"recovery-{index}.wav",
             model=model,
-            language=language,
+            language=lang,
             diarize=False,
             keyterms=keyterms,
         )
         return _words_from_rest_result(result, start)
 
     async def _one(index: int, start: float, end: float) -> list[dict]:
-        return await asyncio.to_thread(_decode, index, start, end)
+        readings = await asyncio.gather(
+            *(asyncio.to_thread(_decode, index, start, end, lang) for lang in languages),
+            return_exceptions=True,
+        )
+        if isinstance(readings[0], BaseException):
+            raise readings[0]
+        if len(readings) == 1:
+            return readings[0]
+        partner = readings[1]
+        if isinstance(partner, BaseException):
+            logger.warning(
+                "recovery: %s re-decode of a span failed; keeping the %s reading: %s",
+                languages[1], language, partner,
+            )
+            return readings[0]
+        return _merge_recovery_readings(readings[0], partner, language, languages[1])
 
     tasks = [
         asyncio.ensure_future(_one(i, start, end))
@@ -511,6 +549,31 @@ async def recover_spans(
         )
     words.sort(key=lambda w: (w["start"], w["end"]))
     return words
+
+
+def _merge_recovery_readings(
+    primary: list[dict], secondary: list[dict], primary_language: str, secondary_language: str
+) -> list[dict]:
+    """Two re-decodes of one span, merged by the live readings' own rules."""
+    def _as_segment(words: list[dict]) -> list[dict]:
+        if not words:
+            return []
+        return [{
+            "start": words[0]["start"],
+            "end": words[-1]["end"],
+            "text": " ".join(w["word"] for w in words),
+            "words": words,
+        }]
+
+    merged = merge_readings(
+        _as_segment(primary),
+        _as_segment(secondary),
+        primary_language=primary_language,
+        secondary_language=secondary_language,
+    )
+    # Provenance on the wire is "recovery" whichever reading a word came
+    # from — that is what the envelope's segment ``source`` promises.
+    return [dict(w, source=RECOVERY_SOURCE) for w in merged.words]
 
 
 def splice_recovered_words(
@@ -563,9 +626,8 @@ def splice_recovered_words(
     )
     if outcome.total != len(fresh):
         logger.info(
-            "recovery: %d decoded word(s) had no room beside the transcript: %s",
+            "recovery: %d decoded word(s) had no room beside the transcript",
             len(fresh) - outcome.total,
-            [str(w.get("word")) for w in fresh][:12],
         )
     return outcome.segments, outcome.total
 
@@ -650,7 +712,9 @@ async def run_recovery(
     audio: Optional[bytes] = None if callable(pcm) else bytes(pcm)
     if audio_sec is None:
         if audio is None:
-            audio = pcm()  # type: ignore[operator]
+            # Off the event loop: a spool read is up to
+            # ``MAX_RECOVERY_READ_BYTES`` of disk I/O (BW-13).
+            audio = await asyncio.to_thread(pcm)  # type: ignore[arg-type]
         audio_sec = len(audio) / float(pcm16_bytes_per_sec(sample_rate))
 
     spans = uncovered_spans(
@@ -664,7 +728,7 @@ async def run_recovery(
         logger.info("recovery: none needed")
         return payload
     if audio is None:
-        audio = pcm()  # type: ignore[operator]
+        audio = await asyncio.to_thread(pcm)  # type: ignore[arg-type]
     if not audio:
         logger.info("recovery: no audio spool for this session; envelope unchanged")
         return payload
@@ -676,6 +740,10 @@ async def run_recovery(
         except Exception as e:  # never let an announcement break a stop
             logger.warning("recovery: budget announcement failed: %s", e)
 
+    # The recording's own statement of how it was read: the dual facade
+    # stamps its partner language on every envelope it produces.
+    stats = payload.get("stats") if isinstance(payload.get("stats"), dict) else {}
+    secondary_language = str(stats.get("dual_secondary_language") or "")
     words = await recover_spans(
         audio,
         spans,
@@ -684,6 +752,7 @@ async def run_recovery(
         sample_rate=sample_rate,
         budget_sec=budget,
         transcribe=transcribe,
+        secondary_language=secondary_language,
     )
     segments, spliced = splice_recovered_words(segments, words)
     report = RecoveryReport(

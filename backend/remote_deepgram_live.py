@@ -44,13 +44,14 @@ Results messages directly.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
 from collections import deque
 from dataclasses import dataclass
 from typing import AsyncIterator, Callable, Iterable, Optional
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode
 
 import websockets
 from websockets.asyncio.client import ClientConnection, connect as ws_connect
@@ -202,9 +203,11 @@ _SEAM_WHOLE_WORDS = frozenset(
 # rolling re-decodes at the observed ~15 Hz interim rate — enough to show
 # what the service was hearing around a hole.
 INTERIM_HYPOTHESIS_RING_SIZE = 40
-# Per-line truncation for that report: enough to recognise the clause,
-# short enough that a block of them stays readable in main.log.
-_HOLE_REPORT_TEXT_CHARS = 120
+# The report never prints what the user SAID — main.log is a plain file
+# users attach to support requests, and it used to hold a searchable
+# three-month transcript of their dictation (BL-02). Each hypothesis is
+# described by its span, its word count and its length, which is what a
+# hole diagnosis reads: did Deepgram hear anything there, and how much.
 # At most this many interim hypotheses are printed per hole.
 _HOLE_REPORT_MAX_INTERIMS = 6
 # At most this many OVERRULED words (an interim word whose audio a
@@ -1493,6 +1496,51 @@ class DeepgramLiveStats:
         }
 
 
+# Hashes of the parameter sets already written to the log this process.
+_PARAMS_LOGGED: set[str] = set()
+
+
+def _log_params_once(log: logging.LoggerAdapter, cfg: "DeepgramLiveConfig") -> None:
+    """Log a session's parameters in full once per distinct configuration.
+
+    The full query string, not a summary: endpointing, utterance_end_ms,
+    smart_format and punctuate all change what the transcript looks like,
+    and a session whose parameters are not in the log cannot be compared
+    against one recorded before they were changed. But it is ~850 bytes,
+    and it was written on every connection — 2.7 times a recording, 3.6 MB
+    (7.4 %) of a month's log — with the user's whole personal vocabulary
+    in it (BL-07). So: once per configuration in full, keyterms as a
+    count only, and every later connection names the configuration by a
+    short hash that points back at that line.
+    """
+    pairs = [(k, v) for k, v in parse_qsl(cfg.to_query_string()) if k != "keyterm"]
+    redacted = urlencode(pairs)
+    digest = hashlib.sha256(cfg.to_query_string().encode("utf-8")).hexdigest()[:8]
+    if digest in _PARAMS_LOGGED:
+        log.info("deepgram-live: params=#%s", digest)
+        return
+    _PARAMS_LOGGED.add(digest)
+    log.info(
+        "deepgram-live: params=#%s %s keyterms=%d", digest, redacted, len(cfg.keyterms)
+    )
+
+
+class _StreamLog(logging.LoggerAdapter):
+    """Prefix every line a session writes with the reading it belongs to.
+
+    A dual-stream recording runs two sessions in parallel, and their lines
+    used to be indistinguishable — two ``is_final`` lines with the same
+    times, two ``finalize ENTER`` one millisecond apart — so the log could
+    not answer "which reading dropped this clause?", the very question
+    the dual-stream merge exists for (BL-08). The tag is the language the
+    session runs (``multi``, ``ru``, ``en``): exactly how the merge, its
+    stop line and ``stats.dual_secondary_language`` name the two readings.
+    """
+
+    def process(self, msg, kwargs):
+        return f"[{self.extra['stream']}] {msg}", kwargs
+
+
 async def _close_socket_bounded(ws) -> None:
     """Close a Deepgram socket, never for longer than ``SEND_WEDGE_SEC``.
 
@@ -1546,6 +1594,9 @@ class DeepgramLiveSession:
             raise DeepgramLiveError("Deepgram API key is required")
         self._api_key = api_key
         self._cfg = config or DeepgramLiveConfig()
+        self._log = _StreamLog(
+            logger, {"stream": resolve_live_language(self._cfg.language)}
+        )
         # Where this SOCKET's audio starts on the RECORDING's timeline
         # (B1). Deepgram times its results from the audio a connection
         # has received — "Word timings in streaming transcription
@@ -1747,17 +1798,8 @@ class DeepgramLiveSession:
             raise DeepgramLiveError("session is closed")
         url = f"{DEEPGRAM_LIVE_URL}?{self._cfg.to_query_string()}"
         headers = [("Authorization", f"Token {self._api_key}")]
-        # The full query string, not a summary: endpointing,
-        # utterance_end_ms, smart_format and punctuate all change what the
-        # transcript looks like, and a session whose parameters are not in
-        # the log cannot be compared against one recorded before they were
-        # changed. No secret is involved — the key travels in a header.
-        logger.info(
-            "deepgram-live: params %s keyterms=%d",
-            self._cfg.to_query_string(),
-            len(self._cfg.keyterms),
-        )
-        logger.info(
+        _log_params_once(self._log, self._cfg)
+        self._log.info(
             "deepgram-live: connecting model=%s language=%s sr=%s timeout=%.1fs",
             self._cfg.model,
             self._cfg.language,
@@ -1782,13 +1824,13 @@ class DeepgramLiveSession:
             try:
                 self._ws = await _attempt(open_timeout)
             except asyncio.TimeoutError:
-                logger.warning(
+                self._log.warning(
                     "deepgram-live: connect timeout attempt=1 budget=%.1fs — retrying once with budget=%.1fs",
                     open_timeout,
                     retry_budget,
                 )
                 self._ws = await _attempt(retry_budget)
-                logger.info(
+                self._log.info(
                     "deepgram-live: connected on retry after total_ms=%.0f",
                     (time.perf_counter() - started) * 1000.0,
                 )
@@ -1801,12 +1843,12 @@ class DeepgramLiveSession:
                 # OSError). Both are transient on the post-sleep wake
                 # / mobile-network-flap paths. Retry once with the
                 # budget the docstring already documents.
-                logger.warning(
+                self._log.warning(
                     "deepgram-live: connect %s on attempt 1 (%s) — retrying once with budget=%.1fs",
                     type(os_err).__name__, os_err, retry_budget,
                 )
                 self._ws = await _attempt(retry_budget)
-                logger.info(
+                self._log.info(
                     "deepgram-live: connected on retry after total_ms=%.0f",
                     (time.perf_counter() - started) * 1000.0,
                 )
@@ -1817,7 +1859,7 @@ class DeepgramLiveSession:
             try:
                 body_text = (e.response.body or b"").decode("utf-8", errors="replace")[:600]
             except Exception as body_err:
-                logger.debug("deepgram-live: failed to read error body: %s", body_err)
+                self._log.debug("deepgram-live: failed to read error body: %s", body_err)
             # Deepgram returns structured JSON on 400: {"err_code": ...,
             # "err_msg": ..., "request_id": ...}. Parse it so the user
             # sees an actionable message instead of raw JSON.
@@ -1856,7 +1898,7 @@ class DeepgramLiveSession:
                 msg = f"Deepgram handshake failed (HTTP {status}): {detail}" if detail else f"Deepgram handshake failed (HTTP {status})"
             else:
                 msg = f"Deepgram handshake failed: {e}"
-            logger.error("deepgram-live: %s (raw body=%s)", msg, body_text[:200])
+            self._log.error("deepgram-live: %s (raw body=%s)", msg, body_text[:200])
             raise DeepgramLiveError(msg) from e
         except asyncio.TimeoutError as e:
             # This branch fires only if BOTH the initial attempt AND the
@@ -1869,11 +1911,11 @@ class DeepgramLiveSession:
                 f"Deepgram connect timed out after {total_budget:.1f}s "
                 f"(2 attempts, elapsed={elapsed_ms:.0f}ms)"
             )
-            logger.error("deepgram-live: %s", msg)
+            self._log.error("deepgram-live: %s", msg)
             raise DeepgramLiveError(msg) from e
         except (WebSocketException, OSError) as e:
             msg = f"Deepgram connect failed: {e}"
-            logger.error("deepgram-live: %s", msg)
+            self._log.error("deepgram-live: %s", msg)
             raise DeepgramLiveError(msg) from e
 
         self.stats.connect_ms = (time.perf_counter() - started) * 1000.0
@@ -1901,7 +1943,7 @@ class DeepgramLiveSession:
                 pass
             self._ws = None
             raise
-        logger.info(
+        self._log.info(
             "deepgram-live: connected in %.0f ms", self.stats.connect_ms
         )
 
@@ -1966,7 +2008,7 @@ class DeepgramLiveSession:
             await self._close_wedged_socket(ws, send, what)
             raise
         if not send.done():
-            logger.warning(
+            self._log.warning(
                 "deepgram-live: %s send wedged (>%.1fs); closing the socket",
                 what,
                 SEND_WEDGE_SEC,
@@ -1977,21 +2019,20 @@ class DeepgramLiveSession:
         try:
             send.result()
         except ConnectionClosed:
-            logger.info("deepgram-live: %s skipped (already closed)", what)
+            self._log.info("deepgram-live: %s skipped (already closed)", what)
             return False
         except (OSError, WebSocketException) as e:
-            logger.warning("deepgram-live: %s send failed: %s", what, e)
+            self._log.warning("deepgram-live: %s send failed: %s", what, e)
             return False
         return True
 
-    @staticmethod
-    async def _close_wedged_socket(ws, send: "asyncio.Future", what: str) -> None:
+    async def _close_wedged_socket(self, ws, send: "asyncio.Future", what: str) -> None:
         """Close ``ws`` to release a write that will not complete."""
         await _close_socket_bounded(ws)
         # The write raises now that the socket is gone. Collected so it
         # is never an unretrieved task exception.
         await asyncio.gather(send, return_exceptions=True)
-        logger.info("deepgram-live: %s write released by closing the socket", what)
+        self._log.info("deepgram-live: %s write released by closing the socket", what)
 
     async def send_pcm(self, chunk: bytes) -> None:
         """Forward a PCM16LE mono chunk to Deepgram.
@@ -2049,7 +2090,7 @@ class DeepgramLiveSession:
                 f"Deepgram upstream closed while sending: {e}", fatal=fatal
             )
             if not fatal:
-                logger.info(
+                self._log.info(
                     "deepgram-live: send after close, degrading gracefully (%d committed segs)",
                     self.stats.segments_final,
                 )
@@ -2118,7 +2159,7 @@ class DeepgramLiveSession:
         ``coveredEndSec``.
         """
         started = time.perf_counter()
-        logger.info(
+        self._log.info(
             "deepgram-live: finalize ENTER segments_final=%d segments_interim=%d bytes_sent=%d",
             self.stats.segments_final, self.stats.segments_interim, self.stats.bytes_sent,
         )
@@ -2176,7 +2217,7 @@ class DeepgramLiveSession:
             self._empty_final_arrived = False
             if await self._send_control({"type": "Finalize"}, what="Finalize"):
                 self._finalize_sent = True
-                logger.info(
+                self._log.info(
                     "deepgram-live: Finalize sent (forces trailing is_final flush)"
                 )
             elif self._ws is None or self.is_closed:
@@ -2236,7 +2277,7 @@ class DeepgramLiveSession:
                 try:
                     on_budget(worst_case, needs_flush)
                 except Exception as e:  # never let telemetry break a stop
-                    logger.warning("deepgram-live: finalize budget callback failed: %s", e)
+                    self._log.warning("deepgram-live: finalize budget callback failed: %s", e)
             # ONE final is not the flush. Deepgram answers a Finalize with
             # as many ``is_final`` messages as the buffered audio needs,
             # and the first of them can cover a fraction of the tail:
@@ -2282,7 +2323,7 @@ class DeepgramLiveSession:
                     break
             waited_ms = (time.perf_counter() - wait_started) * 1000.0
             if flush_covered_tail:
-                logger.info(
+                self._log.info(
                     "deepgram-live: post-Finalize finals=%d covered=%.2fs gap=%.2fs "
                     "waited=%.0fms (budget=%.2fs streamed=%.2fs speech_in_gap=%.2fs)",
                     finals_seen,
@@ -2302,7 +2343,7 @@ class DeepgramLiveSession:
                 # close a gap that was open a moment ago.
                 streamed_sec, covered_end, tail_gap, tail_speech = self._tail_coverage()
                 if self._tail_needs_flush(tail_speech, covered_end):
-                    logger.warning(
+                    self._log.warning(
                         "deepgram-live: tail guard: %.2fs of audio past last final "
                         "(%.2fs of it recognised speech, window_overhang=%.2fs) "
                         "after %d post-Finalize final(s) in %.0fms; retrying "
@@ -2326,9 +2367,9 @@ class DeepgramLiveSession:
                                 self._final_arrived.wait(),
                                 timeout=FINALIZE_FLUSH_WAIT_SEC,
                             )
-                            logger.info("deepgram-live: tail guard: transcript arrived on retry")
+                            self._log.info("deepgram-live: tail guard: transcript arrived on retry")
                         except asyncio.TimeoutError:
-                            logger.warning(
+                            self._log.warning(
                                 "deepgram-live: tail guard: still silent after retry "
                                 "(%.2fs uncovered, %.2fs of it speech); closing",
                                 tail_gap,
@@ -2350,7 +2391,7 @@ class DeepgramLiveSession:
                     # phrasing when the wait ended on the first arrival,
                     # but it now ends on coverage, so a budget can
                     # expire after several finals have landed.
-                    logger.info(
+                    self._log.info(
                         "deepgram-live: post-Finalize finals=%d covered=%.2fs "
                         "gap=%.2fs waited=%.0fms (budget=%.2fs streamed=%.2fs "
                         "speech_in_gap=%.2fs — %s); closing",
@@ -2388,7 +2429,7 @@ class DeepgramLiveSession:
         # fields are derived from the merged list, so it runs before
         # either is built.
         merged_segments = drop_repeated_seam_ngrams(merged_segments)
-        final_text = self._join_segment_texts(merged_segments)
+        final_text = join_segment_texts(merged_segments)
         duration_sec = 0.0
         if merged_segments:
             duration_sec = float(
@@ -2403,7 +2444,7 @@ class DeepgramLiveSession:
         # path to the trailing words. "EXIT" now marks the transcript
         # being complete and ready to send, not the socket being closed
         # (C4) — that is logged separately by shutdown().
-        logger.info(
+        self._log.info(
             "deepgram-live: finalize EXIT %.0f ms text_len=%d segments_final=%d (delta from ENTER) duration_sec=%.2f bytes_sent=%d",
             self.stats.finalize_ms,
             len(final_text),
@@ -2413,7 +2454,7 @@ class DeepgramLiveSession:
         )
         uncovered_speech_sec = self._uncovered_speech_sec()
         if uncovered_speech_sec > 0:
-            logger.warning(
+            self._log.warning(
                 "deepgram-live: %.2fs of recognised speech is not covered by any "
                 "final segment — the committed transcript has holes",
                 uncovered_speech_sec,
@@ -2471,21 +2512,21 @@ class DeepgramLiveSession:
             if await self._send_control(
                 {"type": "CloseStream"}, what="CloseStream"
             ):
-                logger.info("deepgram-live: CloseStream sent")
+                self._log.info("deepgram-live: CloseStream sent")
 
         await cancel_and_await(
-            self._keepalive_task, what="deepgram keepalive loop", log=logger
+            self._keepalive_task, what="deepgram keepalive loop", log=self._log
         )
 
         if self._recv_task is not None:
             try:
                 await asyncio.wait_for(self._recv_task, timeout=wait_timeout)
             except asyncio.TimeoutError:
-                logger.warning(
+                self._log.warning(
                     "deepgram-live: recv drain timeout (%.2fs)", wait_timeout
                 )
                 await cancel_and_await(
-                    self._recv_task, what="deepgram receive loop", log=logger
+                    self._recv_task, what="deepgram receive loop", log=self._log
                 )
 
         await self.close()
@@ -2646,7 +2687,7 @@ class DeepgramLiveSession:
         self._interim_words = []
         self._orphan_interim_words = []
         if orphan_count:
-            logger.info(
+            self._log.info(
                 "deepgram-live: splice pool included %d orphaned interim words",
                 orphan_count,
             )
@@ -2674,7 +2715,7 @@ class DeepgramLiveSession:
         )
         self._finalized_segments = outcome.segments
         if outcome.appended:
-            logger.warning(
+            self._log.warning(
                 "deepgram-live: spliced %d uncovered interim words across %d "
                 "fallback segment(s) into the final transcript "
                 "(+%d word(s) put back inside the finals that omitted them)",
@@ -2683,7 +2724,7 @@ class DeepgramLiveSession:
                 outcome.inserted,
             )
         elif outcome.inserted:
-            logger.warning(
+            self._log.warning(
                 "deepgram-live: spliced %d uncovered interim word(s) back "
                 "into the finals that omitted them",
                 outcome.inserted,
@@ -2716,7 +2757,8 @@ class DeepgramLiveSession:
         ``INTERIM_HYPOTHESIS_RING_SIZE`` hypotheses, at most
         ``_HOLE_REPORT_MAX_INTERIMS`` are printed per hole, at most
         ``_HOLE_REPORT_MAX_OVERRULED`` overruled words are printed, and
-        each line is truncated to ``_HOLE_REPORT_TEXT_CHARS``.
+        and no line carries the dictated words themselves — only spans,
+        word counts and lengths (BL-02).
         """
         overruled = list(self._overruled_words)
         lines = [
@@ -2739,10 +2781,9 @@ class DeepgramLiveSession:
                 lines.append("    interim: (none retained for this span)")
                 continue
             for i_start, i_end, text in touching[-_HOLE_REPORT_MAX_INTERIMS:]:
-                clipped = text[:_HOLE_REPORT_TEXT_CHARS]
-                suffix = "…" if len(text) > _HOLE_REPORT_TEXT_CHARS else ""
                 lines.append(
-                    f"    interim [{i_start:.2f}-{i_end:.2f}] {clipped!r}{suffix}"
+                    f"    interim [{i_start:.2f}-{i_end:.2f}] "
+                    f"words={len(text.split())} chars={len(text)}"
                 )
         if overruled:
             lines.append(
@@ -2754,10 +2795,10 @@ class DeepgramLiveSession:
                     "    overruled interim "
                     f"[{as_float(word.get('start')):.2f}-"
                     f"{as_float(word.get('end')):.2f}] "
-                    f"{str(word.get('word') or '')!r} → final "
+                    f"chars={len(str(word.get('word') or ''))} → final "
                     f"[{as_float(owner.get('start')):.2f}-"
                     f"{as_float(owner.get('end')):.2f}] "
-                    f"{str(owner.get('word') or '')!r} "
+                    f"chars={len(str(owner.get('word') or ''))} "
                     f"(overlap {max(0.0, time_overlap(word, owner)):.2f}s)"
                 )
             not_shown = self._overruled_total - min(
@@ -2765,7 +2806,7 @@ class DeepgramLiveSession:
             )
             if not_shown > 0:
                 lines.append(f"    … {not_shown} more not shown")
-        logger.info("\n".join(lines))
+        self._log.info("\n".join(lines))
 
     def _streamed_seconds(self, byte_count: int) -> float:
         """PCM bytes as a position on the RECORDING's timeline.
@@ -2998,13 +3039,8 @@ class DeepgramLiveSession:
             return False
         return not self._last_final_ended_the_utterance()
 
-    @staticmethod
-    def _union(spans: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
-        """Merge overlapping spans so nothing is measured twice."""
-        return union_spans(spans)
-
     def _final_coverage(self) -> list[tuple[float, float]]:
-        return self._union(
+        return union_spans(
             (as_float(s.get("start")), as_float(s.get("end")))
             for s in self._finalized_segments
         )
@@ -3018,7 +3054,7 @@ class DeepgramLiveSession:
         span-level measurement can see (a hypothesis too short to count
         as speech still carries real words).
         """
-        return self._union(
+        return union_spans(
             (as_float(w.get("start")), as_float(w.get("end")))
             for w in (*self._interim_words, *self._orphan_interim_words)
             if not self._word_covered_by_finals(w)
@@ -3050,7 +3086,7 @@ class DeepgramLiveSession:
                 hi = min(w_end, c_end)
                 if hi > lo:
                     clipped.append((lo, hi))
-        return self._union(clipped)
+        return union_spans(clipped)
 
     def coverage_hole_spans(self) -> list[tuple[float, float]]:
         """Every span this session believes is missing from the transcript.
@@ -3065,7 +3101,7 @@ class DeepgramLiveSession:
         SPANS; ``_uncovered_speech_sec`` needs a total instead and
         charges each region to exactly one measurement.
         """
-        return self._union([*self._uncovered_word_spans(), *self._span_level_holes()])
+        return union_spans([*self._uncovered_word_spans(), *self._span_level_holes()])
 
     def _span_level_holes(self) -> list[tuple[float, float]]:
         """Spans where an interim heard speech and no final landed at all.
@@ -3079,7 +3115,7 @@ class DeepgramLiveSession:
         if not self._finalized_segments or not self._interim_speech_spans:
             return []
         covered = self._final_coverage()
-        speech = self._union(self._interim_speech_spans)
+        speech = union_spans(self._interim_speech_spans)
         holes: list[tuple[float, float]] = []
 
         def _add(start: float, end: float) -> None:
@@ -3175,7 +3211,7 @@ class DeepgramLiveSession:
         self._closed = True
 
         await cancel_and_await(
-            self._keepalive_task, what="deepgram keepalive loop", log=logger
+            self._keepalive_task, what="deepgram keepalive loop", log=self._log
         )
 
         ws = self._ws
@@ -3198,7 +3234,7 @@ class DeepgramLiveSession:
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
             except Exception as e:
-                logger.debug("deepgram-live: close() recv_task await: %s", e)
+                self._log.debug("deepgram-live: close() recv_task await: %s", e)
 
         # Ensure any consumer blocked on events() unblocks. The sentinel
         # is routed through _enqueue_event so it survives overflow — if
@@ -3302,11 +3338,6 @@ class DeepgramLiveSession:
         """
         return union_spans(self._interim_speech_spans)
 
-    @staticmethod
-    def _join_segment_texts(segments: Iterable[dict]) -> str:
-        """This session asking the module-level ``join_segment_texts``."""
-        return join_segment_texts(segments)
-
     def final_text(self) -> str:
         """Best-effort transcript text independent of drain_transcript().
 
@@ -3317,7 +3348,7 @@ class DeepgramLiveSession:
         ``drain_transcript()`` and reuses it for both ``text`` and
         ``segments`` rather than calling this method.
         """
-        return self._join_segment_texts(
+        return join_segment_texts(
             drop_repeated_seam_ngrams(merge_seam_fragments(list(self._finalized_segments)))
         )
 
@@ -3367,7 +3398,7 @@ class DeepgramLiveSession:
             duration_sec = float(max(s.get("end", 0.0) for s in merged_segments))
         streamed_sec = self._streamed_seconds(self.stats.bytes_sent)
         return {
-            "text": self._join_segment_texts(merged_segments),
+            "text": join_segment_texts(merged_segments),
             "segments": merged_segments,
             "durationSec": round(duration_sec, 3),
             "stats": self.stats.as_dict(),
@@ -3400,7 +3431,7 @@ class DeepgramLiveSession:
         except asyncio.QueueFull:
             pass
         except RuntimeError as e:
-            logger.debug("deepgram-live: enqueue runtime error: %s", e)
+            self._log.debug("deepgram-live: enqueue runtime error: %s", e)
             return
         # --- Overflow path ---
         if event is self._QUEUE_SENTINEL:
@@ -3416,13 +3447,13 @@ class DeepgramLiveSession:
             try:
                 self._event_queue.put_nowait(event)
             except (asyncio.QueueFull, RuntimeError) as e:
-                logger.error("deepgram-live: sentinel land failed after drain: %s", e)
+                self._log.error("deepgram-live: sentinel land failed after drain: %s", e)
             return
         if not is_critical:
             # Slow consumer — drop this interim.
             if not self._queue_overflow_warned:
                 self._queue_overflow_warned = True
-                logger.warning(
+                self._log.warning(
                     "deepgram-live: event queue full (cap=%d); dropping interim segments",
                     self._event_queue.maxsize,
                 )
@@ -3461,16 +3492,16 @@ class DeepgramLiveSession:
             drained.pop(victim_index)
             drained.append(event)
         else:
-            logger.error(
+            self._log.error(
                 "deepgram-live: queue full with no interim to evict; "
-                "critical event dropped: %r",
-                event,
+                "critical event dropped: type=%s",
+                event.get("type") if isinstance(event, dict) else type(event).__name__,
             )
         for item in drained:
             try:
                 self._event_queue.put_nowait(item)
             except (asyncio.QueueFull, RuntimeError) as e:
-                logger.error("deepgram-live: re-enqueue after eviction failed: %s", e)
+                self._log.error("deepgram-live: re-enqueue after eviction failed: %s", e)
                 break
 
     def _report_error(self, message: str, *, fatal: bool) -> None:
@@ -3481,7 +3512,7 @@ class DeepgramLiveSession:
             # consequence of that decision, not a failure the user needs
             # to see — and emitting it would abort the recording that is
             # already continuing on the replacement socket.
-            logger.debug("deepgram-live: error on discarded session: %s", message)
+            self._log.debug("deepgram-live: error on discarded session: %s", message)
             return
         self._last_error = message
         self._last_fatal = fatal or self._last_fatal
@@ -3490,7 +3521,7 @@ class DeepgramLiveSession:
             # can move ``bytes_sent``: this is the boundary the recovery
             # pass re-decodes from.
             self._fatal_at_bytes = int(self.stats.bytes_sent)
-        logger.warning(
+        self._log.warning(
             "deepgram-live: error (fatal=%s): %s", fatal, message
         )
         self._enqueue_event(
@@ -3510,7 +3541,7 @@ class DeepgramLiveSession:
                 try:
                     msg = json.loads(raw)
                 except (ValueError, TypeError):
-                    logger.debug("deepgram-live: non-json frame ignored")
+                    self._log.debug("deepgram-live: non-json frame ignored")
                     continue
                 if not isinstance(msg, dict):
                     continue
@@ -3525,7 +3556,19 @@ class DeepgramLiveSession:
         except ConnectionClosed as e:
             code = getattr(e, "code", None)
             reason = getattr(e, "reason", "") or ""
-            logger.info(
+            if self._discarded:
+                # Retired on purpose (``discard()`` — the warm pool's idle
+                # TTL, a mismatched or replaced socket). Whatever close
+                # code comes back is the answer to OUR close; logging it
+                # as "upstream closed … did not receive audio" made 844
+                # routine retirements in 18 days read like Deepgram
+                # outages (BL-05). The retirement itself is logged by
+                # whoever decided it.
+                self._log.debug(
+                    "deepgram-live: retired socket closed code=%s", code
+                )
+                return
+            self._log.info(
                 "deepgram-live: upstream closed code=%s reason=%s finalize_sent=%s final_segs=%d",
                 code,
                 reason,
@@ -3541,7 +3584,7 @@ class DeepgramLiveSession:
                 # caller will use the committed text as the transcript.
                 # This is the common case when Deepgram closes an idle
                 # connection that we haven't managed to keep awake.
-                logger.warning(
+                self._log.warning(
                     "deepgram-live: stream ended early with %d committed segments, using them as transcript",
                     self.stats.segments_final,
                 )
@@ -3561,7 +3604,7 @@ class DeepgramLiveSession:
             # Same logic: if we have committed segments, don't scream
             # at the user — use what we have.
             if self.stats.segments_final > 0:
-                logger.warning(
+                self._log.warning(
                     "deepgram-live: recv error after %d committed segments: %s",
                     self.stats.segments_final,
                     e,
@@ -3569,7 +3612,7 @@ class DeepgramLiveSession:
                 self._last_error = f"recv error: {e}"
             else:
                 self._report_error(f"Deepgram recv error: {e}", fatal=True)
-                logger.error("deepgram-live: recv_loop exception", exc_info=True)
+                self._log.error("deepgram-live: recv_loop exception", exc_info=True)
         finally:
             self._closed = True
             self._enqueue_event(self._QUEUE_SENTINEL, is_critical=True)
@@ -3612,14 +3655,14 @@ class DeepgramLiveSession:
                     await ws.send(json.dumps({"type": "KeepAlive"}))
                     self.stats.keepalives_sent += 1
                     self.stats.last_keepalive_at = time.monotonic()
-                    logger.debug(
+                    self._log.debug(
                         "deepgram-live: sent KeepAlive after %.1fs idle",
                         idle_for,
                     )
                 except ConnectionClosed:
                     return
                 except WebSocketException as e:
-                    logger.debug("deepgram-live: KeepAlive send failed: %s", e)
+                    self._log.debug("deepgram-live: KeepAlive send failed: %s", e)
                     return
                 except AttributeError:
                     # Race lost: close() ran between our snapshot and the
@@ -3661,7 +3704,7 @@ class DeepgramLiveSession:
         mtype = msg.get("type")
 
         if mtype == "Metadata":
-            logger.debug(
+            self._log.debug(
                 "deepgram-live: metadata request_id=%s",
                 str(msg.get("request_id") or "")[:12],
             )
@@ -3685,7 +3728,7 @@ class DeepgramLiveSession:
                 # as every other one (see the Results branch below).
                 value += self._audio_offset_sec
                 self._last_utterance_end = value
-                logger.debug(
+                self._log.debug(
                     "deepgram-live: UtteranceEnd last_word_end=%.2f", value,
                 )
             return None
@@ -3696,7 +3739,7 @@ class DeepgramLiveSession:
             return None
 
         if mtype != "Results":
-            logger.debug("deepgram-live: unknown message type=%s", mtype)
+            self._log.debug("deepgram-live: unknown message type=%s", mtype)
             return None
 
         channel = msg.get("channel")
@@ -3803,9 +3846,10 @@ class DeepgramLiveSession:
                     w for w in self._orphan_interim_words
                     if not (start < (w["start"] + w["end"]) / 2.0 < end)
                 ]
-            logger.info(
-                "deepgram-live: is_final start=%.2f end=%.2f speech_final=%s textLen=%d text=%r",
-                start, end, speech_final, len(text), text[:80],
+            self._log.info(
+                "deepgram-live: is_final start=%.2f end=%.2f speech_final=%s "
+                "textLen=%d words=%d",
+                start, end, speech_final, len(text), len(message_words),
             )
             out_segment: dict[str, object] = {
                 "start": segment["start"],
@@ -3901,7 +3945,7 @@ class DeepgramLiveSession:
         if self.stats.segments_interim % 5 == 1:
             # Sample 1-in-5 interim emissions to keep log volume bounded
             # while still proving Deepgram is producing output.
-            logger.info(
+            self._log.info(
                 "deepgram-live: interim #%d start=%.2f end=%.2f textLen=%d",
                 self.stats.segments_interim, start, end, len(text),
             )

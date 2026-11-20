@@ -248,7 +248,11 @@ class HoleReportTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(block, f"no hole block logged; got {logs.output}")
         self.assertIn("hole 5.50-6.10s", block)
-        self.assertIn("три субагента на или если это", block)
+        # What Deepgram heard there is described by size, never by the
+        # dictated words: main.log is the file users attach for support
+        # (BL-02).
+        self.assertNotIn("субагента", block)
+        self.assertRegex(block, r"interim \[[0-9.]+-[0-9.]+\] words=\d+ chars=\d+")
         self.assertIn("spliced_words=1", block)
 
     async def test_a_clean_session_logs_no_hole_block(self):
@@ -397,10 +401,10 @@ class OverruledWordReportTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(block, f"no block logged; got {logs.output}")
         self.assertIn("overruled=1", block)
-        self.assertIn("'трёх'", block)
-        self.assertIn("'одном'", block)
-        self.assertIn("[5.55-5.85]", block)
-        self.assertIn("[5.60-6.00]", block)
+        self.assertNotIn("трёх", block)
+        self.assertNotIn("одном", block)
+        self.assertIn("[5.55-5.85] chars=4", block)
+        self.assertIn("[5.60-6.00] chars=5", block)
 
     async def test_the_block_is_printed_even_with_no_hole_and_no_splice(self):
         # The gate used to be "spliced or uncovered seconds", both of
