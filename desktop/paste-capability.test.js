@@ -76,11 +76,59 @@ test("trusted + failing probe = broken — the stale post-update grant", () => {
   // The whole reason this module exists: AXIsProcessTrusted() says yes,
   // the real action says no. Reporting "pasted" here is the lie.
   const cap = applyProbeResult(initialPasteCapability(0), {
-    platform: "darwin", trusted: true, probeOk: false, probeReason: "Timed out", now: 10,
+    platform: "darwin", trusted: true, probeOk: false, probeReason: "probe-empty", now: 10,
   });
   assert.equal(cap.state, PASTE_CAPABILITY.BROKEN);
   assert.match(cap.reason, /stale-grant/);
   assert.equal(shouldAttemptPaste(cap), false);
+});
+
+test("one timed-out probe is a loaded machine, not a dead grant — the probe obeys the paste's rule", () => {
+  // main.log 2026-11-20T15:02:40Z: two pastes landed at 14:55 and 15:01,
+  // then the focus probe took 1150 ms against its 1000 ms bound and the
+  // app raised "Auto-paste could not reach macOS — stale-grant:Timed out".
+  const T0 = 1000;
+  const active = applyProbeResult(initialPasteCapability(0), {
+    platform: "darwin", trusted: true, probeOk: true, now: T0,
+  });
+  const once = applyProbeResult(active, {
+    platform: "darwin", trusted: true, probeOk: false, probeReason: "Timed out", now: T0 + 100,
+  });
+  assert.equal(once.state, PASTE_CAPABILITY.ACTIVE, "a single timeout must not condemn the grant");
+  assert.equal(once.silentFailures, 1);
+  assert.equal(shouldAttemptPaste(once), true);
+  assert.equal(mustProbeBeforePaste(once), false, "the next paste is not held up by the strike");
+  assert.equal(
+    planPermissionRepair({ platform: "darwin", state: once, reason: once.reason, trusted: true }).action,
+    PERMISSION_REPAIR.NONE,
+    "no dialog on one timeout",
+  );
+  // The strike is settled at the recheck cadence, not after a full minute.
+  assert.equal(shouldProbe(once, T0 + 100 + PASTE_PROBE_RECHECK_MS), true);
+
+  // A second silent failure in a row — probe or paste, one counter — is the signature.
+  const twice = applyProbeResult(once, {
+    platform: "darwin", trusted: true, probeOk: false, probeReason: "AppleEvent timed out (-1712)", now: T0 + 200,
+  });
+  assert.equal(twice.state, PASTE_CAPABILITY.BROKEN);
+  assert.match(twice.reason, /^stale-grant:/);
+  const viaPaste = applyPasteOutcome(once, { ok: false, reason: "osascript-failed\nTimed out", now: T0 + 200 });
+  assert.equal(viaPaste.state, PASTE_CAPABILITY.BROKEN);
+
+  // A probe that answers in between clears the strike.
+  const cleared = applyProbeResult(once, { platform: "darwin", trusted: true, probeOk: true, now: T0 + 150 });
+  assert.equal(cleared.silentFailures, 0);
+  const afterClear = applyProbeResult(cleared, {
+    platform: "darwin", trusted: true, probeOk: false, probeReason: "Timed out", now: T0 + 300,
+  });
+  assert.equal(afterClear.state, PASTE_CAPABILITY.ACTIVE);
+
+  // A refusal is not a timeout: macOS said no, and that is final at once.
+  const refused = applyProbeResult(active, {
+    platform: "darwin", trusted: true, probeOk: false,
+    probeReason: "Not authorized to send Apple events to System Events. (-1743)", now: T0 + 100,
+  });
+  assert.equal(refused.state, PASTE_CAPABILITY.BROKEN);
 });
 
 test("not trusted = untrusted even when the probe somehow answers", () => {

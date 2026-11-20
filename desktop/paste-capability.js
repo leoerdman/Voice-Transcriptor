@@ -29,6 +29,7 @@
 //   -------------+------------+------------
 //   true         | ok         | active
 //   true         | fails      | broken     <- the stale-grant case
+//   true         | times out  | unchanged  <- one strike; two in a row = broken
 //   false        | (any)      | untrusted
 //   unavailable  | (any)      | unknown    <- non-darwin; paste anyway
 //
@@ -144,6 +145,20 @@ function applyProbeResult(prev, result = {}) {
     next = transition(base, PASTE_CAPABILITY.UNTRUSTED, "not-trusted", at);
   } else if (result.probeOk) {
     next = transition(base, PASTE_CAPABILITY.ACTIVE, "probe-ok", at);
+  } else if (
+    classifyPasteFailure(probeReason) === "silent" &&
+    base.silentFailures + 1 < SILENT_FAILURES_BEFORE_BROKEN
+  ) {
+    // A probe that timed out (or whose osascript never answered) is the
+    // same evidence as a paste that timed out, and it is judged by the
+    // same rule: one is a loaded machine, two in a row on a trusted
+    // system is the stale grant. Condemning the grant on one 1 s timeout
+    // is what raised the "Auto-paste could not reach macOS" dialog a
+    // minute after two pastes had landed — the probe fired as the
+    // window came forward and System Events was slow to answer
+    // (main.log 2026-11-20T15:02:40Z). The verdict stands, the strike is
+    // counted, and shouldProbe() re-checks it at the recheck cadence.
+    next = { ...base, silentFailures: base.silentFailures + 1 };
   } else {
     // The whole point of this module: trusted on paper, dead in practice.
     next = transition(
@@ -152,6 +167,7 @@ function applyProbeResult(prev, result = {}) {
       probeReason ? `stale-grant:${probeReason}` : "stale-grant",
       at,
     );
+    if (classifyPasteFailure(probeReason) === "silent") next.silentFailures = base.silentFailures + 1;
   }
   next.probedAt = at;
   return next;
@@ -316,7 +332,11 @@ function shouldProbe(cap, now = 0) {
   const at = nowOr(now);
   const state = cap?.state || PASTE_CAPABILITY.UNKNOWN;
   if (!cap || !cap.probedAt) return true;
-  const ttl = state === PASTE_CAPABILITY.ACTIVE ? PASTE_PROBE_ACTIVE_TTL_MS : PASTE_PROBE_RECHECK_MS;
+  // An `active` verdict with an unanswered probe behind it is not yet
+  // believed for the full minute: the strike is confirmed or cleared at
+  // the recheck cadence.
+  const believed = state === PASTE_CAPABILITY.ACTIVE && !(cap.silentFailures > 0);
+  const ttl = believed ? PASTE_PROBE_ACTIVE_TTL_MS : PASTE_PROBE_RECHECK_MS;
   return at - cap.probedAt >= ttl;
 }
 
