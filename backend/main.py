@@ -911,6 +911,17 @@ def _sweep_orphan_tmp_files() -> None:
             if not root.exists() or not root.is_dir():
                 continue
             for p in root.iterdir():
+                # A screenshots folder being assembled or retired by
+                # ``screen_sessions.adopt_session`` when the process died.
+                if screen_sessions.is_screens_work_dir(p):
+                    try:
+                        if p.stat().st_mtime > cutoff:
+                            continue
+                        shutil.rmtree(p)
+                        removed += 1
+                    except OSError:
+                        continue
+                    continue
                 if not p.is_file():
                     continue
                 if not _TMP_ORPHAN_RE.search(p.name):
@@ -1093,24 +1104,32 @@ def _adopt_screen_session_for_recording(
     stem: str,
     *,
     audio_started_at: Optional[float],
-) -> Optional[dict[str, Any]]:
+) -> tuple[Optional[dict[str, Any]], str]:
     """Adopt a staged screen session as recording *stem*'s screenshots —
-    the one call both the save and the crash-time promotion make. A
-    failure leaves the staged folder in place and is logged; the audio
-    and transcript are already durable."""
+    the one call both the save and the crash-time promotion make.
+
+    Returns ``(manifest, error)``. ``manifest`` is None when there was
+    nothing to adopt or adoption failed; ``error`` is non-empty only for a
+    failure, which ``adopt_session`` guarantees left the staged folder and
+    any previous screenshots intact. The audio and transcript are already
+    durable, so the save answers 200 and says ``screens_error`` instead of
+    pretending the recording simply has no screenshots."""
     if not screen_session_id:
-        return None
+        return None, ""
     try:
-        return screen_sessions.adopt_session(
-            DATA_DIR,
-            screen_session_id,
-            target_dir,
-            stem,
-            audio_started_at=audio_started_at,
+        return (
+            screen_sessions.adopt_session(
+                DATA_DIR,
+                screen_session_id,
+                target_dir,
+                stem,
+                audio_started_at=audio_started_at,
+            ),
+            "",
         )
-    except OSError as e:
-        logger.warning("screen session %s adoption failed: %s", screen_session_id, e)
-        return None
+    except screen_sessions.ScreenAdoptionError as e:
+        logger.warning("%s", e)
+        return None, "screenshots could not be attached to this recording"
 
 
 def _normalize_live_session_id(value: str) -> str:
@@ -1642,7 +1661,7 @@ def _promote_live_recovery(
             # audio exactly as on the normal save (H-01/BM-04/S-01) —
             # adopted beside the recovered recording BEFORE retention
             # runs, so they are this (exempt) recording's media from now on.
-            screens_manifest = _adopt_screen_session_for_recording(
+            screens_manifest, screens_error = _adopt_screen_session_for_recording(
                 str(meta.get("screen_session_id") or ""),
                 target_dir,
                 stem,
@@ -1658,6 +1677,7 @@ def _promote_live_recovery(
                 "audio_name": audio_out.name,
                 "archive_dir": str(target_dir),
                 "screens": screens_manifest,
+                "screens_error": screens_error,
             }
             _safe_delete_live_recovery(session_id)
             _store_live_promote_cache(session_id, result)
@@ -8263,7 +8283,7 @@ async def _save_recording_audio_source(
     # Screen mode: the take's screenshots become part of this recording —
     # moved beside it as ``<stem>.screens`` before retention runs, so the
     # rule below already sees them as this (exempt) recording's media.
-    screens_manifest = _adopt_screen_session_for_recording(
+    screens_manifest, screens_error = _adopt_screen_session_for_recording(
         screen_session_id,
         target_dir,
         stem,
@@ -8300,6 +8320,7 @@ async def _save_recording_audio_source(
         "archive_dir": str(target_dir),
         "pruned_audio_count": pruned,
         "screens": screens_manifest,
+        "screens_error": screens_error,
     }
 
 

@@ -129,6 +129,87 @@ class AdoptionTests(unittest.TestCase):
         self.assertIsNone(screen_sessions.screenshot_path(self.archive, "r", "../r.txt"))
         self.assertIsNone(screen_sessions.screenshot_path(self.archive, "r", "shot-09.png"))
 
+    # ── BM-05 / BM-06: adoption is all or nothing ─────────────────
+    def _previous_screens(self) -> Path:
+        old = self.archive / "r.screens"
+        old.mkdir()
+        (old / "shot-01.png").write_bytes(b"previous")
+        return old
+
+    def _no_work_dirs(self) -> None:
+        self.assertEqual([p.name for p in self.archive.iterdir() if ".tmp-" in p.name], [])
+
+    def test_a_failed_manifest_write_keeps_the_old_screenshots_and_the_staging(self) -> None:
+        from unittest import mock
+
+        old = self._previous_screens()
+        staged = _stage(self.data)
+        with mock.patch.object(screen_sessions, "atomic_write_json", side_effect=OSError("disk full")):
+            with self.assertRaises(screen_sessions.ScreenAdoptionError):
+                screen_sessions.adopt_session(self.data, SESSION, self.archive, "r")
+        self.assertEqual((old / "shot-01.png").read_bytes(), b"previous")
+        self.assertTrue((staged / "shot-02.png").is_file(), "the staged take must survive for a retry")
+        self._no_work_dirs()
+
+    def test_a_cross_volume_copy_failing_part_way_leaves_no_partial_folder(self) -> None:
+        import errno
+        from unittest import mock
+
+        old = self._previous_screens()
+        staged = _stage(self.data)
+        real_replace = Path.replace
+
+        def exdev_for_staging(path_self, target):
+            if path_self == staged:
+                raise OSError(errno.EXDEV, "cross-device link")
+            return real_replace(path_self, target)
+
+        def partial_copy(src, dst, **_kw):
+            Path(dst).mkdir()
+            (Path(dst) / "shot-01.png").write_bytes(b"half")
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        with mock.patch.object(Path, "replace", exdev_for_staging), \
+                mock.patch.object(screen_sessions.shutil, "copytree", partial_copy):
+            with self.assertRaises(screen_sessions.ScreenAdoptionError):
+                screen_sessions.adopt_session(self.data, SESSION, self.archive, "r")
+        self.assertEqual((old / "shot-01.png").read_bytes(), b"previous")
+        self.assertTrue((staged / "shot-01.png").is_file())
+        self._no_work_dirs()
+
+    def test_a_cross_volume_adoption_removes_the_staging_only_once_archived(self) -> None:
+        import errno
+        from unittest import mock
+
+        staged = _stage(self.data)
+        real_replace = Path.replace
+
+        def exdev_for_staging(path_self, target):
+            if path_self == staged:
+                raise OSError(errno.EXDEV, "cross-device link")
+            return real_replace(path_self, target)
+
+        with mock.patch.object(Path, "replace", exdev_for_staging):
+            manifest = screen_sessions.adopt_session(self.data, SESSION, self.archive, "r")
+        self.assertEqual(manifest["dir"], str(self.archive / "r.screens"))
+        self.assertFalse(staged.exists())
+        self.assertEqual(screen_sessions.list_screenshots(self.archive, "r"), ["shot-01.png", "shot-02.png"])
+        self._no_work_dirs()
+
+    def test_a_reasave_replaces_the_previous_screenshots_atomically(self) -> None:
+        self._previous_screens()
+        _stage(self.data)
+        screen_sessions.adopt_session(self.data, SESSION, self.archive, "r")
+        self.assertEqual((self.archive / "r.screens" / "shot-01.png").read_bytes(), b"\x89PNG fake")
+        self._no_work_dirs()
+
+    def test_malformed_events_do_not_fail_the_adoption(self) -> None:
+        staged = _stage(self.data)
+        (staged / "events.json").write_text(json.dumps({"version": 1, "id": SESSION, "events": 5}), encoding="utf-8")
+        manifest = screen_sessions.adopt_session(self.data, SESSION, self.archive, "r")
+        self.assertEqual(manifest["events"], [])
+        self.assertEqual(screen_sessions.read_manifest(self.archive / "r.screens")["events"], [])
+
     def test_orphans_age_out_and_fresh_ones_stay(self) -> None:
         old = _stage(self.data, "screen-20261101-000000-000")
         fresh = _stage(self.data, "screen-20261120-000000-000")
@@ -231,6 +312,36 @@ class ArchiveIntegrationTests(unittest.TestCase):
         self.assertIsNone(payload["screens_manifest"], "no events.json in this fixture")
         self.assertEqual(payload["screens_dir"], str(self.screen_dir / "take.screens"))
         self.assertEqual(payload["recording_collection"], self.main.RECORDING_COLLECTION_SCREEN)
+
+
+class AdoptionFailureIsReportedTests(unittest.TestCase):
+    """BM-05: a failed adoption is reported as such, not as "no screenshots",
+    and a crash's work folder is collected on the next boot."""
+
+    setUp = ArchiveIntegrationTests.setUp
+    tearDown = ArchiveIntegrationTests.tearDown
+
+    def test_the_save_says_screens_error_when_adoption_fails(self) -> None:
+        from unittest import mock
+
+        _stage(Path(self._tmp.name))
+        with mock.patch.object(screen_sessions, "atomic_write_json", side_effect=OSError("disk full")):
+            manifest, error = self.main._adopt_screen_session_for_recording(
+                SESSION, self.screen_dir, "take", audio_started_at=None
+            )
+        self.assertIsNone(manifest)
+        self.assertTrue(error)
+        self.assertTrue((Path(self._tmp.name) / "screen-sessions" / SESSION).is_dir())
+
+    def test_the_boot_sweep_collects_a_crashed_adoptions_work_folder(self) -> None:
+        work = self.screen_dir / "take.screens.tmp-0123456789abcdef"
+        work.mkdir()
+        (work / "shot-01.png").write_bytes(b"png")
+        old = NOW - 3600
+        os.utime(work, (old, old))
+        self.main._register_archive_dir(self.root)
+        self.main._sweep_orphan_tmp_files()
+        self.assertFalse(work.exists())
 
 
 class CrashedScreenTakeRecoveryTests(unittest.TestCase):

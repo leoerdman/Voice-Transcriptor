@@ -66,3 +66,24 @@ Proof method: SKILL §7.1 — the fixed file is put aside, `git show HEAD:<path>
   ```
 - After: `Ran 5 tests ... OK`; full suite `Ran 894 tests ... OK (skipped=2)`.
 - Cross-domain (renderer): the WS query must carry `screen_session_id` (main.tsx `wsQuery`, ~11474) and the promote call must stop sending `recording_collection: live` (main.tsx ~5126 `recoverBackendAudioSessions`); until the renderer sends the id, the backend path is in place but inert for new takes.
+
+### C4 · BM-05 (P1), BM-06 (P2) · screen adoption is all or nothing and uses the SSOT atomic writer
+- Files: `backend/screen_sessions.py` (`adopt_session` assembles `<stem>.screens.tmp-<hex>` beside the destination — rename on one volume, `copytree` across volumes with the staged source removed only after the swap — writes the manifest with `storage.atomic_write_json`, then rename-swaps over the old folder; any failure puts the staging back, removes the work copy, keeps the old screenshots and raises `ScreenAdoptionError`; `_rehome_manifest` drops a non-list `events`; `_write_manifest` (second atomic writer, pid-named tmp invisible to the sweep) deleted; `SCREENS_WORK_DIR_RE`/`is_screens_work_dir`), `backend/main.py` (`_adopt_screen_session_for_recording` returns `(manifest, error)`; save and promote answer `screens_error`; `_sweep_orphan_tmp_files` removes a crashed adoption's work folder), `backend/tests/test_screen_sessions.py` (5 new `AdoptionTests`, new `AdoptionFailureIsReportedTests`).
+- Check: `python -m unittest backend.tests.test_screen_sessions`
+- Before (both files at HEAD):
+  ```
+  ERROR: test_the_save_says_screens_error_when_adoption_fails (...)
+  AttributeError: <module 'backend.screen_sessions' ...> does not have the attribute 'atomic_write_json'
+  ERROR: test_a_cross_volume_copy_failing_part_way_leaves_no_partial_folder (...)
+  AttributeError: module 'backend.screen_sessions' has no attribute 'ScreenAdoptionError'
+  ERROR: test_a_failed_manifest_write_keeps_the_old_screenshots_and_the_staging (...)
+  AttributeError: <module 'backend.screen_sessions' ...> does not have the attribute 'atomic_write_json'
+  ERROR: test_malformed_events_do_not_fail_the_adoption (...)
+  TypeError: 'int' object is not iterable
+  FAIL: test_the_boot_sweep_collects_a_crashed_adoptions_work_folder (...)
+  AssertionError: True is not false
+  Ran 25 tests in 1.064s
+  FAILED (failures=1, errors=4)
+  ```
+- After: `Ran 25 tests ... OK`; full suite `Ran 901 tests ... OK (skipped=2)`.
+- Cross-domain (renderer): `save-with-audio` / promote now answer `screens_error` (string, empty on success). The renderer should show it and must not fall back to staging paths when it is set (main.tsx ~12682 `parseScreenManifest(persisted.screensManifest) || stagedScreenManifest`).
