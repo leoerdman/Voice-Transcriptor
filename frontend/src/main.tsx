@@ -96,6 +96,14 @@ import {
   type CliAccessStatus,
 } from "./cli-section";
 import { smartRecordingTitle } from "./recording-title";
+import {
+  LIVE_DRAFT_SCHEMA_VERSION,
+  LiveDraftOperationQueue,
+  parsePersistedLiveDraftPayload,
+  recoveredDraftProvider,
+  type LiveDraftOperation,
+  type PersistedLiveDraft,
+} from "./live-draft";
 import { BoundedChunkWindow, capturedHoursLabel, pcmWavDurationSec } from "./pcm-capture";
 import {
   annotateTranscript,
@@ -981,6 +989,12 @@ const UI_TOKENS = {
   },
   draft: {
     autosaveIntervalMs: 1_200,
+    /**
+     * Waits before each retry of a failed draft clear (backend restart,
+     * the endpoint's rate limiter). A clear that never lands leaves the
+     * finished dictation to be recovered again on the next start.
+     */
+    clearRetryDelaysMs: [500, 2_000, 5_000],
   },
   timer: {
     tickMs: 200,
@@ -5779,38 +5793,26 @@ function applyMicHealthStatus(snap: MicHealthSnapshot): void {
 
 micHealth.subscribe(applyMicHealthStatus);
 
-interface PersistedLiveDraft {
-  /**
-   * Payload schema version (BUG-12). The backend stores this blob
-   * opaquely; bump on any breaking field change and branch the reader
-   * on it instead of minting another LEGACY_* storage key.
-   */
-  schema_version: number;
-  session_id?: string;
-  started_at?: number;
-  recording?: boolean;
-  timer?: string;
-  title?: string;
-  source_text?: string;
-  transcript_text?: string;
-  provider?: string;
-  provider_present?: boolean;
-  model?: string;
-  language?: string;
-  archive_dir?: string;
-  recording_collection?: string;
-  updated_at?: number;
-}
-
-/** Bump on any breaking change to PersistedLiveDraft. */
-const LIVE_DRAFT_SCHEMA_VERSION = 2;
-
-type LiveDraftOperation =
-  | { kind: "put"; payload: PersistedLiveDraft }
-  | { kind: "clear"; sessionToken: string };
-
-const liveDraftOperationQueue: LiveDraftOperation[] = [];
-let liveDraftOperationRunner: Promise<void> | null = null;
+const liveDraftQueue = new LiveDraftOperationQueue({
+  put: (payload) => apiPut<{ ok?: boolean }>("/api/ui/live-draft", payload),
+  clear: (sessionToken) => {
+    const query = sessionToken ? `?session_id=${encodeURIComponent(sessionToken)}` : "";
+    return apiDelete<{ ok?: boolean }>(`/api/ui/live-draft${query}`);
+  },
+  sleep: (ms) => new Promise<void>((resolve) => window.setTimeout(resolve, ms)),
+  clearRetryDelaysMs: UI_TOKENS.draft.clearRetryDelaysMs,
+  onPutUnavailable: (e) => {
+    console.warn("live draft: autosave failed; the recording is not crash-protected until it succeeds", e);
+    showRecordSessionNotice(
+      "Draft autosave is unavailable — if the app quits now, this recording's text cannot be recovered.",
+      "warning",
+      UI_TOKENS.notice.longMs,
+    );
+  },
+  onClearAbandoned: (e) => {
+    console.warn("live draft: clearing the finished draft failed; the next start may offer it as a recovered recording", e);
+  },
+});
 
 function buildLiveDraftPayload(recording: boolean): PersistedLiveDraft {
   const provider = activeLiveSessionSnapshot?.provider ?? readProviderSelection();
@@ -5832,46 +5834,8 @@ function buildLiveDraftPayload(recording: boolean): PersistedLiveDraft {
   };
 }
 
-async function drainLiveDraftOperations(): Promise<void> {
-  try {
-    while (liveDraftOperationQueue.length) {
-      const op = liveDraftOperationQueue.shift();
-      if (!op) continue;
-      try {
-        if (op.kind === "put") {
-          await apiPut<{ ok?: boolean }>("/api/ui/live-draft", op.payload);
-        } else {
-          const query = op.sessionToken ? `?session_id=${encodeURIComponent(op.sessionToken)}` : "";
-          await apiDelete<{ ok?: boolean }>(`/api/ui/live-draft${query}`);
-        }
-      } catch (e) {
-        console.debug(`live draft ${op.kind} skipped`, e);
-      }
-    }
-  } finally {
-    liveDraftOperationRunner = null;
-    if (liveDraftOperationQueue.length) {
-      void startLiveDraftOperationRunner();
-    }
-  }
-}
-
-function startLiveDraftOperationRunner(): Promise<void> {
-  if (!liveDraftOperationRunner) {
-    liveDraftOperationRunner = drainLiveDraftOperations();
-  }
-  return liveDraftOperationRunner;
-}
-
 function enqueueLiveDraftOperation(op: LiveDraftOperation): Promise<void> {
-  const lastIndex = liveDraftOperationQueue.length - 1;
-  const last = lastIndex >= 0 ? liveDraftOperationQueue[lastIndex] : null;
-  if (op.kind === "put" && last?.kind === "put") {
-    liveDraftOperationQueue[lastIndex] = op;
-  } else {
-    liveDraftOperationQueue.push(op);
-  }
-  return startLiveDraftOperationRunner();
+  return liveDraftQueue.enqueue(op);
 }
 
 function persistLiveDraftPayload(payload: PersistedLiveDraft): Promise<void> {
@@ -5907,59 +5871,13 @@ function clearLiveDraft(sessionToken = ""): Promise<void> {
   return enqueueLiveDraftOperation({ kind: "clear", sessionToken });
 }
 
-function parsePersistedLiveDraftPayload(parsed: unknown): PersistedLiveDraft | null {
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return null;
-  }
-  // Schema gate (BUG-73): a payload written by a NEWER schema version
-  // must not be fed through the old reader — structural coercion would
-  // silently misread fields instead of taking the corrupt-quarantine
-  // path. Missing version = pre-versioning legacy, accepted as v1.
-  const rawVersion = (parsed as Record<string, unknown>).schema_version;
-  const storedVersion = typeof rawVersion === "number" ? rawVersion : 1;
-  if (!Number.isFinite(storedVersion) || storedVersion > LIVE_DRAFT_SCHEMA_VERSION) {
-    console.warn(
-      `live draft: schema_version ${storedVersion} > supported ${LIVE_DRAFT_SCHEMA_VERSION}, discarding`,
-    );
-    return null;
-  }
-  // Structural type guard: every field that we use is coerced to its
-  // expected type; anything unparseable degrades to empty string /
-  // zero. This is stricter than a bare ``as`` cast and guarantees
-  // downstream code never sees ``null`` / ``undefined`` / arrays /
-  // wrong types in fields we promise are strings.
-  const obj = parsed as Record<string, unknown>;
-  const pickString = (key: string): string => {
-    const v = obj[key];
-    return typeof v === "string" ? v : "";
-  };
-  const pickNumber = (key: string): number => {
-    const v = obj[key];
-    const n = typeof v === "number" ? v : Number(v);
-    return Number.isFinite(n) ? n : 0;
-  };
-  return {
-    schema_version: LIVE_DRAFT_SCHEMA_VERSION,
-    session_id: pickString("session_id"),
-    started_at: pickNumber("started_at"),
-    recording: obj.recording === true,
-    timer: pickString("timer"),
-    title: pickString("title"),
-    source_text: pickString("source_text"),
-    transcript_text: pickString("transcript_text"),
-    provider: pickString("provider"),
-    provider_present: Object.prototype.hasOwnProperty.call(obj, "provider"),
-    model: pickString("model"),
-    language: pickString("language"),
-    archive_dir: pickString("archive_dir"),
-    recording_collection: pickString("recording_collection"),
-    updated_at: pickNumber("updated_at"),
-  };
+function parseStoredLiveDraft(parsed: unknown): PersistedLiveDraft | null {
+  return parsePersistedLiveDraftPayload(parsed, (message) => console.warn(message));
 }
 
 function parsePersistedLiveDraft(raw: string): PersistedLiveDraft | null {
   try {
-    return parsePersistedLiveDraftPayload(JSON.parse(raw));
+    return parseStoredLiveDraft(JSON.parse(raw));
   } catch (e) {
     console.warn("live draft: invalid JSON, discarding", e);
     return null;
@@ -5969,7 +5887,7 @@ function parsePersistedLiveDraft(raw: string): PersistedLiveDraft | null {
 async function readBackendLiveDraft(): Promise<PersistedLiveDraft | null> {
   try {
     const state = await apiGet<{ draft?: unknown }>("/api/ui/live-draft");
-    return parsePersistedLiveDraftPayload(state.draft);
+    return parseStoredLiveDraft(state.draft);
   } catch (e) {
     console.debug("live draft: backend read failed", e);
     return null;
@@ -6015,9 +5933,7 @@ async function recoverLiveDraftIfAny(): Promise<void> {
       title: String(draft.title || "Recovered recording") + " (Recovered)",
       sourceText,
       transcriptText,
-      provider: draft.provider_present
-        ? (String(draft.provider || "").trim() || "none")
-        : "local",
+      provider: recoveredDraftProvider(draft),
       model: String(draft.model || "-"),
       language: String(draft.language || "auto"),
       recordingCollection: RECORDING_COLLECTIONS.live,
