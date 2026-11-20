@@ -135,3 +135,39 @@ Cut from `main` at 8e8f0a6.
   test fails. Restored → 10/10.
 - Suites: desktop 500/500, frontend 649/649, typecheck, lint, build,
   `node --check`: green.
+
+## 4. Recording-state monitor (DM-14) and capsule permissions (DM-35)
+
+- Monitor: `startRecordingStateMonitor` no longer hand-writes a
+  `probeInFlight` flag; its tick runs the one `executeJavaScript` probe
+  through `createSingleFlight().tryRun(...)` — the helper the engine
+  install already uses and single-flight.test.js tests under concurrency.
+  Side effect, a fix: a probe that throws synchronously (webContents gone
+  mid-tick) used to throw out of the interval callback with the flag left
+  `true`, wedging the monitor for the rest of the take; tryRun turns it
+  into a rejected run that releases the flight.
+  `recording-monitor.test.js`: the regex
+  `if (probeInFlight) return;\s*probeInFlight = true;` / `.finally(...)`
+  is replaced by behaviour tests of the shipped helper in the tick's
+  shape (three ticks while a probe is pending start one probe; the next
+  tick after it settles starts another; a synchronously-throwing probe
+  does not wedge it) and a wiring check (the tick's one
+  `executeJavaScript` is inside `probeFlight.tryRun(`; no `probeInFlight`
+  flag). Honest scope: the behaviour proven is the helper's; that the
+  monitor uses it is the wiring check. The "no comment calls it a 1 Hz
+  monitor" absence test is kept (a wording, textual by nature).
+- Capsule permissions: new `desktop/session-permissions.js`
+  `denyAllSessionPermissions(session)`; `ensureRecordingStatusCapsuleWindow`
+  calls it. `capsule-permissions.test.js`: the two regexes over the
+  handler text are replaced by a fake session — every request (media,
+  clipboard-read, notifications, geolocation, openExternal, unknown) is
+  answered `false`, every check is `false`, both handlers are installed —
+  plus a line-anchored wiring check.
+- Break-it evidence: single-flight without its `if (inFlight) return null`
+  → the tick test fails; the monitor's probe taken out of
+  `probeFlight.tryRun` → the wiring test fails; `callback(true)` → the
+  permissions test fails; the check handler not installed → same; the
+  `denyAllSessionPermissions(...)` call commented out in main.js → the
+  wiring test fails. Restored → green.
+- Suites: desktop 503/503, frontend 649/649, typecheck, lint, build,
+  `node --check`: green.

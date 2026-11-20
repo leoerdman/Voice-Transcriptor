@@ -66,6 +66,7 @@
       "ipc-sender-guard.js",
       "quit-path.js",
       "post-stop-handoff.js",
+      "session-permissions.js",
       "log-retention.js",
       "backend-auth.js",
       "private-log.js",

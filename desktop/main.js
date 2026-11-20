@@ -144,6 +144,8 @@ const { buildPwshPasteFallbackScript } = require("./windows-paste-fallback");
 // (DM-09, DM-27).
 const { backendHandleOf, decideBackendExit } = require("./backend-exit");
 const { createSingleFlight } = require("./single-flight");
+// A session that grants no permission request or check (the capsule, DM-35).
+const { denyAllSessionPermissions } = require("./session-permissions");
 const { archivesToPrune } = require("./log-retention");
 // Recording ids are unique only per renderer page: key them with the
 // page's epoch (DM-32).
@@ -2147,9 +2149,7 @@ async function ensureRecordingStatusCapsuleWindow() {
   // its own partition would otherwise keep Electron's default, which
   // grants every request (DM-35).
   try {
-    const capsuleSession = recordingStatusWindow.webContents.session;
-    capsuleSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
-    capsuleSession.setPermissionCheckHandler(() => false);
+    denyAllSessionPermissions(recordingStatusWindow.webContents.session);
   } catch (e) {
     appendMainLog(`[recording-capsule] permission handlers not installed: ${e?.message || e}`);
   }
@@ -2622,13 +2622,12 @@ function startRecordingStateMonitor() {
   stopRecordingStateMonitor();
   // One probe at a time (DM-14): executeJavaScript cannot be cancelled,
   // so on a wedged renderer an unguarded interval queued another pending
-  // evaluation every tick for as long as the take lasted.
-  let probeInFlight = false;
+  // evaluation every tick for as long as the take lasted. A tick while
+  // the previous probe is pending is skipped (./single-flight).
+  const probeFlight = createSingleFlight();
   recordingStateMonitor = setInterval(() => {
     if (!win || win.isDestroyed() || !win.webContents) return;
-    if (probeInFlight) return;
-    probeInFlight = true;
-    win.webContents
+    probeFlight.tryRun(() => win.webContents
       .executeJavaScript(
         `(() => {
           const vu = Number(window.__transcriptorVuLevel || 0);
@@ -2750,9 +2749,8 @@ function startRecordingStateMonitor() {
           appendMainLog(`[recording-autostop-stale] audio pipeline dead for ${Math.round(RECORDING_DEAD_PIPELINE_MS / 1000)}s, forcing stop`);
           guardedStopFromRecordingStatus("autostop-stale");
         }
-      })
-      .catch(() => { })
-      .finally(() => { probeInFlight = false; });
+      }))
+      ?.catch(() => { });
   }, RECORDING_STATUS_LEVEL_POLL_MS);
   try { recordingStateMonitor.unref?.(); } catch { }
 }
