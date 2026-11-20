@@ -96,6 +96,7 @@ import {
   type CliAccessStatus,
 } from "./cli-section";
 import { smartRecordingTitle } from "./recording-title";
+import { BoundedChunkWindow, capturedHoursLabel, pcmWavDurationSec } from "./pcm-capture";
 import {
   annotateTranscript,
   parseScreenManifest,
@@ -4024,7 +4025,8 @@ function downsample(buf: Float32Array, inRate: number, outRate: number): Float32
 //
 // The factory ``createPcmSink`` tries OPFS first and gracefully
 // degrades to memory on any failure, so callers never have to
-// branch. ``isDiskBacked`` lets the UI report which mode is active.
+// branch. A failed disk write is reported to the user by the OPFS sink
+// itself (it is the only party that sees it, at the moment it happens).
 //
 // Orphan cleanup: if the app crashes mid-recording, a ``.pcm16`` file
 // is left in ``pcm-spool/`` inside OPFS. ``cleanupOrphanPcmSpool``
@@ -4036,8 +4038,6 @@ interface PcmSink {
   finalize(sampleRate: number, name?: string): Promise<File>;
   destroy(): Promise<void>;
   readonly totalSamples: number;
-  readonly isDiskBacked: boolean;
-  readonly lastWriteError: Error | null;
 }
 
 function floatSamplesToInt16LE(samples: Float32Array): Int16Array {
@@ -4147,8 +4147,13 @@ class OpfsPcmSink implements PcmSink {
   private dir: OpfsFileSystemDirectoryHandle;
   private fileHandle: OpfsFileSystemFileHandle;
   private writable: OpfsFileSystemWritableFileStream | null;
-  private pendingChunks: Int16Array[] = [];
-  private pendingBytes = 0;
+  /**
+   * Samples not yet on disk. Normally a microtask's worth; after a failed
+   * write it is the whole rest of the recording, so it is bounded by the
+   * same window as every other RAM fallback (see ./pcm-capture).
+   */
+  private pending = new BoundedChunkWindow(UI_TOKENS.capture.fallbackWindowSec * LIVE_SAMPLE_RATE_HZ);
+  private ramTruncationReported = false;
   private flushInProgress = false;
   /** Awaitable handle for the currently-running flush; resolves when done. */
   private flushDone: Promise<void> = Promise.resolve();
@@ -4169,8 +4174,7 @@ class OpfsPcmSink implements PcmSink {
   /** Samples that arrived after the finalize drain barrier. */
   private strandedAfterDrain = 0;
   totalSamples = 0;
-  readonly isDiskBacked = true;
-  lastWriteError: Error | null = null;
+  private lastWriteError: Error | null = null;
 
   constructor(
     dir: OpfsFileSystemDirectoryHandle,
@@ -4223,8 +4227,7 @@ class OpfsPcmSink implements PcmSink {
       return;
     }
     const int16 = floatSamplesToInt16LE(samples);
-    this.pendingChunks.push(int16);
-    this.pendingBytes += int16.byteLength;
+    if (this.pending.push(int16)) this.reportRamTruncation();
     this.totalSamples += int16.length;
     if (this.lastWriteError) return;
     this.scheduleFlush();
@@ -4247,15 +4250,13 @@ class OpfsPcmSink implements PcmSink {
     // cannot be the test for "may I still write".
     if (this.closing) return;
     if (!this.writable) return;
-    if (!this.pendingChunks.length) return;
+    if (!this.pending.samples) return;
     this.flushInProgress = true;
     // Record a promise that outer callers (finalize) can await instead
     // of polling flushInProgress with a bounded busy-wait.
     let _resolveDone!: () => void;
     this.flushDone = new Promise<void>((r) => { _resolveDone = r; });
-    const chunks = this.pendingChunks;
-    this.pendingChunks = [];
-    this.pendingBytes = 0;
+    const chunks = this.pending.take();
     try {
       const totalBytes = chunks.reduce((a, c) => a + c.byteLength, 0);
       const merged = new Uint8Array(totalBytes);
@@ -4266,21 +4267,40 @@ class OpfsPcmSink implements PcmSink {
       }
       await this.writable.write(merged);
     } catch (e) {
+      const firstFailure = !this.lastWriteError;
       this.lastWriteError = e instanceof Error ? e : new Error(String(e));
       // Re-enqueue the failed chunks so finalize() can still produce a
       // WAV from in-memory data via the WebM fallback path. Without this
       // the samples in ``chunks`` are GC'd and permanently lost.
-      this.pendingChunks = [...chunks, ...this.pendingChunks];
-      this.pendingBytes = this.pendingChunks.reduce((a, c) => a + c.byteLength, 0);
+      const truncatedNow = this.pending.restoreHead(chunks);
       console.warn("OpfsPcmSink: write failed — disk may be full or permissions revoked", e);
+      // From here every sample lives in RAM until stop. The member
+      // existed "so the UI can report it" and nothing read it: the user
+      // kept dictating with no idea the disk copy had stopped.
+      if (firstFailure) {
+        showRecordSessionNotice(
+          `Could not write the recording to disk — it continues in memory, and only the last ${capturedHoursLabel(UI_TOKENS.capture.fallbackWindowSec)} are kept.`,
+          "warning",
+          UI_TOKENS.notice.longMs,
+        );
+      } else if (truncatedNow) {
+        this.reportRamTruncation();
+      }
     } finally {
       this.flushInProgress = false;
       _resolveDone();
       this.flushDone = Promise.resolve();
-      if (this.pendingChunks.length && !this.lastWriteError) {
+      if (this.pending.samples && !this.lastWriteError) {
         this.scheduleFlush();
       }
     }
+  }
+
+  /** Once per session: the RAM tail reached the window and lost its oldest audio. */
+  private reportRamTruncation(): void {
+    if (this.ramTruncationReported) return;
+    this.ramTruncationReported = true;
+    console.warn(`OpfsPcmSink: RAM tail exceeded the capture window; ${this.pending.droppedSamples} sample(s) dropped`);
   }
 
   async finalize(sampleRate: number, name = `live-${Date.now()}.wav`): Promise<File> {
@@ -4310,7 +4330,12 @@ class OpfsPcmSink implements PcmSink {
       try {
         await this.writable.close();
       } catch (e) {
-        console.debug("OpfsPcmSink: close failed", e);
+        // ``close()`` is the commit of everything written so far; its
+        // failure can leave the spool without the bytes the writes
+        // reported. The duration that picks the canonical audio is read
+        // off the file (``pcmWavDurationSec``), so a short spool loses to
+        // the container on coverage instead of passing as complete.
+        console.warn("OpfsPcmSink: close failed — the disk spool may be incomplete", e);
       }
       this.writable = null;
     }
@@ -4321,16 +4346,19 @@ class OpfsPcmSink implements PcmSink {
     if (this.lastWriteError) {
       // 1.1.25 fix: previously returned an empty WAV here even though
       // ``flushPending``'s catch branch deliberately
-      // re-enqueues failed chunks into ``pendingChunks`` so finalize
+      // re-enqueues failed chunks into ``pending`` so finalize
       // can salvage them from RAM. Returning empty discarded the bytes
       // and forced the lower-fidelity WebM fallback for what was
       // typically a transient disk hiccup. Now we splice the in-memory
       // chunks together with whatever DID land on the OPFS spool: the
-      // spool prefix + the unwritten tail = a complete WAV.
+      // spool prefix + the unwritten tail. Complete only if close()
+      // committed the prefix and the tail never reached the window;
+      // otherwise the file is shorter than the counter, which is why
+      // its duration is read off the file.
       try {
         const spoolFile = await this.fileHandle.getFile();
         const spoolBytes = spoolFile.size;
-        const tailChunks = this.pendingChunks;
+        const tailChunks = this.pending.take();
         const tailBytes = tailChunks.reduce((a, c) => a + c.byteLength, 0);
         const totalDataBytes = spoolBytes + tailBytes;
         if (totalDataBytes === 0) {
@@ -4376,8 +4404,7 @@ class OpfsPcmSink implements PcmSink {
     } catch (e) {
       console.debug("OpfsPcmSink: destroy remove failed", e);
     }
-    this.pendingChunks = [];
-    this.pendingBytes = 0;
+    this.pending.clear();
   }
 }
 
@@ -4392,43 +4419,33 @@ class OpfsPcmSink implements PcmSink {
  * false of this one, which is the only sink a machine without OPFS gets.
  */
 class MemoryPcmSink implements PcmSink {
-  private chunks: Int16Array[] = [];
-  private bufferedSamples = 0;
-  private truncationWarned = false;
+  private window = new BoundedChunkWindow(UI_TOKENS.capture.fallbackWindowSec * LIVE_SAMPLE_RATE_HZ);
   private destroyed = false;
   totalSamples = 0;
-  readonly isDiskBacked = false;
-  lastWriteError: Error | null = null;
 
   append(samples: Float32Array): void {
     if (this.destroyed) return;
     if (!samples.length) return;
     const int16 = floatSamplesToInt16LE(samples);
-    this.chunks.push(int16);
-    this.bufferedSamples += int16.length;
     this.totalSamples += int16.length;
-    const cap = UI_TOKENS.capture.fallbackWindowSec * LIVE_SAMPLE_RATE_HZ;
-    while (this.bufferedSamples > cap && this.chunks.length > 1) {
-      const dropped = this.chunks.shift();
-      this.bufferedSamples -= dropped ? dropped.length : 0;
-      if (!this.truncationWarned) {
-        this.truncationWarned = true;
-        // Once per session, and said out loud: silently dropping the
-        // start of a recording reads as data loss, which is what it is.
-        showRecordSessionNotice(
-          "Recording exceeds 2 hours and this system has no disk spool — only the last 2 h of audio is kept.",
-          "warning",
-          9000,
-        );
-      }
+    if (this.window.push(int16)) {
+      // Once per session, and said out loud: silently dropping the
+      // start of a recording reads as data loss, which is what it is.
+      const span = capturedHoursLabel(UI_TOKENS.capture.fallbackWindowSec);
+      showRecordSessionNotice(
+        `Recording exceeds ${span} and this system has no disk spool — only the last ${span} of audio is kept.`,
+        "warning",
+        UI_TOKENS.notice.longMs,
+      );
     }
   }
 
   async finalize(sampleRate: number, name = `live-${Date.now()}.wav`): Promise<File> {
-    const totalBytes = this.chunks.reduce((a, c) => a + c.byteLength, 0);
+    const chunks = this.window.chunks;
+    const totalBytes = this.window.bytes;
     const merged = new Uint8Array(totalBytes);
     let offset = 0;
-    for (const c of this.chunks) {
+    for (const c of chunks) {
       merged.set(new Uint8Array(c.buffer, c.byteOffset, c.byteLength), offset);
       offset += c.byteLength;
     }
@@ -4439,8 +4456,7 @@ class MemoryPcmSink implements PcmSink {
 
   async destroy(): Promise<void> {
     this.destroyed = true;
-    this.chunks = [];
-    this.bufferedSamples = 0;
+    this.window.clear();
     this.totalSamples = 0;
   }
 }
@@ -4516,9 +4532,11 @@ async function selectCanonicalCapturedAudio(opts: {
    *  or an in-memory Int16 buffer. Either way it's already a valid
    *  WAV — no encoding happens here. */
   pcmFile: File | null;
-  /** Total sample count reported by the sink. Used to derive
-   *  duration without loading the file back into an
-   *  ``HTMLAudioElement``. */
+  /** Total sample count reported by the sink. The duration is the
+   *  smaller of this and what the file holds (``pcmWavDurationSec``):
+   *  the counter includes samples a bounded RAM window dropped or a
+   *  failed disk commit lost. Neither needs the file loaded back into
+   *  an ``HTMLAudioElement``. */
   pcmSampleCount: number;
   pcmSampleRate: number;
   recordedChunks: Blob[];
@@ -4530,8 +4548,10 @@ async function selectCanonicalCapturedAudio(opts: {
   // A valid WAV from the sink has header (44 bytes) + payload. Empty
   // or header-only files indicate a sink write error; skip them and
   // fall back to the WebM container candidate below.
-  if (opts.pcmFile && opts.pcmFile.size > 44 && opts.pcmSampleCount > 0) {
-    const pcmDurationSec = opts.pcmSampleCount / opts.pcmSampleRate;
+  const pcmDurationSec = opts.pcmFile
+    ? pcmWavDurationSec(opts.pcmFile.size, opts.pcmSampleCount, opts.pcmSampleRate)
+    : 0;
+  if (opts.pcmFile && pcmDurationSec > 0) {
     const pcmFile = opts.pcmFile;
     // FAST PATH: a PCM capture that covers essentially all of the
     // expected duration skips the slow WebM probe altogether — the sink
