@@ -9689,10 +9689,15 @@ app.whenReady().then(async () => {
   // user records, and paste asks for Accessibility/Automation when paste
   // actually needs them.
   refreshMacAccessibilityTrustState();
-  await startBackend();
+  // The backend is started by the window the startup event creates, not
+  // awaited here (DM-29): createWindow owns the boot and its failure
+  // UX — the in-window error page with the backend's stderr tail and the
+  // recovery poll. Awaiting startBackend here first meant a boot failure
+  // skipped the startup event entirely and ended in a bare modal with
+  // no window.
   await applyWindowLifecycleEvent(WINDOW_LIFECYCLE_EVENTS.startup);
 }).catch((err) => {
-  // The whenReady chain has many awaits — startBackend, permission
+  // The whenReady chain has many awaits — IPC and tray setup, permission
   // probes, accessibility checks, and any one of
   // them rejecting becomes an unhandled promise rejection that the
   // top-level ``unhandledRejection`` handler logs but cannot recover
