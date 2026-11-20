@@ -10,8 +10,10 @@
  * place, under test (tests/live-transcript-buffer.test.ts), rather than
  * case by case inside the socket handler.
  *
- * Moved out of main.tsx unchanged apart from taking the segment
- * epsilon as a value instead of reading ``UI_TOKENS`` itself.
+ * The live reading is the provider's live stream and nothing else: the
+ * ``final`` stop envelope is the delivered transcript, a different
+ * reading of the same speech, and folding it in here doubled every
+ * clause of a dual-stream take's ``Original:`` (see the ``final`` case).
  *
  * Pure: no DOM, no I/O.
  */
@@ -274,7 +276,19 @@ export function applyLiveStreamEvent(buffer: LiveTranscriptBuffer, event: LiveSt
       buffer.interimSegment = event.segment;
       return;
     case "final":
-      appendSegmentsToBuffer(buffer, event.segments);
+      // The stop envelope is NOT the live reading and never joins it.
+      // Its segments are the backend's own re-merge of the whole
+      // recording — for a dual-stream take, the two readings' words
+      // regrouped at clause-length silences (``_segments_from_words`` in
+      // backend/deepgram_dual.py) — so their boundaries and starts do
+      // not line up with the primary's finals already held here, and
+      // ``mergeTranscriptSegments``, which can only recognise the same
+      // segment at the same start, kept both: every clause twice,
+      // interleaved by start time, in the saved ``Original:`` of
+      // 2026-11-20's dual-stream takes. The envelope is delivered
+      // verbatim as the transcript (``stopLive``) and replaces the
+      // preview verbatim (``composeLivePreviewText``); what the provider
+      // said live is exactly the ``segments``/``interim`` stream above.
       return;
   }
 }

@@ -11425,10 +11425,10 @@ async function startLive(
       case "final": {
         const lastSeg = msg.segments.length > 0 ? msg.segments[msg.segments.length - 1] : null;
         console.log(`[trace ws-final] session=${sessionUiToken.slice(0, 8)} active=${isActiveSession} textLen=${msg.text.length} segCount=${msg.segments.length} ${lastSeg ? `lastEnd=${lastSeg.end.toFixed(2)} ${traceTextStats("lastText", lastSeg.text)}` : "(empty)"} durationSec=${msg.durationSec.toFixed(2)} error="${msg.error || ""}"`);
+        // ./live-transcript-buffer decides what the envelope does to the
+        // live reading (nothing — see its ``final`` case), so there is
+        // no buffer change to project onto the preview here.
         applyLiveStreamEvent(sessionBuffer, msg);
-        if (isActiveSession) {
-          projectLiveTranscriptBufferToActiveState(sessionBuffer);
-        }
         // The parsed message minus its ``type`` IS the envelope — one
         // contract (./live-envelope). It used to be copied field by
         // field, so a field added to the contract was silently dropped
