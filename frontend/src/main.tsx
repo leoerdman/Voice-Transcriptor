@@ -107,6 +107,7 @@ import { keepaliveFor } from "./keepalive";
 import { parseRuntimeLimits } from "./runtime-limits";
 import { screenThumbLabel, screensStripNote } from "./screens-strip";
 import { fallbackSourceKey, isCurrentPlayerSource } from "./player-source";
+import { parseRecordingSaveResponse, planRecordingSave, recordingSaveFormEntries } from "./recording-save";
 import {
   PROVIDER_DISPLAY_ORDER,
   isRemoteProvider,
@@ -8671,82 +8672,47 @@ async function saveRecordingText(opts: {
   if (!sourceText && !transcriptText && !audioFile && !audioSourcePath) {
     return { name: existingName, archiveDir };
   }
-  let savedName = existingName;
-  let savedArchiveDir = archiveDir;
+  // One request plan and one response parser for the three routes
+  // (./recording-save); a screen session without an audio file is
+  // refused there instead of being dropped.
+  const plan = planRecordingSave({
+    hasAudioFile: !!audioFile,
+    audioSourcePath,
+    consumeAudioSourcePath: !!opts.consumeAudioSourcePath,
+    existingName,
+    archiveDir,
+    recordingCollection,
+    requireExisting,
+    title: opts.title,
+    sourceText,
+    transcriptText,
+    provider: opts.provider,
+    model: opts.model,
+    language: opts.language,
+    liveSessionId: opts.liveSessionId,
+    screenSessionId: opts.screenSessionId,
+    screenAudioStartedAt: opts.screenAudioStartedAt,
+  });
+  let response: unknown;
+  if (plan.route === "save-with-audio" && audioFile) {
+    const fd = new FormData();
+    fd.append("file", audioFile, audioFile.name || "recording.wav");
+    for (const [key, value] of recordingSaveFormEntries(plan.fields)) fd.set(key, value);
+    const r = await fetch("/api/recordings/save-with-audio", { method: "POST", body: fd, headers: authHeaders() });
+    if (!r.ok) throw new Error(await parseError(r));
+    response = await r.json();
+  } else {
+    response = await apiPost<unknown>(`/api/recordings/${plan.route}`, plan.fields);
+  }
   // Audio-retention observability (BUG-02): the backend deletes older
   // recordings' audio on every save (policy: newest keeps audio,
   // transcripts are forever). The count comes back in every save
   // response; surface it so the deletion is never silent.
-  let prunedAudioCount = 0;
-  let screensManifest: unknown = undefined;
-  if (audioFile) {
-    const fd = new FormData();
-    fd.append("file", audioFile, audioFile.name || "recording.wav");
-    if (existingName) fd.set("name", existingName);
-    if (archiveDir) fd.set("archive_dir", archiveDir);
-    if (recordingCollection) fd.set("recording_collection", recordingCollection);
-    if (requireExisting) fd.set("require_existing", "true");
-    fd.set("title", opts.title);
-    fd.set("source_text", sourceText);
-    fd.set("transcript_text", transcriptText);
-    fd.set("provider", opts.provider);
-    fd.set("model", opts.model);
-    fd.set("language", opts.language);
-    if (opts.liveSessionId) fd.set("live_session_id", opts.liveSessionId);
-    if (opts.screenSessionId) {
-      fd.set("screen_session_id", opts.screenSessionId);
-      if (opts.screenAudioStartedAt && opts.screenAudioStartedAt > 0) {
-        fd.set("screen_audio_started_at", String(opts.screenAudioStartedAt));
-      }
-    }
-    const r = await fetch("/api/recordings/save-with-audio", { method: "POST", body: fd, headers: authHeaders() });
-    if (!r.ok) throw new Error(await parseError(r));
-    const js = (await r.json()) as { name?: string; archive_dir?: string; pruned_audio_count?: number; screens?: unknown };
-    savedName = String(js.name || existingName || "").trim();
-    savedArchiveDir = String(js.archive_dir || archiveDir || "").trim();
-    prunedAudioCount = Math.max(0, Math.trunc(Number(js.pruned_audio_count) || 0));
-    screensManifest = js.screens ?? undefined;
-  } else if (audioSourcePath) {
-    const payload: Record<string, unknown> = {
-      source_path: audioSourcePath,
-      name: existingName,
-      recording_collection: recordingCollection,
-      require_existing: requireExisting,
-      title: opts.title,
-      source_text: sourceText,
-      transcript_text: transcriptText,
-      provider: opts.provider,
-      model: opts.model,
-      language: opts.language,
-      consume_source_path: !!opts.consumeAudioSourcePath,
-    };
-    if (archiveDir) payload.archive_dir = archiveDir;
-    const js = await apiPost<{ ok: boolean; name: string; archive_dir?: string; pruned_audio_count?: number }>("/api/recordings/save-from-path", {
-      ...payload,
-    });
-    savedName = String(js.name || existingName || "").trim();
-    savedArchiveDir = String(js.archive_dir || archiveDir || "").trim();
-    prunedAudioCount = Math.max(0, Math.trunc(Number(js.pruned_audio_count) || 0));
-  } else {
-    const payload: Record<string, unknown> = {
-      name: existingName,
-      recording_collection: recordingCollection,
-      require_existing: requireExisting,
-      title: opts.title,
-      source_text: sourceText,
-      transcript_text: transcriptText,
-      provider: opts.provider,
-      model: opts.model,
-      language: opts.language,
-    };
-    if (archiveDir) payload.archive_dir = archiveDir;
-    const js = await apiPost<{ ok: boolean; name: string; archive_dir?: string; pruned_audio_count?: number }>("/api/recordings/save", {
-      ...payload,
-    });
-    savedName = String(js.name || existingName || "").trim();
-    savedArchiveDir = String(js.archive_dir || archiveDir || "").trim();
-    prunedAudioCount = Math.max(0, Math.trunc(Number(js.pruned_audio_count) || 0));
-  }
+  const saved = parseRecordingSaveResponse(response, { name: existingName, archiveDir });
+  const savedName = saved.name;
+  const savedArchiveDir = saved.archiveDir;
+  const prunedAudioCount = saved.prunedAudioCount;
+  const screensManifest = saved.screensManifest;
   // Fire-and-forget, coalesced through a background queue. Live saves
   // happen while the single recording capsule is still busy; direct
   // loadRecordings() here made History redraw during finalization and
