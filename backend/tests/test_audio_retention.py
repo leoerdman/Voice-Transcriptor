@@ -82,12 +82,24 @@ class AudioRetentionTestBase(unittest.TestCase):
         stamp = NOW - age_sec
         if with_transcript:
             txt = d / f"{stem}.txt"
-            txt.write_text("transcript", encoding="utf-8")
+            txt.write_text(self._app_transcript(stem), encoding="utf-8")
             os.utime(txt, (stamp, stamp))
         audio = d / f"{stem}{ext}"
         audio.write_bytes(b"audio")
         os.utime(audio, (stamp, stamp))
         return audio
+
+    def _app_transcript(self, title: str) -> str:
+        """A transcript as the app writes it — the header is what makes a
+        same-stem media file the app's own (``_is_app_recording_text``)."""
+        return self.main._render_recording_content(
+            title=title,
+            source_text="",
+            transcript_text="transcript",
+            provider="local",
+            model="",
+            language="",
+        )
 
     def _set_live_keep(self, count: int) -> None:
         """Point the LIVE policy at a small count for a sweep test.
@@ -453,6 +465,53 @@ class SweepFanOutTests(AudioRetentionTestBase):
         self.main.start_audio_retention_sweeper()
 
         self.assertIsNone(self.main._audio_retention_sweeper_thread)
+
+
+class UserFilesAreNeverOursTests(AudioRetentionTestBase):
+    """BM-03: the archive folder is user-chosen (it may be ~/Movies). A
+    media file beside a same-stem ``.txt`` the app did not write is the
+    user's own pair — retention and "delete all" must never touch it."""
+
+    def _user_pair(self, directory: Path, stem: str, *, age_sec: float) -> tuple[Path, Path]:
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = NOW - age_sec
+        txt = directory / f"{stem}.txt"
+        txt.write_text("my notes for the talk", encoding="utf-8")
+        media = directory / f"{stem}.mp4"
+        media.write_bytes(b"user video")
+        for p in (txt, media):
+            os.utime(p, (stamp, stamp))
+        return txt, media
+
+    def test_retention_never_collects_a_users_own_media(self) -> None:
+        txt, media = self._user_pair(self.root, "talk", age_sec=10 * MINUTE)
+        self._recording("old-take", age_sec=5 * MINUTE)
+        self._recording("new-take", age_sec=1 * MINUTE)
+
+        self.main._prune_recording_audio(self.root, now=NOW, policy=self._keep(1))
+
+        self.assertTrue(media.exists(), "the user's own video was deleted by retention")
+        self.assertTrue(txt.exists())
+        self.assertEqual(self._surviving_audio(self.root), {"new-take.webm", "talk.mp4"})
+
+    def test_a_users_pair_does_not_take_a_slot_in_the_count(self) -> None:
+        self._user_pair(self.root, "talk", age_sec=0)
+        self._recording("only-take", age_sec=1 * MINUTE)
+
+        self.main._prune_recording_audio(self.root, now=NOW, policy=self._keep(1))
+
+        self.assertIn("only-take.webm", self._surviving_audio(self.root))
+
+    def test_delete_all_leaves_a_users_own_pair_alone(self) -> None:
+        txt, media = self._user_pair(self.root, "talk", age_sec=0)
+        self._recording("take", age_sec=0)
+
+        result = self.main._delete_all_recordings_sync()
+
+        self.assertTrue(txt.exists(), "delete-all removed the user's own .txt")
+        self.assertTrue(media.exists(), "delete-all removed the user's own video")
+        self.assertFalse((self.root / "take.txt").exists())
+        self.assertEqual(result, {"deleted": 1, "failed": 0})
 
 
 if __name__ == "__main__":

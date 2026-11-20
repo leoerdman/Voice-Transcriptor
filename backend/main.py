@@ -3426,7 +3426,10 @@ def _prune_recording_audio(
       record and are not subject to retention at any age or count.
     * An audio file with no sibling transcript is left alone: it is
       either an orphan or a save still in flight in another process,
-      and neither is ours to collect.
+      and neither is ours to collect. Neither is one whose sibling
+      transcript this app did not write (``_is_app_recording_text``):
+      the archive folder is user-chosen, and a same-stem pair there may
+      be the user's own files.
     * ``keep_stems`` is an unconditional exemption, used by the save
       path for the recording it has just written. Exempt files still
       occupy a slot in the ``max_items`` ranking — the take the user
@@ -3458,7 +3461,17 @@ def _prune_recording_audio(
     # On an archive with a few thousand entries this turned every save
     # (and every startup retention sweep) into seconds of blocking I/O,
     # which the user experiences as the app stalling right after Stop.
-    text_stems = {p.stem for p in _iter_recording_text_files(target_dir)}
+    text_by_stem = {p.stem: p for p in _iter_recording_text_files(target_dir)}
+    # Ownership is checked only for stems that have media beside them (a
+    # header read per media file, not per transcript), once per stem.
+    owned_cache: dict[str, bool] = {}
+
+    def _owned(stem: str) -> bool:
+        if stem not in owned_cache:
+            text = text_by_stem.get(stem)
+            owned_cache[stem] = text is not None and _is_app_recording_text(text)
+        return owned_cache[stem]
+
     candidates: list[tuple[float, str, Path]] = []
     for entry in entries:
         try:
@@ -3466,7 +3479,7 @@ def _prune_recording_audio(
                 continue
             if entry.suffix.lower() not in _RECORDING_AUDIO_EXTS:
                 continue
-            if entry.stem not in text_stems:
+            if not _owned(entry.stem):
                 continue
             candidates.append((entry.stat().st_mtime, entry.name, entry))
         except OSError as e:
@@ -3482,7 +3495,7 @@ def _prune_recording_audio(
             logger.info("audio retention: removed %s (%s)", entry.name, reason)
         except OSError as e:
             logger.warning("audio retention: failed to remove %s: %s", entry, e)
-    deleted += _prune_recording_screens(entries, text_stems, effective, exempt=exempt, now=stamp)
+    deleted += _prune_recording_screens(entries, _owned, effective, exempt=exempt, now=stamp)
     return deleted
 
 
@@ -3522,7 +3535,7 @@ def _beyond_retention_policy(
 
 def _prune_recording_screens(
     entries: list[Path],
-    text_stems: set[str],
+    owned: Callable[[str], bool],
     policy: AudioRetentionPolicy,
     *,
     exempt: set[str],
@@ -3537,7 +3550,7 @@ def _prune_recording_screens(
         try:
             if not screen_sessions.is_screens_dir(entry):
                 continue
-            if screen_sessions.screens_stem(entry) not in text_stems:
+            if not owned(screen_sessions.screens_stem(entry)):
                 continue
             candidates.append((entry.stat().st_mtime, entry.name, entry))
         except OSError as e:
@@ -3754,6 +3767,30 @@ def _recording_audio_payload(name: str, target_dir: Optional[Path] = None) -> di
         "audio_size_bytes": size_bytes,
         "audio_mime": mime,
     }
+
+
+# Ownership of a transcript: every ``.txt`` this app writes starts with the
+# header ``_render_recording_content`` renders — "Title: …" on the first line
+# and "Saved at: …" on the second (unchanged since the first release). The
+# archive folder is a user-chosen, user-visible folder (it may be ~/Movies,
+# ~/Documents), so a same-stem ``.txt`` beside a media file proves nothing:
+# ``talk.txt`` next to ``talk.mp4`` is the user's own pair. Retention and
+# "delete all" act ONLY on recordings whose transcript carries this header,
+# so they can never delete a file the app did not create.
+_APP_RECORDING_HEADER_RE = re.compile(r"\ATitle: [^\r\n]*\r?\nSaved at: ")
+# The title line is the only variable-length part before "Saved at:".
+_APP_RECORDING_HEADER_READ_BYTES = 8192
+
+
+def _is_app_recording_text(path: Path) -> bool:
+    """True when *path* is a transcript this app wrote (see the header rule
+    above). Unreadable files are not ours to touch."""
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(_APP_RECORDING_HEADER_READ_BYTES)
+    except OSError:
+        return False
+    return bool(_APP_RECORDING_HEADER_RE.match(head.decode("utf-8", errors="replace")))
 
 
 def _render_recording_content(
@@ -7606,6 +7643,11 @@ def _delete_all_recordings_sync() -> dict:
     failed = 0
     for d in _recordings_storage_dirs_for_roots(_get_known_archive_dirs()):
         for p in _iter_recording_text_files(d):
+            # Only recordings this app wrote: the archive folder is
+            # user-chosen, and a ``.txt`` the user keeps there (with its
+            # same-stem media) is not ours to delete.
+            if not _is_app_recording_text(p):
+                continue
             audio_path = _recording_audio_path(p.name, target_dir=d)
             audio_backup: Optional[Path] = None
             try:

@@ -571,7 +571,7 @@ class RecordingNameTests(unittest.TestCase):
         root.mkdir(parents=True)
         recording = root / "Existing.TXT"
         audio = root / "Existing.webm"
-        recording.write_text("Title: Existing\nTranscription:\none\n", encoding="utf-8")
+        recording.write_text("Title: Existing\nSaved at: 2026-11-20 10:00:00\nTranscription:\none\n", encoding="utf-8")
         audio.write_bytes(b"audio")
 
         result = self.main._delete_all_recordings_sync()
@@ -585,7 +585,7 @@ class RecordingNameTests(unittest.TestCase):
         root.mkdir(parents=True)
         recording = root / "Locked.TXT"
         audio = root / "Locked.webm"
-        recording.write_text("Title: Locked\nTranscription:\none\n", encoding="utf-8")
+        recording.write_text("Title: Locked\nSaved at: 2026-11-20 10:00:00\nTranscription:\none\n", encoding="utf-8")
         audio.write_bytes(b"audio")
         original_unlink = Path.unlink
 
@@ -612,10 +612,10 @@ class RecordingNameTests(unittest.TestCase):
         # and be kept forever.
         root = (Path(self._tmp.name) / "recordings").resolve()
         root.mkdir(parents=True)
-        (root / "Keep.TXT").write_text("keep", encoding="utf-8")
+        (root / "Keep.TXT").write_text("Title: Keep\nSaved at: 2026-11-20 10:00:00\n", encoding="utf-8")
         keep_audio = root / "Keep.webm"
         keep_audio.write_bytes(b"keep")
-        (root / "Old.TXT").write_text("old", encoding="utf-8")
+        (root / "Old.TXT").write_text("Title: Old\nSaved at: 2026-11-20 10:00:00\n", encoding="utf-8")
         old_audio = root / "Old.webm"
         old_audio.write_bytes(b"old")
 
@@ -991,7 +991,7 @@ class RecordingNameTests(unittest.TestCase):
         root = (Path(self._tmp.name) / "recordings").resolve()
         root.mkdir(parents=True)
         recording = root / "Existing.TXT"
-        recording.write_text("old", encoding="utf-8")
+        recording.write_text("Title: Existing\nSaved at: 2026-11-20 10:00:00\n", encoding="utf-8")
         audio = root / "Existing.wav"
         audio.write_bytes(b"old audio")
 

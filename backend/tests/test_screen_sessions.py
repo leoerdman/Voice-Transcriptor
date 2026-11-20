@@ -181,7 +181,9 @@ class ArchiveIntegrationTests(unittest.TestCase):
         self._home.cleanup()
 
     def _recording(self, stem: str, mtime: float) -> None:
-        (self.screen_dir / f"{stem}.txt").write_text("Title: t\n\nTranscription:\nhi\n", encoding="utf-8")
+        (self.screen_dir / f"{stem}.txt").write_text(
+            "Title: t\nSaved at: 2026-11-20 10:00:00\n\nTranscription:\nhi\n", encoding="utf-8"
+        )
         audio = self.screen_dir / f"{stem}.wav"
         audio.write_bytes(b"RIFF")
         screens = self.screen_dir / f"{stem}.screens"
