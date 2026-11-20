@@ -1173,8 +1173,9 @@ function applyWindowLifecycleEvent(event, context = {}) {
  * `before-quit` (registered once, below) does the actual teardown —
  * this only starts it, so there is exactly one place in the app that
  * decides "we are quitting now": the lifecycle table's `quit` action
- * above, and the paste-capability self-heal relaunch below, both go
- * through here instead of each calling `app.quit()` on its own.
+ * above, the paste-capability self-heal relaunch, the tray's Quit item
+ * and the SIGINT/SIGTERM/SIGHUP handlers all go through here instead of
+ * each calling `app.quit()` on its own (DM-19).
  */
 function quitApp(reason = "") {
   appendMainLog(`[main-window] quit requested reason=${normalizeLifecycleReason(reason)}`);
@@ -8970,7 +8971,7 @@ for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
     isQuitting = true;
     killBackendHard(`signal-${sig}`, { escalateAfterMs: 250 });
     try {
-      app.quit();
+      quitApp(`signal-${sig}`);
     } catch {
       try { app.exit(SIGNAL_EXIT_CODES[sig] || 0); } catch { process.exit(SIGNAL_EXIT_CODES[sig] || 0); }
     }
@@ -9217,7 +9218,7 @@ app.whenReady().then(async () => {
     { type: "separator" },
     {
       label: "Quit",
-      click: () => app.quit()
+      click: () => quitApp("tray-quit")
     }
   ]);
   tray.on("click", () => {
