@@ -9004,8 +9004,22 @@ app.whenReady().then(async () => {
   // can already query status. invoke-only: the renderer never receives
   // raw ipcRenderer and cannot initiate arbitrary channels.
   const { ipcMain } = require("electron");
-  ipcMain.handle("engine:get-status", () => engineInstallSnapshot());
-  ipcMain.handle("engine:install", async () => {
+  // Every channel the preload exposes answers only the main window's own
+  // webContents (DM-28). Only that window has the preload today, so
+  // nothing else can reach these channels — but the rule was enforced by
+  // two handlers (screen-mode:finish, recording-final, which spell the
+  // same condition inline) and missing from the other four.
+  const isFromMainWindow = (event) =>
+    !!win && !win.isDestroyed() && event?.sender === win.webContents;
+  const refusedSender = (channel) => {
+    appendMainLog(`[ipc] ${channel} refused: sender is not the main window`);
+    return { ok: false, error: "sender" };
+  };
+
+  ipcMain.handle("engine:get-status", (event) =>
+    (isFromMainWindow(event) ? engineInstallSnapshot() : refusedSender("engine:get-status")));
+  ipcMain.handle("engine:install", async (event) => {
+    if (!isFromMainWindow(event)) return refusedSender("engine:install");
     // Every return carries the phase snapshot the renderer branches on.
     // Two of these three paths used to return an object WITHOUT `phase`
     // — so an install that failed because there was no usable Python, or
@@ -9050,7 +9064,8 @@ app.whenReady().then(async () => {
   // asks right after `probePasteCapability("boot")` already ran gets the
   // cached answer for free; the very first ask of a session pays for one
   // probe so the badge is never a beat behind the first recording.
-  ipcMain.handle("paste-capability:get-status", async () => {
+  ipcMain.handle("paste-capability:get-status", async (event) => {
+    if (!isFromMainWindow(event)) return refusedSender("paste-capability:get-status");
     const cap = await ensurePasteCapabilityFresh("renderer-query");
     const context = pasteCapabilityMessageContext();
     return {
@@ -9071,7 +9086,8 @@ app.whenReady().then(async () => {
   // (desktop/paste-capability.js builds it, including the refusal to run
   // it against anything that is not this app's own bundle id); the
   // renderer owns nothing but the click.
-  ipcMain.handle("permissions:repair", async () => {
+  ipcMain.handle("permissions:repair", async (event) => {
+    if (!isFromMainWindow(event)) return refusedSender("permissions:repair");
     try {
       return await repairPastePermissionsOnRequest();
     } catch (e) {
