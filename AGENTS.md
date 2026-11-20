@@ -8,6 +8,10 @@ repository.
 2. Do not add temporary hacks, hidden TODOs, duplicated logic, or parallel
    sources of truth.
 3. Do not delete logs unless the user explicitly asks for log deletion.
+   Standing exception the user approved on 2026-11-20: the desktop boot
+   sweep keeps the newest 10 `main.log` archives and at most 50 MB of them
+   (`desktop/log-retention.js`). Any other log deletion still needs an
+   explicit request.
 4. Preserve SSOT boundaries. Product vision lives in `docs/PRODUCT.md`
    (`docs/VISION.md` is the one-paragraph statement it expands); release
    environment variables live in `.env.example`; app version lives in

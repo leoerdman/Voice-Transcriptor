@@ -129,6 +129,7 @@ const { buildPwshPasteFallbackScript } = require("./windows-paste-fallback");
 // (DM-09, DM-27).
 const { backendHandleOf, decideBackendExit } = require("./backend-exit");
 const { createSingleFlight } = require("./single-flight");
+const { archivesToPrune } = require("./log-retention");
 // Recording ids are unique only per renderer page: key them with the
 // page's epoch (DM-32).
 const { recordingKey, createBoundedKeySet } = require("./renderer-epoch");
@@ -750,19 +751,8 @@ function recoverOrphanRotatingLogs() {
   } catch { /* directory unreadable — non-fatal */ }
 }
 
-// Archive retention (BUG-34): rotation deliberately never deletes, so
-// without a boot-time cap the archives grow without bound (up to 5 MB
-// per rotation, forever). Keep the newest MAIN_LOG_ARCHIVE_KEEP_COUNT
-// archives and at most MAIN_LOG_ARCHIVE_KEEP_BYTES in total; the sweep
-// runs once per boot, never during rotation.
-const MAIN_LOG_ARCHIVE_KEEP_COUNT = 10;
-const MAIN_LOG_ARCHIVE_KEEP_BYTES = 50 * 1024 * 1024;
-// Age cap. The count/byte caps alone let a quiet week and a busy week
-// keep the same amount of history, so a heavy-logging stretch could
-// still pin 50 MB of archives that are months old and useless for
-// triage. Support only ever looks at the last few days.
-const MAIN_LOG_ARCHIVE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
-
+// Archive retention: rotation never deletes; the boot sweep deletes what
+// ./log-retention decides (the user's 10 archives / 50 MB policy, BL-03).
 function pruneMainLogArchives() {
   try {
     const logPath = mainLogFilePath();
@@ -771,33 +761,16 @@ function pruneMainLogArchives() {
     const archives = [];
     for (const name of fs.readdirSync(dir)) {
       if (!name.startsWith(prefix)) continue;
-      const full = path.join(dir, name);
       let st;
-      try { st = fs.statSync(full); } catch { continue; }
+      try { st = fs.statSync(path.join(dir, name)); } catch { continue; }
       if (!st.isFile()) continue;
-      archives.push({ full, mtimeMs: st.mtimeMs, size: st.size });
+      archives.push({ name, mtimeMs: st.mtimeMs, size: st.size });
     }
-    archives.sort((a, b) => b.mtimeMs - a.mtimeMs);
-    const now = Date.now();
-    let keptBytes = 0;
-    for (let i = 0; i < archives.length; i += 1) {
-      const a = archives[i];
-      // The newest archive always survives (it holds the freshest
-      // crash evidence); count, byte and age caps apply to the older
-      // tail. A clock that jumped backwards yields a negative age,
-      // which must not read as "expired".
-      const ageMs = now - a.mtimeMs;
-      const overCaps = i + 1 > MAIN_LOG_ARCHIVE_KEEP_COUNT
-        || keptBytes + a.size > MAIN_LOG_ARCHIVE_KEEP_BYTES
-        || ageMs > MAIN_LOG_ARCHIVE_MAX_AGE_MS;
-      if (i > 0 && overCaps) {
-        try {
-          fs.rmSync(a.full, { force: true });
-          appendMainLog(`[log-rotation] pruned old archive ${path.basename(a.full)}`);
-        } catch { /* keep in place; retried next boot */ }
-        continue;
-      }
-      keptBytes += a.size;
+    for (const name of archivesToPrune(archives)) {
+      try {
+        fs.rmSync(path.join(dir, name), { force: true });
+        appendMainLog(`[log-rotation] pruned old archive ${name}`);
+      } catch { /* keep in place; retried next boot */ }
     }
   } catch { /* directory unreadable — non-fatal */ }
 }
