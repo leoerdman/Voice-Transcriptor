@@ -230,3 +230,42 @@ after:   all OK
 Suites: backend 1002 OK (one full run hit a wall-clock flake in
 `test_deepgram_finalize_budget` under machine load — passes 3/3 alone and in
 the re-run of the full suite); desktop 436; vitest 607; typecheck, lint, build clean.
+
+## C7 — BL-11: GigaAM remembers an unreachable checkpoint host
+
+Files: `backend/transcribe_gigaam.py` (`GIGAAM_UNREACHABLE_RETRY_SEC = 600`,
+`_UnreachableMemory`, `GigaamHostUnreachableError`, `_load_model`),
+`backend/tests/test_transcribe_gigaam.py`.
+
+The warm-up endpoint half (URLError / SSLError classed as "host
+unreachable", no 500) was already on main. Now a load that fails with a
+transport error (`URLError` — which wraps the expired certificate in the
+log —, `ssl.SSLError`, `ConnectionError`, `TimeoutError`, `socket.gaierror`;
+NOT `HTTPError`, which is the host answering) is remembered per model id for
+10 minutes; loads inside the window raise `GigaamHostUnreachableError`
+without downloading, chained to the original error, so
+`backend.main._is_hub_offline_error` still reports "unreachable". Any other
+failure is not remembered; a success clears the entry. Per model, not per
+host: a model already in the local cache must not be blocked by another
+model's download failure.
+
+Check (tests against the previous module): 3 × ERROR (no
+`_UnreachableMemory`); after: 25 tests OK. The test's fake `gigaam` module is
+restored through `addCleanup` so a failing setUp cannot leak it into later
+tests (it did on the old-code run).
+
+## C8 — BM-29: estimated durations are named as estimates (backend + renderer)
+
+Files: `backend/main.py` (`STATS_SPEECH_WORDS_PER_MIN`,
+`estimated_{avg,min,max}_duration_sec`), `backend/tests/test_recording_names.py`,
+`frontend/src/main.tsx` (`RecordingsStats`, `renderRecordingsStats`),
+`frontend/index.html` (labels "Est. Avg/Min/Max Duration").
+
+Chosen over reading real audio durations: retention deletes most audio
+(Live keeps the newest 100), so a real-duration stat would describe a
+different, shifting subset. Check against the previous main.py:
+`FAIL test_recording_collections_save_into_source_specific_folders` (old
+keys); after: OK.
+
+Suites for C7+C8 (one run, disjoint files): backend 1005 OK; desktop 436;
+vitest 607; typecheck, lint, build clean.

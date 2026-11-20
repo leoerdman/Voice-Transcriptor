@@ -542,5 +542,105 @@ class EnginePrefixSsotTests(unittest.TestCase):
         source = inspect.getsource(mm)
         self.assertNotIn("GIGAAM_MODELS", source)
 
+
+class GigaAMUnreachableHostTests(unittest.TestCase):
+    """BL-11: a load that failed because the checkpoint host was out of
+    reach is not retried on every warm-up trigger."""
+
+    def setUp(self):
+        import ssl
+        import urllib.error
+
+        from backend import transcribe_gigaam
+
+        self._mod = transcribe_gigaam
+        self._prev = sys.modules.get("gigaam")
+        self.calls = 0
+        self.error: BaseException = urllib.error.URLError(
+            ssl.SSLCertVerificationError("certificate verify failed: certificate has expired")
+        )
+
+        def load_model(name):
+            self.calls += 1
+            raise self.error
+
+        fake = types.ModuleType("gigaam")
+        fake.load_model = load_model  # type: ignore[attr-defined]
+        self.addCleanup(self._restore_gigaam)
+        sys.modules["gigaam"] = fake
+        self.clock = [1000.0]
+        self._saved_memory = transcribe_gigaam._UNREACHABLE
+        transcribe_gigaam._UNREACHABLE = transcribe_gigaam._UnreachableMemory(
+            600, clock=lambda: self.clock[0]
+        )
+        transcribe_gigaam._MODEL_CACHE.clear()
+
+    def tearDown(self):
+        self._mod._UNREACHABLE = self._saved_memory
+        self._mod._MODEL_CACHE.clear()
+
+    def _restore_gigaam(self):
+        if self._prev is None:
+            sys.modules.pop("gigaam", None)
+        else:
+            sys.modules["gigaam"] = self._prev
+
+    def test_an_unreachable_host_is_not_tried_again_until_the_window_passes(self):
+        mid = "gigaam-v3-e2e-rnnt"
+        with self.assertRaises(OSError):
+            self._mod._load_model(mid)
+        self.assertEqual(self.calls, 1)
+        # The next triggers inside the window do not download again; the
+        # refusal is chained to the original transport failure.
+        self.clock[0] += 300
+        with self.assertRaises(self._mod.GigaamHostUnreachableError) as raised:
+            self._mod._load_model(mid)
+        self.assertIs(raised.exception.__cause__, self.error)
+        self.assertEqual(self.calls, 1)
+        # After the window the load is attempted again.
+        self.clock[0] += 301
+        with self.assertRaises(OSError):
+            self._mod._load_model(mid)
+        self.assertEqual(self.calls, 2)
+
+    def test_other_failures_are_not_remembered(self):
+        import urllib.error
+
+        mid = "gigaam-v3-rnnt"
+        for error in (
+            RuntimeError("bad checkpoint"),
+            urllib.error.HTTPError("https://cdn.example/x", 500, "boom", {}, None),
+        ):
+            with self.subTest(error=type(error).__name__):
+                self.error = error
+                before = self.calls
+                with self.assertRaises(Exception):
+                    self._mod._load_model(mid)
+                with self.assertRaises(Exception):
+                    self._mod._load_model(mid)
+                self.assertEqual(self.calls, before + 2)
+
+    def test_the_backend_reports_the_refusal_as_unreachable_not_as_a_crash(self):
+        import importlib
+        import tempfile
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.dict(os.environ, {
+            "TRANSCRIPTOR_DATA_DIR": tmp.name,
+            "TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG": "1",
+        }):
+            for name in ("backend.main", "backend.config", "backend.storage"):
+                sys.modules.pop(name, None)
+            main = importlib.import_module("backend.main")
+        self.addCleanup(lambda: [sys.modules.pop(n, None) for n in ("backend.main", "backend.config", "backend.storage")])
+        mid = "gigaam-v3-e2e-rnnt"
+        with self.assertRaises(OSError):
+            self._mod._load_model(mid)
+        with self.assertRaises(self._mod.GigaamHostUnreachableError) as raised:
+            self._mod._load_model(mid)
+        self.assertTrue(main._is_hub_offline_error(raised.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
