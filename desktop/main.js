@@ -137,6 +137,8 @@ const {
 // One lease per paste on the snapshot of the user's clipboard, released
 // exactly once (DM-02, DM-26).
 const { createClipboardLeases } = require("./clipboard-lease");
+// The one rule for where this shell keeps its data (DM-07, DM-11, S-12).
+const { MAIN_LOG_FILE, resolveDataDir, oneDriveMigrationEntries } = require("./data-dir");
 
 // SSOT for "which system power events the app reacts to, and what each
 // one means" — subscribed exactly once from app.whenReady below.
@@ -257,10 +259,11 @@ process.on("unhandledRejection", (reason) => {
 // presets + archive-dir preferences. Also: encrypted API keys wind
 // up syncing to OneDrive cloud (privacy leak).
 //
-// Must run BEFORE any `app.getPath('userData')` call (line 227
-// `mainLogFilePath`), BEFORE `requestSingleInstanceLock` (line 154),
-// and BEFORE we spawn the backend (TRANSCRIPTOR_DATA_DIR env flows
-// through to backend/config.py `_default_data_dir`).
+// Must run BEFORE `requestSingleInstanceLock` and BEFORE we spawn the
+// backend (TRANSCRIPTOR_DATA_DIR flows through to backend/data_dir.py).
+// The logger needs no ordering: it derives its path from dataDir() on
+// every write, so lines logged before the re-home land in the old
+// directory and every line after it in the new one.
 function _relocateUserDataOffOneDrive() {
   if (process.platform !== "win32") return;
   const roaming = process.env.APPDATA;
@@ -294,8 +297,10 @@ function _relocateUserDataOffOneDrive() {
       // `cpSync` landed in Node 16.7; the pinned Electron (see
       // devDependencies) is far past that, and package.json engines
       // requires Node >=22.12 for the dev path.
-      // Copy only the user-facing subset — skip bundled-runtime caches,
-      // .venv, anything else that is safe to regenerate.
+      // Copy the user's data — everything except what this shell
+      // regenerates on its own (./data-dir oneDriveMigrationEntries, DM-34).
+      // An inclusion list retyped from the backend's file names silently
+      // left behind every file added since it was written.
       let allCopied = true;
       const copyChild = (name) => {
         const src = path.join(oldDir, name);
@@ -315,14 +320,9 @@ function _relocateUserDataOffOneDrive() {
           allCopied = false;
         }
       };
-      for (const child of [
-        "config.json",
-        ".encryption_key",
-        "api_token.txt",
-        "known_archive_dirs.json",
-        "upscale_presets",
-        "recordings",
-      ]) copyChild(child);
+      let oldEntries = [];
+      try { oldEntries = fs.readdirSync(oldDir); } catch { allCopied = false; }
+      for (const child of oneDriveMigrationEntries(oldEntries)) copyChild(child);
       if (allCopied) {
         try { fs.writeFileSync(marker, new Date().toISOString()); } catch { /* non-fatal */ }
       }
@@ -332,16 +332,14 @@ function _relocateUserDataOffOneDrive() {
     }
   } catch { /* migration best-effort */ }
   // Override BOTH Electron's userData AND the backend's DATA_DIR so
-  // they stay in lockstep. The child-spawn code at line ~5085 reads
-  // `TRANSCRIPTOR_DATA_DIR` from process.env — setting it here means
-  // backend/config.py `_default_data_dir` picks up the override even
-  // though it never sees Electron's `app.setPath` call.
+  // they stay in lockstep: startBackend hands dataDir() — which reads
+  // TRANSCRIPTOR_DATA_DIR first — to the backend, which never sees
+  // Electron's `app.setPath` call.
   try { app.setPath("userData", newDir); } catch { /* path must be absolute on Win; already is */ }
   process.env.TRANSCRIPTOR_DATA_DIR = newDir;
-  // Cache note: main.log path switches to the new dir automatically
-  // on the next appendMainLog call (mainLogFilePath at line 227 is
-  // computed lazily from app.getPath). Old log in OneDrive'd path
-  // stays as an artefact — harmless.
+  // main.log follows on the next write (mainLogFilePath() is derived
+  // from dataDir(), never cached — DM-07). The lines written before this
+  // point stay in the old directory as an artefact.
 }
 // ── The data directory's name ───────────────────────────────────────
 //
@@ -352,8 +350,7 @@ function _relocateUserDataOffOneDrive() {
 // answer wherever the path is resolved or shown.
 //
 // Must run BEFORE anything reads ``app.getPath('userData')`` — the
-// OneDrive re-home below, ``appendMainLog`` (which caches the log path
-// on first use) and the single-instance lock all do.
+// OneDrive re-home below and the single-instance lock both do.
 function _useOneSpellingForUserDataDir() {
   const preferredName = userDataDirName(process.platform);
   const legacyName = app.getName();
@@ -363,7 +360,7 @@ function _useOneSpellingForUserDataDir() {
     app.getPath("appData"), legacyName, preferredName,
   );
   // Adopt the new spelling FIRST: everything below logs, and the logger
-  // pins its path to whatever userData says the moment it is called.
+  // writes to whatever dataDir() says at the moment of each line.
   try { app.setName(preferredName); } catch { /* pre-ready only; ignore */ }
 
   const statDir = (dir) => {
@@ -422,6 +419,24 @@ function _useOneSpellingForUserDataDir() {
 _useOneSpellingForUserDataDir();
 _relocateUserDataOffOneDrive();
 
+/**
+ * The data directory: TRANSCRIPTOR_DATA_DIR when set, else userData —
+ * the same directory the backend is told to use. Read live, never cached,
+ * so a relocation at boot (the OneDrive re-home) is followed by every
+ * reader including the logger. (Declared here, after the two boot steps
+ * that settle userData, so no reader can appear to precede them.)
+ */
+function dataDir() {
+  return resolveDataDir({
+    envDataDir: process.env.TRANSCRIPTOR_DATA_DIR,
+    userDataPath: app.getPath("userData"),
+  });
+}
+
+function mainLogFilePath() {
+  return path.join(dataDir(), MAIN_LOG_FILE);
+}
+
 let backend = null;
 let win = null;
 let recordingStatusWindow = null;
@@ -478,7 +493,6 @@ let shortcutToggleInFlight = false;
 let recordingStopInFlight = false;
 let pasteShortcutInFlight = false;
 let lastTranscriptText = "";
-let mainLogFilePath = "";
 let traceCounter = 0;
 // When the user last asked for the window, cleared when focus lands. The
 // distance to the focus event is the latency the user actually perceives.
@@ -647,7 +661,7 @@ let mainLogCheckCounter = 0;
 
 function mainLogArchivePath(kind) {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const base = `${mainLogFilePath}.${kind}-${stamp}`;
+  const base = `${mainLogFilePath()}.${kind}-${stamp}`;
   let candidate = base;
   for (let i = 1; fs.existsSync(candidate); i += 1) {
     candidate = `${base}-${i}`;
@@ -659,10 +673,10 @@ function recoverOrphanRotatingLogs() {
   // Rotation is rename→rename; a crash between the two steps leaves
   // ``main.log.<kind>-<stamp>.rotating`` orphans that nothing else ever
   // promotes — silently stranded support logs. Sweep them at boot.
-  if (!mainLogFilePath) return;
   try {
-    const dir = path.dirname(mainLogFilePath);
-    const prefix = path.basename(mainLogFilePath) + ".";
+    const logPath = mainLogFilePath();
+    const dir = path.dirname(logPath);
+    const prefix = path.basename(logPath) + ".";
     for (const name of fs.readdirSync(dir)) {
       if (!name.startsWith(prefix) || !name.endsWith(".rotating")) continue;
       const orphan = path.join(dir, name);
@@ -693,10 +707,10 @@ const MAIN_LOG_ARCHIVE_KEEP_BYTES = 50 * 1024 * 1024;
 const MAIN_LOG_ARCHIVE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 function pruneMainLogArchives() {
-  if (!mainLogFilePath) return;
   try {
-    const dir = path.dirname(mainLogFilePath);
-    const prefix = path.basename(mainLogFilePath) + ".";
+    const logPath = mainLogFilePath();
+    const dir = path.dirname(logPath);
+    const prefix = path.basename(logPath) + ".";
     const archives = [];
     for (const name of fs.readdirSync(dir)) {
       if (!name.startsWith(prefix)) continue;
@@ -732,11 +746,11 @@ function pruneMainLogArchives() {
 }
 
 function rotateMainLogIfNeeded() {
-  if (!mainLogFilePath) return;
+  const logPath = mainLogFilePath();
   try {
-    const st = fs.statSync(mainLogFilePath);
+    const st = fs.statSync(logPath);
     if (st.size < MAIN_LOG_MAX_BYTES) return;
-    const legacyPending = mainLogFilePath + ".rotating";
+    const legacyPending = logPath + ".rotating";
     if (fs.existsSync(legacyPending)) {
       try { fs.renameSync(legacyPending, mainLogArchivePath("recovered")); } catch { /* keep orphan in place */ }
     }
@@ -747,7 +761,7 @@ function rotateMainLogIfNeeded() {
     // timestamped archive. If any step fails, preserve the best available
     // file instead of unlinking it.
     try {
-      fs.renameSync(mainLogFilePath, pending);
+      fs.renameSync(logPath, pending);
     } catch {
       // Current log is locked — skip rotation this cycle. Next
       // amortised-counter tick will retry. main.log keeps growing
@@ -760,7 +774,7 @@ function rotateMainLogIfNeeded() {
       // Promotion failed. Restore the log to its original name so
       // appendFile keeps working. If THAT also fails, preserve the
       // pending file as a recovered archive.
-      try { fs.renameSync(pending, mainLogFilePath); } catch {
+      try { fs.renameSync(pending, logPath); } catch {
         try { fs.renameSync(pending, mainLogArchivePath("recovered")); } catch { /* keep pending in place */ }
       }
     }
@@ -769,9 +783,6 @@ function rotateMainLogIfNeeded() {
 
 function appendMainLog(message) {
   try {
-    if (!mainLogFilePath) {
-      mainLogFilePath = path.join(app.getPath("userData"), "main.log");
-    }
     const line = `[${new Date().toISOString()}] ${message}\n`;
     // Amortised rotation check — stat every 256 appends (& 0xff).
     // Must come BEFORE the append so we rotate the CURRENT main.log
@@ -788,7 +799,7 @@ function appendMainLog(message) {
     // appends cost ~0.5-1ms per line on local SSD; trace logging
     // peaks at ~20 lines/second which is still well under 2% of
     // main-process time. Acceptable cost for log durability.
-    fs.appendFileSync(mainLogFilePath, line, "utf8");
+    fs.appendFileSync(mainLogFilePath(), line, "utf8");
   } catch (e) {
     // Last-resort: the logger itself failed. Fall back to stderr so
     // we never silently lose signal.
@@ -940,7 +951,7 @@ function applyMacDockPolicy() {
 }
 
 function mainWindowStatePath() {
-  const dataDir = process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData");
+  const dataDir = dataDir();
   return path.join(dataDir, MAIN_WINDOW_STATE_FILE);
 }
 
@@ -2253,7 +2264,7 @@ function screenModeHelperPath() {
 // Where a take's screenshots are staged until its recording is saved; the
 // backend then moves them beside the recording (backend/screen_sessions.py).
 function screenModeStagingRoot() {
-  const dataDir = process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData");
+  const dataDir = dataDir();
   return path.join(dataDir, SCREEN_MODE.stagingDirName);
 }
 
@@ -3221,7 +3232,7 @@ function pasteTargetSummary(target) {
 
 function getLastTranscriptPath() {
   try {
-    return path.join(app.getPath("userData"), LAST_TRANSCRIPT_FILE);
+    return path.join(dataDir(), LAST_TRANSCRIPT_FILE);
   } catch {
     return "";
   }
@@ -6836,7 +6847,7 @@ function getEngineSiteDir() {
   // OUTSIDE the signed .app: torch must never live inside the bundle
   // (writes break the code signature; updates would wipe it). The
   // backend imports the engine through PYTHONPATH instead.
-  return path.join(app.getPath("userData"), "engine-site");
+  return path.join(dataDir(), "engine-site");
 }
 
 // Written into a staging tree only AFTER pip + reconciliation succeed
@@ -6928,7 +6939,7 @@ async function pickBackendPort(host, preferred = DEFAULT_BACKEND_PORT) {
 
 // ── App-scoped venv (persists across app updates) ──
 function getAppVenvDir() {
-  return path.join(app.getPath("userData"), ".venv");
+  return path.join(dataDir(), ".venv");
 }
 
 /**
@@ -6944,8 +6955,8 @@ function getAppVenvDir() {
  * Only deletes if:
  *   1. We successfully booted with the bundled runtime this session
  *      (caller guarantees this via call site in resolvePython).
- *   2. The path really is ``userData/.venv`` — not some other `.venv`
- *      the user symlinked in via TRANSCRIPTOR_DATA_DIR shenanigans.
+ *   2. The path really is ``<dataDir>/.venv`` — not some other `.venv`
+ *      reached through a symlink or a misconfigured directory.
  *   3. We haven't already cleaned it in a prior session
  *      (idempotency marker).
  *
@@ -6954,7 +6965,7 @@ function getAppVenvDir() {
  */
 function _cleanupOrphanedLegacyVenv() {
   try {
-    const userData = path.resolve(app.getPath("userData"));
+    const userData = path.resolve(dataDir());
     const marker = path.join(userData, ".legacy-venv-cleaned");
     if (fs.existsSync(marker)) return;
     const venvDir = getAppVenvDir();
@@ -7928,7 +7939,7 @@ async function startBackend() {
   const envPath = ffmpegDir
     ? `${ffmpegDir}${path.delimiter}${process.env.PATH || ""}`
     : (process.env.PATH || "");
-  const pythonCacheDir = path.join(app.getPath("userData"), "python-cache");
+  const pythonCacheDir = path.join(dataDir(), "python-cache");
   try {
     fs.mkdirSync(pythonCacheDir, { recursive: true });
   } catch (e) {
@@ -7958,7 +7969,7 @@ async function startBackend() {
     // signed Resources envelope.
     PYTHONDONTWRITEBYTECODE: "1",
     PYTHONPYCACHEPREFIX: pythonCacheDir,
-    TRANSCRIPTOR_DATA_DIR: process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData"),
+    TRANSCRIPTOR_DATA_DIR: dataDir(),
     TRANSCRIPTOR_BOOT_NONCE: BACKEND_BOOT_NONCE,
     TRANSCRIPTOR_PARENT_WATCHDOG: "1",
   });
@@ -8401,12 +8412,12 @@ async function createWindow(options = {}) {
       // archiveDir comes back from saveRecordingText which already
       // sanitises it via _resolve_recordings_target_dir on the backend
       // side, but defence-in-depth: only accept absolute paths under
-      // the userData root or under TRANSCRIPTOR_DATA_DIR / recordings.
+      // the data directory's recordings/ or the configured recordings root.
       const pathContains = (root, candidate) => {
         const rel = path.relative(root, candidate);
         return rel === "" || (!!rel && !rel.startsWith("..") && !path.isAbsolute(rel));
       };
-      const dataDir = process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData");
+      const dataDir = dataDir();
       const recordingsRoot = path.resolve(dataDir, "recordings");
       const allowedRecordingRoots = [recordingsRoot];
       try {
@@ -8713,7 +8724,7 @@ async function createWindow(options = {}) {
     if (shortcutCaptureAbortHandler) {
       shortcutCaptureAbortHandler(`did-fail-load:${code}`);
     }
-    const logPath = path.join(app.getPath("userData"), "main.log");
+    const logPath = mainLogFilePath();
     const msg =
       "Transcriptor could not load the app window.\n\n" +
       `Error: ${desc} (${code})\n\n` +
@@ -8953,7 +8964,7 @@ async function createWindow(options = {}) {
 
     // Platform-specific recovery instructions. Keep these tied to the
     // current root entrypoints instead of deleted legacy install scripts.
-    const logPath = path.join(app.getPath("userData"), "main.log");
+    const logPath = mainLogFilePath();
     let recoveryHtml;
     if (app.isPackaged) {
       recoveryHtml = (
@@ -9596,7 +9607,7 @@ app.whenReady().then(async () => {
   function readShortcutsFromConfig() {
     const defaults = shortcutDefaultsForPlatform();
     try {
-      const dataDir = process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData");
+      const dataDir = dataDir();
       const cfgPath = path.join(dataDir, "config.json");
       if (fs.existsSync(cfgPath)) {
         const raw = JSON.parse(fs.readFileSync(cfgPath, "utf8"));

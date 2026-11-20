@@ -58,6 +58,7 @@
       "recording-stop.js",
       "windows-paste-fallback.js",
       "renderer-toggle.js",
+      "data-dir.js",
       "power-events.js",
       "child-io.js",
       "paste-protocol.js",
