@@ -472,6 +472,87 @@ test("every mac dist script builds screen mode's helper before electron-builder;
   assert.doesNotMatch(mas, /^\s*bash \S*build-native\.sh/m);
 });
 
+// INSTALL_ON_OTHER_MAC.command defines its functions when sourced; these
+// drive them one at a time in a bash of their own.
+function installerBash(body) {
+  const { spawnSync } = require("node:child_process");
+  const installer = path.join(DESKTOP_DIR, "..", "INSTALL_ON_OTHER_MAC.command");
+  return spawnSync("bash", ["-c", `source "$1"\n${body}`, "bash", installer], { encoding: "utf8" });
+}
+
+const hasCodesign = fs.existsSync("/usr/bin/codesign") && fs.existsSync("/System/Applications/Calculator.app");
+
+test("the other-Mac installer refuses a build whose signature would strand the user's permissions", {
+  skip: hasCodesign ? false : "needs macOS codesign and its system apps",
+}, () => {
+  const os = require("node:os");
+  const { execFileSync } = require("node:child_process");
+  const calculator = "/System/Applications/Calculator.app";
+  const chess = "/System/Applications/Chess.app";
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "installer-identity-"));
+  try {
+    const adhoc = path.join(work, "X.app");
+    fs.mkdirSync(path.join(adhoc, "Contents", "MacOS"), { recursive: true });
+    fs.copyFileSync("/usr/bin/true", path.join(adhoc, "Contents", "MacOS", "X"));
+    fs.writeFileSync(
+      path.join(adhoc, "Contents", "Info.plist"),
+      '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>local.x</string><key>CFBundleExecutable</key><string>X</string></dict></plist>',
+    );
+    execFileSync("/usr/bin/codesign", ["-s", "-", "-f", adhoc], { stdio: "ignore" });
+
+    const check = (newApp, installed) => installerBash(`verify_identity_continuity "${newApp}" "${installed}"`);
+    assert.equal(check(calculator, calculator).status, 0, "same signer: install");
+    assert.equal(check(calculator, path.join(work, "missing.app")).status, 0, "nothing installed: install");
+    assert.equal(check(calculator, adhoc).status, 0, "over an ad-hoc copy: nothing to strand");
+    const other = check(calculator, chess);
+    assert.equal(other.status, 1, "another signer: refused");
+    assert.match(other.stderr, /different certificate/);
+    const adhocNew = check(adhoc, calculator);
+    assert.equal(adhocNew.status, 1, "an ad-hoc build: refused");
+    assert.match(adhocNew.stderr, /ad-hoc signed/);
+  } finally {
+    fs.rmSync(work, { recursive: true, force: true });
+  }
+});
+
+test("the other-Mac installer never replaces the bundle under a process that would not quit", () => {
+  // pgrep always finds it, pkill does nothing, the clock runs on sleep.
+  const run = installerBash(`
+    pgrep() { return 0; }
+    pkill() { return 0; }
+    osascript() { return 0; }
+    sleep() { SECONDS=$((SECONDS + 1)); }
+    quit_existing_app
+    echo "returned"
+  `);
+  assert.equal(run.status, 1, run.stdout);
+  assert.doesNotMatch(run.stdout, /returned/);
+  assert.match(run.stderr, /still running/);
+});
+
+test("the other-Mac installer's privileged helpers work before main() decides on sudo (set -u)", () => {
+  const run = installerBash("run_privileged true && echo ran");
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stdout, /ran/);
+});
+
+test("BUILD.command quits a running duplicate bundle before deleting it", () => {
+  const build = fs.readFileSync(path.join(DESKTOP_DIR, "..", "BUILD.command"), "utf8");
+  const start = build.indexOf("retire_duplicate_app_bundle() {");
+  const body = build.slice(start, build.indexOf("\n}\n", start));
+  const quit = body.indexOf('quit_running_app "$duplicate_app"');
+  assert.ok(quit > 0, "the duplicate is quit");
+  assert.ok(quit < body.indexOf('cleanup_path "$duplicate_app"'), "before it is deleted");
+});
+
+test("the TestFlight upload keeps the app-specific password off the command line", () => {
+  // A value in argv is readable by every local user through `ps` for the
+  // whole upload; altool reads `@env:<name>` from its own environment.
+  const upload = fs.readFileSync(path.join(DESKTOP_DIR, "scripts", "upload-testflight.sh"), "utf8");
+  assert.doesNotMatch(upload, /-p\s+"\$ASC_APP_SPECIFIC_PASSWORD"/);
+  assert.match(upload, /-p\s+"@env:ASC_APP_SPECIFIC_PASSWORD"/);
+});
+
 test("every module the desktop bundle ships is named in PROJECT_STRUCTURE.md", () => {
   // The structure map is where a reader looks first; a shipped module
   // missing from it (user-data-dir.js was, from the commit that added it)

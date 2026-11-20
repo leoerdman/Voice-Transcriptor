@@ -236,3 +236,60 @@ the code is. DX-29/H-03: window-lifecycle.js now states that `capsuleInteraction
 from a 700 ms clock in main.js (not an identity) and that a Dock click inside it is
 swallowed; the behavioural fix is main.js's (Cross-domain). Doc-only; no check beyond the
 grep that the stale words are gone.
+
+### C7 — DX-22, DX-21 (altool half), DX-23, H-6, H-7 (old desktop-findings IDs), H-12
+Files: `desktop/scripts/check-designated-requirement.js`, `desktop/scripts/upload-testflight.sh`,
+`INSTALL_ON_OTHER_MAC.command`, `BUILD.command`, `desktop/signing.test.js`, `desktop/packaging.test.js`.
+Check: `node --test --test-name-pattern="without a shell|TestFlight" desktop/signing.test.js desktop/packaging.test.js`
+and `node --test --test-name-pattern="other-Mac|BUILD.command quits" desktop/packaging.test.js`.
+
+DX-22/DX-21 before (both scripts at HEAD of C6):
+```
+exit=1
+✖ the TestFlight upload keeps the app-specific password off the command line (1.520208ms)
+  AssertionError [ERR_ASSERTION]: The input was expected to not match the regular expression /-p\s+"\$ASC_APP_SPECIFIC_PASSWORD"/.
+✖ the install-time requirement check reads the signature without a shell (89.9165ms)
+  AssertionError [ERR_ASSERTION]: a command in the bundle path was executed
+  true !== false
+```
+(the second is a real injection: an unsigned bundle under a directory named
+`inj-$(touch pwned)` made the old `/bin/sh -c` fallback create `pwned`.)
+After:
+```
+exit=0
+✔ the TestFlight upload keeps the app-specific password off the command line (1.700625ms)
+✔ the install-time requirement check reads the signature without a shell (58.203042ms)
+```
+
+Installer/BUILD before (INSTALL_ON_OTHER_MAC.command and BUILD.command at HEAD):
+```
+exit=1
+✖ the other-Mac installer refuses a build whose signature would strand the user's permissions (440.636ms)
+✖ the other-Mac installer never replaces the bundle under a process that would not quit (189.890375ms)
+✖ the other-Mac installer's privileged helpers work before main() decides on sudo (set -u) (76.783625ms)
+✖ BUILD.command quits a running duplicate bundle before deleting it (0.289209ms)
+ℹ pass 0
+ℹ fail 4
+```
+Because the HEAD installer runs `main` when sourced, the same three installer tests were
+also run against HEAD logic with only the source guard added — they still fail on the
+defects themselves:
+```
+✖ the other-Mac installer refuses a build whose signature would strand the user's permissions (169.578208ms)
+  AssertionError [ERR_ASSERTION]: same signer: install          (no verify_identity_continuity at all)
+✖ the other-Mac installer never replaces the bundle under a process that would not quit (49.241458ms)
+  AssertionError [ERR_ASSERTION]: [Transcriptor installer] Stopping still-running Transcriptor process
+  returned
+  0 !== 1                                                        (H-7: pkill, sleep 1, break, carry on)
+✖ the other-Mac installer's privileged helpers work before main() decides on sudo (set -u) (199.716917ms)
+  AssertionError [ERR_ASSERTION]: The input did not match the regular expression /ran/. Input: ''   (H-6: NEEDS_SUDO unbound)
+```
+After:
+```
+exit=0
+ℹ pass 4
+ℹ fail 0
+```
+DX-23 manifest half: `app_id=` in the manifest beside the installer is written by
+BUILD.command into the same kit as the DMG; whoever can replace the manifest can replace
+the DMG, so it is not a trust boundary — left as is (see Not done).

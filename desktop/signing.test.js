@@ -278,6 +278,34 @@ test("afterPack's helper check: a mac build must carry screen-input, an App Stor
   }
 });
 
+test("the install-time requirement check reads the signature without a shell", {
+  skip: fs.existsSync("/usr/bin/codesign") ? false : "codesign is macOS-only",
+}, () => {
+  // The bundle path comes from $TRANSCRIPTOR_INSTALL_DIR. An unsigned
+  // bundle sent the old script to `/bin/sh -c "codesign … <path>"`, where
+  // `$(…)` in the path ran.
+  const os = require("node:os");
+  const { spawnSync } = require("node:child_process");
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "dr-check-"));
+  try {
+    const app = path.join(work, "inj-$(touch pwned)", "Unsigned.app");
+    fs.mkdirSync(path.join(app, "Contents"), { recursive: true });
+    fs.writeFileSync(
+      path.join(app, "Contents", "Info.plist"),
+      '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>local.transcriptor.app</string></dict></plist>',
+    );
+    const run = spawnSync(process.execPath, [path.join(__dirname, "scripts", "check-designated-requirement.js"), app], {
+      cwd: work,
+      encoding: "utf8",
+    });
+    assert.equal(fs.existsSync(path.join(work, "pwned")), false, "a command in the bundle path was executed");
+    assert.equal(run.status, 1);
+    assert.match(run.stderr, /Refusing to install/);
+  } finally {
+    fs.rmSync(work, { recursive: true, force: true });
+  }
+});
+
 test("afterPack runs the helper check for every mac flavour, before signing", () => {
   const afterPack = fs.readFileSync(path.join(__dirname, "afterPack.js"), "utf8");
   const check = afterPack.indexOf("assertScreenInputHelper(appPath, { expected: !isMas })");
