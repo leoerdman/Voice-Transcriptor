@@ -7,7 +7,7 @@ and standard text completions for upscale/post-processing.
 import base64
 import logging
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from backend.audio_mime import audio_content_type
 from backend.http_retry import RemoteError, request_with_retry
@@ -32,7 +32,17 @@ class OpenRouterError(RemoteError):
     under the alias ``OrRemoteError`` and pretended it was a distinct
     type — catching ``(OrRemoteError, DgRemoteError)`` was just
     catching ``RemoteError`` twice with no provider discrimination.
+
+    ``status_code`` is the HTTP status OpenRouter answered with, when the
+    failure IS an HTTP answer (``None`` otherwise: no key, a malformed
+    body, an empty completion). Callers decide on it — the upscale
+    model fallback used to search the message for "HTTP 404" / "not
+    found", which also matched unrelated prose (BM-13).
     """
+
+    def __init__(self, message: str, *, status_code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 # One endpoint, named once: both calls below post to it.
@@ -169,11 +179,11 @@ def openrouter_transcribe(
     # Keep retry count bounded for interactive live-final use. The 2nd
     # attempt catches transient edge failures; a 3rd stalled attempt is
     # usually just extra UI latency before local fallback.
-    upload_retries = 2
+    upload_attempts = 2
     r = request_with_retry(
         "POST", url, headers=headers, json=payload,
         timeout=(10, read_timeout),
-        retries=upload_retries,
+        attempts=upload_attempts,
     )
 
     if r.status_code >= 400:
@@ -187,9 +197,10 @@ def openrouter_transcribe(
         if "input_audio" in lowered or "image input" in lowered:
             raise RemoteError(
                 f"Model '{model}' does not support audio input. Please use a model that supports audio, "
-                f"such as: {', '.join(OPENROUTER_AUDIO_MODELS)}"
+                f"such as: {', '.join(OPENROUTER_AUDIO_MODELS)}",
+                status_code=r.status_code,
             )
-        raise RemoteError(f"openrouter failed: HTTP {r.status_code} {error_text}")
+        raise RemoteError(f"openrouter failed: HTTP {r.status_code} {error_text}", status_code=r.status_code)
 
     js = _json_response(r, "OpenRouter transcribe")
     text = ""
@@ -272,7 +283,10 @@ def openrouter_upscale_text(
     r = request_with_retry("POST", url, headers=headers, json=payload, timeout=(10, 120))
 
     if r.status_code >= 400:
-        raise RemoteError(f"openrouter upscale failed: HTTP {r.status_code} {r.text[:400]}")
+        raise RemoteError(
+            f"openrouter upscale failed: HTTP {r.status_code} {r.text[:400]}",
+            status_code=r.status_code,
+        )
 
     js = _json_response(r, "OpenRouter upscale")
     try:

@@ -328,7 +328,9 @@ class RecordingNameTests(unittest.TestCase):
             self.main._record_recovery_chunk(recovery, b"\x01\x02\x03")
 
             self.assertEqual(recovery["bytes"], 2)
-            self.assertEqual(Path(recovery["pcm_path"]).read_bytes(), b"\x01\x02")
+            # Read through the spool reader, which flushes the writer's
+            # buffer first (BW-13) — the way finalize-time recovery reads it.
+            self.assertEqual(self.main._recovery_spool_bytes(recovery), b"\x01\x02")
         finally:
             try:
                 recovery["pcm_file"].close()

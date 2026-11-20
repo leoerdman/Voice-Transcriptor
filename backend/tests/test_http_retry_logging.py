@@ -63,7 +63,7 @@ class RetryLoggingTests(unittest.TestCase):
         with mock.patch(
             "backend.http_retry._SESSION.request", side_effect=responses
         ), self.assertLogs("backend.http_retry", level="INFO") as captured:
-            resp = request_with_retry("GET", "https://x.test/v1/a", retries=3)
+            resp = request_with_retry("GET", "https://x.test/v1/a", attempts=3)
         self.assertEqual(resp.status_code, 200)
         joined = "\n".join(captured.output)
         self.assertIn("HTTP 503, retrying", joined)
@@ -80,7 +80,7 @@ class RetryLoggingTests(unittest.TestCase):
         with mock.patch(
             "backend.http_retry._SESSION.request", side_effect=responses
         ), self.assertLogs("backend.http_retry", level="INFO") as captured:
-            request_with_retry("GET", "https://x.test/v1/a", retries=3)
+            request_with_retry("GET", "https://x.test/v1/a", attempts=3)
         joined = "\n".join(captured.output)
         self.assertIn("source=retry-after", joined)
         self.assertIn("HTTP 429", joined)
@@ -90,7 +90,7 @@ class RetryLoggingTests(unittest.TestCase):
             "backend.http_retry._SESSION.request",
             side_effect=[requests.ConnectionError("reset"), FakeResponse(200)],
         ), self.assertLogs("backend.http_retry", level="INFO") as captured:
-            request_with_retry("GET", "https://x.test/v1/a", retries=3)
+            request_with_retry("GET", "https://x.test/v1/a", attempts=3)
         self.assertIn("ConnectionError, retrying", "\n".join(captured.output))
 
     def test_a_clean_first_attempt_logs_nothing(self) -> None:
@@ -100,7 +100,7 @@ class RetryLoggingTests(unittest.TestCase):
         with mock.patch(
             "backend.http_retry._SESSION.request", return_value=FakeResponse(200)
         ), self.assertNoLogs(logger, level="INFO"):
-            request_with_retry("GET", "https://x.test/v1/a", retries=3)
+            request_with_retry("GET", "https://x.test/v1/a", attempts=3)
 
     def test_a_caller_error_is_returned_without_a_retry_record(self) -> None:
         # 401 is a bad key: no amount of retry fixes it, and it is the
@@ -109,7 +109,7 @@ class RetryLoggingTests(unittest.TestCase):
         with mock.patch(
             "backend.http_retry._SESSION.request", return_value=FakeResponse(401)
         ), self.assertNoLogs(logger, level="INFO"):
-            resp = request_with_retry("POST", "https://x.test/v1/a", retries=3)
+            resp = request_with_retry("POST", "https://x.test/v1/a", attempts=3)
         self.assertEqual(resp.status_code, 401)
 
 
@@ -128,7 +128,7 @@ class GivingUpTests(unittest.TestCase):
             side_effect=requests.ReadTimeout("no answer"),
         ), self.assertLogs("backend.http_retry", level="WARNING") as captured:
             with self.assertRaises(RemoteError):
-                request_with_retry("POST", "https://x.test/v1/listen", retries=3)
+                request_with_retry("POST", "https://x.test/v1/listen", attempts=3)
         joined = "\n".join(captured.output)
         self.assertIn("read timeout on a non-idempotent request", joined)
         self.assertIn("may already have processed", joined)
@@ -139,7 +139,7 @@ class GivingUpTests(unittest.TestCase):
             "backend.http_retry._SESSION.request",
             side_effect=[requests.ReadTimeout("slow"), FakeResponse(200)],
         ):
-            resp = request_with_retry("GET", "https://x.test/v1/a", retries=3)
+            resp = request_with_retry("GET", "https://x.test/v1/a", attempts=3)
         self.assertEqual(resp.status_code, 200)
 
     def test_the_final_failure_records_attempts_and_elapsed(self) -> None:
@@ -148,7 +148,7 @@ class GivingUpTests(unittest.TestCase):
             side_effect=requests.ConnectionError("down"),
         ), self.assertLogs("backend.http_retry", level="WARNING") as captured:
             with self.assertRaises(RemoteError):
-                request_with_retry("GET", "https://x.test/v1/a", retries=3)
+                request_with_retry("GET", "https://x.test/v1/a", attempts=3)
         joined = "\n".join(captured.output)
         self.assertIn("giving up after 3 attempts", joined)
         self.assertIn("ConnectionError", joined)
@@ -170,7 +170,7 @@ class SupersededResponseIsReleasedTests(unittest.TestCase):
     def test_closed_when_a_later_attempt_succeeds(self) -> None:
         transient, ok = self._closable(503), self._closable(200)
         with mock.patch("backend.http_retry._SESSION.request", side_effect=[transient, ok]):
-            self.assertIs(request_with_retry("GET", "https://x.test/a", retries=3), ok)
+            self.assertIs(request_with_retry("GET", "https://x.test/a", attempts=3), ok)
         transient.close.assert_called_once()
         ok.close.assert_not_called()
 
@@ -181,7 +181,7 @@ class SupersededResponseIsReleasedTests(unittest.TestCase):
             side_effect=[transient, requests.ConnectionError("down"), requests.ConnectionError("down")],
         ):
             with self.assertRaises(RemoteError):
-                request_with_retry("GET", "https://x.test/a", retries=3)
+                request_with_retry("GET", "https://x.test/a", attempts=3)
         transient.close.assert_called_once()
 
 

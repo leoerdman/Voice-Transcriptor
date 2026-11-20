@@ -74,6 +74,48 @@ class UpscalePresetContractTests(unittest.TestCase):
         self.assertEqual(len(upscale.call_args.kwargs["text"]), self.main.MAX_UPSCALE_INPUT_CHARS)
         self.assertEqual(upscale.call_args.kwargs["text"], oversized[11:])
 
+    def test_model_fallback_is_decided_by_the_http_status_not_the_wording(self):
+        # BM-13: "HTTP 404" / "not found" in the message used to decide it.
+        from backend.remote_openrouter import OpenRouterError
+
+        self.main.save_config({
+            "providers": {"openrouter": {"key": "sk-or-v1-test-upscale-key-12345678"}},
+            "preferences": {},
+        })
+        gone = OpenRouterError("no endpoints for this model", status_code=404)
+        with mock.patch.object(
+            self.main, "openrouter_upscale_text",
+            side_effect=[gone, {"text": "From the fallback"}],
+        ) as upscale:
+            response = asyncio.run(self.main.upscale_text({"text": "raw"}, _auth=None))
+        self.assertEqual(response["text"], "From the fallback")
+        self.assertEqual(upscale.call_count, 2)
+
+        # A non-404 failure whose prose says "not found" is not a missing model.
+        worded = OpenRouterError("openrouter upscale failed: HTTP 400 audio file not found", status_code=400)
+        with mock.patch.object(
+            self.main, "openrouter_upscale_text",
+            side_effect=[worded, {"text": "must not be reached"}],
+        ) as upscale:
+            with self.assertRaises(self.main.HTTPException) as raised:
+                asyncio.run(self.main.upscale_text({"text": "raw"}, _auth=None))
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual(upscale.call_count, 1)
+
+    def test_an_http_failure_carries_its_status(self):
+        from backend import remote_openrouter
+
+        class _Resp:
+            status_code = 404
+            text = "model gone"
+
+        with mock.patch.object(remote_openrouter, "request_with_retry", return_value=_Resp()):
+            with self.assertRaises(remote_openrouter.OpenRouterError) as raised:
+                remote_openrouter.openrouter_upscale_text(
+                    api_key="k", model="m", text="t", instruction="i"
+                )
+        self.assertEqual(raised.exception.status_code, 404)
+
 
 class BuiltinPresetIdSsotTests(unittest.TestCase):
     """One list of built-in presets (B-030).

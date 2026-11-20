@@ -48,7 +48,7 @@ class OpenRouterJsonTests(unittest.TestCase):
         self.assertEqual(out["text"], "hello")
         kwargs = req.call_args.kwargs
         self.assertEqual(kwargs["timeout"], (10, 45))
-        self.assertEqual(kwargs["retries"], 2)
+        self.assertEqual(kwargs["attempts"], 2)
         audio_part = kwargs["json"]["messages"][0]["content"][1]
         self.assertEqual(audio_part["input_audio"]["format"], "opus")
 

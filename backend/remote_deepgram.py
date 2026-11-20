@@ -202,13 +202,13 @@ def deepgram_transcribe(
         "Content-Type": content_type,
     }
 
-    timeout, upload_retries = _deepgram_http_policy(len(audio_bytes))
+    timeout, upload_attempts = _deepgram_http_policy(len(audio_bytes))
     logger.info(
         "deepgram_transcribe: model=%s, audio=%d bytes timeout=%s attempts=%d keyterms=%d",
         model,
         len(audio_bytes),
         timeout,
-        upload_retries,
+        upload_attempts,
         len(kt_pairs),
     )
     # Adaptive timeout for Deepgram REST uploads.
@@ -235,7 +235,7 @@ def deepgram_transcribe(
         params=params,
         data=audio_bytes,
         timeout=timeout,
-        retries=upload_retries,
+        attempts=upload_attempts,
     )
 
     if r.status_code >= 400:

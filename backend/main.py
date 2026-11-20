@@ -148,6 +148,7 @@ from backend.remote_deepgram_live import (
     resolve_live_language,
 )
 from backend.transcribe import (
+    _env_int,  # the one integer-env parser (BE-22); transcribe_gigaam uses it too
     merge_channel_transcripts,
     model_is_resident,
     start_idle_model_sweeper,
@@ -698,26 +699,6 @@ def _websocket_accept_subprotocol(websocket: WebSocket) -> Optional[str]:
     raw_protocols = websocket.headers.get("sec-websocket-protocol") or ""
     offered = {item.strip() for item in raw_protocols.split(",") if item.strip()}
     return WS_AUTH_SUBPROTOCOL if WS_AUTH_SUBPROTOCOL in offered else None
-
-
-def _env_int(name: str, default: int) -> int:
-    """Parse an integer env var with graceful fallback.
-
-    A non-numeric value (e.g., ``TRANSCRIPTOR_RESULT_RETENTION_SEC=1h``)
-    would otherwise crash module import with ValueError before FastAPI
-    ever starts, and Electron would see the backend child die
-    repeatedly with no diagnostic. Degrade to the documented default
-    with a warning so the backend boots and the misconfiguration is
-    visible in the log.
-    """
-    raw = (os.environ.get(name) or "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        logger.warning("invalid integer env %s=%r; using default=%d", name, raw, default)
-        return default
 
 
 RESULT_RETENTION_SEC = _env_int("TRANSCRIPTOR_RESULT_RETENTION_SEC", 86400)
@@ -4645,6 +4626,16 @@ def _normalize_live_provider(raw: Optional[str]) -> str:
     return "local"
 
 
+# The recovery spool is written through a buffer of this size (BW-13).
+# It used to be opened unbuffered: one ``write()`` syscall per renderer
+# frame, on the event loop, for every live session. 16 KiB is half a
+# second of 16 kHz mono PCM16 — what a backend PROCESS crash can cost
+# (the kernel keeps everything already flushed); the readers that look
+# at the spool while the session still holds it flush it first
+# (``_flush_recovery_spool``), and finalize flushes and fsyncs.
+LIVE_RECOVERY_WRITE_BUFFER_BYTES = 16 * 1024
+
+
 def _open_live_recovery(
     *,
     session_id: str,
@@ -4704,7 +4695,7 @@ def _open_live_recovery(
     atomic_write_json(meta_path, meta_payload)
 
     try:
-        pcm_file = pcm_path.open("wb", buffering=0)
+        pcm_file = pcm_path.open("wb", buffering=LIVE_RECOVERY_WRITE_BUFFER_BYTES)
     except BaseException:
         _best_effort_unlink(pcm_path, context="live recovery open rollback")
         _best_effort_unlink(meta_path, context="live recovery open rollback")
@@ -4734,6 +4725,27 @@ def _open_live_recovery(
 def _mark_recovery_error(recovery: Optional[dict]) -> None:
     if recovery is not None:
         recovery["had_error"] = True
+
+
+def _flush_recovery_spool(recovery: Optional[dict]) -> None:
+    """Push what the spool's write buffer holds to the file, so a reader
+    that opens the file by path while the session still holds the handle
+    sees every chunk ``_record_recovery_chunk`` accepted.
+
+    A failed flush means accepted audio did not land: the session stops
+    writing and is marked degraded, the same as a failed write."""
+    if not recovery:
+        return
+    f = recovery.get("pcm_file")
+    if f is None or getattr(f, "closed", False):
+        return
+    try:
+        f.flush()
+    except OSError as e:
+        recovery["write_failed"] = True
+        recovery["had_error"] = True
+        recovery["write_error"] = _safe_error_text(e)
+        logger.warning("live recovery flush failed; disabling recovery writes for this session: %s", e)
 
 
 def _record_recovery_chunk(recovery: Optional[dict], data: bytes) -> None:
@@ -4835,6 +4847,9 @@ def _finalize_live_recovery(recovery: dict) -> None:
                 # all we can promise on those platforms.
                 logger.debug("live recovery fsync skipped: %s", fsync_err)
         except OSError as flush_err:
+            # With a buffered writer a flush failure is lost audio, not
+            # just lost durability: the take is degraded.
+            recovery["had_error"] = True
             logger.warning("live recovery flush/fsync failed: %s", flush_err)
     finally:
         # Close ALWAYS runs — even on flush() failure. FD never leaks.
@@ -4891,9 +4906,9 @@ def _recovery_spool_bytes(recovery: Optional[dict]) -> bytes:
       pre-connect reader, by the receiver, and by the finalize drain, so
       audio captured while ``connect()`` was still in flight (or after
       the upstream died) is in it too;
-    * the file is opened UNBUFFERED (``_open_live_recovery``), so
-      everything ``_record_recovery_chunk`` accepted is already visible
-      to this read even though the writer still holds the handle;
+    * the writer's buffer is flushed first (``_flush_recovery_spool``),
+      so everything ``_record_recovery_chunk`` accepted is visible to
+      this read even though the writer still holds the handle;
     * nothing deletes it while the WebSocket handler owns it: a save or
       discard that arrives meanwhile is deferred until the handler's
       ``finally`` has finalized it (``_safe_delete_live_recovery``) —
@@ -4909,6 +4924,7 @@ def _recovery_spool_bytes(recovery: Optional[dict]) -> bytes:
     pcm_path = recovery.get("pcm_path")
     if pcm_path is None:
         return b""
+    _flush_recovery_spool(recovery)
     try:
         size = Path(pcm_path).stat().st_size
     except OSError as e:
@@ -4947,6 +4963,7 @@ def _recovery_spool_seconds(recovery: Optional[dict]) -> float:
     pcm_path = recovery.get("pcm_path")
     if pcm_path is None:
         return 0.0
+    _flush_recovery_spool(recovery)
     try:
         size = Path(pcm_path).stat().st_size
     except OSError:
@@ -7467,9 +7484,10 @@ async def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require
                 break
             except OpenRouterError as e:
                 last_err = e
-                msg = str(e)
-                # Retry with fallback models only for invalid/non-existing model issues.
-                if ("HTTP 404" in msg) or ("not found" in msg.lower()):
+                # Fall back to the next model only when OpenRouter says
+                # this one does not exist (HTTP 404) — decided on the
+                # status, not on words in the message (BM-13).
+                if e.status_code == 404:
                     continue
                 raise
             except RemoteError as e:

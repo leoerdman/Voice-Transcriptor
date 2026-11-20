@@ -182,3 +182,51 @@ vitest cases (the old renderer had no reading at all — `customCount >= 3`,
 literal 1 MiB / 13 s).
 
 Suites: backend 995 OK; desktop 436; vitest 607; typecheck, lint, build clean.
+
+## C6 — BW-13, BE-22, BM-13, BM-24 (backend debts)
+
+Files: `backend/main.py`, `backend/transcribe.py`, `backend/http_retry.py`,
+`backend/remote_openrouter.py`, `backend/remote_deepgram.py`; tests
+`backend/tests/test_live.py`, `test_upscale_presets.py`,
+`test_recording_names.py`, `test_remote_openrouter.py`,
+`test_http_retry_logging.py`, `test_error_honesty.py`.
+
+- BW-13: the recovery spool is opened with a 16 KiB buffer
+  (`LIVE_RECOVERY_WRITE_BUFFER_BYTES`, ½ s of audio) instead of
+  `buffering=0` — no more one `write()` syscall per renderer frame on the
+  event loop. The two readers that look at the file while the session holds
+  it (`_recovery_spool_bytes`, `_recovery_spool_seconds`) flush first
+  (`_flush_recovery_spool`, a failed flush degrades the take like a failed
+  write); finalize flushes + fsyncs as before and now marks the take
+  `had_error` when that flush fails (buffered data would be lost). Trade-off,
+  stated at the constant: a backend PROCESS crash may lose up to ½ s that was
+  still in the buffer (the kernel keeps everything flushed). The finding's
+  other half (`asyncio.to_thread` for the finalize read) is in
+  `deepgram_recovery` (engines lane) — not touched.
+  `test_recording_names` read the file by path while the handle was open
+  (relied on unbuffered); it now reads through `_recovery_spool_bytes`.
+- BE-22: main.py's copy of `_env_int` removed; main imports
+  `backend.transcribe._env_int` (as `transcribe_gigaam` already did), which
+  got the explanatory docstring. Behaviour identical.
+- BM-13: `OpenRouterError(message, status_code=…)` carries the HTTP status
+  for HTTP failures (transcribe, audio-unsupported, upscale); the upscale
+  model fallback continues on `status_code == 404` only, not on "HTTP 404" /
+  "not found" in the prose. Not done: the `http_retry` hint substrings — they
+  only decorate the final error message (no control flow), and DNS failures
+  are only distinguishable by text in `requests`.
+- BM-24: `request_with_retry(retries=…)` → `attempts=…` with the callers
+  (`remote_deepgram`, `remote_openrouter`) and tests. The `last_resp` close
+  half was already fixed (C9 of the archive lane).
+
+Check — new/changed tests against the previous five backend modules:
+```
+before:  ERROR test_an_http_failure_carries_its_status
+         ERROR test_model_fallback_is_decided_by_the_http_status_not_the_wording
+         ERROR test_transcribe_short_audio_uses_interactive_timeout_and_canonical_mime  (kwargs["attempts"])
+         FAIL  test_main_uses_the_shared_parser
+         FAIL  test_small_frames_are_buffered_not_written_one_by_one   (BW-13, separate run)
+after:   all OK
+```
+Suites: backend 1002 OK (one full run hit a wall-clock flake in
+`test_deepgram_finalize_budget` under machine load — passes 3/3 alone and in
+the re-run of the full suite); desktop 436; vitest 607; typecheck, lint, build clean.
