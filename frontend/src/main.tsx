@@ -9399,16 +9399,6 @@ function shouldLivePreview(): boolean {
 });
 
 /**
- * Fill the dual-stream secondary-language select from ``#language``.
- *
- * The language list is written out once, in index.html, on ``#language``.
- * Copying it into a second markup block — or into a constant here —
- * would be a second source that drifts the first time a language is
- * added. "Auto" is the one option that cannot appear: the secondary
- * stream exists precisely to be monolingual, and an Auto secondary would
- * be the multi stream twice.
- */
-/**
  * Copy ``#language``'s options onto ``#uploadLanguage``.
  *
  * The comment on the live language wiring states the rule outright —
@@ -9431,6 +9421,16 @@ function fillUploadLanguageOptions(): void {
   }
 }
 
+/**
+ * Fill the dual-stream secondary-language select from ``#language``.
+ *
+ * The language list is written out once, in index.html, on ``#language``.
+ * Copying it into a second markup block — or into a constant here —
+ * would be a second source that drifts the first time a language is
+ * added. "Auto" is the one option that cannot appear: the secondary
+ * stream exists precisely to be monolingual, and an Auto secondary would
+ * be the multi stream twice.
+ */
 function fillDualSecondaryLanguageOptions(): void {
   const target = dualSecondaryLanguageSelect();
   if (!target || target.options.length) return;
@@ -9498,8 +9498,12 @@ let wsPendingFrames: ArrayBuffer[] = [];
 // holds the worklet's input quantum (e.g. 128 samples at 48 kHz),
 // which downsamples to ~42.7 output samples — 500 frames were ~1.3 s
 // of audio, not the 4 s the old comment promised, so a slow handshake
-// silently dropped opening words. 64 000 samples = 4 s at 16 kHz.
-const WS_PENDING_MAX_SAMPLES = 64_000;
+// silently dropped opening words. The cap is a DURATION, so it is
+// derived from the live sample rate the backend reports (8-96 kHz)
+// rather than written as 64 000 samples — which is 4 s only at 16 kHz
+// and 1.3 s at 48 kHz, the same regression again (FL-06).
+const WS_PENDING_MAX_SEC = 4;
+const wsPendingMaxSamples = (): number => LIVE_SAMPLE_RATE_HZ * WS_PENDING_MAX_SEC;
 let wsPendingFrameSamples = 0;
 /**
  * Frames captured for this session that never reached the backend —
@@ -9591,10 +9595,6 @@ function liveRecordingCollection(mode: LiveRecordingMode): RecordingCollection {
 }
 
 /**
- * Ask main to end the screen-mode session of the take that is stopping.
- * Never throws: a failure means "no marks", not "no transcript".
- */
-/**
  * The screen marks of a recording already in the archive, from its
  * archived manifest — empty for any recording that is not a screen-mode
  * one. Every transcript produced for a saved recording goes through this
@@ -9621,6 +9621,10 @@ async function screenMarksForSavedRecording(
   }
 }
 
+/**
+ * Ask main to end the screen-mode session of the take that is stopping.
+ * Never throws: a failure means "no marks", not "no transcript".
+ */
 async function finishScreenSession(id: string, discard: boolean): Promise<ReturnType<typeof parseScreenManifest>> {
   if (!id || typeof window.transcriptor?.screenFinish !== "function") return null;
   try {
@@ -9730,7 +9734,6 @@ let captureLevel = createCaptureLevel();
 let liveDraftText = "";
 let liveDraftDisplayText = "";
 let liveInterimText = "";
-let liveTranscriptSegments: TranscriptSegment[] = [];
 let liveRecordingSeq = 0;
 let currentRecordingId = 0;
 let stopTransitionInFlight = false;
@@ -9761,7 +9764,6 @@ function markStartPhase(label: string): void {
 }
 let flushRequestSeq = 0;
 const pendingWorkletFlushes = new Map<string, () => void>();
-let liveWsMode: LiveWsMode = "none";
 
 function liveStatusSnapshot(): LiveStatusSnapshot {
   return {
@@ -9844,11 +9846,20 @@ function commitPreArmedFallback(): void {
   for (const frame of buffered) pushCapturedFrame(frame);
 }
 
+/**
+ * Tell the user the capture fell back to the ScriptProcessor path. A
+ * session notice, not a line in the preview text: every ``segments`` /
+ * ``interim`` event rewrites the preview several times a second, and with
+ * preview off it was never shown at all — the only durable trace was a
+ * console line (FL-09).
+ */
 function showMicFallbackNotice(): void {
-  if (!shouldLivePreview()) return;
-  const cur = liveDraftDisplayText || "";
-  if (cur.includes("[Mic fallback engaged]")) return;
-  setLiveDraftState(liveDraftText, (cur ? `${cur}\n` : "") + "[Mic fallback engaged]");
+  showRecordSessionNotice(
+    "Mic fallback engaged: the audio worklet delivered no frames, so capture switched to the compatibility path. The recording continues.",
+    "warning",
+    UI_TOKENS.notice.defaultMs,
+    activeLiveSessionId,
+  );
 }
 
 /**
@@ -9952,7 +9963,7 @@ async function releaseOrphanedAudioContext(reason: string): Promise<void> {
 //     are null;
 //   • it does not exist.
 //
-// Ownership MOVES, it is never shared: ``holdWarmCapture`` empties the
+// Ownership MOVES, it is never shared: ``commitWarmCaptureHold`` empties the
 // module slots as it fills the hold, ``takeWarmCapture`` empties the
 // hold as the next session fills the slots. That is what keeps a
 // failed start from closing a context the hold still points at, and a
@@ -10225,7 +10236,7 @@ function takeWarmCapture(requestedDeviceId: string): WarmCapture | null {
 // because ``decideWarmReuse`` hands it its own rejection reasons; this
 // wrapper is what holds the lifecycle listeners to the named set.
 // Declared, not assigned to a const: the expiry timer in
-// ``holdWarmCapture`` above refers to it, and a hoisted declaration
+// ``commitWarmCaptureHold`` refers to it, and a hoisted declaration
 // cannot be reached before it exists.
 function releaseWarmCaptureOnLifecycle(reason: WarmHoldLifecycleRelease): void {
   releaseWarmCapture(reason);
@@ -10589,7 +10600,6 @@ function hasStreamingActivity(buffer: LiveTranscriptBuffer | null): boolean {
 }
 
 function projectLiveTranscriptBufferToActiveState(buffer: LiveTranscriptBuffer): void {
-  liveTranscriptSegments = buffer.segments;
   liveInterimText = buffer.interimText;
   setLiveDraftState(buffer.committedText, buffer.committedDisplayText);
 }
@@ -10702,9 +10712,9 @@ function logger_warn_client(message: string): void {
  *      that need to know what the UI is currently showing. This is also
  *      what drives the ``$finalOutput`` DOM element.
  *
- * All callers go through ``publishRecordingFinalSignal`` (which passes a
- * session token) or ``publishRecordingOutput`` directly. One call = one
- * atomic update of both channels plus the DOM.
+ * All callers go through ``publishRecordingOutput`` (with a session
+ * token where the call belongs to one). One call = one atomic update of
+ * both channels plus the DOM.
  */
 /**
  * How many finished recordings stay on ``window.__transcriptorFinishedRecords``.
@@ -10842,28 +10852,6 @@ function clearRecordingOutput(): void {
   window.__transcriptorLastUiFinalKind = "";
 }
 
-function clearRecordingFinalSignal(): void {
-  clearRecordingOutput();
-}
-
-function publishRecordingFinalSignal(opts: {
-  recordingId: number;
-  signalText?: string;
-  domText?: string;
-  kind?: RecordingFinalSignalKind;
-  phase?: string;
-  sessionToken?: string;
-}): void {
-  publishRecordingOutput({
-    recordingId: opts.recordingId,
-    pasteText: opts.signalText,
-    domText: opts.domText,
-    kind: opts.kind,
-    phase: opts.phase,
-    sessionToken: opts.sessionToken,
-  });
-}
-
 /**
  * Live-output render coalescing.
  *
@@ -10896,7 +10884,6 @@ function scheduleLiveOutputRender(): void {
       // The display contract (including the exact status wording) is
       // the unit-tested pure function in ./live-pane.
       const status = livePaneDisplayText({
-        previewEnabled: false,
         recording: isRecording,
         started: startAt > 0,
         timerText: liveTimerText,
@@ -10951,7 +10938,6 @@ function resetLiveDraftState(): void {
   liveDraftText = "";
   liveDraftDisplayText = "";
   liveInterimText = "";
-  liveTranscriptSegments = [];
   syncLiveOutputFromState();
 }
 
@@ -11242,6 +11228,10 @@ function pushCapturedFrame(input: Float32Array, preRollMs = 0): void {
   // producing frames immediately on mic connect, but the WS handshake
   // can take 50-300 ms. Without buffering those early frames were
   // silently dropped and Deepgram never heard the first syllables.
+  //
+  // No socket (an audio-only session) means nobody reads the PCM16
+  // bytes, so they are not encoded (FL-17).
+  if (!ws) return;
   const pcm = new ArrayBuffer(ds.length * 2);
   const dv = new DataView(pcm);
   for (let i = 0; i < ds.length; i++) {
@@ -11253,7 +11243,6 @@ function pushCapturedFrame(input: Float32Array, preRollMs = 0): void {
     // stop contain bit-identical samples for the same input.
     dv.setInt16(i * 2, Math.round(x < 0 ? x * 0x8000 : x * 0x7fff), true);
   }
-  if (!ws) return;
   if (ws.readyState === WebSocket.OPEN) {
     // Buffered frames go first so FIFO order is preserved.
     flushPendingWsFrames(ws);
@@ -11274,7 +11263,7 @@ function pushCapturedFrame(input: Float32Array, preRollMs = 0): void {
     // worklet frame downsamples to ~42.7 samples at 16 kHz, so slow
     // handshakes silently dropped opening words and failed the
     // coverage contract.
-    if (wsPendingFrameSamples + ds.length <= WS_PENDING_MAX_SAMPLES) {
+    if (wsPendingFrameSamples + ds.length <= wsPendingMaxSamples()) {
       wsPendingFrames.push(pcm);
       wsPendingFrameSamples += ds.length;
     } else {
@@ -11436,8 +11425,7 @@ async function startLive(
   wsBytesSent = 0;
   resetLiveDraftState();
   clearLiveStreamState();
-  liveWsMode = resolveLiveWsMode(activeLiveSessionSnapshot);
-  const sessionWsMode = liveWsMode;
+  const sessionWsMode = resolveLiveWsMode(activeLiveSessionSnapshot);
   liveTranscriptBuffers.set(sessionUiToken, createLiveTranscriptBuffer(sessionWsMode));
   setBusy(true, sessionUiToken);
   currentRecordingId = ++liveRecordingSeq;
@@ -11448,7 +11436,7 @@ async function startLive(
   // the new currentRecordingId, so Electron main can never observe
   // "new currentRecordingId + old paste-ready text" in a transient
   // race during startLive.
-  clearRecordingFinalSignal();
+  clearRecordingOutput();
   window.__transcriptorCurrentRecordingId = currentRecordingId;
   setRecordButton(true);
   setStatusScoped(sessionUiToken, "Starting");
@@ -11488,7 +11476,9 @@ async function startLive(
       session_id: activeLiveSessionId,
       archive_dir: activeLiveArchiveDir,
       recording_collection: liveRecordingCollection(liveRecordingMode),
-      diarize: readDiarizeEnabled() ? "true" : "false",
+      // The session snapshot, not a second DOM read: the stop path decodes
+      // with ``activeLiveSessionSnapshot.diarize`` too (FL-05 / F-006).
+      diarize: activeLiveSessionSnapshot.diarize ? "true" : "false",
     });
     if (sessionWsMode === "deepgram-stream") {
       wsQuery.set("model", activeLiveSessionSnapshot.model || getRemoteModelValue("deepgram"));
@@ -11640,26 +11630,19 @@ async function startLive(
           if (isActiveSession) {
             projectLiveTranscriptBufferToActiveState(sessionBuffer);
           }
+          // The parsed message minus its ``type`` IS the envelope — one
+          // contract (./live-envelope). It used to be copied field by
+          // field, so a field added to the contract was silently dropped
+          // here (FL-05). Coverage diagnostics (BUG-20 / C5:
+          // ``uncoveredSpeechSec``, ``streamedSec``, ``coveredEndSec``,
+          // ``stats``) ride along to explain a stop in the log; the
+          // backend has already closed its own gaps before sending.
+          const { type: _type, ...fields } = msg;
           const envelope: LiveFinalEnvelope = {
-            text: normalizeTranscriptWhitespace(msg.text),
-            segments: msg.segments,
-            durationSec: msg.durationSec,
-            source: msg.source || sessionWsMode,
+            ...fields,
+            text: normalizeTranscriptWhitespace(fields.text),
+            source: fields.source || sessionWsMode,
           };
-          if (msg.error) envelope.error = msg.error;
-          if (msg.coverage) envelope.coverage = msg.coverage;
-          // BUG-20 / PROTOCOL CONTRACT C5. Carried onto the envelope as
-          // diagnostics: the backend closes its own coverage gaps before
-          // it sends (``stats.recovery``), so these numbers explain a
-          // stop in the log rather than steering it. A renderer that
-          // escalated on them would be re-decoding audio the envelope
-          // already accounts for.
-          if (typeof msg.uncoveredSpeechSec === "number" && msg.uncoveredSpeechSec > 0) {
-            envelope.uncoveredSpeechSec = msg.uncoveredSpeechSec;
-          }
-          if (typeof msg.streamedSec === "number") envelope.streamedSec = msg.streamedSec;
-          if (typeof msg.coveredEndSec === "number") envelope.coveredEndSec = msg.coveredEndSec;
-          if (msg.stats) envelope.stats = msg.stats;
           resolveLiveFinal(sessionUiToken, envelope);
           return;
         }
@@ -12203,7 +12186,6 @@ async function stopLive(
   };
   const provider = effectiveProvider;
   const metadataProvider = provider || (providerValue ? providerValue : "none");
-  let remoteApiPromise: Promise<{ text: string; provider: string; model?: string }> | null = null;
   let savedAudioFile: File | null = null;
   let transcribeInputFile: File | null = null;
   const sessionArchiveDir = String(activeLiveArchiveDir || currentArchiveDirSnapshot()).trim();
@@ -12273,7 +12255,7 @@ async function stopLive(
   // AFTER CloseStream and get dropped. Reordering the pipeline freeze to
   // step 1 fixes this at the root.
   const stopEntryBuffer = getLiveTranscriptBuffer(sessionUiToken);
-  console.log(`[trace stopLive] enter recordedSec=${recordedSec.toFixed(2)} sessionToken=${sessionUiToken.slice(0, 8)} provider=${provider} wsState=${ws ? ws.readyState : "null"} wsPendingFrames=${wsPendingFrames.length} segmentCount=${stopEntryBuffer?.segments.length ?? liveTranscriptSegments.length} liveDraftLen=${stopEntryBuffer?.committedText.length ?? liveDraftText.length} liveInterimLen=${stopEntryBuffer?.interimText.length ?? liveInterimText.length}`);
+  console.log(`[trace stopLive] enter recordedSec=${recordedSec.toFixed(2)} sessionToken=${sessionUiToken.slice(0, 8)} provider=${provider} wsState=${ws ? ws.readyState : "null"} wsPendingFrames=${wsPendingFrames.length} segmentCount=${stopEntryBuffer?.segments.length ?? 0} liveDraftLen=${stopEntryBuffer?.committedText.length ?? liveDraftText.length} liveInterimLen=${stopEntryBuffer?.interimText.length ?? liveInterimText.length}`);
   // §4.7: the graph outlives the recording when it may, and the question
   // "may it?" is asked while the track is still live. The ordering lives
   // in ./capture-warm with the rest of the warm-capture policy, so it is
@@ -12341,7 +12323,7 @@ async function stopLive(
   }
   mark("waitForCaptureDrain");
   const drainDur = performance.now() - t0Drain - flushDur;
-  console.log(`[trace stopLive] drained ackBarrier=${workletAcked ? 1 : 0} flush=${flushDur.toFixed(0)}ms drain=${drainDur.toFixed(0)}ms wsPendingFrames=${wsPendingFrames.length} segmentCount=${getLiveTranscriptBuffer(sessionUiToken)?.segments.length ?? liveTranscriptSegments.length}`);
+  console.log(`[trace stopLive] drained ackBarrier=${workletAcked ? 1 : 0} flush=${flushDur.toFixed(0)}ms drain=${drainDur.toFixed(0)}ms wsPendingFrames=${wsPendingFrames.length} segmentCount=${getLiveTranscriptBuffer(sessionUiToken)?.segments.length ?? 0}`);
 
   // Tell the backend to finalize the upstream provider (Deepgram or local)
   // BEFORE we close the socket. The backend will send a {type:"final", ...}
@@ -12353,8 +12335,8 @@ async function stopLive(
   // session's envelope.
   //
   // We snapshot ``liveStreamError`` only — the committed segments
-  // snapshot is NOT taken here. Instead we read the LIVE
-  // ``liveTranscriptSegments`` after awaiting ``liveFinalPromise`` so
+  // snapshot is NOT taken here. Instead we read the session's LIVE
+  // transcript buffer after awaiting ``liveFinalPromise`` so
   // interim segments that arrive while the envelope is in flight
   // (very common: Deepgram streams one more ``is_final`` message
   // covering the tail of the utterance AFTER CloseStream) still make
@@ -12409,7 +12391,7 @@ async function stopLive(
     if (strandedFrames > 0) {
       wsFramesNeverSent += strandedFrames;
       wsPendingFrames = [];
-  wsPendingFrameSamples = 0;
+      wsPendingFrameSamples = 0;
       console.warn(`[trace stopLive] ${strandedFrames} captured frames never reached the live transport`);
     }
     if (discarding) {
@@ -12475,11 +12457,6 @@ async function stopLive(
     savedAudioFile = canonicalCapture.file;
     transcribeInputFile = canonicalCapture.file;
   }
-
-  // OpenRouter has no streaming API, so it still needs a full-audio REST pass.
-  // Start it only after the durable save path below has created/fetched the
-  // canonical audio. Starting here with the OPFS-backed File can race with
-  // deferredSinkDestroy and upload an empty/truncated body.
 
   // ── Cleanup (runs while provider is finalizing) ─────────────────────────
   if (timer) {
@@ -12653,9 +12630,9 @@ async function stopLive(
     plan: StopEpiloguePlan,
     metadata: { transcriptText: string; provider: string } = { transcriptText: "", provider: metadataProvider },
   ): Promise<FinalSaveOutcome> => runStopEpilogue(plan, {
-    publish: (signal) => publishRecordingFinalSignal({
+    publish: (signal) => publishRecordingOutput({
       recordingId,
-      signalText: "",
+      pasteText: "",
       domText: signal.domText,
       kind: signal.kind,
       sessionToken: sessionUiToken,
@@ -13247,9 +13224,10 @@ async function stopLive(
         // The ONLY fallback: no envelope reached us at all — the socket
         // closed or errored before or during the stop, or the deadline
         // expired with no ``final``. The backend produced no reading of
-        // this recording, so the renderer decodes the audio it saved,
-        // through the same ``transcribe-on-disk`` chain the manual
-        // Re-transcribe button uses.
+        // this recording, so the renderer decodes the audio it saved
+        // (``recoverFromEmptyTranscript``: Deepgram REST on the saved
+        // file, then local Whisper). Re-transcribe runs its own,
+        // separate decode of the saved audio (FL-08).
         //
         // An envelope with EMPTY text and no error is NOT missing: that
         // is the backend saying the recording holds no speech, and
@@ -13312,20 +13290,17 @@ async function stopLive(
           tone: "info",
         }, sessionUiToken);
       }
-      if (!remoteApiPromise && isProviderKeyConfigured(provider)) {
-        const finalAudioFile = await fetchRecoveryAudioFile();
-        if (finalAudioFile) {
-          remoteApiPromise = remoteJobSync(finalAudioFile, {
+      // Started only now, from the durably saved recording: the
+      // in-memory OPFS-backed File can be gone by this point.
+      const finalAudioFile = isProviderKeyConfigured(provider) ? await fetchRecoveryAudioFile() : null;
+      if (finalAudioFile) {
+        try {
+          const syncOut = await remoteJobSync(finalAudioFile, {
             provider,
             language: languageValue,
             diarize: diarizeValue,
             remoteModel: modelValue,
           });
-        }
-      }
-      if (remoteApiPromise) {
-        try {
-          const syncOut = await remoteApiPromise;
           transcriptRaw = String(syncOut.text || "").trim();
           transcriptSource = "remote";
         } catch (e) {
@@ -13411,9 +13386,9 @@ async function stopLive(
       transcribeLatencyMs: transcriptReadyLatencyMs,
     }, sessionUiToken);
 
-    publishRecordingFinalSignal({
+    publishRecordingOutput({
       recordingId,
-      signalText: "",
+      pasteText: "",
       domText: finalUiText,
       kind: "status",
       // The provisional publish §6.8 is about: this text is what the
@@ -13442,9 +13417,9 @@ async function stopLive(
       pasteReadyText = transcriptForPaste
         ? withScreenMarks(transcriptForPaste, transcriptForPaste === plainTranscriptRaw)
         : transcriptRaw;
-      publishRecordingFinalSignal({
+      publishRecordingOutput({
         recordingId,
-        signalText: pasteReadyText,
+        pasteText: pasteReadyText,
         domText: transcriptRaw,
         kind: "transcript",
         sessionToken: sessionUiToken,
@@ -13466,9 +13441,9 @@ async function stopLive(
   } catch (e) {
     console.error("Live transcription finalization failed", e);
     const safeMessage = sanitizeUiErrorMessage(e, "Transcription failed. Audio is still saved.");
-    publishRecordingFinalSignal({
+    publishRecordingOutput({
       recordingId,
-      signalText: "",
+      pasteText: "",
       domText: safeMessage,
       kind: "error",
       sessionToken: sessionUiToken,

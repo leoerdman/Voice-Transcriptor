@@ -444,6 +444,67 @@ describe("the live preview defers to a resolved envelope, verbatim (B-041)", () 
   });
 });
 
+describe("live half: one rule per fact, no dead state (FL-05/06/09/14/15/16/17/18)", () => {
+  const liveCoverageSrc = readFileSync(resolve(process.cwd(), "src/live-coverage.ts"), "utf8");
+  const screenAnnotationsSrc = readFileSync(resolve(process.cwd(), "src/screen-annotations.ts"), "utf8");
+
+  it("FL-14: the dead projections, aliases and the never-reassigned promise are gone", () => {
+    for (const dead of [
+      "liveTranscriptSegments",
+      "let liveWsMode",
+      "clearRecordingFinalSignal",
+      "publishRecordingFinalSignal",
+      "remoteApiPromise",
+      "signalText",
+    ]) {
+      expect(mainTsx, dead).not.toContain(dead);
+    }
+  });
+
+  it("FL-15: live-coverage compares against the exported source constant, not a literal", () => {
+    expect(liveCoverageSrc).toContain("envelope.source !== LOCAL_ASSIST_SOURCE");
+    expect(liveCoverageSrc).not.toContain('"local-assist"');
+  });
+
+  it("FL-18: screen-annotations counts words with text-match's countWords", () => {
+    expect(screenAnnotationsSrc).toContain('import { countWords } from "./text-match";');
+    expect(screenAnnotationsSrc).not.toMatch(/function countWords\(/);
+  });
+
+  it("FL-06: the pre-open buffer cap is a duration at the live sample rate, not 64 000 samples", () => {
+    expect(mainTsx).not.toContain("WS_PENDING_MAX_SAMPLES");
+    expect(mainTsx).toContain("LIVE_SAMPLE_RATE_HZ * WS_PENDING_MAX_SEC");
+    expect(mainTsx).toContain("wsPendingFrameSamples + ds.length <= wsPendingMaxSamples()");
+  });
+
+  it("FL-17: no PCM16 encode without a socket to send it to", () => {
+    const fn = mainTsxSlice("function pushCapturedFrame(", "\nasync function flushWorkletPort(");
+    expect(fn, "pushCapturedFrame not found").toBeTruthy();
+    const guard = fn.indexOf("if (!ws) return;");
+    const encode = fn.indexOf("new ArrayBuffer(ds.length * 2)");
+    expect(guard).toBeGreaterThan(0);
+    expect(encode).toBeGreaterThan(guard);
+  });
+
+  it("FL-05: the final envelope is the parsed message minus its type, and the WS diarize comes from the snapshot", () => {
+    const handler = /case "final": \{([\s\S]*?)\n {8}\}/.exec(mainTsx)?.[1] || "";
+    expect(handler).toContain("const { type: _type, ...fields } = msg;");
+    expect(handler).toContain("...fields,");
+    expect(mainTsx).toContain('diarize: activeLiveSessionSnapshot.diarize ? "true" : "false",');
+  });
+
+  it("FL-09: the mic-fallback notice is a session notice, not text the next preview event overwrites", () => {
+    const fn = mainTsxSlice("function showMicFallbackNotice(): void {", "\n}\n");
+    expect(fn).toContain("showRecordSessionNotice(");
+    expect(fn).not.toContain("setLiveDraftState(");
+  });
+
+  it("FL-16: comments name functions that exist", () => {
+    expect(mainTsx).not.toContain("holdWarmCapture");
+    expect(mainTsx).not.toContain("through the same ``transcribe-on-disk`` chain the manual");
+  });
+});
+
 describe("live socket close handler (FL-03)", () => {
   const handler = /ws\.onclose = \(ev\) => \{([\s\S]*?)\n {4}\};/.exec(mainTsx)?.[1] || "";
 

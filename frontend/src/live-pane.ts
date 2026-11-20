@@ -15,9 +15,13 @@
  * imported by main.tsx's rAF-coalesced renderer.
  */
 
+/**
+ * The preview-off states only: with preview on the caller renders the
+ * transcript itself and never calls this. (It used to take a
+ * ``previewEnabled`` flag whose only legal value was ``false`` and throw
+ * on ``true`` — FL-21; the illegal state is now unrepresentable.)
+ */
 export interface LivePaneInput {
-  /** The livePreviewToggle state. */
-  previewEnabled: boolean;
   /** A recording is currently capturing audio. */
   recording: boolean;
   /** The first capture frame has been timestamped (startAt > 0). */
@@ -29,13 +33,6 @@ export interface LivePaneInput {
 export const LIVE_PANE_STATUS_PREFIX = "● Recording";
 
 export function livePaneDisplayText(input: LivePaneInput): string {
-  if (input.previewEnabled) {
-    // Caller renders transcript content itself; this function only
-    // owns the preview-off states.
-    throw new Error(
-      "livePaneDisplayText handles preview-off states only; render transcript text directly",
-    );
-  }
   if (input.recording && input.started) {
     return `${LIVE_PANE_STATUS_PREFIX} ${input.timerText} — live preview is off; the transcript will appear here after Stop.`;
   }
