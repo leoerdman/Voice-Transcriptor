@@ -146,7 +146,7 @@ class LiveConfigBuilderTests(unittest.TestCase):
                 sys.modules.pop(name, None)
             try:
                 main = importlib.import_module("backend.main")
-                self.assertIs(main._live_config, live_config)
+                self.assertIs(main.live_config, live_config)
             finally:
                 try:
                     main.jobs.shutdown(timeout=0.1)

@@ -4623,15 +4623,28 @@ async def _apply_live_recovery(
         return payload
 
 
-# 1.1.25: hard timeout for the per-message WS send.
-# A misbehaving / paused client (background tab, slow renderer) would
-# otherwise let Starlette's send buffer back up and the await would
-# suspend indefinitely. The Deepgram forwarder calls _ws_send_json on
-# every event; one stalled send wedges the entire forwarder loop and
-# prevents stop.set() from being honoured. 5 s is generous for a
-# loopback websocket — anything beyond is a stalled client we should
-# treat as a broken pipe and let recovery proceed.
-_WS_SEND_TIMEOUT_SEC = 5.0
+# 1.1.25: a bound on the per-message WS send. A misbehaving / paused
+# client (background tab, slow renderer) would otherwise let Starlette's
+# send buffer back up and the await would suspend indefinitely; the
+# Deepgram forwarder calls _ws_send_json on every event. The same bound
+# every other socket write in the live path gets (``SEND_WEDGE_SEC``):
+# a write not accepted in that long is a wedge, whichever socket it is.
+import weakref  # noqa: E402
+
+from backend.remote_deepgram_live import SEND_WEDGE_SEC as _WS_SEND_TIMEOUT_SEC  # noqa: E402
+
+# Renderer sockets on which a send stalled past the bound. A stalled send
+# is NEVER cancelled — cancelling a websocket write mid-frame leaves the
+# connection undefined, the rule the upstream path already follows — so
+# it is left to finish or fail on its own, and nothing else is written
+# to that socket after it: the next frame could only interleave with, or
+# queue behind, the one still in flight (BW-02).
+_STALLED_CLIENT_SOCKETS: "weakref.WeakSet[WebSocket]" = weakref.WeakSet()
+
+
+def _collect_stalled_send(task: "asyncio.Future") -> None:
+    if not task.cancelled() and task.exception() is not None:
+        logger.debug("ws send that stalled ended with: %s", task.exception())
 
 
 async def _ws_send_json(websocket: WebSocket, payload: dict) -> bool:
@@ -4639,25 +4652,29 @@ async def _ws_send_json(websocket: WebSocket, payload: dict) -> bool:
 
     Returns ``True`` on success. Logs transient broken-pipe errors and
     returns ``False`` without raising so the caller can continue its
-    cleanup. A send that exceeds ``_WS_SEND_TIMEOUT_SEC`` is treated as
-    a broken pipe — the sender returns False and the caller's normal
-    "client gone" cleanup path runs.
+    cleanup. A send not accepted within ``_WS_SEND_TIMEOUT_SEC`` is
+    treated as a broken pipe — the caller's normal "client gone" path
+    runs — but the write itself is left running, never cancelled, and
+    the socket takes no further frames.
     """
-    try:
-        await asyncio.wait_for(
-            websocket.send_text(json.dumps(payload, ensure_ascii=False)),
-            timeout=_WS_SEND_TIMEOUT_SEC,
-        )
-        return True
-    except asyncio.TimeoutError:
-        # Same return-False semantics as broken-pipe — caller's loop
-        # treats this as "client gone" and shuts the session down,
-        # rather than wedging on a paused renderer indefinitely.
-        logger.warning(
-            "ws send timed out after %.1fs (treating as broken pipe)",
-            _WS_SEND_TIMEOUT_SEC,
-        )
+    if websocket in _STALLED_CLIENT_SOCKETS:
         return False
+    try:
+        send = asyncio.ensure_future(
+            websocket.send_text(json.dumps(payload, ensure_ascii=False))
+        )
+        done, _pending = await asyncio.wait({send}, timeout=_WS_SEND_TIMEOUT_SEC)
+        if not done:
+            _STALLED_CLIENT_SOCKETS.add(websocket)
+            send.add_done_callback(_collect_stalled_send)
+            logger.warning(
+                "ws send not accepted within %.1fs (treating as broken pipe; "
+                "no further frames on this socket)",
+                _WS_SEND_TIMEOUT_SEC,
+            )
+            return False
+        send.result()
+        return True
     except Exception as e:
         if _is_broken_pipe_error(e):
             logger.debug("ws send skipped (pipe closed): %s", e)
@@ -4706,7 +4723,16 @@ async def _run_local_live_session(
     language: Optional[str],
     recovery: Optional[dict],
 ) -> None:
-    """Drive the local faster-whisper assist pipeline for a live session."""
+    """Drive the local faster-whisper assist pipeline for a live session.
+
+    Its stop protocol is deliberately smaller than the Deepgram path's
+    (``_run_deepgram_live_session``): ``finalize`` ends the receive loop
+    at once, with no post-finalize drain — WebSocket frames are ordered,
+    so every frame the renderer sent before ``finalize`` has already been
+    read — and the final envelope is never repaired by the REST recovery
+    pass: nothing here is billed or remote, and what this transport knows
+    about its gaps travels in ``coverage`` instead (BW-18).
+    """
     if model not in ALLOWED_LOCAL_MODELS:
         model = DEFAULT_LOCAL_TRANSCRIPTION_MODEL
     session = LiveSession(model_name=model, language=language)
@@ -4847,15 +4873,23 @@ async def _run_local_live_session(
         )
 
 
-# B2 (audit §3.7): frames buffered while ``session.connect()`` is still
-# in flight, so they can be replayed into Deepgram once it succeeds.
-# Every such frame is ALSO recorded into the recovery spool unconditio-
-# nally as it arrives — this cap only bounds the in-memory replay queue
-# against a pathologically slow/hung connect, it never bounds what the
-# spool retains. At 16 kHz/16-bit mono a live renderer chunk is small
-# (observed: tens to low hundreds of ms of audio per frame), so this
-# comfortably covers the observed 1-12 s connect window.
-_PRECONNECT_FRAME_BUFFER_MAX = 4096
+# The longest a connect can legitimately take: the open timeout plus one
+# retry (``DeepgramLiveSession.connect``). Every in-memory audio bound in
+# this handler that has to outlast a connect is derived from it, in
+# BYTES — the renderer's frame size is not this module's to assume (the
+# worklet posts ~10 ms frames, a ScriptProcessor fallback far larger),
+# and a bound counted in frames was a different number of seconds for
+# each (BW-05).
+_CONNECT_BUDGET_SEC = DEEPGRAM_LIVE_OPEN_TIMEOUT_SEC + DEEPGRAM_LIVE_RETRY_TIMEOUT_SEC
+
+# B2 (audit §3.7): audio buffered while ``session.connect()`` is still in
+# flight, replayed into Deepgram once it succeeds. Every such frame is
+# ALSO recorded into the recovery spool unconditionally as it arrives —
+# this bound only limits the in-memory replay queue, never what the
+# spool retains. One second above the connect budget, so only a connect
+# that overran its own timeouts can reach it; if one does, the oldest
+# audio is dropped, logged and declared undelivered.
+_PRECONNECT_BUFFER_MAX_BYTES = int((_CONNECT_BUDGET_SEC + 1.0) * LIVE_PCM_BYTES_PER_SEC)
 
 # C2: the tail-preserving drain after ``finalize`` — 250 ms was always
 # spent in full because the mic is already stopped by the time the
@@ -4896,20 +4930,18 @@ _SEND_BATCH_BYTES = 1600
 # transcript; a talking user fills 50 ms of audio in 50 ms, so this only
 # fires at the trailing edge of speech.
 _SEND_BATCH_MAX_WAIT_SEC = 0.05
-# Hard cap on the queue. Both bounds exist: the frame count keeps a
-# pathological renderer from making the queue itself the leak, and the
-# byte count is the meaningful one — 320 kB is 10 s of audio, twice the
-# wedge deadline below, so a healthy session never comes close and a
-# wedged one is detected long before the bound bites.
-_SEND_QUEUE_MAX_FRAMES = 8192
-_SEND_QUEUE_MAX_BYTES = 320_000
+# Hard cap on the queue, in bytes. It has to hold everything captured
+# while a warm-socket SWAP connects its replacement (the wedge watchdog
+# is suspended for exactly that), so it is the connect budget plus a
+# second — a wedge outside a swap is still detected at the 5 s bound,
+# long before this one bites. It used to be 10 s, below the 12 s connect
+# a swap may take (BW-05).
+_SEND_QUEUE_MAX_BYTES = int((_CONNECT_BUDGET_SEC + 1.0) * LIVE_PCM_BYTES_PER_SEC)
 # Audio still waiting this long after it was captured means the upstream
-# is not accepting writes. Sized well above any plausible network hiccup
-# (a 1600-byte write on a live socket completes in microseconds) and at
-# the same 5 s the old per-send timeout used, so the failure is reported
-# no later than it used to be — but by closing the socket rather than by
-# cancelling a write.
-_SEND_WEDGE_TIMEOUT_SEC = 5.0
+# is not accepting writes. The one bound for any Deepgram write
+# (``SEND_WEDGE_SEC``, owned by the session module), not a second copy of
+# the same 5 s: tuning one used to leave the other behind (BW-04).
+_SEND_WEDGE_TIMEOUT_SEC = _WS_SEND_TIMEOUT_SEC
 _SEND_WEDGE_POLL_SEC = 0.5
 # At stop: how long the queued audio may take to drain before Finalize
 # goes out anyway. A wedged upstream is detected at
@@ -4950,17 +4982,13 @@ _WARM_PROBE_POLL_SEC = 0.1
 # Audio kept for replay while the probe is unresolved: everything
 # already written to the adopted socket, so a replacement starts from
 # the true beginning of the recording rather than from the moment the
-# swap completed. Bounded at 8 s of 16 kHz PCM16 — the probe window plus
-# a worst-case connect, with room to spare.
+# swap completed. It has to hold every VOICED byte written before the
+# swap is asked for — the probe window after the first voiced frame —
+# and what it drops off the front is leading silence the replacement's
+# offset accounts for exactly. Audio captured DURING the swap's connect
+# waits in the send queue, not here. 8 s is the probe window three
+# times over.
 _WARM_REPLAY_MAX_BYTES = 8 * LIVE_PCM_BYTES_PER_SEC
-
-
-# The live-config builder now lives with the config type
-# (``remote_deepgram_live.live_config``) so the A/B tool, which drives
-# the same warm pool, builds the same query string this handler does —
-# the pool keys its socket on that string. Bound to the old private name
-# because this module and its tests refer to it by that name.
-_live_config = live_config
 
 
 def _new_live_session(
@@ -5075,12 +5103,10 @@ async def _prewarm_deepgram_at_boot() -> None:
     api_key = _configured_deepgram_key(cfg)
     if not api_key:
         return
-    primary_cfg = _live_config(
-        model=DEFAULT_DEEPGRAM_AUDIO_MODEL,
-        language="auto",
-        diarize=False,
-        keyterms=configured_keyterms(cfg),
-    )
+    # The builder's own defaults ARE the renderer's: model, language
+    # "auto", no diarization — restating them here was a third copy
+    # (BW-14). Only the keyterms come from the config.
+    primary_cfg = live_config(keyterms=configured_keyterms(cfg))
     DEEPGRAM_WARM_POOL.rewarm(api_key, primary_cfg)
     # Both readings, when this configuration runs two. The second one is
     # a different query string and therefore a different pool key, so
@@ -5141,7 +5167,7 @@ async def _run_deepgram_live_session(
     below is written against one session object either way, because the
     dual facade presents the interface of one.
     """
-    dg_cfg = _live_config(
+    dg_cfg = live_config(
         model=model,
         language=language,
         diarize=diarize,
@@ -5170,12 +5196,17 @@ async def _run_deepgram_live_session(
     # session the user spoke 126 s into. Bytes are recorded to recovery
     # unconditionally as they arrive; the bounded queue is only for
     # replaying them into Deepgram once (if) connect succeeds.
-    pending_frames: "deque[bytes]" = deque(maxlen=_PRECONNECT_FRAME_BUFFER_MAX)
+    pending_frames: "deque[bytes]" = deque()
+    pending_bytes = 0
+    # Audio the pre-connect buffer had to drop (a connect that overran its
+    # own timeouts). Declared to the session once it exists, so its
+    # coverage math sees the true length of the recording.
+    preconnect_dropped_bytes = 0
     preconnect_finalize_payload: Optional[dict] = None
     preconnect_disconnected = False
 
     async def _preconnect_reader() -> None:
-        nonlocal frames_received, bytes_received
+        nonlocal frames_received, bytes_received, pending_bytes, preconnect_dropped_bytes
         nonlocal preconnect_finalize_payload, preconnect_disconnected
         while True:
             msg = await _ws_recv_next(websocket)
@@ -5189,6 +5220,16 @@ async def _run_deepgram_live_session(
                 bytes_received += len(data)
                 _record_recovery_chunk(recovery, data)
                 pending_frames.append(data)
+                pending_bytes += len(data)
+                while pending_bytes > _PRECONNECT_BUFFER_MAX_BYTES and pending_frames:
+                    if preconnect_dropped_bytes == 0:
+                        logger.warning(
+                            "deepgram connect overran its budget; dropping the "
+                            "oldest buffered audio (it stays in the spool)"
+                        )
+                    oldest = pending_frames.popleft()
+                    pending_bytes -= len(oldest)
+                    preconnect_dropped_bytes += len(oldest)
                 continue
             if kind == "control" and msg["payload"].get("type") == "finalize":
                 # Rare (Stop pressed before connect() even resolved), but
@@ -5423,10 +5464,15 @@ async def _run_deepgram_live_session(
     warm_replay_dropped = 0
 
     # ---- Send path: queue, sender task, wedge watchdog (audit §3.6) ---
-    send_queue: "asyncio.Queue[object]" = asyncio.Queue(
-        maxsize=_SEND_QUEUE_MAX_FRAMES
-    )
+    send_queue: "asyncio.Queue[object]" = asyncio.Queue()
     queued_bytes = 0
+    # Totals for the end-of-session line (BW-17).
+    send_dropped_bytes = 0
+    warm_swapped = False
+    # Audio dropped while a swap is connecting its replacement. Declared
+    # to whichever session survives the swap, not to the one about to be
+    # discarded, whose numbers nobody reads again (BW-09).
+    swap_undelivered_bytes = 0
     # Capture time of the oldest byte that has not yet been handed to
     # Deepgram — the age the watchdog judges. ``None`` means everything
     # captured has been written.
@@ -5445,6 +5491,7 @@ async def _run_deepgram_live_session(
         sees the honest length of the recording.
         """
         nonlocal queued_bytes, send_dropped_warned, warm_probe_armed_at
+        nonlocal send_dropped_bytes, swap_undelivered_bytes
         if not data:
             return
         if (
@@ -5453,18 +5500,15 @@ async def _run_deepgram_live_session(
             and pcm_has_voice(data)
         ):
             warm_probe_armed_at = time.monotonic()
-        if queued_bytes + len(data) > _SEND_QUEUE_MAX_BYTES:
-            dropped = True
-        else:
-            try:
-                send_queue.put_nowait((time.monotonic(), data))
-                queued_bytes += len(data)
-                dropped = False
-            except asyncio.QueueFull:
-                dropped = True
-        if not dropped:
+        if queued_bytes + len(data) <= _SEND_QUEUE_MAX_BYTES:
+            send_queue.put_nowait((time.monotonic(), data))
+            queued_bytes += len(data)
             return
-        session.note_undelivered_audio(len(data))
+        send_dropped_bytes += len(data)
+        if warm_swap_in_progress:
+            swap_undelivered_bytes += len(data)
+        else:
+            session.note_undelivered_audio(len(data))
         if not send_dropped_warned:
             send_dropped_warned = True
             logger.warning(
@@ -5513,7 +5557,7 @@ async def _run_deepgram_live_session(
         ``streamedSec`` — is measured from the start of the RECORDING
         and not from the start of this second socket.
         """
-        nonlocal session, warm_probe_active
+        nonlocal session, warm_probe_active, warm_swapped, swap_undelivered_bytes
         nonlocal warm_swap_requested, warm_swap_in_progress
         warm_swap_requested = False
         warm_swap_in_progress = True
@@ -5545,6 +5589,9 @@ async def _run_deepgram_live_session(
             warm_probe_active = False
             warm_replay.clear()
             warm_swap_in_progress = False
+            if swap_undelivered_bytes:
+                session.note_undelivered_audio(swap_undelivered_bytes)
+                swap_undelivered_bytes = 0
             return
         if isinstance(session, DualLiveSession):
             # Only the PRIMARY is probed, so only the primary is
@@ -5554,6 +5601,10 @@ async def _run_deepgram_live_session(
         else:
             session = fresh
         await old.discard()
+        warm_swapped = True
+        if swap_undelivered_bytes:
+            fresh.note_undelivered_audio(swap_undelivered_bytes)
+            swap_undelivered_bytes = 0
         warm_probe_active = False
         warm_replay.clear()
         for pos in range(0, len(replay), _SEND_BATCH_BYTES):
@@ -5699,6 +5750,8 @@ async def _run_deepgram_live_session(
     # newly arriving frame is forwarded — Deepgram must see this audio
     # first or the transcript's word timings would be shifted. The queue
     # is FIFO, so enqueueing here preserves that order by construction.
+    if preconnect_dropped_bytes:
+        session.note_undelivered_audio(preconnect_dropped_bytes)
     for _chunk in pending_frames:
         _offer_pcm(_chunk)
     pending_frames.clear()
@@ -5770,7 +5823,10 @@ async def _run_deepgram_live_session(
             break
         elapsed_ms = (time.monotonic() - drain_start) * 1000.0
         if has_counts:
-            logger.info(
+            # Unmatched counts mean audio the renderer sent never arrived
+            # here — a lost tail, which is not an INFO event (BW-17).
+            logger.log(
+                logging.INFO if _matched() else logging.WARNING,
                 "finalize drain: %s after %.0f ms (frames %d/%d)",
                 "matched" if _matched() else "timed out",
                 elapsed_ms,
@@ -6105,7 +6161,8 @@ async def _run_deepgram_live_session(
         streamed_sec = float(final_payload.get("streamedSec") or 0.0)
         logger.info(
             "ws deepgram session complete: bytes=%d streamed_sec=%.1f chunks=%d "
-            "final_segs=%d interim_segs=%d connect_ms=%s finalize_ms=%s text_len=%d",
+            "final_segs=%d interim_segs=%d connect_ms=%s finalize_ms=%s text_len=%d "
+            "dropped_bytes=%d queued_bytes=%d swapped=%s upstream_fatal=%s client_gone=%s",
             session.stats.bytes_sent,
             streamed_sec,
             session.stats.chunks_sent,
@@ -6114,6 +6171,11 @@ async def _run_deepgram_live_session(
             f"{session.stats.connect_ms:.0f}" if session.stats.connect_ms else "?",
             f"{session.stats.finalize_ms:.0f}" if session.stats.finalize_ms else "?",
             len(final_payload.get("text") or ""),
+            send_dropped_bytes + preconnect_dropped_bytes,
+            queued_bytes,
+            warm_swapped,
+            upstream_fatal,
+            client_gone,
         )
         # A session that streamed real audio and produced no final segment
         # is a silently lost transcription: the recording exists, the user
