@@ -78,3 +78,31 @@ frontend typecheck OK, lint OK, vitest `48 files, 609 tests passed`, build OK.
 
 Not verified live: the order change in `toggleRecordingFromShortcut` and the voice-take notice
 (need the packaged app on macOS).
+
+## Step 2 · M3 `screens_error` (save and spool promotion)
+
+Files: `frontend/src/recording-save.ts`, `frontend/src/recovery-summary.ts`, `frontend/src/main.tsx`;
+tests `frontend/tests/recording-save.test.ts`, `frontend/tests/recovery-summary.test.ts`.
+
+- `parseRecordingSaveResponse` returns `screensError` (`parseScreensError`: the trimmed string, ""
+  for none or a non-string). `saveRecordingText` passes it on.
+- `transcriptScreenManifest(adopted, staged, screensError)`: the adopted manifest when there is
+  one; **null when `screens_error` is set** (the staged paths point into the staging folder, which
+  is swept — no marks are written rather than broken links); the staged one otherwise (unchanged).
+  stopLive calls it instead of `adopted || staged`.
+- stopLive: a save with `screens_error` shows a warning notice ("Recording audio is saved, but its
+  screenshots could not be attached (…). The transcript has no screen marks.") instead of the
+  success notice, and logs it.
+- `recoverBackendAudioSessions` reads `screens_error` from each promotion answer and
+  `recoverySummary(succeeded, failed, withoutScreens)` says "Its/Their screenshots could not be
+  attached" (tone warning) instead of a plain success.
+
+Check: `npm --prefix frontend test -- recording-save recovery-summary`.
+Before: HEAD `parseRecordingSaveResponse` returns no `screensError` (the two `toEqual` cases and the
+`screens_error` case fail), `transcriptScreenManifest` / `parseScreensError` do not exist, HEAD
+main.tsx has `parseScreenManifest(persisted.screensManifest) || stagedScreenManifest` (the wiring
+case's `not.toContain` fails), and `recoverySummary(1, 0, 1)` reports a plain success.
+After: `14 passed` in the two files; full frontend `48 files, 616 tests passed`; typecheck, lint,
+build OK; desktop `437/437` (untouched).
+
+Not verified live: a real adoption failure (needs a failing disk write during a screen take's save).

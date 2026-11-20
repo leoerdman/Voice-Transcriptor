@@ -95,6 +95,33 @@ export interface RecordingSaveResult {
   /** Older recordings' audio (or screenshot folders) removed by retention on this save. */
   prunedAudioCount: number;
   screensManifest?: unknown;
+  /**
+   * Non-empty when the save (or a crash-time promotion) could not attach
+   * the take's staged screenshots to the recording (backend
+   * `_adopt_screen_session_for_recording`). The audio and text are saved;
+   * the screenshots stay where they were staged, which is swept later.
+   */
+  screensError: string;
+}
+
+/** A promotion or save answer's `screens_error`, "" for none. */
+export function parseScreensError(js: unknown): string {
+  const value = js && typeof js === "object" ? (js as { screens_error?: unknown }).screens_error : "";
+  return typeof value === "string" ? value.trim() : "";
+}
+
+/**
+ * The screen manifest a take's transcript is annotated from (M3). The
+ * adopted one — its screenshot paths are the archived, permanent ones —
+ * whenever the save returned it. When the save says the screenshots could
+ * NOT be attached there is none: the staged manifest's paths point into
+ * the staging folder, which is swept, so annotating from it would write
+ * links into the saved text that break. Otherwise (nothing adopted, no
+ * error) the staged manifest, as before.
+ */
+export function transcriptScreenManifest<T>(adopted: T | null, staged: T | null, screensError: string): T | null {
+  if (screensError) return null;
+  return adopted || staged;
 }
 
 export function parseRecordingSaveResponse(
@@ -111,6 +138,7 @@ export function parseRecordingSaveResponse(
     name: String(body.name || fallback.name || "").trim(),
     archiveDir: String(body.archive_dir || fallback.archiveDir || "").trim(),
     prunedAudioCount: Math.max(0, Math.trunc(Number(body.pruned_audio_count) || 0)),
+    screensError: parseScreensError(body),
   };
   if (body.screens !== undefined && body.screens !== null) out.screensManifest = body.screens;
   return out;

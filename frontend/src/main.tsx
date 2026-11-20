@@ -130,7 +130,13 @@ import { keepaliveFor } from "./keepalive";
 import { parseRuntimeLimits } from "./runtime-limits";
 import { screenThumbLabel, screensStripNote } from "./screens-strip";
 import { fallbackSourceKey, isCurrentPlayerSource } from "./player-source";
-import { parseRecordingSaveResponse, planRecordingSave, recordingSaveFormEntries } from "./recording-save";
+import {
+  parseRecordingSaveResponse,
+  parseScreensError,
+  planRecordingSave,
+  recordingSaveFormEntries,
+  transcriptScreenManifest,
+} from "./recording-save";
 import {
   RECORDING_COLLECTIONS,
   liveRecordingCollection,
@@ -418,6 +424,8 @@ interface SavedRecordingRef {
    * Absent for every other save.
    */
   screensManifest?: unknown;
+  /** Non-empty when the screenshots could not be attached (M3). */
+  screensError?: string;
 }
 
 interface LoadRecordingsOptions {
@@ -5179,6 +5187,7 @@ async function recoverBackendAudioSessions(): Promise<void> {
   // counts and surface a single notice at the end.
   let succeeded = 0;
   let failed = 0;
+  let withoutScreens = 0;
   for (const item of items) {
     const sessionId = String(item?.session_id || "").trim();
     if (!sessionId) continue;
@@ -5200,12 +5209,19 @@ async function recoverBackendAudioSessions(): Promise<void> {
         continue;
       }
       succeeded += 1;
+      // A recovered screen take whose screenshots could not be attached
+      // (M3): recovered, but the summary says what is missing.
+      const screensError = parseScreensError(await resp.json().catch(() => null));
+      if (screensError) {
+        withoutScreens += 1;
+        console.warn(`Recovery promote for ${sessionId}: screenshots not attached: ${screensError}`);
+      }
     } catch (e) {
       failed += 1;
       console.warn(`Recovery promote exception for ${sessionId}:`, e);
     }
   }
-  const summary = recoverySummary(succeeded, failed);
+  const summary = recoverySummary(succeeded, failed, withoutScreens);
   if (!summary) return;
   showRecordSessionNotice(summary.text, summary.tone, UI_TOKENS.notice.longMs);
   if (succeeded > 0) {
@@ -8731,6 +8747,7 @@ async function saveRecordingText(opts: {
   const savedArchiveDir = saved.archiveDir;
   const prunedAudioCount = saved.prunedAudioCount;
   const screensManifest = saved.screensManifest;
+  const screensError = saved.screensError;
   // Fire-and-forget, coalesced through a background queue. Live saves
   // happen while the single recording capsule is still busy; direct
   // loadRecordings() here made History redraw during finalization and
@@ -8756,6 +8773,7 @@ async function saveRecordingText(opts: {
     name: savedName,
     archiveDir: savedArchiveDir,
     ...(screensManifest !== undefined ? { screensManifest } : {}),
+    ...(screensError ? { screensError } : {}),
   };
 }
 
@@ -12579,7 +12597,11 @@ async function stopLive(
         });
         persistedRecordingName = persisted.name;
         persistedRecordingArchiveDir = persisted.archiveDir;
-        screenManifest = parseScreenManifest(persisted.screensManifest) || stagedScreenManifest;
+        screenManifest = transcriptScreenManifest(
+          parseScreenManifest(persisted.screensManifest),
+          stagedScreenManifest,
+          persisted.screensError || "",
+        );
         setCurrentRecordingAudio(savedAudioFile, persistedRecordingName, persistedRecordingArchiveDir, sessionUiToken);
         // 1.1.25: best-effort recovery discard. The save above ALREADY
         // succeeded; a 5xx from /api/live-recovery/discard does not
@@ -12603,12 +12625,24 @@ async function stopLive(
           tone: "success",
           savedName: persistedRecordingName,
         }, sessionUiToken);
-        showRecordSessionNotice(
-          "Recording audio is saved and available immediately.",
-          "success",
-          UI_TOKENS.notice.briefMs,
-          sessionUiToken,
-        );
+        if (persisted.screensError) {
+          // M3: saved, but not whole — said, not swallowed, and the
+          // transcript gets no marks pointing at the swept staging folder.
+          console.warn(`[trace screen] screenshots not attached: ${persisted.screensError}`);
+          showRecordSessionNotice(
+            `Recording audio is saved, but its screenshots could not be attached (${persisted.screensError}). The transcript has no screen marks.`,
+            "warning",
+            UI_TOKENS.notice.longMs,
+            sessionUiToken,
+          );
+        } else {
+          showRecordSessionNotice(
+            "Recording audio is saved and available immediately.",
+            "success",
+            UI_TOKENS.notice.briefMs,
+            sessionUiToken,
+          );
+        }
         saveDone = true;
       } catch (e) {
         const errMsg = e instanceof Error ? e.message : String(e || "");
