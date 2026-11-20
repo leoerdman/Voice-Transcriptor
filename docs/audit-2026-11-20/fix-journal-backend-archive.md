@@ -124,3 +124,19 @@ Proof method: SKILL §7.1 — the fixed file is put aside, `git show HEAD:<path>
   ```
 - After: `Ran 16 tests ... OK`; full suite `Ran 911 tests ... OK (skipped=2)`.
 - Cross-domain (BL-02 remainder): engine lines `remote_deepgram_live.py` `_handle_result` (`text=%r`), coverage-hole snippets (`_HOLE_REPORT_TEXT_CHARS`), `deepgram_recovery.py` "decoded word(s) had no room … %s"; desktop `appendMainLog` should create main.log with mode 0600.
+
+### C7 · S-08, BM-17, BM-20 (P2) + BM-01 documented honestly · CLI wrapper, PATH card, token outside argv
+- Files: `backend/cli_access.py` (`_wrapper_text`, `_refresh_wrapper` called from `load()` — a wrapper whose interpreter/script no longer match the running app is rewritten at boot; Windows PATH card = PowerShell `SetEnvironmentVariable('Path', <User Path> + ';<dir>', 'User')` built with `PureWindowsPath` (the old `setx PATH "%PATH%;…"` merged system entries into the user PATH, truncated at 1024 chars, and on a POSIX-built path even showed `;.`); module docstring states plainly that the renderer token is served by unauthenticated `GET /`, so the CLI boundary binds a holder of only the CLI token (BM-01 stays open, see Cross-domain)), `backend/cli.py` (`CLI_TOKEN_ENV = "TRANSCRIPTOR_CLI_TOKEN"`, read by `load_connection` when `--token` is absent; `--token` help warns it is visible in the process list), `.env.example` (`TRANSCRIPTOR_CLI_TOKEN`), tests: `test_cli_access.py` (2 new), `test_cli_client.py` (1 new, `import os`).
+- Check: `python -m unittest backend.tests.test_cli_access backend.tests.test_cli_client`
+- Before (cli_access.py + cli.py at HEAD):
+  ```
+  FAIL: test_a_stale_wrapper_is_rewritten_for_the_running_app_at_boot (...)
+  AssertionError: '/Applications/New.app/python3' not found in '#!/bin/sh\n# Transcriptor command-line client. ...\nexec /usr/bin/python3 -E -B /app/backend/cli.py --connection .../cli/connection.json "$@"\n'
+  FAIL: test_the_windows_path_card_writes_only_the_user_path (...)
+  AssertionError: 'setx' unexpectedly found in 'setx PATH "%PATH%;."'
+  ERROR: test_the_token_can_come_from_the_environment_not_argv (...)
+  backend.cli.CliError: command-line access is off (no .../nothing.json).
+  ```
+- After: `Ran 73 tests ... OK`; full suite `Ran 914 tests ... OK (skipped=2)`.
+- Note: one full-suite run under machine load failed two timing tests in `test_deepgram_finalize_budget` (not touched here); they pass alone and on the next full run.
+- BM-20 scope: `--token` is kept (removing a documented flag is a behaviour change); the env var is the non-argv path.

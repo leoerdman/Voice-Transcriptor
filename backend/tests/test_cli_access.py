@@ -315,6 +315,29 @@ class CliAccessFileTests(unittest.TestCase):
         self.assertEqual(status["command_path"], str(self.access.wrapper_path))
         self.assertTrue(status["cards"])
 
+    def test_a_stale_wrapper_is_rewritten_for_the_running_app_at_boot(self):
+        # S-08: the wrapper embeds the interpreter and script of the app
+        # that wrote it; after a move or reinstall they point nowhere.
+        self.access.enable("http://127.0.0.1:8321")
+        moved = self.CliAccess(self.data_dir, python_executable="/Applications/New.app/python3",
+                               cli_script=Path("/Applications/New.app/backend/cli.py"), platform="darwin")
+        moved.load()
+        wrapper = moved.wrapper_path.read_text(encoding="utf-8")
+        self.assertIn("/Applications/New.app/python3", wrapper)
+        self.assertNotIn("/usr/bin/python3", wrapper)
+        self.assertTrue(os.access(moved.wrapper_path, os.X_OK))
+
+    def test_the_windows_path_card_writes_only_the_user_path(self):
+        # BM-17: `setx PATH "%PATH%;…"` copies system entries into the user
+        # PATH and truncates it at 1024 characters.
+        from backend.cli_access import command_cards
+
+        card = next(c for c in command_cards("C:\\Users\\a\\cli\\transcriptor.cmd", "win32") if c["id"] == "path")
+        self.assertNotIn("setx", card["text"])
+        self.assertNotIn("%PATH%", card["text"])
+        self.assertIn("GetEnvironmentVariable('Path', 'User')", card["text"])
+        self.assertIn("C:\\Users\\a\\cli", card["text"])
+
     def test_cards_quote_a_path_with_spaces(self):
         from backend.cli_access import command_cards
 

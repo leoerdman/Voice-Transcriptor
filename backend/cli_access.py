@@ -22,9 +22,18 @@ Files, all under ``<data dir>/cli``:
     backend runs on and points it at ``connection.json``. This is the
     command the CLI section shows; it is the whole "install".
 
-The CLI token opens only the transcription routes (``cli_token_may_call``).
-It is not the renderer's token with a different name: it cannot read or
-write the config, provider keys, the archive listing or the live socket.
+The CLI token opens only the transcription routes (``cli_token_may_call``),
+and on the one route it shares with the renderer it may only file a new
+recording (``cli_save_request_refusal``). It is not the renderer's token
+with a different name: with it alone a client cannot read or write the
+config, provider keys, the archive listing or the live socket.
+
+What this boundary does NOT cover: the renderer's own token is injected
+into the page served by the unauthenticated ``GET /`` (backend/main.py
+``index``), so a local process that fetches that page holds the full
+token. Closing that needs the desktop shell to hand the token to its
+window itself (audit BM-01, open); until then the CLI token limits what a
+holder of only the CLI token can do, not what any local process can.
 
 Pure where it can be: the wrapper text, the command cards, the route
 rule, the address-from-scope reader and the defaults derivation take
@@ -42,7 +51,7 @@ import secrets
 import shlex
 import stat
 import sys
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Mapping, Optional
 
 from backend.model_catalog import (
@@ -215,8 +224,17 @@ def command_cards(wrapper_path: str, platform: str = sys.platform) -> list[dict[
         f"Transcriptor's History). Run {cmd} --help for everything else."
     )
     if is_win:
-        install = f'setx PATH "%PATH%;{str(Path(wrapper_path).parent)}"'
-        install_note = "Adds the folder to your PATH, so `transcriptor transcribe ...` works in any new shell."
+        # Appends to the USER Path only. ``setx PATH "%PATH%;…"`` (the
+        # previous card) expands %PATH% to system + user entries, writes
+        # all of them into the user Path, and truncates the result at 1024
+        # characters — silently breaking a long PATH.
+        folder = str(PureWindowsPath(wrapper_path).parent).replace("'", "''")
+        install = (
+            "powershell -NoProfile -Command \"[Environment]::SetEnvironmentVariable("
+            "'Path', [Environment]::GetEnvironmentVariable('Path', 'User') + "
+            f"';{folder}', 'User')\""
+        )
+        install_note = "Adds the folder to your user PATH, so `transcriptor transcribe ...` works in any new shell."
     else:
         install = f"ln -sf {cmd} /usr/local/bin/transcriptor"
         install_note = (
@@ -340,6 +358,7 @@ class CliAccess:
                 self._base_url = str(data.get("base_url") or "").strip() if isinstance(data, dict) else ""
         except (OSError, ValueError) as e:
             logger.warning("cli connection file unreadable at %s: %s — will be rewritten", self.connection_path, e)
+        self._refresh_wrapper()
 
     def is_enabled(self) -> bool:
         return bool(self._token)
@@ -460,12 +479,36 @@ class CliAccess:
         )
         self._base_url = url
 
+    def _wrapper_text(self) -> str:
+        render = render_windows_wrapper if self._platform == "win32" else render_posix_wrapper
+        return render(self._python, self._cli_script, str(self.connection_path))
+
+    def _refresh_wrapper(self) -> None:
+        """Re-derive the wrapper from the RUNNING app (S-08). It embeds the
+        interpreter and script paths of the app that wrote it; after a
+        move, a reinstall or a switch between a dev checkout and the
+        packaged app those paths point nowhere while the section still
+        says "on". Rewritten only when the text differs. Never raises —
+        ``load`` runs at boot."""
+        try:
+            # Bytes, as written: a text read would fold the Windows
+            # wrapper's CRLF and never compare equal.
+            current = self.wrapper_path.read_bytes()
+        except OSError:
+            current = None
+        if current == self._wrapper_text().encode("utf-8"):
+            return
+        try:
+            self._write_wrapper()
+            logger.info("cli wrapper rewritten for this install at %s", self.wrapper_path)
+        except OSError as e:
+            logger.warning("cli wrapper at %s is stale and could not be rewritten: %s", self.wrapper_path, e)
+
     def _write_wrapper(self) -> None:
+        text = self._wrapper_text()
         if self._platform == "win32":
-            text = render_windows_wrapper(self._python, self._cli_script, str(self.connection_path))
             atomic_write_text(self.wrapper_path, text, mode=0o600)
             return
-        text = render_posix_wrapper(self._python, self._cli_script, str(self.connection_path))
         atomic_write_text(self.wrapper_path, text, mode=0o700)
         # atomic_write_text applies the mode to the temp file before the
         # rename; belt and braces for a writer that honours umask only.
