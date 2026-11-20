@@ -52,6 +52,35 @@ func runInterrupted(
   print("ok \(name)")
 }
 
+// BetterTouchTool's double-tap-and-drag (system tap-drag off): the second
+// press is POSTED by BTT, this helper holds it, so the window server never
+// knows the button is down and the finger's movement arrives as plain
+// `mouseMoved` — 2026-11-20 15:36, four presses logged `click drags=0`.
+run("a posted press that moves as mouseMoved draws", [
+  (.down, 200, 200, .hold),
+  (.up, 200, 200, .replayClick),
+  (.down, 200, 200, .hold),
+  (.moved, 202, 201, .hold),
+  (.moved, 220, 200, .strokeStart(from: CGPoint(x: 200, y: 200))),
+  (.moved, 260, 230, .strokeMove),
+  (.dragged, 270, 235, .strokeMove),
+  (.up, 270, 235, .strokeEnd),
+])
+
+run("hover with no press held passes, and does not start a stroke", [
+  (.moved, 100, 100, .pass),
+  (.moved, 160, 140, .pass),
+  (.down, 160, 140, .hold),
+  (.up, 160, 140, .replayClick),
+  (.moved, 200, 200, .pass),
+])
+
+run("a held press that only hovers under the threshold is still a click", [
+  (.down, 100, 100, .hold),
+  (.moved, 102, 101, .hold),
+  (.up, 102, 101, .replayClick),
+])
+
 run("a click is replayed to the app underneath", [
   (.down, 100, 100, .hold),
   (.up, 100, 100, .replayClick),

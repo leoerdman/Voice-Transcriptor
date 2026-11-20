@@ -135,6 +135,7 @@ let callback: CGEventTapCallBack = { _, type, event, _ in
   case .leftMouseDown: kind = .down
   case .leftMouseDragged: kind = .dragged
   case .leftMouseUp: kind = .up
+  case .mouseMoved: kind = .moved
   default: return Unmanaged.passUnretained(event)
   }
   let p = event.location
@@ -151,10 +152,15 @@ let callback: CGEventTapCallBack = { _, type, event, _ in
       "echoes": echoes, "by": posterName(event),
     ])
   }
+  // Cursor motion is never swallowed (PressClassifier: a held press moving
+  // with no button the window server knows of): the stroke is drawn from
+  // it, and the event goes on as the hover it is to everyone else.
+  let passOn = kind == .moved
   switch decision {
   case .pass:
     return Unmanaged.passUnretained(event)
   case .hold:
+    if passOn { return Unmanaged.passUnretained(event) }
     if kind == .down { state.heldDown = event.copy() }
     if kind == .up { state.heldDown = nil }  // a drag that wandered off a control
     return nil
@@ -169,10 +175,10 @@ let callback: CGEventTapCallBack = { _, type, event, _ in
     state.heldDown = nil
     emitPoint("start", from)
     emitPoint("move", p)
-    return nil
+    return passOn ? Unmanaged.passUnretained(event) : nil
   case .strokeMove:
     emitPoint("move", p)
-    return nil
+    return passOn ? Unmanaged.passUnretained(event) : nil
   case .strokeEnd:
     emitPoint("end", p)
     return nil
@@ -189,7 +195,8 @@ let callback: CGEventTapCallBack = { _, type, event, _ in
 let mask: CGEventMask =
   (1 << CGEventType.leftMouseDown.rawValue) |
   (1 << CGEventType.leftMouseDragged.rawValue) |
-  (1 << CGEventType.leftMouseUp.rawValue)
+  (1 << CGEventType.leftMouseUp.rawValue) |
+  (1 << CGEventType.mouseMoved.rawValue)
 
 guard let tap = CGEvent.tapCreate(
   tap: .cgSessionEventTap,

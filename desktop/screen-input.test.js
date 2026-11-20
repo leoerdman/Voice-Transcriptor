@@ -32,6 +32,9 @@ const helperSource = path.join(native, "screen-input", "main.swift");
 // Every case the Swift suite must run, by name. A case that disappears or
 // stops printing fails here; a new case is added to this list on purpose.
 const CASES = [
+  "a posted press that moves as mouseMoved draws",
+  "hover with no press held passes, and does not start a stroke",
+  "a held press that only hovers under the threshold is still a click",
   "a click is replayed to the app underneath",
   "a jitter under the threshold is still a click",
   "press and drag is a stroke from the press point",

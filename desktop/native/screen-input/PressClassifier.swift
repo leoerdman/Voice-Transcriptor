@@ -33,6 +33,20 @@
 // tap on the machine). Every replayed event's timestamp is remembered,
 // and an event carrying one passes untouched and is counted (`echoes`).
 //
+// A press another app POSTED (BetterTouchTool's double-tap-and-drag, which
+// emulates the gesture with its own event tap while the system tap-drag is
+// off) changes no button state in the window server — this helper holds
+// that press back, so the window server never learns the button went
+// down, and the finger's movement keeps arriving as plain `mouseMoved`.
+// Waiting for `leftMouseDragged` there waits for an event that never
+// comes: the user's take of 2026-11-20 15:36 logged four such presses as
+// `click drags=0`, and nothing was drawn. So while a press is held (or
+// drawing, or on a control) a `moved` event is the press moving and is
+// classified as a drag. Everywhere else it is hover and passes. The
+// helper passes every `moved` event on whatever the decision — it is
+// cursor motion, and the app underneath never saw the held press, so it
+// reads it as hover, not as a drag.
+//
 // The click count plays no part in the decision, so a double-tap-and-drag
 // whose second press this tap does see is a press that moves: a stroke.
 //
@@ -50,7 +64,7 @@
 import CoreGraphics
 
 struct PressClassifier {
-  enum Kind { case down, dragged, up }
+  enum Kind { case down, dragged, moved, up }
 
   enum Decision: Equatable {
     /// Let the event through unchanged.
@@ -165,7 +179,16 @@ struct PressClassifier {
     }
   }
 
-  mutating func classify(_ kind: Kind, at p: CGPoint, stamp: UInt64) -> Decision {
+  mutating func classify(_ event: Kind, at p: CGPoint, stamp: UInt64) -> Decision {
+    var kind = event
+    if kind == .moved {
+      // Movement with no button the window server knows of: only a press
+      // this classifier is holding makes it a drag.
+      switch phase {
+      case .held, .drawing, .onControl: kind = .dragged
+      case .idle, .orphanDrawing, .handedOver: return .pass
+      }
+    }
     if kind != .dragged, stamp != 0, replayed.contains(stamp) {
       // An event this helper already handed to the app, back again
       // without its marker: another tap re-posted it. It is the app's;
@@ -202,6 +225,8 @@ struct PressClassifier {
         phase = .orphanDrawing
         return .strokeStart(from: p)
       }
+    case .moved:
+      return .pass  // mapped to .dragged above, or already passed
     case .up:
       let was = phase
       phase = .idle
