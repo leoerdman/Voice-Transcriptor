@@ -1268,25 +1268,11 @@ async function refreshWindowForFrontendBuild(force = false) {
   return false;
 }
 
-function normalizeProviderChoice(value) {
-  const v = String(value || "").trim();
-  // UI group ids (transcription-catalog SSOT) map onto wire providers:
-  // both local groups transcribe through provider "local".
-  if (v === "local-whisper" || v === "gigaam") return "local";
-  if (v === "local" || v === "openrouter" || v === "deepgram" || v === "") return v;
-  return "local";
-}
-
-function normalizeLocalModelChoice(value) {
-  const v = String(value || "").trim();
-  return v || "small";
-}
-
 /**
  * Race win.webContents.executeJavaScript(code) against a timeout.
  *
- * Every hotkey-lifecycle renderer probe (`getRendererProviderChoice`,
- * `getRendererLocalModelChoice`, auto-stop config reads, etc.) previously awaited the
+ * Every hotkey-lifecycle renderer probe (recording state, auto-stop
+ * config reads, the toggle press, etc.) previously awaited the
  * executeJavaScript Promise unconditionally. If the renderer was
  * stuck (long synchronous work, layout lock, extension interaction),
  * the main process would hang in the recording startup path forever —
@@ -1316,25 +1302,6 @@ async function execRendererJsWithTimeout(code, fallback, timeoutMs = 2000) {
   } finally {
     if (timer) clearTimeout(timer);
   }
-}
-
-async function getRendererProviderChoice() {
-  const v = await execRendererJsWithTimeout(
-    `(() => {
-      const el = document.getElementById('providerSelect');
-      return String(el ? el.value : 'local').trim();
-    })();`,
-    "local",
-  );
-  return normalizeProviderChoice(v);
-}
-
-async function getRendererLocalModelChoice() {
-  const v = await execRendererJsWithTimeout(
-    `(() => String((document.getElementById('remoteModelSelect')?.value || 'small')).trim())();`,
-    "small",
-  );
-  return normalizeLocalModelChoice(v);
 }
 
 async function getRendererAutoStopSilenceConfig() {
@@ -2142,7 +2109,6 @@ async function updateRecordingStatusCapsule(patch = {}) {
   const payload = {
     status,
     mode,
-    tone: presentation.tone,
     startedAt: recordingStatusCapsuleState.startedAt,
     elapsedMs: Math.max(0, Number(recordingStatusCapsuleState.elapsedMs || 0)),
     timerRunning: !!recordingStatusCapsuleState.timerRunning,
@@ -5298,8 +5264,6 @@ async function pasteFromClipboard(text, target, options, trace, clipboardLease) 
 
       logPasteTrace("direct_attempt", { attempt: attempt + 1, method: "win_paste" });
       traceStep(trace, "method_begin", { method: "win_paste", attempt: attempt + 1 });
-
-      const cmdStarted = Date.now();
 
       // Fast path: VBS SendKeys — no compilation, no .NET assembly
       // loading, executes in <100 ms on all Windows versions.
@@ -8574,20 +8538,11 @@ async function createWindow(options = {}) {
   win.on("moved", () => noteMainWindowUserGeometry("moved"));
 
   win.on("closed", () => {
-    // Drop webContents listeners explicitly before releasing the ref
-    // so nothing can re-bind them through a stale closure. Electron
-    // GCs the BrowserWindow's native resources on its own, but
-    // JavaScript closures that captured ``win.webContents`` would
-    // still hold references to the old listener set.
-    try {
-      if (win && !win.isDestroyed() && win.webContents) {
-        win.webContents.removeAllListeners("render-process-gone");
-        win.webContents.removeAllListeners("did-fail-load");
-        win.webContents.removeAllListeners("did-finish-load");
-      }
-    } catch (e) {
-      appendMainLog(`[win-closed-listener-cleanup] ${e?.message || e}`);
-    }
+    // The webContents and its listeners are destroyed with the window.
+    // (A removeAllListeners block used to sit here behind
+    // ``!win.isDestroyed()`` — always false inside "closed" — so it
+    // never ran; it was deleted rather than "fixed", because there is
+    // nothing left to remove.)
     win = null;
   });
 
