@@ -98,6 +98,7 @@ import {
 import { smartRecordingTitle } from "./recording-title";
 import { historyFailureSurfaces, noticeSurfaces } from "./notice-surface";
 import { recoverySummary } from "./recovery-summary";
+import { networkVerdict, type NetworkProbeOutcome } from "./network-probe";
 import { waitForJob } from "./job-poll";
 import {
   LIVE_DRAFT_SCHEMA_VERSION,
@@ -5343,6 +5344,17 @@ function setNetworkState(online: boolean, latencyMs: number | null = null): void
   pill.setAttribute("title", latencyMs != null ? `Internet is available (${latencyMs} ms)` : "Internet is available");
 }
 
+/**
+ * The app's own backend did not answer the liveness probe. Not
+ * "Offline": the internet state is unknown and the last known one keeps
+ * deciding provider routing (./network-probe).
+ */
+function setBackendUnreachable(): void {
+  $("netDot").className = "net-dot offline";
+  $("netText").textContent = "No backend";
+  $("netPill").setAttribute("title", "The app's backend is not responding");
+}
+
 function parseViewName(value: string): ViewName {
   return value === "upload" || value === "recordings" || value === "settings" || value === "record"
     ? value
@@ -5436,7 +5448,7 @@ function localFallbackReason(preferred: Provider): string {
   return "Transcribing locally.";
 }
 
-async function refreshNetworkState(): Promise<void> {
+async function probeNetwork(): Promise<NetworkProbeOutcome> {
   try {
     // The one request that does NOT go through ``apiGet``, on purpose:
     // /api/health is the liveness probe, it is answered before the API
@@ -5455,33 +5467,41 @@ async function refreshNetworkState(): Promise<void> {
       // Non-JSON or shape mismatch — keep prior backend runtime config.
       console.debug("health body parse skipped", e);
     }
-    // First successful /api/health means the Python backend is up and
-    // serving — drop the boot overlay. hideBootOverlayOnce is idempotent
-    // so later refreshes don't re-trigger work after the first success.
-    hideBootOverlayOnce();
-    // A renderer that started before the backend did has its settings
-    // marked "never loaded", and stays that way — and refuses to save —
-    // until they are actually read. The backend is answering now.
-    void loadCfgOnce();
+  } catch (e) {
+    console.warn("backend health probe failed", e);
+    return { kind: "health-failed" };
+  }
+  // First successful /api/health means the Python backend is up and
+  // serving — drop the boot overlay. hideBootOverlayOnce is idempotent
+  // so later refreshes don't re-trigger work after the first success.
+  hideBootOverlayOnce();
+  // A renderer that started before the backend did has its settings
+  // marked "never loaded", and stays that way — and refuses to save —
+  // until they are actually read. The backend is answering now.
+  void loadCfgOnce();
+  try {
     // /api/network performs outbound probes, so it stays behind the same
     // token + rate-limit guard as the rest of the API.
     const netResp = await fetch("/api/network", { headers: authHeaders() });
-    if (!netResp.ok) {
-      setNetworkState(true, null);
-      return;
-    }
+    if (!netResp.ok) return { kind: "network-not-ok" };
     const s = (await netResp.json()) as NetworkStatusResponse;
-    // Honor the backend's ``online`` field instead of forcing true.
-    // The old hardcoded ``true`` ignored the backend's connectivity
-    // probe entirely — even when /api/network reported the network
-    // unreachable, ``resolveEffectiveProvider`` kept routing to remote
-    // providers, which then timed out with a confusing "remote
-    // provider unreachable" error instead of falling back to local
-    // Whisper as the offline indicator was supposed to enforce.
-    setNetworkState(s.online !== false, s.latency_ms ?? null);
-  } catch {
-    setNetworkState(false, null);
+    // Honor the backend's ``online`` field instead of forcing true: a
+    // hard-coded ``true`` kept routing to remote providers that then
+    // timed out instead of falling back to local Whisper.
+    return { kind: "network", online: s.online, latencyMs: s.latency_ms ?? null };
+  } catch (e) {
+    console.warn("network probe failed after the backend answered", e);
+    return { kind: "network-failed" };
   }
+}
+
+async function refreshNetworkState(): Promise<void> {
+  const verdict = networkVerdict(await probeNetwork());
+  if (!verdict.backendReachable) {
+    setBackendUnreachable();
+    return;
+  }
+  setNetworkState(verdict.internetOnline ?? isNetworkOnline, verdict.latencyMs);
 }
 
 // Idempotent boot-overlay-hide hook. Called from ``refreshNetworkState``
