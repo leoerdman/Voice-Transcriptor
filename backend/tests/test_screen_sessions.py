@@ -529,6 +529,18 @@ class CrashedScreenTakeRecoveryTests(unittest.TestCase):
         # Two seconds of 16 kHz PCM16 in the spool.
         self.assertEqual(screens["endedAt"] - screens["audioStartedAt"], 2000)
 
+    def test_a_promotion_says_what_it_wrote_so_the_renderer_can_complete_the_entry(self) -> None:
+        # The renderer rewrites the recovered entry with the crash draft's
+        # text and the marks; fields it has nothing better for are kept.
+        self._crashed_screen_take()
+        result = self.main._promote_live_recovery(self.SID, recording_collection="")
+        text = (Path(result["archive_dir"]) / result["name"]).read_text(encoding="utf-8")
+        for key in ("title", "source_text", "provider", "model", "language"):
+            self.assertIsInstance(result[key], str)
+        self.assertIn(result["title"], text)
+        self.assertIn(result["source_text"], text)
+        self.assertEqual(result["transcript_text"], "")
+
     def test_the_promote_route_without_a_collection_lets_the_sidecar_decide(self) -> None:
         import asyncio
 

@@ -113,6 +113,7 @@ frontend/
     ├── live-envelope.ts              # the `final` stop-envelope wire type: one reader, matches backend/live_envelope.py
     ├── screen-annotations.ts         # screen-mode marks: manifest → bracketed marks placed in the transcript by their moment in speech (pure)
     ├── take-collection.ts            # which History collection a live take is filed under, on every path (live socket, save, draft, recovery) (pure)
+    ├── take-recovery.ts              # a crashed take put back at the next launch: crash draft + promoted audio/screenshots → one entry with live text and screen marks (pure)
     ├── transcription-catalog.ts      # transcription catalog + selection SSOT for every model picker (pure)
     ├── shortcut-display.ts           # Electron accelerator → Settings keycap labels, per platform (pure)
     ├── cli-section.ts                # Settings → Command line: parses /api/cli and decides what the section shows (the backend composes every command)

@@ -1715,18 +1715,22 @@ def _promote_live_recovery(
             )
             audio_out = target_dir / f"{stem}.wav"
             tmp_audio = _atomic_temp_path(audio_out)
+            # What the entry's text file says. Returned with the result:
+            # the renderer completes the entry (the take's crash draft and
+            # its screen marks) by rewriting this file, and keeps every
+            # field it has nothing better for.
+            text_fields = {
+                "title": title,
+                "source_text": "[Recovered live audio capture]",
+                "transcript_text": "",
+                "provider": "local",
+                "model": model,
+                "language": language,
+            }
             try:
                 write_wav_from_pcm16_stream(str(pcm_path), str(tmp_audio), LIVE_SAMPLE_RATE_HZ)
                 atomic_promote_file(tmp_audio, audio_out)
-                _write_recording_text_file(
-                    out=text_out,
-                    title=title,
-                    source_text="[Recovered live audio capture]",
-                    transcript_text="",
-                    provider="local",
-                    model=model,
-                    language=language,
-                )
+                _write_recording_text_file(out=text_out, **text_fields)
                 # 1.1.25 fix: register the archive AFTER writes succeed.
                 # Previously called before write_wav; if the write
                 # failed, the archive dir was already registered for
@@ -1771,6 +1775,7 @@ def _promote_live_recovery(
                 "archive_dir": str(target_dir),
                 "screens": screens_manifest,
                 "screens_error": screens_error,
+                **text_fields,
             }
             _safe_delete_live_recovery(session_id)
             _store_live_promote_cache(session_id, result)

@@ -79,3 +79,18 @@ signal to the desktop shell keeps its short status, so the capsule never shows a
 transcript as a status). `stopLive` computes `screenMarks` once, right after the save, and
 every exit — silence/mic fault, Auto transcribe off, no canonical input, no key, the
 empty final, the `catch` — shows and saves `keptLiveTranscript()`. Never pasted.
+
+## Step 3 · Crash recovery: the draft joins the entry its audio was promoted into
+
+Backend: the promote answer carries the text fields it wrote (`title`, `source_text`,
+`transcript_text`, `provider`, `model`, `language`) so the renderer rewrites the entry
+without guessing. New pure module `frontend/src/take-recovery.ts`: `parsePromotedTake`,
+`recoveredTakeTranscript` (draft words + marks via `annotateTranscript`, in the manifest's
+time frame), `planTakeRecovery`. `recoverBackendAudioSessions` returns the promoted takes;
+`recoverLiveDraftIfAny(promoted)` writes the draft's text with marks into the promoted entry
+(`requireExisting: true`), gives a promoted screen take without a draft its marks, saves a
+draft with no promoted take on its own (as before), shows the draft's take in the
+TRANSCRIBE panel, and clears the draft only once the write carrying it succeeded.
+Tests: `frontend/tests/take-recovery.test.ts` (12), contract pins in
+`renderer-main-contract.test.ts` / `recording-save.test.ts`,
+`test_a_promotion_says_what_it_wrote_so_the_renderer_can_complete_the_entry`.

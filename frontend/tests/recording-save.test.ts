@@ -114,7 +114,10 @@ describe("main.tsx surfaces screens_error (M3)", () => {
     expect(mainTsx).toContain("if (persisted.screensError) {");
   });
   it("the spool promotion counts recoveries without their screenshots", () => {
-    expect(mainTsx).toContain("parseScreensError(await resp.json().catch(() => null))");
+    // One read of the answer: the take it names and its screens_error.
+    expect(mainTsx).toContain("const body: unknown = await resp.json().catch(() => null);");
+    expect(mainTsx).toContain("const take = parsePromotedTake(sessionId, body);");
+    expect(mainTsx).toContain("const screensError = parseScreensError(body);");
     expect(mainTsx).toContain("recoverySummary(succeeded, failed, withoutScreens)");
   });
 });
