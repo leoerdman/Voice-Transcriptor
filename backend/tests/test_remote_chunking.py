@@ -110,7 +110,7 @@ class RemoteChunkingTests(unittest.TestCase):
         self.assertGreaterEqual(progress[0], 0.18)
         self.assertGreaterEqual(progress[-1], 0.9)
 
-    def test_remote_model_uses_canonical_field_and_legacy_alias(self):
+    def test_remote_model_travels_under_model_only(self):
         source = Path(self._tmp.name) / "source.wav"
         source.write_bytes(b"source-audio-bytes")
         chunk = Path(self._tmp.name) / "chunk.webm"
@@ -141,7 +141,17 @@ class RemoteChunkingTests(unittest.TestCase):
                 remote_model="nova-3",
                 cfg={"providers": {"deepgram": {"key": "dg-key"}}, "preferences": {}},
             )
-            legacy = self.main._run_remote_transcribe_once(
+
+        self.assertEqual(canonical["model"], "nova-3")
+        self.assertEqual(models, ["nova-3"])
+        # FG-11: the "legacy aliases kept for older clients" are gone — no
+        # older client exists (renderer and CLI send ``model``).
+        self.assertEqual(self.main._remote_model_from_payload({"model": " nova-3 "}), "nova-3")
+        self.assertEqual(
+            self.main._remote_model_from_payload({"remote_model": "a", "openrouter_model": "b"}), ""
+        )
+        with self.assertRaises(TypeError):
+            self.main._run_remote_transcribe_once(
                 provider_norm="deepgram",
                 upload_path=source,
                 orig_name="source.wav",
@@ -151,10 +161,6 @@ class RemoteChunkingTests(unittest.TestCase):
                 openrouter_model="legacy-nova",
                 cfg={"providers": {"deepgram": {"key": "dg-key"}}, "preferences": {}},
             )
-
-        self.assertEqual(canonical["model"], "nova-3")
-        self.assertEqual(legacy["model"], "legacy-nova")
-        self.assertEqual(models, ["nova-3", "legacy-nova"])
 
     def test_live_recovery_helpers_are_optional(self):
         # A session with no recovery spool must be a NO-OP: not a crash,

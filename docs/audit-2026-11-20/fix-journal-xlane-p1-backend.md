@@ -118,3 +118,35 @@ before:  ✖ a log the appender creates is readable by its owner only
 after:   ℹ pass 4  ℹ fail 0
 ```
 Suites: backend 992 OK; desktop 436 pass; vitest 604; typecheck, lint, build clean.
+
+## C4 — FG-04, FG-06, FG-11 (backend contracts with the renderer)
+
+Files: `backend/main.py` (`_normalize_live_draft`, new
+`_live_draft_schema_version`, new `_bounded_text_tail`,
+`_remote_model_from_payload`, `_run_remote_transcribe_once`,
+`/api/remote/jobs`, `/api/remote/transcribe-sync`, transcribe-on-disk
+docstring), `backend/tests/test_live_draft_state.py`,
+`backend/tests/test_remote_chunking.py`, comments in
+`frontend/src/live-draft.ts` and `frontend/src/main.tsx`.
+
+- FG-04: the draft keeps `schema_version` (a positive integer; absent or
+  malformed → 1, the renderer's own reading of a pre-versioning draft), so
+  the renderer's newer-schema gate now works for backend drafts.
+- FG-06: `source_text` / `transcript_text` over `LIVE_DRAFT_MAX_TEXT_CHARS`
+  keep the TAIL (newest words). Chosen over publishing the limit: one owner
+  of the cap, no renderer copy.
+- FG-11: `remote_model` / `openrouter_model` removed from the JSON helper,
+  both form endpoints and `_run_remote_transcribe_once`; only `model` is
+  read (the renderer sends only `model` since bf3cb2f, `backend/cli.py` too).
+  `/api/remote/jobs/from-path` and transcribe-on-disk read through
+  `_remote_model_from_payload`, so they follow.
+
+Check — new tests against the previous `backend/main.py`:
+```
+before:  ERROR: test_the_schema_version_survives_the_round_trip
+         FAIL:  test_an_over_long_draft_keeps_its_newest_text (source_text, transcript_text)
+         FAIL:  test_remote_model_travels_under_model_only
+         FAILED (failures=3, errors=1)
+after:   Ran 9 tests OK
+```
+Suites: backend 994 OK; desktop 436; vitest 604; typecheck, lint, build clean.

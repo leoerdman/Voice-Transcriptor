@@ -25,10 +25,9 @@ export interface PersistedLiveDraft {
   /**
    * Payload schema version (BUG-12). Bump on any breaking field change
    * and branch the reader on it instead of minting another LEGACY_*
-   * storage key. The backend rebuilds the draft from a fixed key list
-   * and does not keep this field (FG-04, backend side), so the gate in
-   * `parsePersistedLiveDraftPayload` only bites for the legacy
-   * localStorage copy until it does.
+   * storage key. The backend keeps the number through its round trip
+   * (FG-04), so the gate in `parsePersistedLiveDraftPayload` bites for
+   * backend drafts as well as for the legacy localStorage copy.
    */
   schema_version: number;
   session_id?: string;

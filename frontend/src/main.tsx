@@ -4730,8 +4730,8 @@ function getRemoteModelValue(provider: Provider): string {
  * reads first. It used to be sent three times (``model``,
  * ``remote_model``, ``openrouter_model``, the last two "legacy aliases
  * kept for older clients"), although renderer and backend ship in one
- * bundle and no older client exists; the backend side of the alias is
- * listed for removal in the audit journal.
+ * bundle and no older client exists; the backend reads only ``model`` now
+ * (FG-11).
  */
 function appendRemoteModelFormFields(fd: FormData, provider: Provider, model: string | undefined): void {
   if (!isRemoteProvider(provider)) return;

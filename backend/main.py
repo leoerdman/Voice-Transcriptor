@@ -2508,12 +2508,14 @@ def _first_nonempty_text(*values: Any) -> str:
 
 
 def _remote_model_from_payload(payload: Optional[dict]) -> str:
-    data = payload or {}
-    return _first_nonempty_text(
-        data.get("model"),
-        data.get("remote_model"),
-        data.get("openrouter_model"),  # legacy alias kept for older clients
-    )
+    """The remote model a JSON request names — under ``model`` only.
+
+    ``remote_model`` / ``openrouter_model`` were "legacy aliases kept for
+    older clients" (FG-11); renderer and backend ship in one bundle, the
+    renderer sends only ``model`` (bf3cb2f) and so does the CLI, so no
+    older client exists to keep them for.
+    """
+    return _first_nonempty_text((payload or {}).get("model"))
 
 
 def _form_bool(value: Any, default: bool = False) -> bool:
@@ -2818,6 +2820,13 @@ def _bounded_text(value: object, max_len: int) -> str:
     return str(value or "").strip()[:max_len]
 
 
+def _bounded_text_tail(value: object, max_len: int) -> str:
+    """Like ``_bounded_text`` but keeps the END: for text that grows at the
+    end (a live transcript), the newest words are the ones worth keeping."""
+    text = str(value or "").strip()
+    return text[-max_len:] if len(text) > max_len else text
+
+
 def _nonneg_finite(value: object) -> Optional[float]:
     if value is None:
         return None
@@ -2898,6 +2907,10 @@ def _read_upload_queue_state() -> dict[str, Any]:
 
 LIVE_DRAFT_STATE_PATH = UI_STATE_DIR / "live_draft.json"
 LIVE_DRAFT_STATE_VERSION = 1
+# A draft's text past this length keeps its TAIL (FG-06): about four hours
+# of continuous speech, and a draft that long is the crash net of a take
+# still growing at its end — dropping the end lost the newest words while
+# the response said ok.
 LIVE_DRAFT_MAX_TEXT_CHARS = 200_000
 
 
@@ -2908,6 +2921,14 @@ def _default_live_draft_state() -> dict[str, Any]:
     }
 
 
+
+
+def _live_draft_schema_version(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 1
+    if not math.isfinite(value) or value < 1 or int(value) != value:
+        return 1
+    return int(value)
 
 
 def _normalize_live_draft(payload: object) -> Optional[dict[str, Any]]:
@@ -2934,14 +2955,20 @@ def _normalize_live_draft(payload: object) -> Optional[dict[str, Any]]:
     if not isinstance(draft_src, dict):
         raise HTTPException(status_code=400, detail="live draft must be an object")
     return {
+        # The renderer's payload schema version (FG-04). Kept, not
+        # interpreted: the renderer's reader discards a draft written by a
+        # NEWER schema than it knows (a downgraded app), which it can only
+        # do if the number survives the round trip. Absent or malformed →
+        # 1, the renderer's own reading of a pre-versioning draft.
+        "schema_version": _live_draft_schema_version(draft_src.get("schema_version")),
         "session_id": _bounded_text(draft_src.get("session_id"), 128),
         "started_at": _nonneg_finite(draft_src.get("started_at")) or 0,
         "updated_at": _nonneg_finite(draft_src.get("updated_at")) or int(time.time() * 1000),
         "recording": bool(draft_src.get("recording") is True),
         "timer": _bounded_text(draft_src.get("timer"), 32),
         "title": _bounded_text(draft_src.get("title"), 512),
-        "source_text": _bounded_text(draft_src.get("source_text"), LIVE_DRAFT_MAX_TEXT_CHARS),
-        "transcript_text": _bounded_text(draft_src.get("transcript_text"), LIVE_DRAFT_MAX_TEXT_CHARS),
+        "source_text": _bounded_text_tail(draft_src.get("source_text"), LIVE_DRAFT_MAX_TEXT_CHARS),
+        "transcript_text": _bounded_text_tail(draft_src.get("transcript_text"), LIVE_DRAFT_MAX_TEXT_CHARS),
         "provider": _bounded_text(draft_src.get("provider"), 32),
         "model": _bounded_text(draft_src.get("model"), 256),
         "language": _bounded_text(draft_src.get("language"), 32),
@@ -6837,7 +6864,6 @@ def _run_remote_transcribe_once(
     diarize: bool,
     num_speakers: str,
     remote_model: str = "",
-    openrouter_model: str = "",
     cfg: Optional[dict] = None,
     cancel_event: Optional[threading.Event] = None,
     progress_cb: Optional[Callable[[float], None]] = None,
@@ -6881,7 +6907,7 @@ def _run_remote_transcribe_once(
         or ((cfg.get("preferences") or {}).get("remote_provider"))
         or DEFAULT_REMOTE_TRANSCRIPTION_PROVIDER
     ).strip()
-    explicit_model = _first_nonempty_text(remote_model, openrouter_model)
+    explicit_model = _first_nonempty_text(remote_model)
 
     _raise_if_cancelled()
     if prov == "openrouter":
@@ -7166,8 +7192,6 @@ async def create_remote_job(
     diarize: bool = Form(False),
     num_speakers: str = Form(""),
     model: str = Form(""),
-    remote_model: str = Form(""),
-    openrouter_model: str = Form(""),
 ):
     _cleanup_expired_files()
     provider_norm = _form_text(provider, "").strip()
@@ -7190,11 +7214,7 @@ async def create_remote_job(
         language=lang_opt,
         diarize=_form_bool(diarize, False),
         num_speakers=_form_text(num_speakers, ""),
-        remote_model=_first_nonempty_text(
-            _form_text(model, ""),
-            _form_text(remote_model, ""),
-            _form_text(openrouter_model, ""),
-        ),
+        remote_model=_form_text(model, ""),
         cleanup_upload_path=True,
     )
     return {"job_id": job_id}
@@ -7244,8 +7264,6 @@ async def remote_transcribe_sync(
     diarize: bool = Form(False),
     num_speakers: str = Form(""),
     model: str = Form(""),
-    remote_model: str = Form(""),
-    openrouter_model: str = Form(""),
 ):
     provider_norm = _form_text(provider, "").strip()
     if provider_norm and provider_norm not in ALLOWED_REMOTE_PROVIDERS:
@@ -7273,11 +7291,7 @@ async def remote_transcribe_sync(
                 language=lang_opt,
                 diarize=_form_bool(diarize, False),
                 num_speakers=_form_text(num_speakers, ""),
-                remote_model=_first_nonempty_text(
-                    _form_text(model, ""),
-                    _form_text(remote_model, ""),
-                    _form_text(openrouter_model, ""),
-                ),
+                remote_model=_form_text(model, ""),
                 cfg=cfg,
             ),
         )
@@ -7324,7 +7338,7 @@ async def transcribe_recording_on_disk(
         language:        ISO-639-1 / "auto" (default: auto)
         diarize:         bool (default: false)
         num_speakers:    str (deepgram only)
-        model/remote_model: str (legacy alias: openrouter_model)
+        model:           str — the remote model (default: the provider's preference)
         archive_dir:     str — same as the GET endpoint
 
     Returns same shape as ``/api/remote/transcribe-sync``.

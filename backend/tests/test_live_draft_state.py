@@ -60,6 +60,28 @@ class LiveDraftStateTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.status_code, 400)
 
+    def test_the_schema_version_survives_the_round_trip(self):
+        # FG-04: the renderer discards a draft from a NEWER schema (a
+        # downgraded app) — only possible if the number comes back.
+        self.main.put_live_draft_state({"schema_version": 99, "source_text": "x"}, _auth=None)
+        self.assertEqual(self.main.get_live_draft_state(_auth=None)["draft"]["schema_version"], 99)
+        for raw in (None, "2", True, 0, -3, 1.5, float("nan")):
+            with self.subTest(raw=raw):
+                saved = self.main.put_live_draft_state({"schema_version": raw}, _auth=None)
+                self.assertEqual(saved["draft"]["schema_version"], 1)
+
+    def test_an_over_long_draft_keeps_its_newest_text(self):
+        # FG-06: a draft grows at its end; the cap used to drop the end.
+        limit = self.main.LIVE_DRAFT_MAX_TEXT_CHARS
+        text = "old " + "x" * limit + " newest words"
+        saved = self.main.put_live_draft_state(
+            {"source_text": text, "transcript_text": text}, _auth=None
+        )
+        for key in ("source_text", "transcript_text"):
+            with self.subTest(key=key):
+                self.assertEqual(len(saved["draft"][key]), limit)
+                self.assertTrue(saved["draft"][key].endswith(" newest words"))
+
 
 if __name__ == "__main__":
     unittest.main()
