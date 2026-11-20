@@ -3,6 +3,22 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.14] - 2026-11-21
+
+### Changed
+
+- **Short recording names.** A new recording is named by when it began: `20261121-034611` (plus four hex digits if two begin in the same second) — digits only, no title, no spaces. The title lives in the transcript and History shows it from there. Recordings saved under the old names keep working as before.
+- **Screen takes read section by section.** Each screenshot is a section (`### Скрин 7 · 01:04–02:47 · shot-07-preview.jpg`) holding what was said for it, with the strokes' boxes on one line; speech after the last screenshot has its own section. The per-mark screenshot number, the `[📸 …]` marks and the summary at the end are gone. The header states the file names once (`shot-NN.png`, `shot-NN-preview.jpg`, `shot-NN-nK.jpg`).
+- **A rectangle is not named in its mark** (it is the default tool); one drawn flat reads as a line.
+
+### Added
+
+- **Clicks in screen mode** (Settings → "Record clicks in screen mode", on by default): a small ring on the screenshot and a `[🖱 клик, …]` mark in the text.
+
+### Fixed
+
+- **No more Persian or Arabic words in a Russian/English transcript.** Deepgram's multilingual model sometimes writes Russian speech in another alphabet; a transcript now keeps only the alphabets of the expected languages (Settings → Expected languages). An upscale preset that translates keeps its target language's alphabet.
+
 ## [1.6.13] - 2026-11-21
 
 ### Removed
