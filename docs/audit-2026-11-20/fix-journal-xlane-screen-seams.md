@@ -187,3 +187,43 @@ turn, not one compositor transaction); the real press→visible time (read the n
 `surfaces visible press_to_visible_ms=` line); that a hidden capsule window keeps its painted
 state for the reveal; the re-dispatch-after-mic-prompt path; the unconfirmed-mic discard path
 (the frames may flash up and go if the mic confirmation fails after they were shown).
+
+## Not done (ID → reason)
+
+- **D3 residue — an ENDED take's collection** → a take stopped before its screen session
+  started (ENDED) was already stopped by the renderer as a screen take, so it is saved under
+  Screen Sessions without screenshots. Fixing it means deciding the collection in stopLive after
+  `finishScreenSession` answers (screen only with a manifest), but `recordingCollection` is
+  captured at the top of stopLive and also feeds `createSessionMetadataSaver` before the manifest
+  is awaited — a restructuring of stopLive owned by the frontend-live lane. Cross-domain #1.
+- **S-04 residue — the recovery sidecar of a demoted take** → the live socket opens before main
+  knows whether the session started, so the backend sidecar says `screen` + the session id.
+  A crash AFTER a demotion promotes the take into Screen Sessions (adoption of the missing
+  staged session returns nothing, no error). The draft snapshot (`buildLiveDraftPayload`) does
+  follow the demotion. Needs a backend way to update the sidecar's collection (e.g. on the draft
+  PUT) — backend lane. Cross-domain #2.
+- **Capsule hold / reveal in main.js** has no behaviour test: it is window state inside main.js
+  (needs Electron); covered only by the order checks in `screen-session-start.test.js` and the
+  controller's fake `prepareCapsule`/`showCapsule`.
+
+## Cross-domain for the lead
+
+1. Renderer (frontend-live): stopLive should file a screen take under Screen Sessions only when
+   `finishScreenSession` returned a manifest (an ENDED take is a voice take).
+2. Backend: let the live draft PUT (which now carries the take's real collection) or a small
+   endpoint update the recovery sidecar's `recording_collection` / clear `screen_session_id`, so a
+   take demoted by `screen-mode:voice-take` is recovered under Live.
+3. `ipc-contract.test.js:195` still pins the inline sender check of `screen-mode:finish`
+   (unchanged here; DM-28 item from fix-journal-desktop-main Cross-domain #7).
+4. CHANGELOG: screen mode now appears in one moment (capsule, palette, frames); the helper no
+   longer floods `press` lines; a failed screen start keeps the take as a voice take; the drawing
+   helper dying or a failed screenshot is now told to the user; a recording whose screenshots
+   could not be attached says so.
+5. Merge note: `RECORDING_COLLECTIONS` / `liveRecordingCollection` moved from main.tsx to
+   `frontend/src/take-collection.ts` (import added next to `./recording-save`).
+
+## Not verified live (summary)
+
+Everything that needs the packaged app on macOS: the one-moment showing and its real
+press→visible time, the voice-take notice reaching the renderer, the lost-renderer retirement,
+the helper's press-line fix (needs the rebuilt helper), a real `screens_error`.
