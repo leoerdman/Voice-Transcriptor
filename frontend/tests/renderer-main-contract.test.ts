@@ -747,3 +747,21 @@ describe("screen mode's record-clicks setting", () => {
     expect(mainTsx).toMatch(/window\.__transcriptorLiveTake = \(\) => \(\{[\s\S]*?screenClicks: liveScreenClicks,/);
   });
 });
+
+/**
+ * A new recording is named by when it BEGAN (backend/recording_names.py):
+ * every save that files one says so (./recording-save refuses one that
+ * does not), and a screen take's marks are placed by the same moment.
+ */
+describe("every new recording is saved with the moment it began", () => {
+  it("a live take: its first sample (or its press), for its audio save and its metadata save", () => {
+    expect(mainTsx).toContain("const takeStartedAt = takeStartedAtMs(startAt, startRequestedAt);");
+    expect(mainTsx.match(/recordedAtMs: takeStartedAt,/g)).toHaveLength(2);
+    expect(mainTsx).not.toContain("screenAudioStartedAt");
+  });
+
+  it("an upload: when it started; a recovered draft: its own start", () => {
+    expect(mainTsxSlice("async function saveUploadItemToHistory(", "\n}\n")).toContain("recordedAtMs: item.startedAt,");
+    expect(mainTsx).toContain("recordedAtMs: Number(draft.started_at) || 0,");
+  });
+});

@@ -495,6 +495,10 @@ def cmd_transcribe(conn: Connection, args: argparse.Namespace) -> int:
     if not args.quiet:
         engine_label = options["engine"] + (f"/{options['model']}" if options["model"] else "")
         note(f"{Path(source_path).name} → {engine_label} ({options['language']})")
+    # A file sent from the command line has no recording of its own to
+    # begin: the moment it is submitted is its recording's start, and the
+    # archive names it by that (backend/recording_names.py).
+    submitted_at_ms = int(time.time() * 1000)
     created = create_job(conn, source_path, options, args)
     job_id = created["job_id"]
     progress = Progress(not args.quiet)
@@ -515,7 +519,7 @@ def cmd_transcribe(conn: Connection, args: argparse.Namespace) -> int:
         emit(str(result.get("text") or "").encode("utf-8"), args.out, what="Transcript", quiet=args.quiet)
 
     if args.save:
-        saved = save_to_archive(conn, created, options, result, args)
+        saved = save_to_archive(conn, created, options, result, args, submitted_at_ms=submitted_at_ms)
         if saved and not args.quiet:
             note(f"saved to the archive as {saved}")
     return EXIT_OK
@@ -542,8 +546,13 @@ def save_to_archive(
     options: dict,
     result: dict,
     args: argparse.Namespace,
+    *,
+    submitted_at_ms: int,
 ) -> str:
     """Put the finished transcription in the app's History.
+
+    ``submitted_at_ms`` is when the file was submitted: the moment the
+    archive names this recording by (a CLI file's upload is its recording).
 
     Uses the snapshot the backend already made of the source file, and
     consumes it: without ``--save`` that copy is a temp file the app
@@ -563,6 +572,7 @@ def save_to_archive(
         "model": options["model"],
         "language": options["language"],
         "consume_source_path": True,
+        "recorded_at_ms": submitted_at_ms,
     }
     try:
         saved = _request(conn, "POST", "/api/recordings/save-from-path", payload)

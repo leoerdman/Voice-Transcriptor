@@ -114,6 +114,7 @@ CLI_SAVE_FROM_PATH_FIELDS: frozenset[str] = frozenset({
     "model",
     "language",
     "consume_source_path",
+    "recorded_at_ms",
 })
 
 

@@ -70,6 +70,7 @@ class SaveRunsOffTheEventLoopTests(_MainCase):
         with mock.patch.object(self.main, "_prune_recording_audio", spy):
             asyncio.run(self.main._save_recording_audio_source(
                 orig_name="take.wav", write_tmp_audio=write_tmp, title="take",
+                recorded_at_ms=1_795_200_000_000,
             ))
         self.assertEqual(threads, [False], "the save scanned the archive on the event loop thread")
 

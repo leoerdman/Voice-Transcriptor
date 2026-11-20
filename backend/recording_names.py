@@ -48,15 +48,19 @@ _LEGACY_STEM_RE = re.compile(
 )
 
 
-def recording_stem_candidates(when: Optional[datetime] = None) -> Iterator[str]:
+def recording_stem_candidates(when: datetime) -> Iterator[str]:
     """The names a new recording may take, in order of preference.
 
-    *when* is the local time of the recording (default: now). A timezone-
-    aware value is converted to local time first, so the name always reads
-    as the clock on the user's Mac did. The caller reserves the first free
-    candidate (``_claim_recording_text_path`` in ``backend.main``).
+    *when* is the moment the recording BEGAN — a dictation's first audio
+    sample, an upload's start, a crash-recovered take's spool start. It has
+    no default: "now" is when the name is asked for, which for a take is
+    its end, minutes after it began, so every caller says which moment its
+    recording began. A timezone-aware value is converted to local time
+    first, so the name always reads as the clock on the user's Mac did.
+    The caller reserves the first free candidate
+    (``_claim_recording_text_path`` in ``backend.main``).
     """
-    moment = when if when is not None else datetime.now()
+    moment = when
     if moment.tzinfo is not None:
         moment = moment.astimezone()
     base = moment.strftime(STEM_TIME_FORMAT)

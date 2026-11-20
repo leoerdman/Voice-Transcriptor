@@ -20,6 +20,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -380,6 +381,9 @@ class WireTests(unittest.TestCase):
         self.assertEqual(body["title"], "Standup")
         self.assertEqual(body["transcript_text"], "hello from the app")
         self.assertTrue(body["consume_source_path"])
+        # Named by when the file was submitted: its upload is its recording.
+        self.assertIsInstance(body["recorded_at_ms"], int)
+        self.assertLessEqual(abs(body["recorded_at_ms"] - time.time() * 1000), 60_000)
 
     def test_a_failed_save_does_not_fail_a_delivered_transcript(self):
         self.backend.state.requests.clear()
@@ -389,6 +393,7 @@ class WireTests(unittest.TestCase):
                 self.conn, {"audio_source_path": "/snap/job-1.wav"},
                 {"engine": "local", "model": "small", "language": "auto"},
                 {"text": "t"}, _Args(file=str(self.media), title="x"),
+                submitted_at_ms=1,
             )
         self.assertEqual(saved, "")
 

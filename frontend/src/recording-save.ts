@@ -14,6 +14,17 @@
 
 export type RecordingSaveRoute = "save-with-audio" | "save-from-path" | "save";
 
+/**
+ * When a live take BEGAN — what the archive names it by
+ * (backend/recording_names.py) and, for a screen take, the clock its marks
+ * are placed by: its first audio sample (the renderer's recording clock).
+ * A take whose microphone never delivered a sample has no first sample;
+ * it began when it was asked for (the press that started it).
+ */
+export function takeStartedAtMs(firstSampleAt: number, requestedAt: number): number {
+  return firstSampleAt > 0 ? firstSampleAt : requestedAt;
+}
+
 export interface RecordingSaveInput {
   hasAudioFile: boolean;
   audioSourcePath: string;
@@ -30,7 +41,14 @@ export interface RecordingSaveInput {
   language: string;
   liveSessionId?: string;
   screenSessionId?: string;
-  screenAudioStartedAt?: number;
+  /**
+   * Epoch ms the recording BEGAN: a take's start (``takeStartedAtMs``),
+   * an upload's start — an upload has no recording of its own, its upload
+   * is the recording. Required to file a NEW recording (its name is made
+   * of it, and a screen take's marks are placed by it); a rewrite of an
+   * existing recording keeps its name and does not need it.
+   */
+  recordedAtMs?: number;
 }
 
 export interface RecordingSavePlan {
@@ -48,6 +66,10 @@ export function planRecordingSave(input: RecordingSaveInput): RecordingSavePlan 
   if (input.screenSessionId && route !== "save-with-audio") {
     throw new Error("A screen-mode recording is saved with its audio file; the screen session cannot be attached to a text-only save.");
   }
+  const recordedAtMs = Number(input.recordedAtMs) || 0;
+  if (!input.existingName && !(recordedAtMs > 0)) {
+    throw new Error("A new recording is filed under the moment it began; this save does not say when that was.");
+  }
   const common: Record<string, string | boolean> = {
     name: input.existingName,
     recording_collection: input.recordingCollection,
@@ -60,6 +82,7 @@ export function planRecordingSave(input: RecordingSaveInput): RecordingSavePlan 
     language: input.language,
   };
   if (input.archiveDir) common.archive_dir = input.archiveDir;
+  if (recordedAtMs > 0) common.recorded_at_ms = String(Math.round(recordedAtMs));
   if (route === "save-from-path") {
     return {
       route,
@@ -75,12 +98,7 @@ export function planRecordingSave(input: RecordingSaveInput): RecordingSavePlan 
   if (!input.recordingCollection) delete fields.recording_collection;
   if (!input.requireExisting) delete fields.require_existing;
   if (input.liveSessionId) fields.live_session_id = input.liveSessionId;
-  if (input.screenSessionId) {
-    fields.screen_session_id = input.screenSessionId;
-    if (input.screenAudioStartedAt && input.screenAudioStartedAt > 0) {
-      fields.screen_audio_started_at = String(input.screenAudioStartedAt);
-    }
-  }
+  if (input.screenSessionId) fields.screen_session_id = input.screenSessionId;
   return { route, fields };
 }
 

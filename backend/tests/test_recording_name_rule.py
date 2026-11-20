@@ -22,16 +22,11 @@ class RecordingStemFormatTests(unittest.TestCase):
         self.assertEqual(stem, "20261121-034611")
         self.assertRegex(stem, r"^[0-9]{8}-[0-9]{6}$")
 
-    def test_without_a_time_it_is_named_after_now(self):
-        moment = datetime(2026, 1, 2, 3, 4, 5)
-
-        class _Frozen(datetime):
-            @classmethod
-            def now(cls, tz=None):
-                return moment
-
-        with mock.patch.object(recording_names, "datetime", _Frozen):
-            self.assertEqual(next(recording_names.recording_stem_candidates()), "20260102-030405")
+    def test_there_is_no_now_in_place_of_the_recording_start(self):
+        # "Now" at save time is the take's END: every caller must say when
+        # its recording began.
+        with self.assertRaises(TypeError):
+            next(recording_names.recording_stem_candidates())  # type: ignore[call-arg]
 
     def test_an_aware_time_is_named_in_local_time(self):
         aware = datetime(2026, 11, 21, 0, 46, 11, tzinfo=timezone(timedelta(hours=-3)))

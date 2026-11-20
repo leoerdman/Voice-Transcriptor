@@ -21,16 +21,10 @@ TEST_WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 _RENDERER_REQUEST = SimpleNamespace(state=SimpleNamespace(api_caller="renderer"))
 
 
-def _frozen_recording_clock(main, moment: datetime):
-    """Hold the naming rule's "now" at *moment*: every new recording asks
-    for the same ``YYYYMMDD-HHMMSS`` name."""
-
-    class _Frozen(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return moment if tz is None else moment.astimezone(tz)
-
-    return mock.patch.object(main.recording_names, "datetime", _Frozen)
+# The moment the recordings these tests file began: every new save sends
+# it (``recorded_at_ms``), and the archive names the recording after it.
+RECORDED_AT = datetime(2026, 11, 21, 3, 46, 11)
+RECORDED_AT_MS = RECORDED_AT.timestamp() * 1000
 
 
 def _fresh_main_module(data_dir: str):
@@ -88,7 +82,7 @@ class RecordingNameTests(_IsolatedMainCase):
 
         # Through the path the app actually takes: the O_EXCL reservation,
         # which names every new recording by the one rule.
-        stem, _out = self.main._claim_recording_text_path(target)
+        stem, _out = self.main._claim_recording_text_path(target, recorded_at=RECORDED_AT)
         self.assertRegex(stem, r"^\d{8}-\d{6}$")
 
         out = target / f"{stem}.txt"
@@ -351,6 +345,7 @@ class RecordingNameTests(_IsolatedMainCase):
 
     def test_recording_collections_save_into_source_specific_folders(self):
         live = self.main.save_recording({
+            "recorded_at_ms": RECORDED_AT_MS,
             "title": "Live note",
             "source_text": "live source",
             "transcript_text": "live transcript",
@@ -360,6 +355,7 @@ class RecordingNameTests(_IsolatedMainCase):
             "recording_collection": "live",
         })
         upload = self.main.save_recording({
+            "recorded_at_ms": RECORDED_AT_MS,
             "title": "Upload note",
             "source_text": "upload source",
             "transcript_text": "upload transcript",
@@ -414,6 +410,7 @@ class RecordingNameTests(_IsolatedMainCase):
         (target / "Existing.TXT").write_text("old", encoding="utf-8")
 
         result = self.main.save_recording({
+            "recorded_at_ms": RECORDED_AT_MS,
             "name": "Existing.TXT",
             "archive_dir": str(target),
             "require_existing": "true",
@@ -446,6 +443,7 @@ class RecordingNameTests(_IsolatedMainCase):
         existing.write_text("old", encoding="utf-8")
 
         result = self.main.save_recording({
+            "recorded_at_ms": RECORDED_AT_MS,
             "name": r"C:\archive\Existing.TXT",
             "archive_dir": str(target),
             "require_existing": "true",
@@ -466,6 +464,7 @@ class RecordingNameTests(_IsolatedMainCase):
         with mock.patch.object(self.main, "_atomic_write_text", side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
                 self.main.save_recording({
+                    "recorded_at_ms": RECORDED_AT_MS,
                     "archive_dir": str(target),
                     "title": "Will fail",
                     "source_text": "source",
@@ -643,6 +642,7 @@ class RecordingNameTests(_IsolatedMainCase):
         )
 
         result = asyncio.run(self.main.save_recording_with_audio(
+            recorded_at_ms=RECORDED_AT_MS,
             file=upload_file,
             name="",
             archive_dir="",
@@ -673,6 +673,7 @@ class RecordingNameTests(_IsolatedMainCase):
         )
 
         result = asyncio.run(self.main.save_recording_with_audio(
+            recorded_at_ms=RECORDED_AT_MS,
             file=upload_file,
             name="",
             archive_dir="",
@@ -706,6 +707,7 @@ class RecordingNameTests(_IsolatedMainCase):
         )
 
         result = asyncio.run(self.main.save_recording_with_audio(
+            recorded_at_ms=RECORDED_AT_MS,
             file=upload_file,
             name="Existing.TXT",
             archive_dir=str(target),
@@ -741,6 +743,7 @@ class RecordingNameTests(_IsolatedMainCase):
         )
 
         result = asyncio.run(self.main.save_recording_with_audio(
+            recorded_at_ms=RECORDED_AT_MS,
             file=upload_file,
             name=r"C:\archive\Existing.TXT",
             archive_dir=str(target),
@@ -774,6 +777,7 @@ class RecordingNameTests(_IsolatedMainCase):
 
         with self.assertRaises(OSError):
             asyncio.run(self.main._save_recording_audio_source(
+                recorded_at_ms=RECORDED_AT_MS,
                 orig_name="replacement.wav",
                 write_tmp_audio=failing_writer,
                 name="Existing.txt",
@@ -813,6 +817,7 @@ class RecordingNameTests(_IsolatedMainCase):
         with mock.patch.object(self.main.os, "replace", side_effect=fail_backup_replace):
             with self.assertRaises(self.main.HTTPException) as cm:
                 asyncio.run(self.main._save_recording_audio_source(
+                    recorded_at_ms=RECORDED_AT_MS,
                     orig_name="replacement.wav",
                     write_tmp_audio=writer,
                     name="Existing.txt",
@@ -852,6 +857,7 @@ class RecordingNameTests(_IsolatedMainCase):
 
         with mock.patch.object(Path, "unlink", flaky_unlink):
             result = asyncio.run(self.main._save_recording_audio_source(
+                recorded_at_ms=RECORDED_AT_MS,
                 orig_name="replacement.wav",
                 write_tmp_audio=writer,
                 name="Existing.txt",
@@ -881,6 +887,7 @@ class RecordingNameTests(_IsolatedMainCase):
 
         with self.assertRaises(OSError):
             asyncio.run(self.main._save_recording_audio_source(
+                recorded_at_ms=RECORDED_AT_MS,
                 orig_name="replacement.wav",
                 write_tmp_audio=failing_writer,
                 name="",
@@ -1008,6 +1015,7 @@ class RecordingNameTests(_IsolatedMainCase):
         source.write_bytes(payload)
 
         result = asyncio.run(self.main.save_recording_from_path(request=_RENDERER_REQUEST, payload={
+            "recorded_at_ms": RECORDED_AT_MS,
             "source_path": str(source),
             "title": "Lecture",
             "source_text": "source",
@@ -1035,6 +1043,7 @@ class RecordingNameTests(_IsolatedMainCase):
         source.write_bytes(payload)
 
         result = asyncio.run(self.main.save_recording_from_path(request=_RENDERER_REQUEST, payload={
+            "recorded_at_ms": RECORDED_AT_MS,
             "source_path": str(source),
             "title": "Lecture",
             "source_text": "source",
@@ -1057,6 +1066,7 @@ class RecordingNameTests(_IsolatedMainCase):
         source.write_bytes(payload)
 
         result = asyncio.run(self.main.save_recording_from_path(request=_RENDERER_REQUEST, payload={
+            "recorded_at_ms": RECORDED_AT_MS,
             "source_path": str(source),
             "title": "Lecture",
             "source_text": "source",
@@ -1203,7 +1213,6 @@ class RecordingNameTests(_IsolatedMainCase):
         # save) and every retry in the same second was pushed to a
         # suffixed name. The clock is held in one second throughout, so
         # every attempt below asks for the same name.
-        self.enterContext(_frozen_recording_clock(self.main, datetime(2026, 11, 21, 3, 46, 11)))
         target = Path(self._tmp.name) / "recordings"
         target.mkdir()
 
@@ -1213,6 +1222,7 @@ class RecordingNameTests(_IsolatedMainCase):
         for _ in range(2):
             with self.assertRaises(OSError):
                 asyncio.run(self.main._save_recording_audio_source(
+                    recorded_at_ms=RECORDED_AT_MS,
                     orig_name="lecture.wav",
                     write_tmp_audio=failing_writer,
                     archive_dir=str(target),
@@ -1238,6 +1248,7 @@ class RecordingNameTests(_IsolatedMainCase):
             tmp_audio.write_bytes(b"audio")
 
         asyncio.run(self.main._save_recording_audio_source(
+            recorded_at_ms=RECORDED_AT_MS,
             orig_name="lecture.wav",
             write_tmp_audio=ok_writer,
             archive_dir=str(target),
@@ -1278,6 +1289,7 @@ class RecordingNameTests(_IsolatedMainCase):
         target.mkdir()
 
         self.main.save_recording({
+            "recorded_at_ms": RECORDED_AT_MS,
             "title": "silent-a",
             "source_text": "",
             "transcript_text": "",
@@ -1289,6 +1301,7 @@ class RecordingNameTests(_IsolatedMainCase):
             tmp_audio.write_bytes(b"audio")
 
         asyncio.run(self.main._save_recording_audio_source(
+            recorded_at_ms=RECORDED_AT_MS,
             orig_name="silent-b.wav",
             write_tmp_audio=writer,
             archive_dir=str(target),
@@ -1331,10 +1344,15 @@ class RecordingNameTests(_IsolatedMainCase):
         # The spool name ``_open_live_recovery`` writes: ``YYYYmmdd_HHMMSS_<session>``.
         pcm = recovery_dir / f"20260904_193712_{session_id}.pcm16"
         pcm.write_bytes(b"\x00\x00" * 16000)
+        # The spool's last write is when capture ended; minus the audio it
+        # holds, when it began — the first sample the take is named by.
+        held_s = pcm.stat().st_size / self.main.LIVE_PCM_BYTES_PER_SEC
+        first_sample = datetime(2026, 9, 4, 19, 37, 12, 400000).timestamp()
+        os.utime(pcm, (first_sample + held_s, first_sample + held_s))
         pcm.with_suffix(".json").write_text(
             json.dumps({
                 "session_id": session_id,
-                "started_at": "2026-09-04T19:37:12.123456",
+                "started_at": "2026-09-04T19:37:11.900000",
                 "bytes": pcm.stat().st_size,
                 "model": "nova-3",
                 "language": "ru",
@@ -1358,7 +1376,7 @@ class RecordingNameTests(_IsolatedMainCase):
         self.assertEqual(list(promoted_dir.glob("*.claim")), [])
         # The title lives in the header only.
         self.assertIn(
-            "Title: Recovered 2026-09-04T19:37:12.123456",
+            "Title: Recovered 2026-09-04T19:37:11.900000",
             (promoted_dir / result["name"]).read_text(encoding="utf-8"),
         )
 
@@ -1379,6 +1397,7 @@ class ShortRecordingNameTests(_IsolatedMainCase):
         for collection in ("live", "uploads", "screen"):
             with self.subTest(collection=collection):
                 result = self.main.save_recording({
+                    "recorded_at_ms": RECORDED_AT_MS,
                     "title": self.TITLE,
                     "source_text": "source",
                     "transcript_text": "transcript",
@@ -1398,6 +1417,7 @@ class ShortRecordingNameTests(_IsolatedMainCase):
             size=len(b"tiny mp4 payload"),
         )
         result = asyncio.run(self.main.save_recording_with_audio(
+            recorded_at_ms=RECORDED_AT_MS,
             file=upload_file,
             name="",
             archive_dir="",
@@ -1423,9 +1443,9 @@ class ShortRecordingNameTests(_IsolatedMainCase):
         self.assertEqual(item["audio_name"], f"{stem}.mp4")
 
     def test_saves_in_the_same_second_get_a_collision_suffix(self):
-        self.enterContext(_frozen_recording_clock(self.main, datetime(2026, 11, 21, 3, 46, 11)))
         names = [
             self.main.save_recording({
+                "recorded_at_ms": RECORDED_AT_MS,
                 "title": self.TITLE,
                 "source_text": "s",
                 "transcript_text": f"take {i}",
@@ -1527,3 +1547,76 @@ class ShortRecordingNameTests(_IsolatedMainCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RecordingStartNameTests(_IsolatedMainCase):
+    """A new recording is named by when it BEGAN (the request's
+    ``recorded_at_ms``), never by when it was saved."""
+
+    def test_the_name_is_the_recording_start_not_the_save_time(self):
+        began = datetime(2026, 3, 7, 23, 59, 58)
+        text = self.main.save_recording({
+            "recorded_at_ms": began.timestamp() * 1000,
+            "title": "t", "source_text": "s", "transcript_text": "x", "provider": "local",
+        })
+        self.assertEqual(text["name"], "20260307-235958.txt")
+
+        async def write_tmp(tmp: Path) -> None:
+            tmp.write_bytes(b"RIFF" + b"\x00" * 64)
+
+        with_audio = asyncio.run(self.main._save_recording_audio_source(
+            orig_name="take.wav", write_tmp_audio=write_tmp, title="t",
+            recorded_at_ms=datetime(2026, 3, 8, 0, 0, 1).timestamp() * 1000,
+        ))
+        self.assertEqual(with_audio["name"], "20260308-000001.txt")
+
+    def test_two_recordings_begun_in_the_same_second_get_a_suffix(self):
+        began_ms = datetime(2026, 3, 7, 10, 0, 0, 100000).timestamp() * 1000
+        names = [
+            self.main.save_recording({
+                "recorded_at_ms": began_ms + offset, "title": "t", "source_text": "s",
+                "transcript_text": f"x{offset}", "provider": "local",
+            })["name"]
+            for offset in (0, 700)
+        ]
+        self.assertEqual(names[0], "20260307-100000.txt")
+        self.assertRegex(names[1], r"^20260307-100000-[0-9a-f]{4}\.txt$")
+
+    def test_a_new_recording_without_its_start_is_refused_not_named_by_now(self):
+        for bad in (None, "", 0, -5, "soon", float("nan")):
+            with self.subTest(recorded_at_ms=bad):
+                with self.assertRaises(self.main.HTTPException) as raised:
+                    self.main.save_recording({
+                        "recorded_at_ms": bad, "title": "t", "source_text": "s",
+                        "transcript_text": "x", "provider": "local",
+                    })
+                self.assertEqual(raised.exception.status_code, 400)
+                self.assertIn("recorded_at_ms", raised.exception.detail)
+
+    def test_rewriting_an_existing_recording_needs_no_start(self):
+        first = self.main.save_recording({
+            "recorded_at_ms": RECORDED_AT_MS, "title": "t", "source_text": "s",
+            "transcript_text": "x", "provider": "local",
+        })
+        again = self.main.save_recording({
+            "name": first["name"], "archive_dir": first["archive_dir"], "require_existing": True,
+            "title": "t2", "source_text": "s", "transcript_text": "y", "provider": "local",
+        })
+        self.assertEqual(again["name"], first["name"])
+
+    def test_a_screen_take_places_its_marks_by_the_same_start(self):
+        seen: dict = {}
+
+        def adopt(session_id, target_dir, stem, *, audio_started_at=None, audio_ended_at=None):
+            seen["audio_started_at"] = audio_started_at
+            return None, ""
+
+        async def write_tmp(tmp: Path) -> None:
+            tmp.write_bytes(b"RIFF" + b"\x00" * 64)
+
+        with mock.patch.object(self.main, "_adopt_screen_session_for_recording", adopt):
+            asyncio.run(self.main._save_recording_audio_source(
+                orig_name="take.wav", write_tmp_audio=write_tmp, title="t",
+                screen_session_id="screen-20261121-034611-000", recorded_at_ms=RECORDED_AT_MS,
+            ))
+        self.assertEqual(seen["audio_started_at"], RECORDED_AT_MS)

@@ -162,6 +162,7 @@ import {
   parseScreensError,
   planRecordingSave,
   recordingSaveFormEntries,
+  takeStartedAtMs,
   transcriptScreenManifest,
 } from "./recording-save";
 import {
@@ -6184,6 +6185,8 @@ async function recoverLiveDraftIfAny(promoted: ReadonlyArray<PromotedTake> = [])
         model: String(draft.model || "-"),
         language: String(draft.language || "auto"),
         recordingCollection: recordingCollectionFromDraft(draft.recording_collection),
+        // The draft's own start (its take's recording clock).
+        recordedAtMs: Number(draft.started_at) || 0,
       });
       draftSaved = true;
       shown = { text: draftSpokenText(draft), title, savedName: recovered.name };
@@ -8894,8 +8897,10 @@ async function saveRecordingText(opts: {
   liveSessionId?: string;
   /** Screen mode: the staged session the backend adopts beside this recording. */
   screenSessionId?: string;
-  /** Screen mode: epoch ms of the first audio sample, archived with the session. */
-  screenAudioStartedAt?: number;
+  /** Epoch ms the recording began (./recording-save ``recordedAtMs``):
+   *  required for a new recording, which is named by it; a screen take's
+   *  marks are placed by the same moment. */
+  recordedAtMs?: number;
   refreshList?: boolean;
 }): Promise<SavedRecordingRef> {
   const hasArchiveDirOption = Object.prototype.hasOwnProperty.call(opts, "archiveDir");
@@ -8932,7 +8937,7 @@ async function saveRecordingText(opts: {
     language: opts.language,
     liveSessionId: opts.liveSessionId,
     screenSessionId: opts.screenSessionId,
-    screenAudioStartedAt: opts.screenAudioStartedAt,
+    recordedAtMs: opts.recordedAtMs,
   });
   let response: unknown;
   if (plan.route === "save-with-audio" && audioFile) {
@@ -11905,6 +11910,9 @@ async function stopLive(
   // its manifest is awaited only where the transcript is composed.
   const recordingMode = liveRecordingMode;
   const recordingClockStartAt = startAt;
+  // When this take began, for the archive's name and the screen marks'
+  // clock: its first audio sample, or its press when there was none.
+  const takeStartedAt = takeStartedAtMs(startAt, startRequestedAt);
   const screenSessionPromise = recordingMode === "screen"
     ? finishScreenSession(liveScreenSessionId, discarding)
     : Promise.resolve(null);
@@ -12536,6 +12544,7 @@ async function stopLive(
     fallbackTitle: defaultTitle,
     save: async (request) => saveRecordingText({
       ...request,
+      recordedAtMs: takeStartedAt,
       model: modelValue,
       language: languageValue,
       recordingCollection: await recordingCollectionPromise,
@@ -12644,7 +12653,7 @@ async function stopLive(
           audioFile: savedAudioFile,
           liveSessionId: liveSessionId,
           screenSessionId: stagedScreenManifest?.id || undefined,
-          screenAudioStartedAt: stagedScreenManifest ? recordingClockStartAt : undefined,
+          recordedAtMs: takeStartedAt,
           refreshList: false,
         });
         persistedRecordingName = persisted.name;
@@ -14960,6 +14969,8 @@ async function saveUploadItemToHistory(
       model: item.model || "",
       language: item.language || "",
       recordingCollection: RECORDING_COLLECTIONS.uploads,
+      // An upload has no recording of its own: it began when it started.
+      recordedAtMs: item.startedAt,
       audioFile: audio.file,
       audioSourcePath: audio.sourcePath,
       consumeAudioSourcePath: audio.consumeSourcePath,

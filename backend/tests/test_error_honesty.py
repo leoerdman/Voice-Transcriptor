@@ -18,6 +18,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from datetime import datetime
 from unittest import mock
 
 
@@ -118,7 +119,7 @@ class UnreadableRecordingsFolderTests(_MainCase):
             Path, "iterdir", side_effect=OSError("disk not mounted")
         ):
             with self.assertRaises(self.main.HTTPException) as raised:
-                self.main._claim_recording_text_path(target)
+                self.main._claim_recording_text_path(target, recorded_at=datetime(2026, 11, 21, 3, 46, 11))
         self.assertEqual(raised.exception.status_code, 503)
         self.assertIn("not readable", raised.exception.detail)
 

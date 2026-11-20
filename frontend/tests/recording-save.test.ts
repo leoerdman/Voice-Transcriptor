@@ -7,6 +7,7 @@ import {
   parseScreensError,
   planRecordingSave,
   recordingSaveFormEntries,
+  takeStartedAtMs,
   transcriptScreenManifest,
   type RecordingSaveInput,
 } from "../src/recording-save";
@@ -26,6 +27,7 @@ function input(extra: Partial<RecordingSaveInput> = {}): RecordingSaveInput {
     provider: "local",
     model: "small",
     language: "auto",
+    recordedAtMs: 1_795_200_000_000,
     ...extra,
   };
 }
@@ -37,10 +39,26 @@ describe("planRecordingSave (FU-21)", () => {
   });
 
   it("attaches the screen session to the multipart save", () => {
-    const plan = planRecordingSave(input({ hasAudioFile: true, screenSessionId: "scr-1", screenAudioStartedAt: 1700 }));
+    const plan = planRecordingSave(input({ hasAudioFile: true, screenSessionId: "scr-1", recordedAtMs: 1700 }));
     expect(plan.route).toBe("save-with-audio");
     expect(plan.fields.screen_session_id).toBe("scr-1");
-    expect(plan.fields.screen_audio_started_at).toBe("1700");
+    // One field: the recording's start names it and places the screen marks.
+    expect(plan.fields.recorded_at_ms).toBe("1700");
+  });
+
+  it("a new recording says when it began, on every route; a rewrite of an existing one need not", () => {
+    for (const extra of [{}, { audioSourcePath: "/a.wav" }, { hasAudioFile: true }]) {
+      expect(planRecordingSave(input({ ...extra, recordedAtMs: 1_795_200_000_123.4 })).fields.recorded_at_ms).toBe("1795200000123");
+      expect(() => planRecordingSave(input({ ...extra, recordedAtMs: undefined }))).toThrow(/moment it began/);
+      expect(() => planRecordingSave(input({ ...extra, recordedAtMs: 0 }))).toThrow(/moment it began/);
+    }
+    const rewrite = planRecordingSave(input({ existingName: "20261121-034611.txt", requireExisting: true, recordedAtMs: undefined }));
+    expect(rewrite.fields).not.toHaveProperty("recorded_at_ms");
+  });
+
+  it("a take began at its first audio sample, or at its press when the microphone delivered nothing", () => {
+    expect(takeStartedAtMs(1_000_500, 1_000_000)).toBe(1_000_500);
+    expect(takeStartedAtMs(0, 1_000_000)).toBe(1_000_000);
   });
 
   it("sends the same common fields on every route", () => {

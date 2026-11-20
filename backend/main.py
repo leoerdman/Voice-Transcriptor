@@ -1721,12 +1721,24 @@ def _promote_live_recovery(
             # existed and was applied on the neighbouring path. Two
             # answers to "is this name free", one of them able to lose a
             # race with the other and overwrite the .txt/.wav it picked.
-            # Named after when the take STARTED (the spool's own clock),
-            # not when it was recovered — days may separate the two.
-            try:
-                recorded_at = datetime.fromisoformat(started_at) if started_at else None
-            except ValueError:
-                recorded_at = None
+            # Named after when the take STARTED — its first audio sample,
+            # from the spool itself (the same moment a normal save names
+            # the take after, and the screen marks' clock below) — not
+            # when it was recovered: days may separate the two. A spool
+            # that cannot be read for that has no audio to recover; its
+            # sidecar's ``started_at`` (the socket's opening, within a
+            # frame of the first sample) names it then.
+            audio_started_at, audio_ended_at = _recovery_audio_span_ms(pcm_path)
+            if audio_started_at is not None:
+                recorded_at = datetime.fromtimestamp(audio_started_at / 1000.0)
+            else:
+                try:
+                    recorded_at = datetime.fromisoformat(started_at)
+                except ValueError:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="live recovery has no start time to name it by",
+                    )
             stem, text_out = _claim_recording_text_path(
                 target_dir, recorded_at=recorded_at
             )
@@ -1773,7 +1785,6 @@ def _promote_live_recovery(
             # audio exactly as on the normal save (H-01/BM-04/S-01) —
             # adopted beside the recovered recording BEFORE retention
             # runs, so they are this (exempt) recording's media from now on.
-            audio_started_at, audio_ended_at = _recovery_audio_span_ms(pcm_path)
             screens_manifest, screens_error = _adopt_screen_session_for_recording(
                 str(meta.get("screen_session_id") or ""),
                 target_dir,
@@ -3317,15 +3328,41 @@ def _release_recording_text_claim(out: Path, context: str) -> None:
     _best_effort_unlink(_recording_text_claim_path(out), context=context)
 
 
+def _recording_started_at(recorded_at_ms: object) -> datetime:
+    """The moment a NEW recording began, from the request's
+    ``recorded_at_ms`` (epoch ms) — what its name is made of.
+
+    Every caller that files a new recording says it: the renderer sends a
+    take's first audio sample (its recording clock, ``startAt``) and an
+    upload's start; the CLI sends when it submitted the file — an upload
+    and a CLI file have no recording of their own to begin, their upload
+    IS the recording. There is no "now" in its place: at save time now is
+    the take's end, and a name made of it would say the wrong minute
+    without anyone noticing. A request that files a new recording without
+    it is refused.
+    """
+    try:
+        ms = float(recorded_at_ms)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        ms = 0.0
+    if not math.isfinite(ms) or ms <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="recorded_at_ms (epoch ms the recording began) is required to file a new recording",
+        )
+    return datetime.fromtimestamp(ms / 1000.0)
+
+
 def _claim_recording_text_path(
-    target_dir: Path, *, recorded_at: Optional[datetime] = None
+    target_dir: Path, *, recorded_at: datetime
 ) -> tuple[str, Path]:
     """Reserve a new recording's name in ``target_dir``: ``(stem, <stem>.txt)``.
 
     The one way a recording is named — every save, upload and recovery
     comes through here, and the names come from ONE rule
-    (``recording_names.recording_stem_candidates``: the local time of the
-    recording, ``YYYYMMDD-HHMMSS``, plus a random suffix on a collision).
+    (``recording_names.recording_stem_candidates``: the local time the
+    recording began, ``YYYYMMDD-HHMMSS``, plus a random suffix on a
+    collision).
     The title never takes part. The first free candidate is RESERVED with
     an ``O_EXCL`` marker, so two parallel saves cannot pick the same name.
     """
@@ -8861,7 +8898,9 @@ def save_recording(
     else:
         if require_existing:
             raise HTTPException(status_code=400, detail="require_existing needs an existing recording name")
-        _stem, out = _claim_recording_text_path(target_dir)
+        _stem, out = _claim_recording_text_path(
+            target_dir, recorded_at=_recording_started_at(payload.get("recorded_at_ms"))
+        )
         claimed_new_text = True
     try:
         _write_recording_text_file(
@@ -8901,8 +8940,15 @@ async def _save_recording_audio_source(
     language: str = "",
     live_session_id: str = "",
     screen_session_id: str = "",
-    screen_audio_started_at: float = 0.0,
+    recorded_at_ms: float = 0.0,
 ) -> dict[str, Any]:
+    """File a recording with its audio (save-with-audio, save-from-path).
+
+    ``recorded_at_ms`` is the epoch ms the recording began
+    (``_recording_started_at``): a new recording's name is made of it, and
+    for a screen take — whose renderer sends its first audio sample — it is
+    also the clock its screen marks are placed by (``audioStartedAt``).
+    """
     raw_existing_name = str(name or "").strip()
     existing_name = _recording_text_name_leaf(raw_existing_name) if raw_existing_name else ""
     fields = _normalize_save_fields(
@@ -8935,7 +8981,9 @@ async def _save_recording_audio_source(
     else:
         if require_existing:
             raise HTTPException(status_code=400, detail="require_existing needs an existing recording name")
-        stem, out_text = _claim_recording_text_path(target_dir)
+        stem, out_text = _claim_recording_text_path(
+            target_dir, recorded_at=_recording_started_at(recorded_at_ms)
+        )
         text_name = out_text.name
         claimed_new_text = True
 
@@ -9042,7 +9090,7 @@ async def _save_recording_audio_source(
             screen_session_id,
             target_dir,
             stem,
-            audio_started_at=screen_audio_started_at,
+            audio_started_at=recorded_at_ms,
         )
         # Persist this dir only after transcript + audio are durable so startup
         # retroactive retention does not learn failed/empty archive targets.
@@ -9097,7 +9145,7 @@ async def save_recording_with_audio(
     language: str = Form(""),
     live_session_id: str = Form(""),
     screen_session_id: str = Form(""),
-    screen_audio_started_at: str = Form(""),
+    recorded_at_ms: str = Form(""),
 ):
     orig_name = _normalize_filename(file.filename or "recording.wav")
     return await _save_recording_audio_source(
@@ -9115,7 +9163,7 @@ async def save_recording_with_audio(
         language=_form_text(language, ""),
         live_session_id=_form_text(live_session_id, ""),
         screen_session_id=_form_text(screen_session_id, ""),
-        screen_audio_started_at=_form_float(screen_audio_started_at),
+        recorded_at_ms=_form_float(recorded_at_ms),
     )
 
 
@@ -9156,6 +9204,7 @@ async def save_recording_from_path(
         model=str((payload or {}).get("model") or ""),
         language=str((payload or {}).get("language") or ""),
         live_session_id="",
+        recorded_at_ms=_form_float((payload or {}).get("recorded_at_ms")),
     )
     if consume_source_path and _is_backend_owned_upload_path(source_path):
         _best_effort_unlink(source_path, context="recording consumed upload source cleanup")
