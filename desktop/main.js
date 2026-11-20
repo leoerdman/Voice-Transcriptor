@@ -128,6 +128,7 @@ const { buildPwshPasteFallbackScript } = require("./windows-paste-fallback");
 // What a backend exit means: restart or not, and whose handle it clears
 // (DM-09, DM-27).
 const { backendHandleOf, decideBackendExit } = require("./backend-exit");
+const { createSingleFlight } = require("./single-flight");
 // Recording ids are unique only per renderer page: key them with the
 // page's epoch (DM-32).
 const { recordingKey, createBoundedKeySet } = require("./renderer-epoch");
@@ -7261,8 +7262,10 @@ const engineInstall = {
   reason: "",
   error: "",
   startedAtMs: 0,
-  inFlight: null,
 };
+
+/** At most one engine install at a time (DM-06, desktop/single-flight.js). */
+const engineInstallFlight = createSingleFlight();
 
 function setEnginePhase(phase, fields = {}) {
   engineInstall.phase = phase;
@@ -7305,9 +7308,6 @@ async function probeGigaamImportable(python, repoRoot) {
  * relaunch — the existing crash-restart machinery owns the respawn.
  */
 async function installGigaamEngine(python, repoRoot) {
-  if (engineInstall.inFlight) {
-    return { ok: false, status: "already-running", ...engineInstallSnapshot() };
-  }
   const marker = path.join(repoRoot, "ENABLE_GIGAAM");
   if (!fs.existsSync(marker)) {
     return { ok: false, status: "disabled", reason: "engine feature not enabled in this build" };
@@ -7317,17 +7317,12 @@ async function installGigaamEngine(python, repoRoot) {
     return { ok: false, status: "disabled", reason: "requirements-gigaam.txt missing" };
   }
   // Single flight, claimed on THIS synchronous turn — before the first
-  // await (DM-06). The flag used to be set only after the up-to-60 s
-  // import probe, so two invokes inside that window (double click, two
-  // windows, a StrictMode double effect) both passed the check above and
-  // ran two multi-GB pip installs into the same staging directory.
-  const run = runGigaamEngineInstall(python, repoRoot, req);
-  engineInstall.inFlight = run;
-  try {
-    return await run;
-  } finally {
-    if (engineInstall.inFlight === run) engineInstall.inFlight = null;
-  }
+  // await (DM-06): the up-to-60 s import probe used to run before the
+  // claim, so two invokes inside it both ran a multi-GB pip install into
+  // one staging directory. The helper makes check-and-claim one step.
+  const run = engineInstallFlight.tryRun(() => runGigaamEngineInstall(python, repoRoot, req));
+  if (!run) return { ok: false, status: "already-running", ...engineInstallSnapshot() };
+  return run;
 }
 
 async function runGigaamEngineInstall(python, repoRoot, req) {

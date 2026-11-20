@@ -35,10 +35,12 @@ function createSingleFlight() {
       } catch (error) {
         run = Promise.reject(error);
       }
+      // Claimed on this synchronous turn: ``finally`` callbacks always run
+      // on a later microtask, so the claim below precedes the release.
       const held = run.finally(() => {
         if (inFlight === held) inFlight = null;
       });
-      Promise.resolve().then(() => { inFlight = held; });
+      inFlight = held;
       return held;
     },
   };
