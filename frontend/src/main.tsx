@@ -100,6 +100,7 @@ import { historyFailureSurfaces, noticeSurfaces } from "./notice-surface";
 import { recoverySummary } from "./recovery-summary";
 import { networkVerdict, type NetworkProbeOutcome } from "./network-probe";
 import { keyEventToAccelerator } from "./shortcut-capture";
+import { keyAction, performKeyAction, type KeyAction } from "./key-action";
 import { waitForJob } from "./job-poll";
 import {
   LIVE_DRAFT_SCHEMA_VERSION,
@@ -3888,16 +3889,18 @@ function clearMaskedKeyOnEdit(provider: RemoteProvider): void {
   el.readOnly = false;
 }
 
+function currentKeyAction(provider: RemoteProvider): KeyAction {
+  const input = keyInput(provider);
+  return keyAction({ saved: keySavedState[provider], masked: isMaskedKeyInput(input), value: input.value });
+}
+
 function syncKeyActionButton(provider: RemoteProvider): void {
   const btn = keyActionButton(provider);
-  const input = keyInput(provider);
-  const masked = isMaskedKeyInput(input);
-  const hasTyped = !masked && !!input.value.trim();
-  const canDelete = keySavedState[provider] && !hasTyped;
-  const canSave = hasTyped;
+  const action = currentKeyAction(provider);
+  const canDelete = action === "delete";
   btn.classList.toggle("delete", canDelete);
   btn.classList.toggle("save", !canDelete);
-  btn.disabled = !(canDelete || canSave);
+  btn.disabled = action === "none";
   btn.title = canDelete ? "Delete key" : "Save key";
   btn.setAttribute("aria-label", canDelete ? "Delete key" : "Save key");
 }
@@ -7212,12 +7215,18 @@ async function deleteProviderKey(provider: RemoteProvider): Promise<void> {
 }
 
 async function handleKeyAction(provider: RemoteProvider): Promise<void> {
-  const btn = keyActionButton(provider);
-  if (btn.classList.contains("delete")) {
-    await deleteProviderKey(provider);
-    return;
-  }
-  await saveProviderKey(provider);
+  // Decided from state (./key-action), not from the button's CSS class;
+  // a delete asks first.
+  const input = keyInput(provider);
+  await performKeyAction(
+    { saved: keySavedState[provider], masked: isMaskedKeyInput(input), value: input.value },
+    {
+      providerName: providerLabel(provider),
+      confirm: (message) => window.confirm(message),
+      save: () => saveProviderKey(provider),
+      remove: () => deleteProviderKey(provider),
+    },
+  );
 }
 
 ($("recordingsDirInput") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
