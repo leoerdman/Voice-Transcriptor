@@ -1452,6 +1452,11 @@ let recordingStatusCapsuleUpdateSeq = 0;
 // Cost of the last capsule window create, so the log can separate "the
 // capsule was slow to appear" from "the press was slow to arrive".
 let recordingStatusCapsuleLastCreateMs = 0;
+// A screen take's capsule is painted in its screen shape but kept hidden
+// until the screen-mode controller shows it together with the frames and
+// the palette (desktop/screen-surfaces.js). `painted` resolves true at its
+// first hidden paint (false when the hold is dropped first).
+let capsuleScreenHold = null; // { painted: Promise<boolean>, resolvePainted, since }
 let recordingStatusSuppressActivateUntil = 0;
 let recordingStatusCapsuleLevelUpdateInFlight = false;
 let recordingStatusCapsuleLastLevelSent = -1;
@@ -2186,23 +2191,76 @@ async function updateRecordingStatusCapsule(patch = {}) {
       `window.__setCapsuleState(${JSON.stringify(payload)})`,
       true,
     );
-    if (!capsuleWindow.isVisible()) {
-      // `showInactive` on a `focusable: false` window: the capsule
-      // appears without taking focus, without activating the app and
-      // without reordering the main window. The lifecycle table is asked
-      // anyway, so "the capsule appeared" is a transition on the record
-      // and its answer — do nothing to the main window — is stated in
-      // one place rather than assumed here.
-      capsuleWindow.showInactive();
-      applyWindowLifecycleEvent(WINDOW_LIFECYCLE_EVENTS.capsuleShown);
-      appendMainLog(
-        `[recording-capsule] visible status="${status}" ms=${Date.now() - requestedAt} ` +
-        `create=${recordingStatusCapsuleLastCreateMs}ms`,
-      );
-      recordingStatusCapsuleLastCreateMs = 0;
+    if (capsuleScreenHold) {
+      // A screen take: painted, and left hidden for the shared showing.
+      capsuleScreenHold.resolvePainted(true);
+    } else if (!capsuleWindow.isVisible()) {
+      revealRecordingStatusCapsule(capsuleWindow, status, requestedAt);
     }
   } catch (e) {
     appendMainLog(`[recording-capsule] update failed: ${e?.message || e}`);
+  }
+}
+
+function revealRecordingStatusCapsule(capsuleWindow, status, requestedAt) {
+  // `showInactive` on a `focusable: false` window: the capsule
+  // appears without taking focus, without activating the app and
+  // without reordering the main window. The lifecycle table is asked
+  // anyway, so "the capsule appeared" is a transition on the record
+  // and its answer — do nothing to the main window — is stated in
+  // one place rather than assumed here.
+  capsuleWindow.showInactive();
+  applyWindowLifecycleEvent(WINDOW_LIFECYCLE_EVENTS.capsuleShown);
+  appendMainLog(
+    `[recording-capsule] visible status="${status}" ms=${Date.now() - requestedAt} ` +
+    `create=${recordingStatusCapsuleLastCreateMs}ms`,
+  );
+  recordingStatusCapsuleLastCreateMs = 0;
+}
+
+/**
+ * A screen take is starting: its capsule's first paint is already the
+ * screen shape (wider, with the computer button), and it stays hidden
+ * until the controller shows it with the frames and the palette. A capsule
+ * already on screen (a start re-dispatched after the microphone prompt)
+ * counts as prepared: it restyles in place.
+ */
+function holdCapsuleForScreenTake() {
+  releaseCapsuleScreenHold({ voice: false });
+  recordingStatusCapsuleState.screen = true;
+  let resolvePainted;
+  const painted = new Promise((resolve) => { resolvePainted = resolve; });
+  if (recordingStatusWindow && !recordingStatusWindow.isDestroyed() && recordingStatusWindow.isVisible()) {
+    resolvePainted(true);
+    void updateRecordingStatusCapsule({}).catch(() => { });
+    return;
+  }
+  capsuleScreenHold = { painted, resolvePainted, since: Date.now() };
+}
+
+/** The controller's showing: the prepared capsule appears now. */
+function showHeldScreenCapsule() {
+  const hold = capsuleScreenHold;
+  capsuleScreenHold = null;
+  if (!hold) return;
+  const w = recordingStatusWindow;
+  if (!w || w.isDestroyed() || !recordingStatusWindowReady || w.isVisible()) return;
+  revealRecordingStatusCapsule(w, String(recordingStatusCapsuleState.status || ""), hold.since);
+}
+
+/**
+ * Drop the hold: the screen session did not start (or the take is over),
+ * so the capsule is shown its usual way — in its voice shape unless
+ * `voice` is false.
+ */
+function releaseCapsuleScreenHold({ voice = true } = {}) {
+  const hold = capsuleScreenHold;
+  capsuleScreenHold = null;
+  if (hold) hold.resolvePainted(false);
+  if (!voice) return;
+  if (!screenMode.isActive()) recordingStatusCapsuleState.screen = false;
+  if (String(recordingStatusCapsuleState.status || "").trim()) {
+    void updateRecordingStatusCapsule({}).catch(() => { });
   }
 }
 
@@ -2330,6 +2388,18 @@ function retireScreenTake(id) {
   if (id && screenTakeId === id) screenTakeId = "";
 }
 
+/**
+ * Start the screen side of a take the renderer has just accepted: the
+ * capsule is held for the shared showing and the session starts now — not
+ * behind the microphone confirmation, the frontmost-app lookup or the
+ * capsule session (S-02 / DM-31, and the "everything at once" showing).
+ */
+function startScreenTake(id, pressedAt) {
+  screenTakeId = id;
+  holdCapsuleForScreenTake();
+  return screenMode.start(id, { pressedAt });
+}
+
 const screenMode = createScreenModeController({
   BrowserWindow,
   screen,
@@ -2350,6 +2420,9 @@ const screenMode = createScreenModeController({
     }
   },
   onWarning: (kind) => notifyScreenModeWarning(kind),
+  // The capsule's part in the one-moment showing (desktop/screen-surfaces.js).
+  prepareCapsule: () => (capsuleScreenHold ? capsuleScreenHold.painted : Promise.resolve(false)),
+  showCapsule: () => showHeldScreenCapsule(),
   screenCaptureAccess: () => {
     try {
       return String(systemPreferences.getMediaAccessStatus("screen") || "");
@@ -2444,6 +2517,10 @@ function scheduleRecordingStatusCapsuleTeardown() {
 }
 
 function hideRecordingStatusCapsule() {
+  if (capsuleScreenHold) {
+    capsuleScreenHold.resolvePainted(false);
+    capsuleScreenHold = null;
+  }
   recordingStatusCapsuleUpdateSeq++;
   recordingStatusCapsuleState.status = "";
   recordingStatusCapsuleState.level = 0;
@@ -2788,6 +2865,7 @@ async function dispatchRendererTogglePress(allowStart, startDetail = { mode: "vo
  */
 async function toggleRecordingFromShortcut(mode = "voice") {
   if (shortcutToggleInFlight) return;
+  const pressedAt = Date.now();
   const trace = createTrace("toggle_hotkey", { mode });
   const startDetail = mode === "screen" && screenMode.isSupported()
     ? { mode: "screen", screenSessionId: screenSessionId() }
@@ -2852,6 +2930,14 @@ async function toggleRecordingFromShortcut(mode = "voice") {
       dispatched: !!result.dispatched,
       wasRecording: !!result.wasRecording,
     });
+    // A press that started a screen take starts its screen side at once:
+    // the session and its surfaces come up while the microphone opens.
+    let screenStart = null;
+    const beginScreenTake = () => {
+      if (screenStart || startDetail.mode !== "screen" || !result?.dispatched || !result.recording) return;
+      screenStart = startScreenTake(startDetail.screenSessionId, pressedAt);
+    };
+    beginScreenTake();
 
     if (result.discarded) {
       // The renderer threw this recording away — it was shorter than the
@@ -2918,11 +3004,21 @@ async function toggleRecordingFromShortcut(mode = "voice") {
         traceEnd(trace, "failed", { reason: "renderer-toggle-failed" });
         return;
       }
+      beginScreenTake();
     }
 
     if (result.recording) {
       const confirmedStart = await waitForRendererRecordingStart();
       if (!confirmedStart.confirmed) {
+        if (screenStart) {
+          // No take, so no screen take: the capsule shows its failure in its
+          // usual shape and the session is dropped once its start settles.
+          releaseCapsuleScreenHold();
+          retireScreenTake(startDetail.screenSessionId);
+          void screenMode.finish({ id: startDetail.screenSessionId, discard: true }).catch((e) => {
+            appendMainLog(`[screen-mode] discard of an unconfirmed take failed: ${e?.message || e}`);
+          });
+        }
         appendMainLog(
           `[shortcut] recording start not confirmed within ` +
           `${RENDERER_RECORDING_START_CONFIRM_TIMEOUT_MS}ms ` +
@@ -2938,15 +3034,6 @@ async function toggleRecordingFromShortcut(mode = "voice") {
         resetRecordingStatusState();
         traceEnd(trace, "failed", { reason: "recording-start-not-confirmed" });
         return;
-      }
-      // Screen mode starts the moment the take is confirmed, not behind the
-      // frontmost-app lookup and the capsule session below: every await
-      // before start() widened the window in which the take could end
-      // with no session to end (S-02 / DM-31). Awaited after them.
-      let screenStart = null;
-      if (startDetail.mode === "screen") {
-        screenTakeId = startDetail.screenSessionId;
-        screenStart = screenMode.start(startDetail.screenSessionId);
       }
       // The frontmost-app lookup was fired at the press, so it reports
       // the app the user was in when they hit the key no matter when it
@@ -2979,7 +3066,10 @@ async function toggleRecordingFromShortcut(mode = "voice") {
         const started = await screenStart;
         traceStep(trace, "screen_mode_started", { outcome: started?.outcome || "", error: started?.error || "" });
         const after = decideAfterScreenStart(started);
-        if (after !== AFTER_SCREEN_START.KEEP) retireScreenTake(startDetail.screenSessionId);
+        if (after !== AFTER_SCREEN_START.KEEP) {
+          retireScreenTake(startDetail.screenSessionId);
+          releaseCapsuleScreenHold();
+        }
         if (after === AFTER_SCREEN_START.VOICE_TAKE) notifyRendererVoiceTake(startDetail.screenSessionId);
         traceStep(trace, "screen_mode_after_start", { decision: after });
       }

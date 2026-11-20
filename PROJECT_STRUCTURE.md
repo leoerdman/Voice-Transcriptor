@@ -173,6 +173,7 @@ desktop/
 ├── capsule-geometry.js             # the recording capsule's window size and placement (pure, node --test)
 ├── screen-session-start.js         # what main does once screenMode.start() has answered: keep, already ended, or a voice take (pure, node --test)
 ├── screen-mode-warnings.js         # the one copy table for screen-mode warnings, keyed by the controller's kinds (pure, node --test)
+├── screen-surfaces.js              # a screen take's capsule, palette and frames are shown together, once, never a subset (pure, node --test)
 ├── capsule-preload.js              # the recording capsule's preload bridge to main (stop, screenshot, geometry) — replaces the document.title channel
 ├── ipc-contract.test.js            # main.js/preload.js IPC channel-name contract test (node --test)
 ├── preload.js                      # safe renderer bridge (path-for-file, engine lifecycle invoke-only, recordingFinal send-only, system-suspend receive-only)

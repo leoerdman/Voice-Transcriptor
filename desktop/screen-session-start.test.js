@@ -41,10 +41,13 @@ test("an answer that is not a start is never mistaken for a live session", () =>
 // is read — only for which names are called, and in which order).
 test("main starts the session before the awaits that used to delay it, and reads the answer after (S-02)", () => {
   const fn = topLevelFunctionSource("toggleRecordingFromShortcut");
-  const startAt = fn.indexOf("screenMode.start(startDetail.screenSessionId)");
+  const startAt = fn.indexOf("screenStart = startScreenTake(startDetail.screenSessionId, pressedAt)");
   assert.ok(startAt > 0, "toggleRecordingFromShortcut starts the screen session");
+  assert.ok(startAt < fn.indexOf("await waitForRendererRecordingStart()"), "start() waits behind the microphone confirmation");
   assert.ok(startAt < fn.indexOf("await frontAtHotkeyPromise"), "start() waits behind the frontmost-app lookup");
   assert.ok(startAt < fn.indexOf("await beginRecordingStatusSession()"), "start() waits behind the capsule session");
+  assert.ok(startAt < fn.indexOf("void publishRecordingStatus(transitionStatus)"), "the capsule is held (screen shape, hidden) before its first paint");
+  assert.match(topLevelFunctionSource("startScreenTake"), /holdCapsuleForScreenTake\(\);\n  return screenMode\.start\(id, \{ pressedAt \}\);/);
   assert.match(fn, /decideAfterScreenStart\(started\)/);
   assert.match(fn, /AFTER_SCREEN_START\.VOICE_TAKE\) notifyRendererVoiceTake\(/);
 });

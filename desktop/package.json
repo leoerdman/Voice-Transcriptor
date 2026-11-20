@@ -72,6 +72,7 @@
       "screen-mode.js",
       "screen-mode-controller.js",
       "screen-mode-warnings.js",
+      "screen-surfaces.js",
       "shortcut-migration.js",
       "linux-wm-class.js",
       "python-version.js",

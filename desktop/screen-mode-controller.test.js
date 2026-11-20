@@ -78,7 +78,7 @@ function pageContext(html, { width, height, hit }) {
 }
 
 // ── Electron fakes ─────────────────────────────────────────────────────
-function createWorld({ displays, helperReady = true, failLoad = () => false, hit = () => null } = {}) {
+function createWorld({ displays, helperReady = true, failLoad = () => false, hit = () => null, loadGate = () => null } = {}) {
   const world = {
     displays: displays || [{ id: 1, bounds: { x: 0, y: 0, width: 1000, height: 800 }, workArea: { x: 0, y: 25, width: 1000, height: 775 } }],
     windows: [],
@@ -88,6 +88,7 @@ function createWorld({ displays, helperReady = true, failLoad = () => false, hit
     active: [],
     captures: [],
     captureGate: null,
+    capsuleShows: [],
   };
 
   class FakeWindow {
@@ -119,6 +120,8 @@ function createWorld({ displays, helperReady = true, failLoad = () => false, hit
     setVisibleOnAllWorkspaces() { }
     async loadURL(url) {
       await tick();
+      const gate = loadGate(this);
+      if (gate) await gate;
       if (failLoad(this)) throw new Error("loadURL failed");
       const html = decodeURIComponent(url.slice(url.indexOf(",") + 1));
       this.page = pageContext(html, { width: this.bounds.width, height: this.bounds.height, hit });
@@ -175,6 +178,11 @@ function createWorld({ displays, helperReady = true, failLoad = () => false, hit
     capsuleWindow: () => world.capsule,
     onActiveChange: (active) => world.active.push(active),
     onWarning: (kind) => world.warnings.push(kind),
+    prepareCapsule: () => (world.prepareCapsule ? world.prepareCapsule() : Promise.resolve(false)),
+    showCapsule: () => {
+      // What else is on screen at the instant the capsule is shown.
+      world.capsuleShows.push({ overlays: world.visibleOverlays(), palette: !!world.palette()?.isVisible() });
+    },
     screenCaptureAccess: () => world.captureAccess || "granted",
     captureRegion: async (bounds, outFile) => {
       world.captures.push({ bounds, outFile });
@@ -188,6 +196,7 @@ function createWorld({ displays, helperReady = true, failLoad = () => false, hit
   world.say = (obj) => world.helper().stdout.emit("data", `${JSON.stringify(obj)}\n`);
   world.overlays = () => world.windows.filter((w) => w.opts.title === "Transcriptor Screen Mode" && !w.destroyed);
   world.palette = () => world.windows.find((w) => w.opts.title === "Transcriptor Screen Colors" && !w.destroyed) || null;
+  world.visibleOverlays = () => world.overlays().filter((w) => w.isVisible()).length;
   world.cleanup = () => {
     world.controller.teardown();
     fs.rmSync(staging, { recursive: true, force: true });
@@ -358,6 +367,93 @@ test("a helper that cannot be spawned fails the start", async () => {
     assert.match(started.error, /ENOENT/);
     assert.deepEqual(world.warnings, ["start-failed"]);
     assert.equal(world.controller.isActive(), false);
+  } finally {
+    world.cleanup();
+  }
+});
+
+// ── surfaces at once (coordinator requirement, 2026-11-20 12:28:06 log) ──
+test("the capsule, the palette and the frames appear in one step, and not before the slowest is ready", async () => {
+  const second = { id: 2, bounds: { x: 1000, y: 0, width: 800, height: 600 }, workArea: { x: 1000, y: 0, width: 800, height: 600 } };
+  let capsuleReady;
+  let paletteLoaded;
+  const paletteGate = new Promise((resolve) => { paletteLoaded = resolve; });
+  const world = createWorld({
+    displays: [{ id: 1, bounds: { x: 0, y: 0, width: 1000, height: 800 }, workArea: { x: 0, y: 25, width: 1000, height: 775 } }, second],
+    // The palette page is the slow one.
+    loadGate: (w) => (w.opts.title === "Transcriptor Screen Colors" ? paletteGate : null),
+  });
+  world.prepareCapsule = () => new Promise((resolve) => { capsuleReady = resolve; });
+  try {
+    const starting = world.controller.start(ID);
+    await tick(10);
+    capsuleReady(true);
+    await tick(10);
+    // Frames and capsule ready, palette still loading: nothing is shown.
+    assert.equal(world.visibleOverlays(), 0, "a frame was shown before the palette was ready");
+    assert.deepEqual(world.capsuleShows, []);
+    assert.deepEqual(world.active, []);
+    paletteLoaded();
+    const started = await starting;
+    assert.equal(started.outcome, SCREEN_START_OUTCOME.STARTED);
+    // One step: main told, then capsule, frames, palette — no gap between.
+    assert.deepEqual(world.active, [true]);
+    assert.equal(world.capsuleShows.length, 1);
+    assert.deepEqual(world.capsuleShows[0], { overlays: 0, palette: false }, "the capsule is the first of the three, in the same step");
+    assert.equal(world.visibleOverlays(), 2);
+    assert.equal(world.palette().isVisible(), true);
+    assert.ok(world.logs.some((l) => /surfaces visible press_to_visible_ms=\d+ capsule=1 overlays=2 palette=1/.test(l)));
+  } finally {
+    world.cleanup();
+  }
+});
+
+test("the surfaces do not wait for the mouse helper; the start answers when it is ready", async () => {
+  let ready;
+  const world = createWorld({ helperReady: (child) => { ready = () => child.stdout.emit("data", '{"t":"ready"}\n'); } });
+  world.prepareCapsule = () => Promise.resolve(true);
+  try {
+    let answered = false;
+    const starting = world.controller.start(ID).then((r) => { answered = true; return r; });
+    await tick(20);
+    assert.equal(world.visibleOverlays(), 1, "the frame waited for the helper");
+    assert.equal(world.palette().isVisible(), true);
+    assert.equal(world.capsuleShows.length, 1);
+    assert.equal(answered, false, "the start answered before the helper could draw");
+    ready();
+    assert.equal((await starting).outcome, SCREEN_START_OUTCOME.STARTED);
+  } finally {
+    world.cleanup();
+  }
+});
+
+test("a capsule that cannot be prepared hidden is left out; the frame and palette still show together", async () => {
+  const world = createWorld();
+  world.prepareCapsule = () => Promise.resolve(false);
+  try {
+    const started = await world.controller.start(ID);
+    assert.equal(started.outcome, SCREEN_START_OUTCOME.STARTED);
+    assert.deepEqual(world.capsuleShows, [], "main shows that capsule its own way");
+    assert.equal(world.visibleOverlays(), 1);
+    assert.equal(world.palette().isVisible(), true);
+  } finally {
+    world.cleanup();
+  }
+});
+
+test("a helper that fails before the surfaces are ready shows nothing at all", async () => {
+  const world = createWorld({
+    helperReady: (child) => child.emit("exit", 2, null),
+    loadGate: () => tick(20),
+  });
+  world.prepareCapsule = () => Promise.resolve(true);
+  try {
+    const started = await world.controller.start(ID);
+    assert.equal(started.outcome, SCREEN_START_OUTCOME.FAILED);
+    assert.deepEqual(world.capsuleShows, []);
+    assert.deepEqual(world.active, []);
+    await tick(40);
+    assert.equal(world.windows.filter((w) => w.isVisible()).length, 0, "a window appeared after the failed start");
   } finally {
     world.cleanup();
   }

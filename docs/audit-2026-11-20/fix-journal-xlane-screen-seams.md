@@ -127,3 +127,63 @@ After: `pass 2 fail 0`.
 Not verified live: which process posts the stray mouse-ups on the user's machine is not known;
 after the next build the log should show no repeated `press` lines (the shipped helper binary
 must be rebuilt by `desktop/scripts/build-native.sh`).
+
+## Step 4 · coordinator requirement: capsule, palette and frames appear at once (S-02 area)
+
+Evidence (user's main.log, take 12:28:06): press 06.211 → capsule visible 06.222 in VOICE shape →
+front-app lookup 211 ms → `screenMode.start` → helper ready 06.483 → started 06.758; the frames,
+palette and computer button arrived ~550 ms after the capsule, one after another. Causes: (a) the
+capsule was shown by its first status paint, before main knew anything about screen mode;
+(b) the session started only after mic confirmation + front-app lookup + capsule session (step 1
+moved it before the last two); (c) the controller awaited the helper's `ready` BEFORE creating
+the overlays, showed each overlay as it loaded, then created the palette, then told main
+(`onActiveChange`) to restyle the capsule.
+
+Design (no delays added):
+- `desktop/screen-surfaces.js` (new, pure): `createSurfacePresenter({required, optional, present})`.
+  Each surface reports ready/failed; `present(ready)` runs exactly ONCE when every surface has
+  reported, with all ready ones, or never (a required surface failed / the start was aborted).
+  `expire()` bounds the wait (late surfaces count as failed). Required: the frames; optional:
+  capsule, palette.
+- Controller: overlays and palette are created hidden (`showInactive` only after the showing;
+  a display plugged in mid-take shows when ready). Overlays, palette, capsule preparation and the
+  helper start run side by side; `presentSurfaces` (on the presenter's single call) tells main the
+  session is on, then shows capsule → overlays → palette back to back with no await, then logs
+  `[screen-mode] surfaces visible press_to_visible_ms=<n> capsule=<0|1> overlays=<n> palette=<0|1>`.
+  The helper is not a surface: the picture does not wait for it; `start()` answers STARTED once
+  the helper is ready. A helper that fails BEFORE the surfaces are ready aborts the presenter
+  (nothing shown); after — teardown + warning as before. Wait bound
+  `SURFACES_READY_TIMEOUT_MS = 3000` (a page that never loads). The palette is placed above the
+  capsule window while both are still hidden (`capsuleBounds` reads the hidden capsule).
+  `start(id, { pressedAt })` carries the press time for the log line.
+- main.js: `startScreenTake(id, pressedAt)` = hold the capsule + `screenMode.start`, called right
+  after the renderer accepted a screen start (also after a re-dispatch following the mic prompt) —
+  before the transition status's first paint, mic confirmation, front-app lookup and capsule
+  session. `holdCapsuleForScreenTake` sets the capsule's screen shape before its first paint and
+  keeps it hidden (`updateRecordingStatusCapsule` paints, resolves `prepareCapsule`, does not
+  show); `showHeldScreenCapsule` is the controller's `showCapsule`; `releaseCapsuleScreenHold`
+  shows the capsule its usual (voice) way when the session did not start (ENDED/FAILED), when the
+  mic was not confirmed (the session is then discarded), and `hideRecordingStatusCapsule` drops a
+  hold. A capsule already visible (re-dispatch path) is not hidden: it restyles in place
+  (capsule=0 in the log line).
+
+Files: `desktop/screen-surfaces.js` (+ test, new), `desktop/screen-mode-controller.js`,
+`desktop/main.js`, `desktop/package.json` (build.files), `PROJECT_STRUCTURE.md`,
+`desktop/screen-mode-controller.test.js` (fake `loadGate`, `prepareCapsule`/`showCapsule`;
+4 new cases), `desktop/screen-session-start.test.js` (start before mic confirmation / first paint).
+
+Check: `node --test desktop/screen-surfaces.test.js desktop/screen-mode-controller.test.js`.
+Before (step-3 controller, new tests): `fail 2` — `the surfaces do not wait for the mouse helper`
+→ `AssertionError: the frame waited for the helper`; `…appear in one step…` → the old controller
+never asks for the capsule (`TypeError: capsuleReady is not a function`: no `prepareCapsule`
+call) and showed each overlay as it loaded. The presenter's own suite (6 cases: no subset in any
+ready order, one call only, optional left out, no frame → nothing, abort → nothing, expiry) is new.
+After: desktop `tests 447 pass 447` (run twice); `node --check` OK; frontend typecheck/lint OK,
+vitest `616 passed`, build OK.
+
+**Not verified live** (needs the packaged app on macOS): that the three windows actually
+appear in the same frame on screen (`showInactive` of four-plus windows back to back is one JS
+turn, not one compositor transaction); the real press→visible time (read the new
+`surfaces visible press_to_visible_ms=` line); that a hidden capsule window keeps its painted
+state for the reveal; the re-dispatch-after-mic-prompt path; the unconfirmed-mic discard path
+(the frames may flash up and go if the mic confirmation fails after they were shown).
