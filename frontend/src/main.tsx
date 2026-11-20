@@ -96,6 +96,8 @@ import {
   type CliAccessStatus,
 } from "./cli-section";
 import { smartRecordingTitle } from "./recording-title";
+import { historyFailureSurfaces, noticeSurfaces } from "./notice-surface";
+import { recoverySummary } from "./recovery-summary";
 import { waitForJob } from "./job-poll";
 import {
   LIVE_DRAFT_SCHEMA_VERSION,
@@ -3333,6 +3335,12 @@ function showRecordSessionNotice(
       resetRecordSessionNotice();
     }, timeoutMs);
   }
+  // The banner lives inside the Live view; from any other view the
+  // status pill is the surface the user can see (./notice-surface).
+  const visibleView = (["record", "upload", "recordings", "settings"] as const).find(isViewVisible) ?? null;
+  if (noticeSurfaces(visibleView).status) {
+    setStatus(text, toneToStatusKind(tone, text));
+  }
 }
 
 /**
@@ -5197,29 +5205,19 @@ async function recoverBackendAudioSessions(): Promise<void> {
       console.warn(`Recovery promote exception for ${sessionId}:`, e);
     }
   }
+  const summary = recoverySummary(succeeded, failed);
+  if (!summary) return;
+  showRecordSessionNotice(summary.text, summary.tone, UI_TOKENS.notice.longMs);
   if (succeeded > 0) {
-    showRecordSessionNotice(
-      `Recovered ${succeeded} interrupted recording${succeeded === 1 ? "" : "s"} into Recordings.`,
-      "success",
-      UI_TOKENS.notice.longMs,
-    );
     void loadRecordings(true).catch((e) => {
       console.warn("Recovery History refresh failed", e);
       const msg = sanitizeUiErrorMessage(e, "Could not refresh the archive.");
-      setStatus(`Recovery saved. History refresh failed: ${msg}`, "warning");
       showRecordSessionNotice(
-        `Recovered ${succeeded} interrupted recording${succeeded === 1 ? "" : "s"}, but History refresh failed: ${msg}`,
+        `${summary.text} History refresh failed: ${msg}`,
         "warning",
         UI_TOKENS.notice.longMs,
       );
     });
-  }
-  if (failed > 0 && succeeded === 0) {
-    showRecordSessionNotice(
-      `Could not recover ${failed} interrupted recording${failed === 1 ? "" : "s"}. Check the Recordings folder manually.`,
-      "warning",
-      UI_TOKENS.notice.longMs,
-    );
   }
 }
 
@@ -7420,8 +7418,8 @@ async function handleKeyAction(provider: RemoteProvider): Promise<void> {
       await loadUpscalePresets(r.item?.id || "");
       queueUiPreferencesSave();
     })
-    .catch((e: Error) => {
-      msg.textContent = e.message;
+    .catch((e: unknown) => {
+      msg.textContent = sanitizeUiErrorMessage(e, "Could not save the preset.");
     });
 });
 ($("upscalePromptSaveBtn") as HTMLButtonElement).addEventListener("click", () => {
@@ -7452,8 +7450,8 @@ async function handleKeyAction(provider: RemoteProvider): Promise<void> {
         closeUpscalePromptModal();
       }, 220);
     })
-    .catch((e: Error) => {
-      msg.textContent = e.message;
+    .catch((e: unknown) => {
+      msg.textContent = sanitizeUiErrorMessage(e, "Could not save the instruction.");
     });
 });
 ($("upscalePromptDefaultBtn") as HTMLButtonElement).addEventListener("click", () => {
@@ -7470,8 +7468,8 @@ async function handleKeyAction(provider: RemoteProvider): Promise<void> {
       queueUiPreferencesSave();
       msg.textContent = "Default applied";
     })
-    .catch((e: Error) => {
-      msg.textContent = e.message;
+    .catch((e: unknown) => {
+      msg.textContent = sanitizeUiErrorMessage(e, "Could not restore the default instruction.");
     });
 });
 ($("upscalePresetDeleteBtn") as HTMLButtonElement).addEventListener("click", () => {
@@ -7489,17 +7487,16 @@ async function handleKeyAction(provider: RemoteProvider): Promise<void> {
     `Delete the upscale preset “${presetLabel}”?\n\nThis cannot be undone.`,
   );
   if (!confirmed) return;
-  void fetch(`/api/upscale/presets/${encodeURIComponent(cur.id)}`, {
-    method: "DELETE",
-    headers: authHeaders(),
-  })
-    .then(async (r) => {
-      if (!r.ok) throw new Error(await parseError(r));
+  void apiDelete<{ ok?: boolean }>(`/api/upscale/presets/${encodeURIComponent(cur.id)}`)
+    .then(async () => {
       await loadUpscalePresets("");
       queueUiPreferencesSave();
     })
-    .catch((e: Error) => {
-      $("upscaleOutput").textContent = `Preset delete failed: ${e.message}`;
+    .catch((e: unknown) => {
+      // Not into ``#upscaleOutput``: that pane holds the user's upscaled
+      // text, and an error written there replaced it.
+      console.warn("upscale preset delete failed", e);
+      setStatus(`Preset delete failed: ${sanitizeUiErrorMessage(e, "Could not delete the preset.")}`, "error");
     });
 });
 ($("pickRecordingsDirBtn") as HTMLButtonElement).addEventListener("click", () => {
@@ -8646,6 +8643,11 @@ async function openRecording(name: string, archiveDir = "", options: OpenRecordi
           player.removeAttribute("src");
           player.load();
           setRecordingViewerAudioRowVisible(false);
+          // The list says "Audio" for this item; a player that simply
+          // vanished said nothing. The Live player reports the same
+          // failure with the same sentence.
+          const meta = $("recordingMeta");
+          meta.textContent = `${meta.textContent} · ${AUDIO_LOAD_FAILED_TEXT}`;
         }
       }
     } else {
@@ -8840,8 +8842,11 @@ async function saveRecordingText(opts: {
 
 $("recordingsRefreshBtn").addEventListener("click", () =>
   void loadRecordings(true).catch((e: Error) => {
-    $("recordingContent").textContent = sanitizeUiErrorMessage(e, "Could not refresh the archive.");
-    updateRecordingCopyState();
+    console.warn("History refresh failed", e);
+    const msg = sanitizeUiErrorMessage(e, "Could not refresh the archive.");
+    const surfaces = historyFailureSurfaces(!!selectedRecordingName);
+    if (surfaces.status) setStatus(`Refresh failed: ${msg}`, "warning");
+    if (surfaces.placeholder) resetRecordingViewer(msg);
   })
 );
 // Window growth. Passive: the handler only reads geometry and never
