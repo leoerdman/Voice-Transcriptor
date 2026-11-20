@@ -131,7 +131,7 @@ class LiveRecoveryListingTests(_MainCase):
     def _sidecar(self, session_id: str, **extra) -> None:
         recovery_dir = self.main.LIVE_RECOVERY_DIR
         recovery_dir.mkdir(parents=True, exist_ok=True)
-        pcm = recovery_dir / f"2026-09-04_19-37-12_{session_id}.pcm16"
+        pcm = recovery_dir / f"20260904_193712_{session_id}.pcm16"
         pcm.write_bytes(b"\x00\x00" * 16000)
         meta = {
             "session_id": session_id,

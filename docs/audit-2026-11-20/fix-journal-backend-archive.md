@@ -162,3 +162,35 @@ Proof method: SKILL §7.1 — the fixed file is put aside, `git show HEAD:<path>
 - After: `Ran 5 tests ... OK`; full suite `Ran 919 tests ... OK (skipped=2)`.
 - H-11 (perf, hypothesis) has no failing check: the payload now asks once instead of three times; behaviour identical (existing payload tests green).
 - Cross-domain (S-17 remainder): `frontend/src/main.tsx` ~380 comment "the backend keeps the audio of the newest five" restates an env-tunable default.
+
+### C9 · BL-04, BL-11, BM-21, BM-22, BM-23, BM-24 (part), BM-28 (P2) · support-module fixes
+- Files: `backend/async_tasks.py` (logger `__name__` → `backend.async_tasks`, visible through main.py's one handler), `backend/main.py` (`_hub_offline_error_types` + `urllib.error.URLError`, `ssl.SSLError`; `_is_hub_offline_error` excludes `HTTPError` (the host answered); `_recovery_stem_glob` = `YYYYmmdd_HHMMSS_<id>` used by `_live_recovery_paths` and `_delete_live_recovery`), `backend/config.py` (`_clear_empty_keyfile` decides on stripped content like `_read_existing_keyfile`; an invalid keyfile's log no longer says "regenerating" — it is kept, by the pinned rule; `_adopt_legacy_encryption_key` replaces the keyfile with `atomic_write_bytes(mode=0o600)` instead of unlink-then-create), `backend/models_manager.py` (`huggingface_hub` import inside the worker's `try`; the no-op `time.sleep(0.5)` in `finally` removed), `backend/http_retry.py` (a superseded transient response is closed on success and on giving up, not only when another transient replaces it), tests: `test_untested_units.py` (`AsyncTasksLoggerTests`), `test_live_teardown.py` (asserts on `backend.async_tasks`), `test_warmup_offline.py` (2 new), `test_config.py` (`test_a_whitespace_only_keyfile_is_an_empty_one`, `LegacyKeyAdoptionTests`), `test_models_manager.py` (1 new, `import sys`), `test_http_retry_logging.py` (`SupersededResponseIsReleasedTests`), `test_live_recovery_liveness.py` (`SessionIdMatchingTests`), `test_recording_names.py` + `test_error_honesty.py` (spool fixtures now use the real `YYYYmmdd_HHMMSS_` stem instead of an invented `2026-09-04_19-37-12_`, which only the loose glob matched).
+- Checks and before-outputs (each with only the named file restored from HEAD):
+  - main.py + async_tasks.py: 
+    ```
+    ERROR: test_an_expired_certificate_on_the_model_cdn_is_unreachable_not_500 (...)
+    FAIL: test_async_tasks_logs_into_the_backend_namespace (...)
+    AssertionError: False is not true : transcriptor.async_tasks
+    FAIL: test_a_failure_inside_the_task_is_logged_not_dropped (...)
+    AssertionError: no logs of level WARNING or higher triggered on backend.async_tasks
+    Ran 19 tests ... FAILED (failures=2, errors=1)
+    ```
+  - models_manager.py: `ERROR: test_a_missing_hub_package_ends_in_error_not_a_stuck_download … ModuleNotFoundError: import of huggingface_hub halted; None in sys.modules` (the worker thread dies; state stays "downloading").
+  - http_retry.py: `FAIL: test_closed_when_a_later_attempt_succeeds … Expected 'mock' to have been called once. Called 0 times.` and the same for `test_closed_when_the_call_gives_up_on_a_transport_error`.
+  - config.py:
+    ```
+    FAIL: test_a_failed_write_keeps_the_current_keyfile (...)
+    AssertionError: b'-rqfL5…' != b'AkTb…' : the key in use no longer exists on disk
+    FAIL: test_a_whitespace_only_keyfile_is_an_empty_one (...)
+    AssertionError: unexpectedly None : a whitespace keyfile left encryption off
+    ```
+  - main.py (BM-28):
+    ```
+    FAIL: test_discarding_b_never_touches_a_b (...)
+    AssertionError: False is not true : session a_b was deleted by a discard of b
+    FAIL: test_the_paths_of_b_are_bs (...)
+    AssertionError: '20261120_101012_a_b.pcm16' != '20261120_101011_b.pcm16'
+    ```
+- After: every named check OK; full suite `Ran 929 tests ... OK (skipped=2)`.
+- BM-24 naming part (`retries` means attempts): the callers are engine modules (`remote_deepgram.py`, `remote_openrouter.py`); renaming the parameter needs them changed in the same commit → Cross-domain.
+- BM-21, non-empty invalid keyfile: kept as is — `test_a_keyfile_with_content_is_never_replaced` pins "a keyfile with content is never replaced" (B-020 decision); only the misleading "regenerating" message was fixed.

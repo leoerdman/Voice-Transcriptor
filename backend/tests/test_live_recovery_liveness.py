@@ -159,6 +159,33 @@ class LiveRecoveryLivenessTests(unittest.TestCase):
         self.assertAlmostEqual(record["duration_sec"], 43.0, delta=0.5)
 
 
+class SessionIdMatchingTests(unittest.TestCase):
+    """BM-28: ids may contain underscores, so ``*_b`` matched ``<ts>_a_b``."""
+
+    setUp = LiveRecoveryLivenessTests.setUp
+    tearDown = LiveRecoveryLivenessTests.tearDown
+
+    def _spool(self, stem: str) -> Path:
+        pcm = self.main.LIVE_RECOVERY_DIR / f"{stem}.pcm16"
+        pcm.write_bytes(b"\x00\x01" * 32000)
+        pcm.with_suffix(".json").write_text("{}", encoding="utf-8")
+        return pcm
+
+    def test_discarding_b_never_touches_a_b(self) -> None:
+        other = self._spool("20261120_101010_a_b")
+        mine = self._spool("20261120_101011_b")
+        self.main._delete_live_recovery("b")
+        self.assertFalse(mine.exists())
+        self.assertTrue(other.exists(), "session a_b was deleted by a discard of b")
+        self.assertTrue(other.with_suffix(".json").exists())
+
+    def test_the_paths_of_b_are_bs(self) -> None:
+        self._spool("20261120_101011_b")
+        self._spool("20261120_101012_a_b")
+        pcm, _meta = self.main._live_recovery_paths("b")
+        self.assertEqual(pcm.name, "20261120_101011_b.pcm16")
+
+
 class SpoolHasOneOwnerTests(unittest.TestCase):
     """BL-01: while the WebSocket handler owns a session, a save/discard
     must not unlink the spool the finalize-time recovery still reads."""

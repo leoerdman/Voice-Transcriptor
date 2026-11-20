@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import time
 import unittest
 from unittest import mock
@@ -142,6 +143,18 @@ class ModelsManagerTests(unittest.TestCase):
         self.assertEqual(final["status"], "done")
         self.assertEqual(final["progress"], 100.0)
         self.assertEqual(sorted(dl_calls), sorted(files))
+
+    def test_a_missing_hub_package_ends_in_error_not_a_stuck_download(self):
+        # BM-23: the import sat outside the worker's try; an ImportError
+        # killed the thread with the state still "downloading" — the model
+        # neither downloadable nor deletable until a restart.
+        model_id = WHISPER_LOCAL_MODELS[0]
+        models_manager._set_state(model_id, status="downloading", progress=0.0)
+        with mock.patch.dict(sys.modules, {"huggingface_hub": None}):
+            models_manager._download_worker(model_id)
+        final = models_manager._get_state(model_id)
+        self.assertEqual(final["status"], "error")
+        self.assertIn("huggingface_hub", final["error"])
 
     def test_already_downloaded_short_circuits_without_thread(self):
         with mock.patch(

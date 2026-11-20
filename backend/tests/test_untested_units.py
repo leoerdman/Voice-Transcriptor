@@ -191,5 +191,15 @@ class AbToolTests(unittest.TestCase):
         self.assertEqual(len(pcm), len(frames))
 
 
+class AsyncTasksLoggerTests(unittest.TestCase):
+    """BL-04: main.py installs its one handler on the ``backend`` logger;
+    a module logging under any other name is invisible at INFO."""
+
+    def test_async_tasks_logs_into_the_backend_namespace(self):
+        from backend import async_tasks
+
+        self.assertTrue(async_tasks.logger.name.startswith("backend."), async_tasks.logger.name)
+
+
 if __name__ == "__main__":
     unittest.main()

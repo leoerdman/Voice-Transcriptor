@@ -9,6 +9,8 @@ import binascii
 import hashlib
 import importlib
 import socket
+import ssl
+import urllib.error
 import uuid
 import re
 import secrets
@@ -1191,11 +1193,21 @@ def _normalize_live_session_id(value: str) -> str:
     return str(uuid.uuid4())
 
 
+def _recovery_stem_glob(session_id: str) -> str:
+    """The glob for ONE session's spool stem, exactly as
+    ``_open_live_recovery`` names it: ``YYYYmmdd_HHMMSS_<session id>``.
+    A bare ``*_<id>`` also matched ``<ts>_a_b`` for id ``b`` (ids may hold
+    underscores — BUG-52), so discarding or promoting ``b`` could act on
+    session ``a_b`` (BM-28). The caller validates the id first
+    (``LIVE_SESSION_ID_RE``: no glob metacharacters)."""
+    return f"{'[0-9]' * 8}_{'[0-9]' * 6}_{session_id}"
+
+
 def _live_recovery_paths(session_id: str) -> tuple[Optional[Path], Optional[Path]]:
     safe_session_id = (session_id or "").strip()
     if not safe_session_id or not LIVE_SESSION_ID_RE.fullmatch(safe_session_id):
         return None, None
-    matches = sorted(LIVE_RECOVERY_DIR.glob(f"*_{safe_session_id}.pcm16"))
+    matches = sorted(LIVE_RECOVERY_DIR.glob(f"{_recovery_stem_glob(safe_session_id)}.pcm16"))
     if not matches:
         return None, None
     pcm_path = matches[-1]
@@ -1218,7 +1230,7 @@ def _delete_live_recovery(session_id: str) -> bool:
     Deleting a session's remains must not depend on which half of it
     still happens to exist.
     """
-    stem_glob = f"*_{session_id}" if LIVE_SESSION_ID_RE.fullmatch(session_id or "") else ""
+    stem_glob = _recovery_stem_glob(session_id) if LIVE_SESSION_ID_RE.fullmatch(session_id or "") else ""
     if not stem_glob:
         return False
     removed = False
@@ -1978,6 +1990,13 @@ def _hub_offline_error_types() -> tuple[type[BaseException], ...]:
                 types.append(candidate)
     # DNS failure below every client library.
     types.append(socket.gaierror)
+    # The stdlib transport (GigaAM fetches its checkpoint with urllib) and
+    # TLS failures below every client: a host whose certificate expired is
+    # as unreachable as one with no route (BL-11 — the GigaAM CDN's
+    # expired certificate answered this endpoint with HTTP 500 and a stack
+    # trace). ``HTTPError`` is a URLError too, but it is the host
+    # answering, not the host being out of reach — see _is_hub_offline_error.
+    types.extend((urllib.error.URLError, ssl.SSLError))
     return tuple(types)
 
 
@@ -1996,7 +2015,7 @@ def _is_hub_offline_error(exc: BaseException) -> bool:
     current: Optional[BaseException] = exc
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if isinstance(current, _HUB_OFFLINE_ERRORS):
+        if isinstance(current, _HUB_OFFLINE_ERRORS) and not isinstance(current, urllib.error.HTTPError):
             return True
         current = current.__cause__ or current.__context__
     return False
