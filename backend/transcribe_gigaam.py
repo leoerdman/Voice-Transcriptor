@@ -55,6 +55,13 @@ _MODEL_CACHE: "OrderedDict[str, Any]" = OrderedDict()
 # loading model A must not serialise with loading model B — the single
 # global lock that sat here made the first v3_rnnt load block a
 # concurrent v3_e2e_rnnt load for the whole multi-second weight read.
+#
+# ``_MODEL_LOCKS_GUARD`` guards the lock registry AND every read or write
+# of ``_MODEL_CACHE``, held only for the dict operation itself (never
+# across a load). The cache used to be mutated under the per-model lock
+# and read under the guard — two locks for one dict — so two loads of
+# different models could both pass the cap check and evict each other's
+# fresh model (BE-24).
 _MODEL_LOCKS_GUARD = threading.Lock()
 _MODEL_LOCKS: "dict[str, threading.Lock]" = {}
 
@@ -99,20 +106,26 @@ def _model_lock(model_id: str) -> threading.Lock:
 
 def _load_model(model_id: str) -> Any:
     with _model_lock(model_id):
-        model = _MODEL_CACHE.get(model_id)
-        if model is not None:
-            # LRU bookkeeping: a hit promotes the entry to most-recently-
-            # used so the eviction below always drops the coldest model.
-            _MODEL_CACHE.move_to_end(model_id)
-            return model
+        with _MODEL_LOCKS_GUARD:
+            model = _MODEL_CACHE.get(model_id)
+            if model is not None:
+                # LRU bookkeeping: a hit promotes the entry to most-
+                # recently-used so the eviction below always drops the
+                # coldest model.
+                _MODEL_CACHE.move_to_end(model_id)
+                return model
         import gigaam
 
         upstream_name = model_id.removeprefix("gigaam-").replace("-", "_")
         logger.info("gigaam: loading %s (upstream name %s)", model_id, upstream_name)
         model = gigaam.load_model(upstream_name)
-        _MODEL_CACHE[model_id] = model
-        while len(_MODEL_CACHE) > _GIGAAM_CACHE_MAX:
-            evicted_id, _ = _MODEL_CACHE.popitem(last=False)
+        with _MODEL_LOCKS_GUARD:
+            _MODEL_CACHE[model_id] = model
+            _MODEL_CACHE.move_to_end(model_id)
+            evicted = []
+            while len(_MODEL_CACHE) > _GIGAAM_CACHE_MAX:
+                evicted.append(_MODEL_CACHE.popitem(last=False)[0])
+        for evicted_id in evicted:
             logger.info(
                 "gigaam: evicted %s from cache (cap=%d)",
                 evicted_id, _GIGAAM_CACHE_MAX,

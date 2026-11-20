@@ -42,9 +42,7 @@ class DeepgramRemoteError(RemoteError):
 
 # 1.1.25 SSOT: imported from ``backend.deepgram_endpoints`` so REST
 # and live modules share one source of truth for the Deepgram host.
-# Re-exported as ``DEEPGRAM_API_BASE`` for backward compat with any
-# external caller that imports the old name.
-from backend.deepgram_endpoints import DEEPGRAM_REST_BASE as DEEPGRAM_API_BASE  # noqa: E402,F401
+from backend.deepgram_endpoints import DEEPGRAM_REST_BASE  # noqa: E402
 
 
 _DEEPGRAM_CONNECT_TIMEOUT_SEC = 10
@@ -155,7 +153,7 @@ def deepgram_transcribe(
     if not api_key:
         raise DeepgramRemoteError("Deepgram API key is not configured")
 
-    url = f"{DEEPGRAM_API_BASE}/listen"
+    url = f"{DEEPGRAM_REST_BASE}/listen"
 
     params: Dict[str, Any] = {
         "model": model or DEFAULT_DEEPGRAM_AUDIO_MODEL,

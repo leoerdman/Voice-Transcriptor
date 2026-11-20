@@ -161,7 +161,9 @@ class InterimEvidence:
     # End of the newest interim's own decode window, session timeline.
     interim_window_end: float = 0.0
     # The session's configured endpointing silence window, in seconds.
-    endpointing_sec: float = 0.3
+    # Defaults are the live config's own, not a second copy of them
+    # (BE-17).
+    endpointing_sec: float = DeepgramLiveConfig.endpointing_ms / 1000.0
     # ``last_word_end`` of the newest ``UtteranceEnd``, or ``None``.
     # Deepgram's affirmative "the utterance ended here" — the only signal
     # that tells a user who stopped talking apart from a provider that
@@ -171,7 +173,7 @@ class InterimEvidence:
     utterance_end: Optional[float] = None
     # After this much silence Deepgram OWES an ``UtteranceEnd``; a gap
     # longer than it with none inside is the unexplained one.
-    utterance_end_sec: float = 2.0
+    utterance_end_sec: float = DeepgramLiveConfig.utterance_end_ms / 1000.0
 
 
 def evidence_from_session(session: Any) -> InterimEvidence:
@@ -184,10 +186,13 @@ def evidence_from_session(session: Any) -> InterimEvidence:
     return InterimEvidence(
         hole_spans=tuple(session.coverage_hole_spans()),
         speech_spans=tuple(session.interim_speech_spans()),
-        interim_window_end=float(session.interim_window_end or 0.0),
-        endpointing_sec=float(session.endpointing_sec or 0.3),
+        # Read as given: ``or <default>`` turned a legitimately
+        # configured 0 into the default, and restated the defaults a
+        # third time (BE-17).
+        interim_window_end=float(session.interim_window_end),
+        endpointing_sec=float(session.endpointing_sec),
         utterance_end=session.last_utterance_end,
-        utterance_end_sec=float(session.utterance_end_sec or 2.0),
+        utterance_end_sec=float(session.utterance_end_sec),
     )
 
 

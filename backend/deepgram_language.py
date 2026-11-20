@@ -29,6 +29,17 @@ the transcript around it.
 from __future__ import annotations
 
 
+def _normalize(language: str) -> str:
+    """A configured language as both endpoints read it: trimmed, lowercased.
+
+    One spelling rule for both functions below. ``rest_language_params``
+    used to skip the lowercasing its own docstring promised, so "RU"
+    reached the live endpoint as "ru" and the prerecorded one as "RU"
+    (BE-21).
+    """
+    return (language or "").strip().lower()
+
+
 def resolve_live_language(language: str) -> str:
     """The Deepgram ``language`` value a configured language maps to.
 
@@ -42,7 +53,7 @@ def resolve_live_language(language: str) -> str:
     recording is actually multilingual — and two places deciding what
     "auto" means is exactly how they would come to disagree.
     """
-    lang = (language or "").strip().lower()
+    lang = _normalize(language)
     return "multi" if lang in ("", "auto", "multi") else lang
 
 
@@ -54,8 +65,8 @@ def rest_language_params(language: str) -> dict[str, str]:
     ``resolve_live_language`` performs, so a configured language reaches
     both endpoints identically and only the auto case differs.
     """
-    lang = (language or "").strip()
-    if not lang or lang.lower() == "auto":
+    lang = _normalize(language)
+    if lang in ("", "auto"):
         return {"detect_language": "true"}
     return {"language": lang}
 

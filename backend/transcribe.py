@@ -59,10 +59,21 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-_DEFAULT_CPU_THREADS = max(
-    4,
-    min(8, _env_int("TRANSCRIPTOR_WHISPER_CPU_THREADS", max(4, _CPU_COUNT // 2))),
-)
+def _cpu_threads() -> int:
+    """Whisper's CPU thread count: the user's explicit choice, else a default.
+
+    The default is half the cores, kept within 4..8. An explicit
+    ``TRANSCRIPTOR_WHISPER_CPU_THREADS`` is honoured as given (at least
+    one): the outer ``max(4, …)`` used to apply to it too, so a user who
+    set 2 to keep the machine responsive silently got 4 (BE-22).
+    """
+    explicit = os.environ.get("TRANSCRIPTOR_WHISPER_CPU_THREADS")
+    if explicit is not None and explicit.strip():
+        return max(1, _env_int("TRANSCRIPTOR_WHISPER_CPU_THREADS", 4))
+    return max(4, min(8, _CPU_COUNT // 2))
+
+
+_DEFAULT_CPU_THREADS = _cpu_threads()
 _DEFAULT_NUM_WORKERS = max(
     1,
     min(3, _env_int("TRANSCRIPTOR_WHISPER_NUM_WORKERS", 2 if _CPU_COUNT >= 8 else 1)),
@@ -260,7 +271,7 @@ def model_is_resident(model_name: str) -> bool:
         module = _gigaam_module()
         if module is None:
             return False
-        return model_name in getattr(module, "_MODEL_CACHE", {})
+        return model_name in module.resident_gigaam_models()
     with _MODEL_LOCK:
         return model_name in _MODEL_CACHE
 
@@ -307,6 +318,11 @@ def release_idle_models(now: Optional[float] = None) -> List[str]:
     gigaam = _gigaam_module()
     released: List[str] = []
     gigaam_expired: List[str] = []
+    # Snapshotted BEFORE ``_MODEL_LOCK``: the GigaAM cache has its own
+    # lock, and taking one while holding the other is how two locks
+    # become a deadlock — the rule restated just below, which this read
+    # used to break (BE-24).
+    gigaam_resident = gigaam.resident_gigaam_models() if gigaam is not None else []
     with _MODEL_LOCK:
         # BOTH engines. ``model_is_resident`` already knew about the
         # GigaAM cache while this function did not, so the ~1 GB torch
@@ -314,8 +330,7 @@ def release_idle_models(now: Optional[float] = None) -> List[str]:
         # ``_MODEL_IDLE_UNLOAD_SEC`` exists — was the one model that
         # never came back out of memory until the process exited.
         resident = list(_MODEL_CACHE.keys())
-        if gigaam is not None:
-            resident.extend(gigaam.resident_gigaam_models())
+        resident.extend(gigaam_resident)
         for name in resident:
             last = _MODEL_LAST_USED.get(name)
             if last is None:
@@ -617,7 +632,11 @@ def transcribe_file(
         )
     except Exception as e:
         if _is_empty_sequence_transcribe_error(e):
-            return _empty_transcribe_result(0.0)
+            # The file's REAL duration, as every other door reports it
+            # (``_undecodable_wav_result``, ``transcribe_audio``): the
+            # same empty recognition must describe the same recording
+            # whichever entry point it came through (BE-22).
+            return _empty_transcribe_result(sf.info(path_wav_16k_mono).duration)
         raise
 
     return _build_result(segments, info, word_timestamps)
