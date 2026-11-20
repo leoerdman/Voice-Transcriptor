@@ -478,6 +478,20 @@ describe("upload queue wiring for a failed History save (FQ-01/FQ-05/FQ-18)", ()
     expect(mainTsx).toMatch(/if \(isUploadClearable\(uploadQueue\[i\]\)\) \{\s*uploadQueue\.splice\(i, 1\);/);
   });
 
+  it("FQ-02: a failed queue snapshot write re-arms the dirty flag and goes through the retry policy", () => {
+    const flush = mainTsxSlice("async function flushUploadQueueSnapshotNow(", "\nfunction saveUploadQueueSnapshot(");
+    const catchBlock = /\.catch\(\(e\) => \{([\s\S]*?)\n {4}\}\);/.exec(flush)?.[1];
+    expect(catchBlock, "the PUT's catch block was not found").toBeTruthy();
+    expect(String(catchBlock)).toContain("uploadQueueSavePending = true;");
+    expect(flush).toContain("nextQueueSaveRetry(uploadQueueSaveFailures)");
+    expect(flush).toContain("setStatus(UPLOAD_QUEUE_SAVE_FAILED_STATUS, \"warning\")");
+  });
+
+  it("FQ-03: the unload flush listens to pagehide only", () => {
+    expect(mainTsx).toContain('window.addEventListener("pagehide", flushUploadQueueSnapshotBestEffort');
+    expect(mainTsx).not.toContain('window.addEventListener("beforeunload", flushUploadQueueSnapshotBestEffort');
+  });
+
   it("the save stage cannot be 'stopped': cancel ignores it and the Stop button is disabled", () => {
     expect(mainTsx).toContain('if (item.cancelRequested || item.stage === "saving") return;');
     expect(mainTsx).toContain('stopBtn.disabled = item.cancelRequested === true || item.stage === "saving";');

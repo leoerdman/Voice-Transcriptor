@@ -38,6 +38,7 @@ import {
   uploadErrorView,
   uploadRetryPlan,
 } from "./upload-item";
+import { UPLOAD_QUEUE_SAVE_FAILED_STATUS, nextQueueSaveRetry } from "./upload-queue-persist";
 import {
   captureElapsedMs,
   decidePreRoll,
@@ -14116,6 +14117,8 @@ let uploadQueueSaveTimer: number | null = null;
 let uploadQueueSaveInFlight: Promise<void> = Promise.resolve();
 let uploadQueueSavePending = false;
 let uploadQueueLastSaveOk = false;
+/** Consecutive failed snapshot writes (./upload-queue-persist). */
+let uploadQueueSaveFailures = 0;
 let uploadRevealReconcileInFlight: Promise<void> | null = null;
 const UPLOAD_EMPTY_TRANSCRIPT_TEXT = "[No speech captured]";
 // Per-file ceiling for the Upload tab. This must match MAX_FILE_BYTES,
@@ -14525,12 +14528,35 @@ async function flushUploadQueueSnapshotNow(unloading = false): Promise<void> {
         { keepalive: unloading },
       );
       uploadQueueLastSaveOk = true;
+      uploadQueueSaveFailures = 0;
     })
     .catch((e) => {
       uploadQueueLastSaveOk = false;
-      console.warn("Upload queue backend snapshot save failed", e);
+      // FQ-02: the backend does not hold this state, so the queue is
+      // still dirty — a failed write must not read as a finished one.
+      uploadQueueSavePending = true;
+      uploadQueueSaveFailures += 1;
+      console.warn(`Upload queue backend snapshot save failed (attempt ${uploadQueueSaveFailures})`, e);
     });
   await uploadQueueSaveInFlight;
+  if (!uploadQueueLastSaveOk) {
+    if (unloading) return;
+    const retry = nextQueueSaveRetry(uploadQueueSaveFailures);
+    if (retry) {
+      if (uploadQueueSaveTimer === null) {
+        uploadQueueSaveTimer = window.setTimeout(() => {
+          uploadQueueSaveTimer = null;
+          void flushUploadQueueSnapshotNow();
+        }, retry.retryInMs);
+      }
+    } else {
+      // Out of retries: say so once. The queue stays dirty, and the next
+      // change to it starts a fresh retry budget.
+      uploadQueueSaveFailures = 0;
+      setStatus(UPLOAD_QUEUE_SAVE_FAILED_STATUS, "warning");
+    }
+    return;
+  }
   if (uploadQueueSavePending) {
     uploadQueueSavePending = false;
     await flushUploadQueueSnapshotNow(unloading);
@@ -14653,8 +14679,10 @@ function flushUploadQueueSnapshotBestEffort(): void {
   void flushUploadQueueSnapshotNow(true);
 }
 
+// ``pagehide`` alone: it fires on every unload (close, reload, navigate),
+// after ``beforeunload``. Listening to both sent the same keepalive PUT
+// twice, and the two shared the browser's 64 KiB keepalive budget (FQ-03).
 window.addEventListener("pagehide", flushUploadQueueSnapshotBestEffort, { capture: true });
-window.addEventListener("beforeunload", flushUploadQueueSnapshotBestEffort, { capture: true });
 
 function addUploadQueueItem(item: UploadQueueItem): void {
   uploadQueue.unshift(item);
