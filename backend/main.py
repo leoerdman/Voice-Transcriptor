@@ -861,9 +861,30 @@ _live_promote_cache: dict[str, tuple[float, dict]] = {}
 _LIVE_PROMOTE_CACHE_TTL_SEC = 60.0
 
 
+def _retire_persisted_api_token(path: Path) -> None:
+    """Delete a token file the running app no longer uses.
+
+    Since BM-01 the desktop shell mints the token per launch and passes it
+    in the environment; a file token persisted by an earlier build (or a
+    standalone run) is then a live-looking credential nobody honours, left
+    on disk. The user decided on 2026-11-20 that it is removed at launch.
+    Only the env-token path calls this — a standalone backend still keeps
+    its token in that file.
+    """
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        logger.warning("stale api token file not removed at %s: %s", path, e)
+        return
+    logger.info("removed the stale api token file %s (the token comes from the shell)", path)
+
+
 def _load_or_create_api_token() -> str:
     env_token = os.environ.get("TRANSCRIPTOR_API_TOKEN", "").strip()
     if env_token:
+        _retire_persisted_api_token(API_TOKEN_PATH)
         return env_token
     # The token path lives under DATA_DIR; if the user has permission or
     # filesystem issues (read-only mount, sandbox denial, anti-virus
