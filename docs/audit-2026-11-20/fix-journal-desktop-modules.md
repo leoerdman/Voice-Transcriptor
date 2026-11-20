@@ -166,3 +166,42 @@ exit=0
 ℹ pass 1
 ```
 The capsule's own title channel (костыль 1, main.js) is unchanged — main.js lane.
+
+### C5 — DX-11, H-09, DX-25, DX-20
+Files: `desktop/afterPack.js`, `desktop/scripts/macos-signing-utils.js`, `desktop/scripts/build-mas.sh`,
+`desktop/scripts/build-native.sh`, `desktop/package.json`, `.github/workflows/tests.yml`,
+`desktop/packaging.test.js`, `desktop/signing.test.js`.
+Check: `node --test desktop/packaging.test.js desktop/signing.test.js`.
+H-09 settled by reading app-builder-lib 26.15.3: `macPackager.getPlatformConfig("mas")` =
+`deepAssign({}, mac, mas)` and `deepAssign` concatenates arrays — so the MAS build inherits
+`build.mac.extraResources` (the helper directory AND a second copy of `runtime/mac-${arch}`
+to the same destination; the duplicate-destination test modelled mas as base+mas only).
+Decision: the App Store build ships no helper (an active CGEventTap cannot run in the App
+Sandbox); `build-mas.sh` empties `native/build/mac-arm64` before packing and afterPack
+refuses a MAS bundle that carries one; the redundant `build.mas.extraResources` is removed.
+Before (all eight files at HEAD of C4, new tests):
+```
+exit=1
+✖ CI runs the desktop suite where its osacompile tests can execute (1.126583ms)
+  AssertionError [ERR_ASSERTION]: The input was expected to not match the regular expression /\b(\d+|one|…|seventeen|…) suites are\b/i.
+✖ no extraResource is copied to the same destination twice (0.433834ms)
+  AssertionError [ERR_ASSERTION]: mas: duplicate extraResources destinations
+✖ every mac dist script builds screen mode's helper before electron-builder; the App Store one leaves it out (7.735667ms)
+  AssertionError [ERR_ASSERTION]: The expression evaluated to a falsy value:
+✖ the helper's place in the bundle is one fact across build-native.sh, package.json, main.js and afterPack (2.778042ms)
+  TypeError [ERR_INVALID_ARG_TYPE]: The "path" argument must be of type string. Received undefined
+✖ afterPack's helper check: a mac build must carry screen-input, an App Store build must not (0.3945ms)
+✖ afterPack runs the helper check for every mac flavour, before signing (0.641208ms)
+ℹ pass 28
+ℹ fail 6
+```
+After:
+```
+exit=0
+ℹ pass 34
+ℹ fail 0
+```
+DX-25: `build-native.sh mac-x64` is now an explicit error ("macOS builds are arm64-only")
+instead of a dead branch; the mis-indented `"user-data-dir.js"` entry is fixed. main.js's
+dev path `mac-${process.arch}` stays (main.js lane; on Intel it resolves to a directory
+that is never built → `isSupported()` false, consistent with arm64-only).

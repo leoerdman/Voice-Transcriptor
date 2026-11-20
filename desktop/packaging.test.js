@@ -227,6 +227,9 @@ test("CI runs the desktop suite where its osacompile tests can execute", () => {
   );
   const desktopJob = workflow.slice(workflow.indexOf("\n  desktop:"));
   assert.match(desktopJob, /runs-on:\s*macos-latest/);
+  // A count of the suites in prose went stale at the next added suite
+  // ("seventeen" while there were 23); the directory is the count.
+  assert.doesNotMatch(workflow, /\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty[- \w]*) suites are\b/i);
 
   // ...and those two suites must still be the darwin-gated ones, or the
   // reason for the macOS runner has quietly moved somewhere else.
@@ -254,9 +257,17 @@ test("no extraResource is copied to the same destination twice", () => {
   // ../requirements-gigaam.txt and ../ENABLE_GIGAAM were each copied to the
   // same path twice on mac, win and linux, and all six had to be edited
   // together to change one path.
-  for (const platform of ["mac", "mas", "win", "linux"]) {
-    const platformCfg = pkg.build[platform] || {};
-    const combined = [...pkg.build.extraResources, ...(platformCfg.extraResources || [])];
+  // The mas target is built from build.mac MERGED with build.mas
+  // (macPackager getPlatformConfig → deepAssign, which concatenates
+  // arrays), so its list is base + mac + mas.
+  const ownLists = {
+    mac: [pkg.build.mac],
+    mas: [pkg.build.mac, pkg.build.mas],
+    win: [pkg.build.win],
+    linux: [pkg.build.linux],
+  };
+  for (const [platform, cfgs] of Object.entries(ownLists)) {
+    const combined = [...pkg.build.extraResources, ...cfgs.flatMap((cfg) => (cfg && cfg.extraResources) || [])];
     const destinations = combined.map((entry) => entry.to);
     const duplicated = destinations.filter((to, i) => destinations.indexOf(to) !== i);
     assert.deepEqual(duplicated, [], `${platform}: duplicate extraResources destinations`);
@@ -441,4 +452,35 @@ test("the READMEs do not promise a signing mode the default build no longer uses
       `${name} still describes the default build as ad-hoc signed`,
     );
   }
+});
+
+test("every mac dist script builds screen mode's helper before electron-builder; the App Store one leaves it out", () => {
+  // Without the helper the screen hotkey is silently not offered
+  // (controller isSupported() is an existsSync), so a script that packs a
+  // mac build without build-native.sh ships a DMG that fails no check.
+  const macDist = Object.entries(pkg.scripts).filter(([, body]) => /electron-builder --mac(?! mas)/.test(body));
+  assert.ok(macDist.length >= 4, "the mac dist scripts are found");
+  for (const [name, body] of macDist) {
+    const native = body.indexOf("build-native.sh mac-arm64");
+    assert.ok(native >= 0 && native < body.indexOf("electron-builder"), `${name} packs a mac build without building the helper first`);
+  }
+  // dist:mas: build-mas.sh empties the helper directory build.mac's
+  // extraResources hand to the merged mas config, before packing.
+  const mas = fs.readFileSync(path.join(DESKTOP_DIR, "scripts", "build-mas.sh"), "utf8");
+  const emptied = mas.indexOf("rm -rf ./native/build/mac-arm64");
+  assert.ok(emptied >= 0 && emptied < mas.indexOf("npx electron-builder --mac mas"));
+  assert.doesNotMatch(mas, /^\s*bash \S*build-native\.sh/m);
+});
+
+test("the helper's place in the bundle is one fact across build-native.sh, package.json, main.js and afterPack", () => {
+  const { SCREEN_INPUT_HELPER_IN_BUNDLE } = require("./scripts/macos-signing-utils");
+  const [dirInBundle, name] = [path.dirname(SCREEN_INPUT_HELPER_IN_BUNDLE), path.basename(SCREEN_INPUT_HELPER_IN_BUNDLE)];
+  const buildNative = fs.readFileSync(path.join(DESKTOP_DIR, "scripts", "build-native.sh"), "utf8");
+  assert.match(buildNative, new RegExp(`-o "\\$OUT_DIR/${name}"`));
+  const entry = pkg.build.mac.extraResources.find((e) => e.from === "native/build/mac-${arch}");
+  assert.ok(entry, "build.mac.extraResources copies the helper directory");
+  assert.equal(path.join("Contents", "Resources", entry.to), dirInBundle);
+  const main = fs.readFileSync(path.join(DESKTOP_DIR, "main.js"), "utf8");
+  const segments = entry.to.split("/").concat(name).map((s) => `"${s}"`).join(", ");
+  assert.ok(main.includes(`path.join(process.resourcesPath, ${segments})`), "main.js runs the helper from where the bundle has it");
 });

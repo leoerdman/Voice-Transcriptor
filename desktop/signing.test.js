@@ -20,6 +20,8 @@ const path = require("node:path");
 
 const {
   REQUIRED_USAGE_DESCRIPTION_KEYS,
+  SCREEN_INPUT_HELPER_IN_BUNDLE,
+  assertScreenInputHelper,
   designatedRequirementIsStable,
   isDeveloperIdIdentity,
   resolveSigningPlan,
@@ -254,4 +256,33 @@ test("no updater metadata is published: the app has no updater", () => {
   // writeUpdateInfo:false deliberately suppresses the other half. There
   // is no electron-updater in the app at all.
   assert.equal(packageJson.build.publish, null);
+});
+
+test("afterPack's helper check: a mac build must carry screen-input, an App Store build must not", () => {
+  const os = require("node:os");
+  const app = fs.mkdtempSync(path.join(os.tmpdir(), "helper-check-")) + "/Transcriptor.app";
+  const helper = path.join(app, SCREEN_INPUT_HELPER_IN_BUNDLE);
+  try {
+    assert.throws(() => assertScreenInputHelper(app, { expected: true }), /missing from the bundle/);
+    assert.equal(assertScreenInputHelper(app, { expected: false }), null);
+    // A thin 64-bit Mach-O executable header (MH_MAGIC_64, MH_EXECUTE).
+    const header = Buffer.alloc(32);
+    header.writeUInt32LE(0xfeedfacf, 0);
+    header.writeUInt32LE(2, 12);
+    fs.mkdirSync(path.dirname(helper), { recursive: true });
+    fs.writeFileSync(helper, header);
+    assert.equal(assertScreenInputHelper(app, { expected: true }), helper);
+    assert.throws(() => assertScreenInputHelper(app, { expected: false }), /must not ship/);
+  } finally {
+    fs.rmSync(path.dirname(app), { recursive: true, force: true });
+  }
+});
+
+test("afterPack runs the helper check for every mac flavour, before signing", () => {
+  const afterPack = fs.readFileSync(path.join(__dirname, "afterPack.js"), "utf8");
+  const check = afterPack.indexOf("assertScreenInputHelper(appPath, { expected: !isMas })");
+  assert.ok(check > 0, "afterPack checks the helper");
+  assert.ok(check < afterPack.indexOf("if (isMas) {"), "before the MAS branch returns");
+  assert.ok(check < afterPack.indexOf("preSignRuntimeBinaries({"), "before the runtime is signed");
+  assert.match(afterPack, /"--verify", "--strict", "--verbose=2", screenInputHelper/);
 });

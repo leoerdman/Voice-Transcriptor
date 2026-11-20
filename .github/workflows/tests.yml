@@ -5,8 +5,8 @@
 # version bump cannot leave CI testing an interpreter the product does not
 # ship.
 #
-# The desktop job needs no `npm install` — its seventeen suites are pure
-# node:test modules with zero dependencies; requiring "electron" would
+# The desktop job needs no `npm install` — its suites are pure node:test
+# modules with zero dependencies; requiring "electron" would
 # matter only if a future test imported an entrypoint, and that failure
 # mode is exactly what packaging.test.js exists to describe.
 #
@@ -16,7 +16,9 @@
 # they had therefore never run once: a stray backtick truncating the paste
 # template (the exact failure applescript.test.js was written for) would
 # have reached users with CI green, on the platform the product is
-# primarily shipped for.
+# primarily shipped for. screen-input.test.js needs it too: it compiles
+# screen mode's native helper (its click-vs-stroke rule and its event tap)
+# with swiftc, which exists only there.
 name: tests
 
 on:
@@ -90,7 +92,7 @@ jobs:
       - run: npm run build
 
   desktop:
-    # macOS, so the two osacompile suites actually execute. See the header.
+    # macOS, so the osacompile and swiftc suites actually execute. See the header.
     runs-on: macos-latest
     defaults:
       run:
