@@ -105,6 +105,14 @@ import { keyEventToAccelerator } from "./shortcut-capture";
 import { keyAction, performKeyAction, type KeyAction } from "./key-action";
 import { keepaliveFor } from "./keepalive";
 import { parseRuntimeLimits } from "./runtime-limits";
+import {
+  PROVIDER_DISPLAY_ORDER,
+  isRemoteProvider,
+  normalizeProviderSelection,
+  providerKeyErrorMessage,
+  providerLabel,
+  requireRemoteProvider,
+} from "./providers";
 import { waitForJob } from "./job-poll";
 import {
   LIVE_DRAFT_SCHEMA_VERSION,
@@ -2987,24 +2995,6 @@ function setCurrentRecordingAudio(file: File | null, savedName = "", archiveDir 
   });
 })();
 
-function providerLabel(provider: string): string {
-  const value = String(provider || "").trim().toLowerCase();
-  if (!value || value === "unknown") return "Unknown";
-  if (value === "none") return "None";
-  if (value === "local") return "Local";
-  if (value === "openrouter") return "OpenRouter";
-  if (value === "deepgram") return "Deepgram";
-  return provider;
-}
-
-/**
- * The order the three providers are shown in, wherever a list of them
- * is shown. Was written out twice in a row inside the stats renderer,
- * three lines apart, as the third copy of a fact already stated by
- * ``providerLabel`` and by the ``Provider`` type.
- */
-const PROVIDER_DISPLAY_ORDER: ReadonlyArray<string> = ["local", "openrouter", "deepgram"];
-
 /**
  * Whether a provider name recorded in the archive is one this build has.
  *
@@ -3020,22 +3010,10 @@ function isKnownProviderName(name: string): boolean {
   return !!key && !RETIRED_PROVIDER_NAMES.has(key);
 }
 
-function normalizeProviderSelection(value: unknown, fallback: Provider = "local"): Provider {
-  const provider = String(value ?? "").trim();
-  if (provider === "" || provider === "local" || provider === "openrouter" || provider === "deepgram") {
-    return provider;
-  }
-  return fallback;
-}
-
 const REMOTE_SMALL_AUDIO_BYTES = 1 * 1024 * 1024;
 const DEEPGRAM_SMALL_AUDIO_UI_TIMEOUT_MS = UI_TOKENS.finalize.smallAudioUiMs;
 const LIVE_SHORT_EMPTY_RECOVERY_TIMEOUT_MS = UI_TOKENS.finalize.shortEmptyRecoveryMs;
 const LIVE_DEFAULT_EMPTY_RECOVERY_TIMEOUT_MS = UI_TOKENS.finalize.defaultEmptyRecoveryMs;
-function isRemoteProvider(provider: Provider): provider is RemoteProvider {
-  return provider === "openrouter" || provider === "deepgram";
-}
-
 function isRemoteProviderReachable(provider: Provider, providerReachabilityHint = false): boolean {
   return isRemoteProvider(provider) && (providerReachabilityHint || isNetworkOnline);
 }
@@ -4715,23 +4693,22 @@ function getRemoteModelValue(provider: Provider): string {
   return selectedLocalModel();
 }
 
+/**
+ * The remote model travels as ``model`` — the name every backend endpoint
+ * reads first. It used to be sent three times (``model``,
+ * ``remote_model``, ``openrouter_model``, the last two "legacy aliases
+ * kept for older clients"), although renderer and backend ship in one
+ * bundle and no older client exists; the backend side of the alias is
+ * listed for removal in the audit journal.
+ */
 function appendRemoteModelFormFields(fd: FormData, provider: Provider, model: string | undefined): void {
   if (!isRemoteProvider(provider)) return;
-  const value = String(model || "").trim();
-  fd.set("model", value);
-  fd.set("remote_model", value);
-  // Legacy backend alias. Keep it derived here so there is still one caller-side SSOT.
-  fd.set("openrouter_model", value);
+  fd.set("model", String(model || "").trim());
 }
 
 function remoteModelJsonFields(provider: Provider, model: string | undefined): Record<string, string> {
   if (!isRemoteProvider(provider)) return {};
-  const value = String(model || "").trim();
-  return {
-    model: value,
-    remote_model: value,
-    openrouter_model: value,
-  };
+  return { model: String(model || "").trim() };
 }
 
 async function remoteJob(
@@ -4740,7 +4717,7 @@ async function remoteJob(
 ): Promise<BackendJobCreated> {
   const fd = new FormData();
   fd.append("file", file, file.name || "audio.wav");
-  fd.set("provider", opts.provider || "openrouter");
+  fd.set("provider", requireRemoteProvider(opts.provider));
   fd.set("language", opts.language || "auto");
   fd.set("diarize", String(!!opts.diarize));
   appendRemoteModelFormFields(fd, opts.provider, opts.remoteModel);
@@ -4784,7 +4761,7 @@ async function remoteJobFromPath(
     signal: opts.signal,
     body: JSON.stringify({
       source_path: sourcePath,
-      provider: opts.provider || "openrouter",
+      provider: requireRemoteProvider(opts.provider),
       language: opts.language || "auto",
       diarize: !!opts.diarize,
       ...remoteModelJsonFields(opts.provider, opts.remoteModel),
@@ -5005,7 +4982,7 @@ async function remoteJobSync(
   const abortSignal = createLinkedAbortSignal(opts.signal, timeoutMs);
   const fd = new FormData();
   fd.append("file", file, file.name || "audio.wav");
-  fd.set("provider", opts.provider || "openrouter");
+  fd.set("provider", requireRemoteProvider(opts.provider));
   fd.set("language", opts.language || "auto");
   fd.set("diarize", String(!!opts.diarize));
   appendRemoteModelFormFields(fd, opts.provider, opts.remoteModel);
@@ -5033,25 +5010,14 @@ async function remoteJobSync(
   }
 }
 
-function isProviderKeyConfigured(provider: Provider): boolean {
-  if (provider === "local" || !provider) return true;
-  if (provider === "openrouter") {
-    return hasOpenrouterKey;
-  }
-  if (provider === "deepgram") {
-    return hasDeepgramKey;
-  }
-  return true;
-}
+/** Keyed by the remote set (./providers), so a new provider must say where its key lives. */
+const REMOTE_PROVIDER_KEY_CONFIGURED: Record<RemoteProvider, () => boolean> = {
+  openrouter: () => hasOpenrouterKey,
+  deepgram: () => hasDeepgramKey,
+};
 
-function providerKeyErrorMessage(provider: Provider): string {
-  if (provider === "deepgram") {
-    return "Deepgram API key is not configured. Add it in Settings -> API Keys.";
-  }
-  if (provider === "openrouter") {
-    return "OpenRouter API key is not configured. Add it in Settings -> API Keys.";
-  }
-  return "Provider API key is not configured.";
+function isProviderKeyConfigured(provider: Provider): boolean {
+  return !isRemoteProvider(provider) || REMOTE_PROVIDER_KEY_CONFIGURED[provider]();
 }
 
 function syncRecordingsSearchControls(): void {
@@ -6969,8 +6935,9 @@ async function loadCfg(): Promise<void> {
     syncAutoLanguageUi();
     // Restore the unified selection from persisted wire values
     // (provider + local_model + per-provider remote models). The UI
-    // group is DERIVED (gigaam-* local model ⇒ gigaam group), never
-    // persisted — the wire format stays backward compatible.
+    // group is DERIVED here (gigaam-* local model ⇒ gigaam group);
+    // ``collectUiPreferences`` does persist ``provider_group``, but only
+    // for the CLI (backend/cli_access.py) — this reader ignores it.
     {
       const hasStoredProvider = Object.prototype.hasOwnProperty.call(ui, "provider");
       const wire = hasStoredProvider
@@ -6986,8 +6953,9 @@ async function loadCfg(): Promise<void> {
       }
       uiModelByGroup.deepgram = remoteModelByProvider.deepgram;
       uiModelByGroup.openrouter = remoteModelByProvider.openrouter;
-      // The "None" provider option was removed: transcription always has
-      // a provider now, so a legacy stored "" coerces to Whisper.
+      // A stored "" (the Live toolbar's "None") is read back as Whisper
+      // by ``groupFromWire``, so a None chosen in the toolbar does not
+      // survive a restart.
       uiProviderGroup = group;
     }
     const auto = $("autoTranscribeToggle") as HTMLInputElement;
