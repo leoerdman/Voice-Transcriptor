@@ -15,6 +15,7 @@ import {
   EMPTY_FINAL_STATUS,
   emptyFinalKeepsLiveText,
   keepLiveTranscript,
+  keptTranscriptText,
   resolveEmptyFinalSummary,
   NOTHING_KEPT,
   resolveEpilogueSummary,
@@ -364,6 +365,7 @@ describe("keepLiveTranscript — a take without a final transcript keeps its liv
       text: "hello there",
       note: "The live text is kept as the transcript.",
       spoken: true,
+      screen: EMPTY_SCREEN_ANNOTATION,
     });
   });
 
@@ -459,13 +461,35 @@ describe("runStopEpilogue — a failed stop keeps the live text with marks in th
   });
 });
 
+describe("a screen take with no speech keeps its header first", () => {
+  it("the reason heads the body: header, reason, marks one per line, summary", () => {
+    const screen = screenAnnotationFromManifest(parseScreenManifest({
+      version: 2,
+      dir: "/rec/take.screens",
+      startedAt: 1_000_000,
+      audioStartedAt: 1_000_000,
+      events: [
+        { type: "stroke", at: 1_001_000, endedAt: 1_002_000, color: "#ffcc00", shot: 1, n: 1, shape: "loop", box: { x: 10, y: 10, w: 10, h: 10 } },
+        { type: "shot", at: 1_003_000, shot: 1, files: ["/rec/take.screens/shot-01.png"], area: "window" },
+      ],
+    })!);
+    const kept = keepLiveTranscript("", screen, 5_000);
+    expect(keptTranscriptText(kept, "[ Silence ]")).toBe([
+      screen.header,
+      "[ Silence ]",
+      "[✏️1 скрин 1: жёлтый обвод, вверху слева]\n[📸 00:03 скрин 1]",
+      screen.summary,
+    ].join("\n\n"));
+  });
+});
+
 describe("review findings, 2026-11-20", () => {
-  it("a silent take that drew keeps the reason above its marks", async () => {
-    const { keptTranscriptText, keepLiveTranscript } = await import("../src/stop-epilogue");
-    const marksOnly = { text: "[✏️ 00:02 линия в центре (54%, 48%) → скрин 1]", note: "x", spoken: false };
-    expect(keptTranscriptText(marksOnly, "[ Silence ]")).toBe(`[ Silence ]\n\n${marksOnly.text}`);
+  it("a silent take that drew keeps the reason above its marks", () => {
+    const mark = "[✏️1 скрин 1: штрих, в центре]";
+    const marksOnly = keepLiveTranscript("", marksOnlyAnnotation([{ atMs: 2_000, text: mark }]), 10_000);
+    expect(keptTranscriptText(marksOnly, "[ Silence ]")).toBe(`[ Silence ]\n\n${mark}`);
     expect(keptTranscriptText({ ...marksOnly, spoken: true }, "[ Silence ]")).toBe(marksOnly.text);
-    expect(keptTranscriptText({ text: "", note: "", spoken: false }, "[ Mic not delivering audio ]")).toBe("[ Mic not delivering audio ]");
+    expect(keptTranscriptText(NOTHING_KEPT, "[ Mic not delivering audio ]")).toBe("[ Mic not delivering audio ]");
     expect(keepLiveTranscript("привет", EMPTY_SCREEN_ANNOTATION, 1000).spoken).toBe(true);
     expect(keepLiveTranscript("", EMPTY_SCREEN_ANNOTATION, 1000).spoken).toBe(false);
   });

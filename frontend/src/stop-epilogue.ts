@@ -18,7 +18,12 @@
  */
 
 import { smartRecordingTitle } from "./recording-title";
-import { annotateTranscript, hasScreenAnnotation, type ScreenAnnotation } from "./screen-annotations";
+import {
+  EMPTY_SCREEN_ANNOTATION,
+  annotateTranscript,
+  hasScreenAnnotation,
+  type ScreenAnnotation,
+} from "./screen-annotations";
 
 export interface DrainedSilenceInput {
   /** ``captureSilenceSnapshot(...).silentCapture`` — the session's own
@@ -223,19 +228,29 @@ export interface KeptTranscript {
   note: string;
   /** ``text`` holds words that were said, not only screen marks. */
   spoken: boolean;
+  /** The take's screen annotation (empty for a voice take): what a
+   *  marks-only text is recomposed from when a reason joins it. */
+  screen: ScreenAnnotation;
 }
 
-export const NOTHING_KEPT: KeptTranscript = Object.freeze({ text: "", note: "", spoken: false });
+export const NOTHING_KEPT: KeptTranscript = Object.freeze({
+  text: "",
+  note: "",
+  spoken: false,
+  screen: EMPTY_SCREEN_ANNOTATION,
+});
 
 /**
  * The transcript a no-transcript stop stores and shows: the kept text, but
  * a take that kept only marks still says WHY there is no speech — the
- * "[ Silence ]" / "[ Mic not delivering audio ]" marker stays above them.
+ * "[ Silence ]" / "[ Mic not delivering audio ]" marker heads its body,
+ * under the header and above the marks (the composer's ``silence``).
  */
 export function keptTranscriptText(kept: KeptTranscript, marker: string): string {
+  const reason = String(marker || "").trim();
   if (!kept.text) return String(marker || "");
-  if (kept.spoken || !String(marker || "").trim()) return kept.text;
-  return `${String(marker).trim()}\n\n${kept.text}`;
+  if (kept.spoken || !reason) return kept.text;
+  return annotateTranscript("", kept.screen, { silence: reason });
 }
 
 export function keepLiveTranscript(
@@ -251,7 +266,7 @@ export function keepLiveTranscript(
     : live
       ? "The live text is kept as the transcript."
       : "The screen marks are kept as the transcript.";
-  return { text, note, spoken: !!live };
+  return { text, note, spoken: !!live, screen };
 }
 
 /** A summary that says what the take kept, when it kept anything. */

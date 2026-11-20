@@ -84,7 +84,8 @@ export interface ScreenManifestEvent {
   /** v2 shot: absolute path of its reduced copy. */
   preview?: string;
   area?: "window" | "display";
-  /** Shot: how many strokes it carries, as the shell counted them. */
+  /** Shot: how many strokes it carries, as the shell counted them (the
+   *  stroke events say the same; the transcript reads those). */
   strokes?: number;
   reason?: string;
 }
@@ -363,9 +364,9 @@ function shotSaved(e: ScreenManifestEvent): boolean {
   return !!(e.files && e.files.length);
 }
 
-/** A shot drew nothing: no stroke of the manifest is on it, and the shell counted none. */
+/** No stroke of the manifest is on the shot (the stroke events are the one record of them). */
 function shotIsBlank(e: ScreenManifestEvent, strokes: ReadonlyArray<NumberedStroke>): boolean {
-  return !strokes.some((s) => s.shot !== undefined && s.shot === e.shot) && !(e.strokes && e.strokes > 0);
+  return !strokes.some((s) => s.shot !== undefined && s.shot === e.shot);
 }
 
 function shotMark(e: ScreenManifestEvent, atMs: number, strokes: ReadonlyArray<NumberedStroke>): ScreenMark {
@@ -497,7 +498,7 @@ export function wordStartsFromSegments(segments: ReadonlyArray<TimedSegment>): n
 }
 
 /** Fraction (0..1) of the speech that came before `atMs`. */
-export function speechFractionAt(atMs: number, opts: { wordStartsMs?: number[]; durationMs?: number }): number {
+export function speechFractionAt(atMs: number, opts: Pick<AnnotateOptions, "wordStartsMs" | "durationMs">): number {
   const words = opts.wordStartsMs || [];
   if (words.length) {
     let before = 0;
@@ -509,17 +510,30 @@ export function speechFractionAt(atMs: number, opts: { wordStartsMs?: number[]; 
   return 1;
 }
 
+export interface AnnotateOptions {
+  /** Each word's start, ms — the text's own timings (the live envelope). */
+  wordStartsMs?: number[];
+  /** The recording's length, ms — placement by share without timings. */
+  durationMs?: number;
+  /**
+   * What stands for the words when nothing was said — the stop's reason,
+   * "[ Silence ]" / "[ Mic not delivering audio ]": it heads the body,
+   * above the marks and under the header. Unused when words were said.
+   */
+  silence?: string;
+}
+
 /** The spoken words with the marks put in at the boundaries their moments point to. */
-function placeMarks(
-  body: string,
-  marks: ReadonlyArray<ScreenMark>,
-  opts: { wordStartsMs?: number[]; durationMs?: number },
-): string {
+function placeMarks(body: string, marks: ReadonlyArray<ScreenMark>, opts: AnnotateOptions): string {
+  // Nothing was said: the reason, if the stop gave one, then the marks
+  // alone, one per line — the user drew without speaking, and the marks
+  // are still the record of it. No span holds a word, so nothing is closed.
+  if (!body) {
+    const silence = String(opts.silence || "").trim();
+    const lines = marks.map((m) => m.text).join("\n");
+    return [silence, lines].filter(Boolean).join("\n\n");
+  }
   if (!marks.length) return body;
-  // Nothing was said: the marks alone, one per line — the user drew
-  // without speaking, and the marks are still the record of it. No span
-  // holds a word, so nothing is closed.
-  if (!body) return marks.map((m) => m.text).join("\n");
   const tokens = body.split(/(\s+)/);
   const wordTokenIndexes: number[] = [];
   tokens.forEach((t, i) => { if (t && !/^\s+$/.test(t)) wordTokenIndexes.push(i); });
@@ -563,13 +577,14 @@ function placeMarks(
 /**
  * The transcript of a screen take: the header, the spoken words with the
  * marks placed in them, the summary — blocks separated by a blank line.
- * `text` is the spoken words (see the module comment). With an empty
- * annotation the text is returned as it is.
+ * `text` is the spoken words (see the module comment); with none,
+ * ``opts.silence`` heads the body. With an empty annotation the text is
+ * returned as it is.
  */
 export function annotateTranscript(
   text: string,
   annotation: ScreenAnnotation,
-  opts: { wordStartsMs?: number[]; durationMs?: number } = {},
+  opts: AnnotateOptions = {},
 ): string {
   if (!hasScreenAnnotation(annotation)) return text;
   const body = placeMarks(String(text || "").trim(), annotation.marks, opts);

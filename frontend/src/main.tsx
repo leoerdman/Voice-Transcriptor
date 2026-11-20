@@ -13304,7 +13304,7 @@ async function stopLive(
     // A throw after the final transcript was shown (a later save or paste
     // step) keeps that final; before it, the live text with its marks.
     const kept: KeptTranscript = finalTranscriptShown
-      ? { text: finalTranscriptShown, note: "The final transcript is kept.", spoken: true }
+      ? { text: finalTranscriptShown, note: "The final transcript is kept.", spoken: true, screen: screenAnnotation }
       : keptLiveTranscript();
     publishRecordingOutput({
       recordingId,
