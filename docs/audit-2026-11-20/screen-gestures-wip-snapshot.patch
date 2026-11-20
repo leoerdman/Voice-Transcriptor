@@ -1,0 +1,253 @@
+diff --git a/desktop/native/screen-input/PressClassifier.swift b/desktop/native/screen-input/PressClassifier.swift
+index 5fa4dc5..a34aa73 100644
+--- a/desktop/native/screen-input/PressClassifier.swift
++++ b/desktop/native/screen-input/PressClassifier.swift
+@@ -22,6 +22,17 @@
+ //     that saw a press must see it end, and one that did not ignores a
+ //     stray release.
+ //
++// A click this helper replays is the app's, and stays the app's when it
++// comes back. The helper marks what it posts (`eventSourceUserData`), but
++// another app's event tap can take the replayed events and post them
++// again with its own user data in the marker's place; they then arrive as
++// a press nobody made, and replaying THAT feeds a loop — thousands of
++// "clicks" a second, the cursor warped back to the press point each
++// round, a double-tap-and-drag torn into one-point strokes (the user's
++// take of 2026-11-20 14:55, with BetterTouchTool's left-button session
++// tap on the machine). Every replayed event's timestamp is remembered,
++// and an event carrying one passes untouched and is counted (`echoes`).
++//
+ // The click count plays no part in the decision, so a double-tap-and-drag
+ // whose second press this tap does see is a press that moves: a stroke.
+ //
+@@ -96,6 +107,21 @@ struct PressClassifier {
+   private enum Phase { case idle, held, drawing, onControl, orphanDrawing, handedOver }
+   private var phase: Phase = .idle
+   private var downPoint = CGPoint.zero
++  private var downStamp: UInt64 = 0
++  /// The timestamps of the events this helper handed back to the app
++  /// (`replayClick`, a press handed over by `interrupt`), newest last.
++  /// Bounded: an echo comes back within the same burst of events, so
++  /// only the last few replays can still return.
++  private var replayed: [UInt64] = []
++  private static let replayedKept = 8
++  /// Replayed events that came back re-posted since `takeEchoes` was last
++  /// called — the helper reports them on its next press line.
++  private var echoes = 0
++
++  mutating func takeEchoes() -> Int {
++    defer { echoes = 0 }
++    return echoes
++  }
+   private var lastPoint = CGPoint.zero
+   private var controlMoved = false
+   private(set) var lastOutcome: Outcome? = nil
+@@ -111,6 +137,11 @@ struct PressClassifier {
+     return (dx * dx + dy * dy).squareRoot() >= dragThreshold
+   }
+ 
++  private mutating func remember(_ stamps: UInt64...) {
++    replayed.append(contentsOf: stamps.filter { $0 != 0 })
++    if replayed.count > Self.replayedKept { replayed.removeFirst(replayed.count - Self.replayedKept) }
++  }
++
+   /// The tap was switched off and is back on: abandon the press in
+   /// progress and say what it was. `buttonDown` is the left button's state
+   /// now. Afterwards the classifier is idle — or, for a held press whose
+@@ -127,17 +158,27 @@ struct PressClassifier {
+       return .stroke(at: lastPoint)
+     case .held:
+       if buttonDown { phase = .handedOver }
++      remember(downStamp)
+       return .heldPress(buttonDown: buttonDown)
+     case .onControl:
+       return .controlPress
+     }
+   }
+ 
+-  mutating func classify(_ kind: Kind, at p: CGPoint) -> Decision {
++  mutating func classify(_ kind: Kind, at p: CGPoint, stamp: UInt64) -> Decision {
++    if kind != .dragged, stamp != 0, replayed.contains(stamp) {
++      // An event this helper already handed to the app, back again
++      // without its marker: another tap re-posted it. It is the app's;
++      // the press in progress, if any, is not touched by it.
++      lastOutcome = nil
++      echoes += 1
++      return .pass
++    }
+     lastPoint = p
+     switch kind {
+     case .down:
+       downPoint = p
++      downStamp = stamp
+       drags = 0
+       controlMoved = false
+       lastOutcome = nil
+@@ -171,6 +212,7 @@ struct PressClassifier {
+         return controlMoved ? .hold : .tap(at: downPoint)
+       case .held:
+         lastOutcome = .click
++        remember(downStamp, stamp)
+         return .replayClick
+       case .drawing:
+         lastOutcome = .stroke
+diff --git a/desktop/native/screen-input/main.swift b/desktop/native/screen-input/main.swift
+index ba8bf2c..c04353b 100644
+--- a/desktop/native/screen-input/main.swift
++++ b/desktop/native/screen-input/main.swift
+@@ -21,7 +21,11 @@
+ //           {"t":"start","x":..,"y":..} {"t":"move","x":..,"y":..} {"t":"end","x":..,"y":..}
+ //           {"t":"tap","x":..,"y":..}                  a press-and-release on a control
+ //           {"t":"press","outcome":"click|stroke|tap|controlDrag|orphanStroke|handedOver",
+-//            "clicks":n,"drags":n}                     one line per finished press
++//            "clicks":n,"drags":n,"echoes":n,"by":name} one line per finished
++//                                                      press; `echoes`: replayed
++//                                                      events another tap posted
++//                                                      back since the last line;
++//                                                      `by`: the release's poster
+ //           {"t":"tap-disabled","reason":"timeout|user-input",
+ //            "abandoned":"none|stroke|held|control"}   macOS switched the tap
+ //                                                      off; it is back on and
+@@ -67,6 +71,17 @@ func emitPoint(_ kind: String, _ p: CGPoint) {
+   emit(["t": kind, "x": (p.x * 10).rounded() / 10, "y": (p.y * 10).rounded() / 10])
+ }
+ 
++// Which process posted an event (`eventSourceUnixProcessID`), by name:
++// the window server for the user's own hardware, an app's name for an
++// event an app posted. One syscall per finished press, for its log line.
++func posterName(_ event: CGEvent) -> String {
++  let pid = pid_t(truncatingIfNeeded: event.getIntegerValueField(.eventSourceUnixProcessID))
++  if pid <= 0 { return "pid\(pid)" }
++  var buffer = [CChar](repeating: 0, count: 256)
++  let length = proc_name(pid, &buffer, UInt32(buffer.count))
++  return length > 0 ? String(cString: buffer) : "pid\(pid)"
++}
++
+ func repost(_ event: CGEvent) {
+   event.setIntegerValueField(.eventSourceUserData, value: syntheticMarker)
+   event.post(tap: .cgSessionEventTap)
+@@ -125,12 +140,16 @@ let callback: CGEventTapCallBack = { _, type, event, _ in
+   let p = event.location
+   let clicks = event.getIntegerValueField(.mouseEventClickState)
+   state.lock.lock()
+-  let decision = state.classifier.classify(kind, at: p)
++  let decision = state.classifier.classify(kind, at: p, stamp: event.timestamp)
+   let outcome = kind == .up ? state.classifier.lastOutcome : nil
+   let drags = state.classifier.drags
++  let echoes = outcome != nil ? state.classifier.takeEchoes() : 0
+   state.lock.unlock()
+   if let outcome = outcome {
+-    emit(["t": "press", "outcome": outcome.rawValue, "clicks": clicks, "drags": drags])
++    emit([
++      "t": "press", "outcome": outcome.rawValue, "clicks": clicks, "drags": drags,
++      "echoes": echoes, "by": posterName(event),
++    ])
+   }
+   switch decision {
+   case .pass:
+diff --git a/desktop/native/tests/press-classifier/main.swift b/desktop/native/tests/press-classifier/main.swift
+index 66b3341..a4824c7 100644
+--- a/desktop/native/tests/press-classifier/main.swift
++++ b/desktop/native/tests/press-classifier/main.swift
+@@ -14,9 +14,14 @@ func fail(_ message: String) -> Never {
+   exit(1)
+ }
+ 
++// Every hardware event has a timestamp of its own; the suite hands each
++// step a fresh one, the way the window server does.
++var clock: UInt64 = 1_000_000
++
+ func play(_ name: String, _ c: inout PressClassifier, _ steps: [Step]) {
+   for (i, step) in steps.enumerated() {
+-    let got = c.classify(step.0, at: CGPoint(x: step.1, y: step.2))
++    clock += 1_000
++    let got = c.classify(step.0, at: CGPoint(x: step.1, y: step.2), stamp: clock)
+     if got != step.3 { fail("\(name) step \(i): expected \(step.3), got \(got)") }
+   }
+ }
+@@ -123,6 +128,51 @@ run("a drag with no press seen still draws, and its release passes on", [
+   (.up, 340, 320, .strokeEndPassingUp),
+ ])
+ 
++// Another app's event tap (BetterTouchTool on the user's Mac keeps a
++// modifying one on left-button events at the session level) can take the
++// click this helper replays and post it again with its OWN user data in
++// place of this helper's marker. The press comes back carrying the
++// replayed events' timestamps. Classified as a new press, it was held and
++// replayed again — a loop that logged ~20,800 "press outcome=click" lines
++// in two bursts of one take (2026-11-20 14:55) and warped the cursor back
++// to the press point on every round. A replayed event is recognised by
++// its timestamp and passes; the press in progress is untouched.
++do {
++  let name = "a replayed click that comes back re-posted is passed, not pressed again"
++  var c = PressClassifier(dragThreshold: 5)
++  let downAt: UInt64 = 7_000_000
++  let upAt: UInt64 = 7_050_000
++  func step(_ kind: PressClassifier.Kind, _ x: Double, _ stamp: UInt64, _ want: D) {
++    let got = c.classify(kind, at: CGPoint(x: x, y: 100), stamp: stamp)
++    if got != want { fail("\(name): \(kind) at \(x) stamp \(stamp): expected \(want), got \(got)") }
++  }
++  step(.down, 100, downAt, .hold)
++  step(.up, 100, upAt, .replayClick)
++  if c.lastOutcome != .click { fail("\(name): the click itself has no outcome") }
++  // The echo, several rounds of it: nothing is held, nothing replayed,
++  // and no press is reported for it.
++  for _ in 0..<3 {
++    step(.down, 100, downAt, .pass)
++    step(.up, 100, upAt, .pass)
++    if c.lastOutcome != nil { fail("\(name): the echo reported an outcome") }
++  }
++  // The user's own next press — the hold of a double-tap-and-drag —
++  // draws one stroke, and an echo arriving in the middle of it neither
++  // ends it nor starts another.
++  step(.down, 100, 7_200_000, .hold)
++  step(.dragged, 130, 7_210_000, .strokeStart(from: CGPoint(x: 100, y: 100)))
++  step(.up, 100, upAt, .pass)
++  step(.down, 100, downAt, .pass)
++  step(.dragged, 160, 7_220_000, .strokeMove)
++  step(.up, 160, 7_230_000, .strokeEnd)
++  if c.lastOutcome != .stroke { fail("\(name): expected one stroke, got \(String(describing: c.lastOutcome))") }
++  // Every echo is counted for the helper's log line, once.
++  let echoes = c.takeEchoes()
++  if echoes != 8 { fail("\(name): expected 8 echoes counted, got \(echoes)") }
++  if c.takeEchoes() != 0 { fail("\(name): echoes counted twice") }
++  print("ok \(name)")
++}
++
+ run("a release with no press seen passes", [
+   (.up, 1, 1, .pass),
+ ])
+diff --git a/desktop/screen-input.test.js b/desktop/screen-input.test.js
+index bac672a..d969d8f 100644
+--- a/desktop/screen-input.test.js
++++ b/desktop/screen-input.test.js
+@@ -42,6 +42,7 @@ const CASES = [
+   "a press that wanders off a control taps nothing",
+   "a drag that ends on a control is still a stroke",
+   "a drag with no press seen still draws, and its release passes on",
++  "a replayed click that comes back re-posted is passed, not pressed again",
+   "a release with no press seen passes",
+   "a stray release after a click reports no second outcome",
+   "a tap switched off mid-stroke ends the stroke and the next drag draws",
+diff --git a/desktop/screen-mode-controller.js b/desktop/screen-mode-controller.js
+index 64bbe98..06ff4f9 100644
+--- a/desktop/screen-mode-controller.js
++++ b/desktop/screen-mode-controller.js
+@@ -773,12 +773,13 @@ function createScreenModeController(deps) {
+       return;
+     }
+     if (t === "press") {
+-      // One line per finished press: what the hardware sent and what the
+-      // rule made of it — the record any "this gesture did not draw"
+-      // report is diagnosed from.
+-      log(`[screen-mode] press outcome=${msg.outcome} clicks=${msg.clicks} drags=${msg.drags}`);
++      // One line per finished press: what the hardware sent, who posted
++      // it and what the rule made of it — the record any "this gesture
++      // did not draw" report is diagnosed from.
++      logPress(`[screen-mode] press outcome=${msg.outcome} clicks=${msg.clicks} drags=${msg.drags} echoes=${msg.echoes ?? 0} by=${msg.by ?? "?"}`);
+       return;
+     }
++    flushPressRepeats();
+     if (t === "tap-disabled") {
+       // macOS switched the tap off and the helper switched it back on; the
+       // press it cut was abandoned (a stroke ended, a held press handed to
