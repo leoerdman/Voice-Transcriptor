@@ -105,6 +105,7 @@ import { keyEventToAccelerator } from "./shortcut-capture";
 import { keyAction, performKeyAction, type KeyAction } from "./key-action";
 import { keepaliveFor } from "./keepalive";
 import { parseRuntimeLimits } from "./runtime-limits";
+import { screenThumbLabel, screensStripNote } from "./screens-strip";
 import {
   PROVIDER_DISPLAY_ORDER,
   isRemoteProvider,
@@ -3961,6 +3962,13 @@ async function apiPut<T>(
   return (await r.json()) as T;
 }
 
+/** The ``apiGet`` of a binary resource: same auth, same error text. */
+async function apiGetBlob(url: string, signal?: AbortSignal): Promise<Blob> {
+  const r = await fetch(url, { headers: authHeaders(), signal });
+  if (!r.ok) throw new Error(await parseError(r));
+  return r.blob();
+}
+
 async function apiDelete<T>(url: string): Promise<T> {
   const r = await fetch(url, {
     method: "DELETE",
@@ -7689,34 +7697,55 @@ async function showRecordingViewerScreens(
   const params = new URLSearchParams();
   if (archiveDir) params.set("archive_dir", archiveDir);
   const suffix = params.toString() ? `?${params.toString()}` : "";
-  for (const file of screens) {
-    try {
-      const resp = await fetch(
-        `/api/recordings/${encodeURIComponent(name)}/screens/${encodeURIComponent(file)}${suffix}`,
-        { headers: authHeaders() },
-      );
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const url = URL.createObjectURL(await resp.blob());
-      if (!stillCurrent()) {
-        URL.revokeObjectURL(url);
-        return;
-      }
-      recordingViewerScreenUrls.push(url);
-      const img = document.createElement("img");
-      img.src = url;
-      img.alt = file;
-      img.title = screensDir ? `${screensDir}/${file}` : file;
-      img.setAttribute("role", "listitem");
-      img.addEventListener("click", () => {
-        const expanded = img.classList.toggle("expanded");
-        row.classList.toggle("has-expanded", expanded || !!row.querySelector("img.expanded"));
-      });
-      row.appendChild(img);
-      row.hidden = false;
-    } catch (e) {
-      console.warn(`Screenshot ${file} could not be loaded`, e);
+  // All at once, painted in order: one at a time made every screenshot
+  // wait for the slowest before it.
+  const results = await Promise.allSettled(
+    screens.map((file) =>
+      apiGetBlob(`/api/recordings/${encodeURIComponent(name)}/screens/${encodeURIComponent(file)}${suffix}`),
+    ),
+  );
+  if (!stillCurrent()) return;
+  let failed = 0;
+  results.forEach((result, index) => {
+    const file = screens[index];
+    if (result.status === "rejected") {
+      failed += 1;
+      console.warn(`Screenshot ${file} could not be loaded`, result.reason);
+      return;
     }
+    const url = URL.createObjectURL(result.value);
+    recordingViewerScreenUrls.push(url);
+    const item = document.createElement("span");
+    item.setAttribute("role", "listitem");
+    item.className = "screen-thumb-item";
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "screen-thumb";
+    btn.setAttribute("aria-expanded", "false");
+    btn.setAttribute("aria-label", screenThumbLabel(index, screens.length, false));
+    btn.title = screensDir ? `${screensDir}/${file}` : file;
+    const img = document.createElement("img");
+    img.src = url;
+    img.alt = "";
+    btn.appendChild(img);
+    btn.addEventListener("click", () => {
+      const expanded = btn.classList.toggle("expanded");
+      btn.setAttribute("aria-expanded", String(expanded));
+      btn.setAttribute("aria-label", screenThumbLabel(index, screens.length, expanded));
+      row.classList.toggle("has-expanded", !!row.querySelector(".screen-thumb.expanded"));
+    });
+    item.appendChild(btn);
+    row.appendChild(item);
+  });
+  const note = screensStripNote(failed, screens.length);
+  if (note) {
+    const el = document.createElement("span");
+    el.className = "recording-screens-note";
+    el.setAttribute("role", "listitem");
+    el.textContent = note;
+    row.appendChild(el);
   }
+  row.hidden = !row.childElementCount;
 }
 
 function resetRecordingViewer(placeholder: string = UI_COPY.recordings.viewerPlaceholder): void {
