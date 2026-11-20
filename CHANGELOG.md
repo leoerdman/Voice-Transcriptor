@@ -3,11 +3,40 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [1.6.7] - 2026-11-20
+
+The fixes of the 2026-11-20 audit (275 findings — `BUGSAUDIT-2026-11-20.md`), plus the requests made while they landed.
+
+### Added
+
+- **Expected languages for Auto mode.** Since 2026-10-23 Deepgram serves a 55-language model behind `language=multi`, and it labelled Russian speech as Latvian, Ukrainian, Persian or Bulgarian — often with higher confidence than the correct Russian reading. Settings → Deepgram (Auto) now has *Expected languages* (Russian and English by default). They are sent as Nova-3 `language_hint`s, and the dual-stream merge treats a stretch the multilingual reading labels with any other language as a mislabel and takes the Russian reading's words for it. Measured live on the user's own recordings: "Tā, tak, tak, tak" → "Так, так, так, так"; "Тобто ніби ось Так а йшов у нас…" → "Так, а ещё у нас…"; the Bulgarian words in the trilingual test recording are gone and its English stays. Words recovered from interim results now keep Deepgram's language tag, which is what let the Ukrainian ones slip through.
+- **Start and stop tones are back.** A short rising tone when the microphone is really recording, a falling one when the take stops — whatever started or stopped it (hotkey, button, auto-stop). They had gone silent on 2026-07-02 together with the old overlay window.
+- **Closing the window during a recording asks first.** The red button or Cmd+W while a take is recording, or while its transcript is still being prepared or pasted, asks *Keep Running / Quit*. With nothing in flight, closing still quits at once.
+
+### Changed
+
+- **Screen mode appears in one moment.** The capsule with its screen button, the palette and the red frame are prepared hidden and shown together; they no longer wait for the frontmost-app lookup or the drawing helper. `main.log` records `press_to_visible_ms` for every start.
+- **Old `main.log` archives are pruned**: the newest 10, at most 50 MB (the boot sweep never ran before; 25 archives / 131.6 MB had piled up).
+- The Live toolbar no longer offers the "None" provider; a stored "None" becomes the default provider.
+- Shortcut badges in Settings update the moment registration changes; the window and main process talk over preload channels instead of the page title.
+- Archive statistics label their durations as estimates.
 
 ### Fixed
 
+- **Deleting old recordings could delete your own files.** Retention and "Delete all" treated any media file with a recording's name in a registered folder as the app's own — `talk.mp4` next to `talk.txt` in `~/Movies` could go. Only files the app wrote are touched now.
+- **A quarter of recordings lost their missed-word recovery** (since 2026-09-05): the audio spool was removed before the stop read it.
+- **Screen mode:** a failed start is told to the user and the take carries on as a voice take, filed under Live; a quick stop is no longer reported as "didn't start"; the drawing helper dying or a failed screenshot is told to the user; a recording whose screenshots could not be attached says so instead of pointing at paths that vanish; the helper no longer floods the log with empty press lines; a take stopped before its screen session started is saved under Live, and a crash after a screen take was demoted recovers it under Live too.
+- A dictation that starts with "HTTP …" or contains "network error" is pasted like any other.
+- The History entry is named after the final transcript again, not the live text; the capsule shows *Upscaling* again.
+- An upload job no longer hangs after one failed status poll, and a missing job ends the wait at once.
+- A long live draft keeps its newest text; GigaAM stops re-downloading from an unreachable host for 10 minutes; the passive update check no longer writes "Couldn't check…" into Settings; the boot overlay no longer flashes "Ready" before a boot error.
 - **Documentation: the voice-mode capsule can still bring the window forward on macOS.** The 1.6.4 entry said the capsule never moves the main window. That holds for everything the app does with the capsule, and for screen mode, where a press on the capsule never reaches the window server. Outside screen mode a click on the capsule is an ordinary click on a window of an inactive app, and macOS answers it by activating the app; the app ignores that one activate (it is told apart by a short time window, so a genuine Dock click inside that window is ignored too), but macOS may already have raised the window. `desktop/window-lifecycle.js` states the limit; removing it needs the screen-mode tap path for the voice capsule as well.
+
+### Security
+
+- **The full API token is no longer served in the app's page.** Anything able to reach the loopback port could read it from the unauthenticated `GET /`. The desktop shell now mints it per launch, passes it to the backend in its environment and hands it to the window over IPC; a stale `api_token.txt` from earlier builds is removed at launch.
+- `main.log` is created owner-only (0600).
+- A shell injection in the build's signature check is fixed.
 
 ## [1.6.6] - 2026-11-20
 
