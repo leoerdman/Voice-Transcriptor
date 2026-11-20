@@ -1,4 +1,4 @@
-const { app, BrowserWindow, globalShortcut, Tray, Menu, nativeImage, systemPreferences, dialog, clipboard, shell, screen } = require("electron");
+const { app, BrowserWindow, globalShortcut, Tray, Menu, nativeImage, systemPreferences, dialog, clipboard, shell, screen, ipcMain } = require("electron");
 const { spawn, spawnSync } = require("child_process");
 const http = require("http");
 const net = require("net");
@@ -111,6 +111,45 @@ const {
 // post-stop task waits on (BUGS_AUDIT 2026-09-03 §6.7/§6.8/§6.9) —
 // unit-tested by desktop/recording-final-slot.test.js.
 const { createRecordingFinalSlot } = require("./recording-final-slot");
+// What a hand-off signal means (paste / keep waiting / terminal status),
+// decided from the renderer's explicit fields — never from the words the
+// user dictated (Ultra-Audit 2026-11-20 DM-01).
+const {
+  SIGNAL_OUTCOME,
+  normalizeTranscriptText,
+  isPasteableTranscript,
+  classifyRecordingSignal,
+} = require("./transcript-signal");
+// What a main-process stop does with the renderer's answer — or its
+// silence (DM-03, DM-22).
+const { STOP_ACTION, decideMainProcessStop } = require("./recording-stop");
+// The Windows PowerShell paste fallback: activate, verify, then Ctrl+V (DM-04).
+const { buildPwshPasteFallbackScript } = require("./windows-paste-fallback");
+// What a backend exit means: restart or not, and whose handle it clears
+// (DM-09, DM-27).
+const { backendHandleOf, decideBackendExit } = require("./backend-exit");
+// Recording ids are unique only per renderer page: key them with the
+// page's epoch (DM-32).
+const { recordingKey, createBoundedKeySet } = require("./renderer-epoch");
+// The runtime accelerator set and how a Settings update changes it
+// (S-11, DM-23).
+const { normalizeShortcutSet, applyShortcutUpdate, screenShotSlotStatus } = require("./shortcut-runtime");
+// The capsule window's size (one flag) and when it is placed (DM-13, DM-25).
+const { capsuleWindowSize, capsuleBoundsIn, capsuleNeedsPlacement } = require("./capsule-geometry");
+// What to do once screenMode.start() answered for a take (DM-31).
+const { AFTER_SCREEN_START, decideAfterScreenStart } = require("./screen-session-start");
+// The record hotkey's renderer round trip, with a press that expires
+// when main stops waiting for it (DM-05).
+const {
+  RENDERER_TOGGLE_BUDGET_MS,
+  toggleNotAfter,
+  toggleDispatchScript,
+} = require("./renderer-toggle");
+// One lease per paste on the snapshot of the user's clipboard, released
+// exactly once (DM-02, DM-26).
+const { createClipboardLeases } = require("./clipboard-lease");
+// The one rule for where this shell keeps its data (DM-07, DM-11, S-12).
+const { MAIN_LOG_FILE, resolveDataDir, oneDriveMigrationEntries } = require("./data-dir");
 
 // SSOT for "which system power events the app reacts to, and what each
 // one means" — subscribed exactly once from app.whenReady below.
@@ -231,10 +270,11 @@ process.on("unhandledRejection", (reason) => {
 // presets + archive-dir preferences. Also: encrypted API keys wind
 // up syncing to OneDrive cloud (privacy leak).
 //
-// Must run BEFORE any `app.getPath('userData')` call (line 227
-// `mainLogFilePath`), BEFORE `requestSingleInstanceLock` (line 154),
-// and BEFORE we spawn the backend (TRANSCRIPTOR_DATA_DIR env flows
-// through to backend/config.py `_default_data_dir`).
+// Must run BEFORE `requestSingleInstanceLock` and BEFORE we spawn the
+// backend (TRANSCRIPTOR_DATA_DIR flows through to backend/data_dir.py).
+// The logger needs no ordering: it derives its path from dataDir() on
+// every write, so lines logged before the re-home land in the old
+// directory and every line after it in the new one.
 function _relocateUserDataOffOneDrive() {
   if (process.platform !== "win32") return;
   const roaming = process.env.APPDATA;
@@ -268,8 +308,10 @@ function _relocateUserDataOffOneDrive() {
       // `cpSync` landed in Node 16.7; the pinned Electron (see
       // devDependencies) is far past that, and package.json engines
       // requires Node >=22.12 for the dev path.
-      // Copy only the user-facing subset — skip bundled-runtime caches,
-      // .venv, anything else that is safe to regenerate.
+      // Copy the user's data — everything except what this shell
+      // regenerates on its own (./data-dir oneDriveMigrationEntries, DM-34).
+      // An inclusion list retyped from the backend's file names silently
+      // left behind every file added since it was written.
       let allCopied = true;
       const copyChild = (name) => {
         const src = path.join(oldDir, name);
@@ -289,14 +331,9 @@ function _relocateUserDataOffOneDrive() {
           allCopied = false;
         }
       };
-      for (const child of [
-        "config.json",
-        ".encryption_key",
-        "api_token.txt",
-        "known_archive_dirs.json",
-        "upscale_presets",
-        "recordings",
-      ]) copyChild(child);
+      let oldEntries = [];
+      try { oldEntries = fs.readdirSync(oldDir); } catch { allCopied = false; }
+      for (const child of oneDriveMigrationEntries(oldEntries)) copyChild(child);
       if (allCopied) {
         try { fs.writeFileSync(marker, new Date().toISOString()); } catch { /* non-fatal */ }
       }
@@ -306,16 +343,14 @@ function _relocateUserDataOffOneDrive() {
     }
   } catch { /* migration best-effort */ }
   // Override BOTH Electron's userData AND the backend's DATA_DIR so
-  // they stay in lockstep. The child-spawn code at line ~5085 reads
-  // `TRANSCRIPTOR_DATA_DIR` from process.env — setting it here means
-  // backend/config.py `_default_data_dir` picks up the override even
-  // though it never sees Electron's `app.setPath` call.
+  // they stay in lockstep: startBackend hands dataDir() — which reads
+  // TRANSCRIPTOR_DATA_DIR first — to the backend, which never sees
+  // Electron's `app.setPath` call.
   try { app.setPath("userData", newDir); } catch { /* path must be absolute on Win; already is */ }
   process.env.TRANSCRIPTOR_DATA_DIR = newDir;
-  // Cache note: main.log path switches to the new dir automatically
-  // on the next appendMainLog call (mainLogFilePath at line 227 is
-  // computed lazily from app.getPath). Old log in OneDrive'd path
-  // stays as an artefact — harmless.
+  // main.log follows on the next write (mainLogFilePath() is derived
+  // from dataDir(), never cached — DM-07). The lines written before this
+  // point stay in the old directory as an artefact.
 }
 // ── The data directory's name ───────────────────────────────────────
 //
@@ -326,8 +361,7 @@ function _relocateUserDataOffOneDrive() {
 // answer wherever the path is resolved or shown.
 //
 // Must run BEFORE anything reads ``app.getPath('userData')`` — the
-// OneDrive re-home below, ``appendMainLog`` (which caches the log path
-// on first use) and the single-instance lock all do.
+// OneDrive re-home below and the single-instance lock both do.
 function _useOneSpellingForUserDataDir() {
   const preferredName = userDataDirName(process.platform);
   const legacyName = app.getName();
@@ -337,7 +371,7 @@ function _useOneSpellingForUserDataDir() {
     app.getPath("appData"), legacyName, preferredName,
   );
   // Adopt the new spelling FIRST: everything below logs, and the logger
-  // pins its path to whatever userData says the moment it is called.
+  // writes to whatever dataDir() says at the moment of each line.
   try { app.setName(preferredName); } catch { /* pre-ready only; ignore */ }
 
   const statDir = (dir) => {
@@ -396,6 +430,24 @@ function _useOneSpellingForUserDataDir() {
 _useOneSpellingForUserDataDir();
 _relocateUserDataOffOneDrive();
 
+/**
+ * The data directory: TRANSCRIPTOR_DATA_DIR when set, else userData —
+ * the same directory the backend is told to use. Read live, never cached,
+ * so a relocation at boot (the OneDrive re-home) is followed by every
+ * reader including the logger. (Declared here, after the two boot steps
+ * that settle userData, so no reader can appear to precede them.)
+ */
+function dataDir() {
+  return resolveDataDir({
+    envDataDir: process.env.TRANSCRIPTOR_DATA_DIR,
+    userDataPath: app.getPath("userData"),
+  });
+}
+
+function mainLogFilePath() {
+  return path.join(dataDir(), MAIN_LOG_FILE);
+}
+
 let backend = null;
 let win = null;
 let recordingStatusWindow = null;
@@ -452,7 +504,6 @@ let shortcutToggleInFlight = false;
 let recordingStopInFlight = false;
 let pasteShortcutInFlight = false;
 let lastTranscriptText = "";
-let mainLogFilePath = "";
 let traceCounter = 0;
 // When the user last asked for the window, cleared when focus lands. The
 // distance to the focus event is the latency the user actually perceives.
@@ -476,13 +527,19 @@ const RECORDING_STATUS_TERMINAL_DWELL_MS = 900;
 
 // ── Recording-monitor bounds ──────────────────────────────────────────
 //
-// The four numbers the 1 Hz recording-state monitor and the capsule spend.
+// The numbers the recording-state monitor (RECORDING_STATUS_LEVEL_POLL_MS,
+// ~5.5 Hz) and the capsule spend.
 // They were bare literals inside the monitor body, which is where a product
 // parameter goes to stop being one: nothing named them, nothing could state
 // them, and one of them was retyped into the message the user reads.
 
-/** How long a click on the capsule suppresses the app-activate that
- *  would otherwise raise the main window behind it. */
+/** How long a click on the capsule makes the lifecycle table answer the
+ *  app's `activate` event with "do nothing". This is all it does: it
+ *  cannot stop macOS itself from bringing the app's windows forward on a
+ *  click in an inactive app — acbf737 measured the main window taking
+ *  focus ~0.5 s after a capsule click in voice mode. Only screen mode,
+ *  whose clicks are taken by the in-process mouse helper and never reach
+ *  the window server, avoids that (Ultra-Audit 2026-11-20 H-03). */
 const RECORDING_STATUS_CAPSULE_ACTIVATE_SUPPRESS_MS = 700;
 
 /** How often the monitor re-reads the renderer's auto-stop settings. The
@@ -498,10 +555,6 @@ const RECORDING_AUTOSTOP_WARMUP_MS = 1500;
  *  running with no way out but quitting. */
 const RECORDING_DEAD_PIPELINE_MS = 8000;
 
-/** How many finished recordings the renderer snapshot carries back. It is
- *  a hand-off buffer, not a history: the post-stop task looks for ONE id
- *  in it, and the renderer owns the real list. */
-const RENDERER_FINISHED_RECORDS_LIMIT = 30;
 let recordingSilenceStartedAt = 0;
 let recordingAutoStopConfig = DEFAULT_RECORDING_AUTO_STOP_CONFIG;
 let recordingAutoStopConfigRefreshAt = 0;
@@ -522,8 +575,20 @@ let pendingTranscriptionCount = 0;
 // because the renderer can publish the paste-ready text BEFORE the
 // post-stop task starts waiting for it (fast recording, queued task) —
 // an event fired into no listener would be lost, and the recording
-// would fall back to the 32 s poll for a transcript that already exists.
-const recordingFinalSlot = createRecordingFinalSlot();
+// would wait out its deadline for a transcript that already exists.
+//
+// One mailbox per renderer EPOCH (DM-32): the renderer restarts its
+// recording ids at 1 on every page load, so a new page's recording 1 must
+// not be answered from the old page's mailbox. beginRendererEpoch()
+// replaces it; a task keeps the mailbox of the epoch it was stopped in.
+let rendererEpoch = 1;
+let recordingFinalSlot = createRecordingFinalSlot();
+
+function beginRendererEpoch(reason) {
+  rendererEpoch += 1;
+  recordingFinalSlot = createRecordingFinalSlot();
+  appendMainLog(`[renderer-epoch] ${rendererEpoch} (${reason})`);
+}
 let backendRestartTimer = null;
 // Render-process-gone recovery timer. Schedules a loadURL to recreate
 // the renderer 500 ms after a crash. Tracked at module scope so
@@ -540,6 +605,37 @@ let backendRestartAttempts = 0;
  * thing being started is uvicorn.
  */
 const BACKEND_RESTART_HEALTH_TIMEOUT_MS = 30000;
+
+/**
+ * Cold start: how long createWindow waits for the first /api/health
+ * before it shows the error page. A fresh install with the bundled
+ * runtime is typically under 5 s; this bounds the wait, it is not a
+ * target.
+ */
+const BACKEND_COLD_START_HEALTH_TIMEOUT_MS = 60_000;
+/** How long the page itself may take to load once the backend answers. */
+const MAIN_WINDOW_PAGE_LOAD_TIMEOUT_MS = 15_000;
+/**
+ * How long a reveal (tray click, second instance) waits for the first
+ * load of a window created at cold start: the backend's whole cold-start
+ * budget plus the page load (DM-20). It was 15 s against a 60 s health
+ * budget, so a reveal during a slow cold start showed the un-loaded dark
+ * window the "no blank window" design exists to prevent.
+ */
+const MAIN_WINDOW_INITIAL_LOAD_TIMEOUT_MS = BACKEND_COLD_START_HEALTH_TIMEOUT_MS + MAIN_WINDOW_PAGE_LOAD_TIMEOUT_MS;
+
+/**
+ * Crash-restart policy. After BACKEND_RESTART_MAX_ATTEMPTS restarts the
+ * shell stops and shows the boot error: a deterministically broken backend
+ * would otherwise restart forever, grow the log and hide the real failure.
+ * The backoff grows by one step per attempt up to its ceiling.
+ */
+const BACKEND_RESTART_MAX_ATTEMPTS = 8;
+const BACKEND_RESTART_BACKOFF_STEP_MS = 800;
+const BACKEND_RESTART_BACKOFF_MAX_MS = 5000;
+/** /api/health polling: pause between tries, and one request's ceiling. */
+const BACKEND_HEALTH_RETRY_MS = 250;
+const BACKEND_HEALTH_REQUEST_TIMEOUT_MS = 2000;
 
 /**
  * Bounds for the backend-down recovery poll shown in the error window.
@@ -621,7 +717,7 @@ let mainLogCheckCounter = 0;
 
 function mainLogArchivePath(kind) {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const base = `${mainLogFilePath}.${kind}-${stamp}`;
+  const base = `${mainLogFilePath()}.${kind}-${stamp}`;
   let candidate = base;
   for (let i = 1; fs.existsSync(candidate); i += 1) {
     candidate = `${base}-${i}`;
@@ -633,10 +729,10 @@ function recoverOrphanRotatingLogs() {
   // Rotation is rename→rename; a crash between the two steps leaves
   // ``main.log.<kind>-<stamp>.rotating`` orphans that nothing else ever
   // promotes — silently stranded support logs. Sweep them at boot.
-  if (!mainLogFilePath) return;
   try {
-    const dir = path.dirname(mainLogFilePath);
-    const prefix = path.basename(mainLogFilePath) + ".";
+    const logPath = mainLogFilePath();
+    const dir = path.dirname(logPath);
+    const prefix = path.basename(logPath) + ".";
     for (const name of fs.readdirSync(dir)) {
       if (!name.startsWith(prefix) || !name.endsWith(".rotating")) continue;
       const orphan = path.join(dir, name);
@@ -667,10 +763,10 @@ const MAIN_LOG_ARCHIVE_KEEP_BYTES = 50 * 1024 * 1024;
 const MAIN_LOG_ARCHIVE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 function pruneMainLogArchives() {
-  if (!mainLogFilePath) return;
   try {
-    const dir = path.dirname(mainLogFilePath);
-    const prefix = path.basename(mainLogFilePath) + ".";
+    const logPath = mainLogFilePath();
+    const dir = path.dirname(logPath);
+    const prefix = path.basename(logPath) + ".";
     const archives = [];
     for (const name of fs.readdirSync(dir)) {
       if (!name.startsWith(prefix)) continue;
@@ -706,11 +802,11 @@ function pruneMainLogArchives() {
 }
 
 function rotateMainLogIfNeeded() {
-  if (!mainLogFilePath) return;
+  const logPath = mainLogFilePath();
   try {
-    const st = fs.statSync(mainLogFilePath);
+    const st = fs.statSync(logPath);
     if (st.size < MAIN_LOG_MAX_BYTES) return;
-    const legacyPending = mainLogFilePath + ".rotating";
+    const legacyPending = logPath + ".rotating";
     if (fs.existsSync(legacyPending)) {
       try { fs.renameSync(legacyPending, mainLogArchivePath("recovered")); } catch { /* keep orphan in place */ }
     }
@@ -721,7 +817,7 @@ function rotateMainLogIfNeeded() {
     // timestamped archive. If any step fails, preserve the best available
     // file instead of unlinking it.
     try {
-      fs.renameSync(mainLogFilePath, pending);
+      fs.renameSync(logPath, pending);
     } catch {
       // Current log is locked — skip rotation this cycle. Next
       // amortised-counter tick will retry. main.log keeps growing
@@ -734,7 +830,7 @@ function rotateMainLogIfNeeded() {
       // Promotion failed. Restore the log to its original name so
       // appendFile keeps working. If THAT also fails, preserve the
       // pending file as a recovered archive.
-      try { fs.renameSync(pending, mainLogFilePath); } catch {
+      try { fs.renameSync(pending, logPath); } catch {
         try { fs.renameSync(pending, mainLogArchivePath("recovered")); } catch { /* keep pending in place */ }
       }
     }
@@ -743,9 +839,6 @@ function rotateMainLogIfNeeded() {
 
 function appendMainLog(message) {
   try {
-    if (!mainLogFilePath) {
-      mainLogFilePath = path.join(app.getPath("userData"), "main.log");
-    }
     const line = `[${new Date().toISOString()}] ${message}\n`;
     // Amortised rotation check — stat every 256 appends (& 0xff).
     // Must come BEFORE the append so we rotate the CURRENT main.log
@@ -762,7 +855,7 @@ function appendMainLog(message) {
     // appends cost ~0.5-1ms per line on local SSD; trace logging
     // peaks at ~20 lines/second which is still well under 2% of
     // main-process time. Acceptable cost for log durability.
-    fs.appendFileSync(mainLogFilePath, line, "utf8");
+    fs.appendFileSync(mainLogFilePath(), line, "utf8");
   } catch (e) {
     // Last-resort: the logger itself failed. Fall back to stderr so
     // we never silently lose signal.
@@ -822,23 +915,6 @@ function compactLogText(value, max = 180) {
   return `${s.slice(0, max)}...`;
 }
 
-function normalizeTranscriptText(value) {
-  return String(value || "").replace(/\s+/g, " ").trim();
-}
-
-function isNoSpeechFinalStatusText(value) {
-  const txt = normalizeTranscriptText(value);
-  if (!txt) return false;
-  const lower = txt.toLowerCase();
-  return (
-    lower.includes("no speech detected") ||
-    lower.includes("no speech captured") ||
-    lower.includes("silence detected") ||
-    lower === "[silence]" ||
-    lower === "[ silence ]"
-  );
-}
-
 function textDigest(input) {
   const str = String(input || "");
   let h = 2166136261;
@@ -847,17 +923,6 @@ function textDigest(input) {
     h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24);
   }
   return (h >>> 0).toString(16).padStart(8, "0");
-}
-
-function isMeaningfulTranscriptText(value) {
-  const txt = normalizeTranscriptText(value);
-  if (!txt) return false;
-  const lower = txt.toLowerCase();
-  const compact = lower.replace(/\s+/g, "");
-  if (isNoSpeechFinalStatusText(txt)) return false;
-  if (lower === "error" || lower === "[websocket error]" || compact === "[silence]") return false;
-  if (lower.startsWith("http ") || lower.startsWith("network error")) return false;
-  return true;
 }
 
 function createTrace(scope, seed = {}) {
@@ -942,8 +1007,7 @@ function applyMacDockPolicy() {
 }
 
 function mainWindowStatePath() {
-  const dataDir = process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData");
-  return path.join(dataDir, MAIN_WINDOW_STATE_FILE);
+  return path.join(dataDir(), MAIN_WINDOW_STATE_FILE);
 }
 
 function loadMainWindowState() {
@@ -1148,8 +1212,9 @@ function applyWindowLifecycleEvent(event, context = {}) {
  * `before-quit` (registered once, below) does the actual teardown —
  * this only starts it, so there is exactly one place in the app that
  * decides "we are quitting now": the lifecycle table's `quit` action
- * above, and the paste-capability self-heal relaunch below, both go
- * through here instead of each calling `app.quit()` on its own.
+ * above, the paste-capability self-heal relaunch, the tray's Quit item
+ * and the SIGINT/SIGTERM/SIGHUP handlers all go through here instead of
+ * each calling `app.quit()` on its own (DM-19).
  */
 function quitApp(reason = "") {
   appendMainLog(`[main-window] quit requested reason=${normalizeLifecycleReason(reason)}`);
@@ -1243,25 +1308,11 @@ async function refreshWindowForFrontendBuild(force = false) {
   return false;
 }
 
-function normalizeProviderChoice(value) {
-  const v = String(value || "").trim();
-  // UI group ids (transcription-catalog SSOT) map onto wire providers:
-  // both local groups transcribe through provider "local".
-  if (v === "local-whisper" || v === "gigaam") return "local";
-  if (v === "local" || v === "openrouter" || v === "deepgram" || v === "") return v;
-  return "local";
-}
-
-function normalizeLocalModelChoice(value) {
-  const v = String(value || "").trim();
-  return v || "small";
-}
-
 /**
  * Race win.webContents.executeJavaScript(code) against a timeout.
  *
- * Every hotkey-lifecycle renderer probe (`getRendererProviderChoice`,
- * `getRendererLocalModelChoice`, auto-stop config reads, etc.) previously awaited the
+ * Every hotkey-lifecycle renderer probe (recording state, auto-stop
+ * config reads, the toggle press, etc.) previously awaited the
  * executeJavaScript Promise unconditionally. If the renderer was
  * stuck (long synchronous work, layout lock, extension interaction),
  * the main process would hang in the recording startup path forever —
@@ -1291,25 +1342,6 @@ async function execRendererJsWithTimeout(code, fallback, timeoutMs = 2000) {
   } finally {
     if (timer) clearTimeout(timer);
   }
-}
-
-async function getRendererProviderChoice() {
-  const v = await execRendererJsWithTimeout(
-    `(() => {
-      const el = document.getElementById('providerSelect');
-      return String(el ? el.value : 'local').trim();
-    })();`,
-    "local",
-  );
-  return normalizeProviderChoice(v);
-}
-
-async function getRendererLocalModelChoice() {
-  const v = await execRendererJsWithTimeout(
-    `(() => String((document.getElementById('remoteModelSelect')?.value || 'small')).trim())();`,
-    "small",
-  );
-  return normalizeLocalModelChoice(v);
 }
 
 async function getRendererAutoStopSilenceConfig() {
@@ -1353,7 +1385,6 @@ const RECORDING_STATUS_CAPSULE = Object.freeze((() => {
   const t = {
   width: 110,
   height: 30,
-  geometryPadding: 0,
   minWidth: 110,
   minHeight: 30,
   maxHeight: 30,
@@ -1380,6 +1411,8 @@ const RECORDING_STATUS_CAPSULE = Object.freeze((() => {
   waveLevelTickMs: 220,
   waveIdleTickMs: 360,
   waveActiveStaleMs: 900,
+  // A pointer-down is reported at most once per this window.
+  pointerLockMs: 80,
   };
   // Screen mode adds the screenshot button to the right of the timer and
   // the pill grows by exactly that: one more gap and the icon.
@@ -1406,7 +1439,10 @@ const recordingStatusCapsuleState = {
   screen: false,
 };
 
-let recordingStatusCapsuleGeometry = null;
+// The size the capsule window was last placed with; null while hidden.
+// Placement happens when the capsule appears or changes size — never on
+// a status or level tick (DM-25).
+let recordingStatusCapsulePlacedSize = null;
 // Every intent to change what the capsule shows takes the next number.
 // An update that has to wait for its window — a cold create is 110-380 ms
 // — checks the counter again before it paints, so a slow publish can
@@ -1421,19 +1457,6 @@ let recordingStatusCapsuleLevelUpdateInFlight = false;
 let recordingStatusCapsuleLastLevelSent = -1;
 let recordingStatusCapsuleLastLevelSentAt = 0;
 
-function clampRecordingStatusCapsuleDimension(value, min, max) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return min;
-  return Math.max(min, Math.min(max, Math.ceil(n)));
-}
-
-function getRecordingStatusCapsuleFallbackWindowSize() {
-  return {
-    width: RECORDING_STATUS_CAPSULE.width,
-    height: RECORDING_STATUS_CAPSULE.height,
-  };
-}
-
 function noteRecordingStatusCapsuleInteraction() {
   recordingStatusSuppressActivateUntil = Date.now() + RECORDING_STATUS_CAPSULE_ACTIVATE_SUPPRESS_MS;
 }
@@ -1443,60 +1466,23 @@ function shouldSuppressActivateForRecordingStatusCapsule() {
   return true;
 }
 
+// The window is exactly the pill, and the pill's size is a function of
+// one flag (./capsule-geometry, DM-13). It used to be measured in the
+// capsule page and reported back over document.title, which left the
+// window 110 px wide — clipping the 126 px screen-mode pill — until the
+// first measurement arrived.
 function getRecordingStatusCapsuleWindowSize() {
-  const geometry = recordingStatusCapsuleGeometry;
-  if (!geometry) {
-    return getRecordingStatusCapsuleFallbackWindowSize();
-  }
-  const pad = Math.max(0, Number(RECORDING_STATUS_CAPSULE.geometryPadding) || 0);
-  return {
-    width: clampRecordingStatusCapsuleDimension(
-      geometry.width + pad,
-      RECORDING_STATUS_CAPSULE.minWidth,
-      RECORDING_STATUS_CAPSULE.maxWidth,
-    ),
-    height: clampRecordingStatusCapsuleDimension(
-      geometry.height + pad,
-      RECORDING_STATUS_CAPSULE.minHeight,
-      RECORDING_STATUS_CAPSULE.maxHeight,
-    ),
-  };
+  return capsuleWindowSize(RECORDING_STATUS_CAPSULE, !!recordingStatusCapsuleState.screen);
 }
 
-function applyRecordingStatusCapsuleWindowSize() {
-  if (!recordingStatusWindow || recordingStatusWindow.isDestroyed()) return;
+/** Size and position the capsule window, and let screen mode re-lay out. */
+function placeRecordingStatusCapsule(capsuleWindow) {
   const size = getRecordingStatusCapsuleWindowSize();
   try {
-    recordingStatusWindow.setSize(size.width, size.height, false);
-    recordingStatusWindow.setBounds(recordingStatusCapsuleBounds(), false);
+    capsuleWindow.setBounds(recordingStatusCapsuleBounds(size, capsuleWindow), false);
+    recordingStatusCapsulePlacedSize = size;
   } catch { }
   screenMode.refreshLayout();
-}
-
-function applyRecordingStatusCapsuleGeometryPayload(rawPayload) {
-  let payload = null;
-  try {
-    payload = JSON.parse(decodeURIComponent(String(rawPayload || "")));
-  } catch {
-    return;
-  }
-  const width = Number(payload?.width);
-  const height = Number(payload?.height);
-  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return;
-  const next = {
-    width: clampRecordingStatusCapsuleDimension(width, 1, RECORDING_STATUS_CAPSULE.maxWidth),
-    height: clampRecordingStatusCapsuleDimension(height, 1, RECORDING_STATUS_CAPSULE.maxHeight),
-  };
-  const prev = recordingStatusCapsuleGeometry;
-  if (
-    prev &&
-    prev.width === next.width &&
-    prev.height === next.height
-  ) {
-    return;
-  }
-  recordingStatusCapsuleGeometry = next;
-  applyRecordingStatusCapsuleWindowSize();
 }
 
 // The two substring ladders that used to live here — one for the mode,
@@ -1736,7 +1722,6 @@ function recordingStatusCapsuleHtml() {
     </div>
   </div>
   <script>
-    const stackEl = document.getElementById("stack");
     const pillEl = document.getElementById("pill");
     let screenMode = false;
     const stateIcon = document.getElementById("stateIcon");
@@ -1763,7 +1748,6 @@ function recordingStatusCapsuleHtml() {
       timerRunning: false,
       level: 0
     };
-    let geometryEmitScheduled = false;
     let lastLevelAt = 0;
     let lastWavePushAt = 0;
     let lastRenderFrameAt = 0;
@@ -1778,26 +1762,6 @@ function recordingStatusCapsuleHtml() {
       const mm = String(Math.floor(total / 60)).padStart(2, "0");
       const ss = String(total % 60).padStart(2, "0");
       return mm + ":" + ss;
-    }
-    function emitGeometry() {
-      const stackRect = stackEl.getBoundingClientRect();
-      let left = stackRect.left;
-      let top = stackRect.top;
-      let right = stackRect.right;
-      let bottom = stackRect.bottom;
-      const payload = {
-        width: Math.max(1, Math.ceil(right - left)),
-        height: Math.max(1, Math.ceil(bottom - top))
-      };
-      document.title = "__recording_capsule_geometry__" + encodeURIComponent(JSON.stringify(payload));
-    }
-    function scheduleGeometryEmit() {
-      if (geometryEmitScheduled) return;
-      geometryEmitScheduled = true;
-      requestAnimationFrame(() => {
-        geometryEmitScheduled = false;
-        setTimeout(emitGeometry, 0);
-      });
     }
     function applyStatusMode(mode) {
       const next = String(mode || "idle");
@@ -1938,7 +1902,6 @@ function recordingStatusCapsuleHtml() {
       if (nextScreen !== screenMode) {
         screenMode = nextScreen;
         pillEl.classList.toggle("screen", screenMode);
-        scheduleGeometryEmit();
       }
       render();
       if (pageIsActive()) {
@@ -1949,17 +1912,16 @@ function recordingStatusCapsuleHtml() {
       }
       return true;
     };
-    window.addEventListener("resize", scheduleGeometryEmit);
     document.addEventListener("pointerdown", () => {
       if (pointerEmitLocked) return;
       pointerEmitLocked = true;
-      setTimeout(() => { pointerEmitLocked = false; }, 80);
-      document.title = "__recording_capsule_pointer__" + Date.now();
+      setTimeout(() => { pointerEmitLocked = false; }, ${t.pointerLockMs});
+      window.__capsule.pointer();
     }, true);
     document.getElementById("shotBtn").addEventListener("click", (event) => {
       // Inside #core, whose click stops the recording: this one must not.
       event.stopPropagation();
-      if (screenMode) document.title = "__recording_capsule_shot__" + Date.now();
+      if (screenMode) window.__capsule.shot();
     });
     document.getElementById("core").addEventListener("click", (event) => {
       // "autostop" too: the capsule is amber and counting down, but the
@@ -1969,7 +1931,7 @@ function recordingStatusCapsuleHtml() {
       // nothing.
       if (waveMode === "recording" || waveMode === "autostop") {
         event.stopPropagation();
-        document.title = "__recording_capsule_stop__";
+        window.__capsule.stop();
       }
     });
     function animationLoop(frameNow) {
@@ -1989,29 +1951,78 @@ function recordingStatusCapsuleHtml() {
     }
     render();
     if (pageIsActive()) requestAnimationLoop();
-    scheduleGeometryEmit();
   </script>
 </body>
 </html>`;
 }
 
-function recordingStatusCapsuleBounds() {
-  const size = getRecordingStatusCapsuleWindowSize();
-  const fallback = { x: 0, y: 0, width: 1440, height: 900 };
-  let workArea = fallback;
+/**
+ * Where the capsule goes: the display it is already on while it is
+ * visible (a resize or a display change must not move it to another
+ * monitor), else the display under the cursor — the one the user is
+ * looking at as it appears.
+ */
+function recordingStatusCapsuleBounds(size = getRecordingStatusCapsuleWindowSize(), capsuleWindow = null) {
+  let workArea = null;
   try {
-    const point = screen.getCursorScreenPoint();
-    const display = screen.getDisplayNearestPoint(point) || screen.getPrimaryDisplay();
-    workArea = display?.workArea || fallback;
+    const visible = !!capsuleWindow && !capsuleWindow.isDestroyed() && capsuleWindow.isVisible();
+    const display = visible
+      ? screen.getDisplayMatching(capsuleWindow.getBounds())
+      : (screen.getDisplayNearestPoint(screen.getCursorScreenPoint()) || screen.getPrimaryDisplay());
+    workArea = display?.workArea || null;
   } catch {
-    workArea = fallback;
+    workArea = null;
   }
-  return {
-    x: Math.round(workArea.x + (workArea.width - size.width) / 2),
-    y: Math.round(workArea.y + workArea.height - size.height - RECORDING_STATUS_CAPSULE.bottomMargin),
-    width: size.width,
-    height: size.height,
+  return capsuleBoundsIn(workArea, size, RECORDING_STATUS_CAPSULE.bottomMargin);
+}
+
+let recordingStatusCapsuleDisplayWatch = false;
+/** Keep a visible capsule on screen when displays are added, removed or rescaled. */
+function watchDisplaysForRecordingStatusCapsule() {
+  if (recordingStatusCapsuleDisplayWatch) return;
+  recordingStatusCapsuleDisplayWatch = true;
+  const replace = () => {
+    const capsuleWindow = recordingStatusWindow;
+    if (!capsuleWindow || capsuleWindow.isDestroyed() || !capsuleWindow.isVisible()) return;
+    placeRecordingStatusCapsule(capsuleWindow);
   };
+  for (const event of ["display-added", "display-removed", "display-metrics-changed"]) {
+    try { screen.on(event, replace); } catch { }
+  }
+}
+
+// The capsule's three verbs arrive over its preload (./capsule-preload),
+// not over document.title (DM-10, capsule half): a title channel fires
+// nothing when the same title is set twice, so a second stop click after
+// a stale stop was lost. Registered once; each verb is accepted only from
+// the capsule window that exists right now.
+let recordingStatusCapsuleIpcInstalled = false;
+function installRecordingStatusCapsuleIpc() {
+  if (recordingStatusCapsuleIpcInstalled) return;
+  recordingStatusCapsuleIpcInstalled = true;
+  const fromCapsule = (event) =>
+    !!recordingStatusWindow && !recordingStatusWindow.isDestroyed()
+    && event?.sender === recordingStatusWindow.webContents;
+  ipcMain.on("capsule:pointer", (event) => {
+    if (!fromCapsule(event)) return;
+    noteRecordingStatusCapsuleInteraction();
+  });
+  ipcMain.on("capsule:shot", (event) => {
+    if (!fromCapsule(event)) return;
+    noteRecordingStatusCapsuleInteraction();
+    void screenMode.takeShot("capsule").catch((e) => {
+      appendMainLog(`[screen-mode] capsule shot failed: ${e?.message || e}`);
+    });
+  });
+  ipcMain.on("capsule:stop", (event) => {
+    if (!fromCapsule(event)) return;
+    noteRecordingStatusCapsuleInteraction();
+    recordingStopInFlight = true;
+    // The capsule stops the recording. It does NOT touch the main
+    // window — it used to hide it here, which is how pressing stop
+    // could make the app vanish.
+    guardedStopFromRecordingStatus("capsule-click");
+  });
 }
 
 async function ensureRecordingStatusCapsuleWindow() {
@@ -2062,6 +2073,8 @@ async function ensureRecordingStatusCapsuleWindow() {
     backgroundColor: "#00000000",
     webPreferences: {
       partition: RECORDING_STATUS_CAPSULE_SESSION_PARTITION,
+      // Three send-only verbs (stop, shot, pointer) — ./capsule-preload.
+      preload: path.join(__dirname, "capsule-preload.js"),
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: true,
@@ -2070,6 +2083,16 @@ async function ensureRecordingStatusCapsuleWindow() {
     },
   });
 
+  // The capsule is a static data: page that needs no permission at all;
+  // its own partition would otherwise keep Electron's default, which
+  // grants every request (DM-35).
+  try {
+    const capsuleSession = recordingStatusWindow.webContents.session;
+    capsuleSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
+    capsuleSession.setPermissionCheckHandler(() => false);
+  } catch (e) {
+    appendMainLog(`[recording-capsule] permission handlers not installed: ${e?.message || e}`);
+  }
   recordingStatusWindow.setMenuBarVisibility(false);
   try { recordingStatusWindow.setAlwaysOnTop(true, "floating"); } catch { }
   if (recordingStatusCapsuleState.screen) applyCapsuleScreenModeLayer(true);
@@ -2080,33 +2103,7 @@ async function ensureRecordingStatusCapsuleWindow() {
     recordingStatusWindowLoadPromise = null;
     cancelRecordingStatusCapsuleTeardown();
   });
-  recordingStatusWindow.webContents.on("page-title-updated", (event, title) => {
-    const raw = String(title || "");
-    if (!raw.startsWith("__recording_capsule_")) return;
-    event.preventDefault();
-    noteRecordingStatusCapsuleInteraction();
-    if (raw.startsWith("__recording_capsule_pointer__")) {
-      return;
-    }
-    if (raw.startsWith("__recording_capsule_shot__")) {
-      void screenMode.takeShot("capsule").catch((e) => {
-        appendMainLog(`[screen-mode] capsule shot failed: ${e?.message || e}`);
-      });
-      return;
-    }
-    if (raw === "__recording_capsule_stop__") {
-      recordingStopInFlight = true;
-      // The capsule stops the recording. It does NOT touch the main
-      // window — it used to hide it here, which is how pressing stop
-      // could make the app vanish.
-      guardedStopFromRecordingStatus("capsule-click");
-      return;
-    }
-    if (raw.startsWith("__recording_capsule_geometry__")) {
-      applyRecordingStatusCapsuleGeometryPayload(raw.replace("__recording_capsule_geometry__", ""));
-      return;
-    }
-  });
+  installRecordingStatusCapsuleIpc();
 
   const html = recordingStatusCapsuleHtml();
   recordingStatusWindowLoadPromise = recordingStatusWindow
@@ -2159,10 +2156,17 @@ async function updateRecordingStatusCapsule(patch = {}) {
   // while holding the newest sequence number silences the one that would
   // have painted.
   if (seq !== recordingStatusCapsuleUpdateSeq) return;
-  try {
-    capsuleWindow.setBounds(recordingStatusCapsuleBounds(), false);
-  } catch { }
-  screenMode.refreshLayout();
+  // Placed when it appears or changes size (screen mode adds a button),
+  // on the display it is on — not on every status and level tick, and
+  // not on whatever display the cursor has wandered to (DM-25).
+  if (capsuleNeedsPlacement({
+    visible: capsuleWindow.isVisible(),
+    placedSize: recordingStatusCapsulePlacedSize,
+    size: getRecordingStatusCapsuleWindowSize(),
+  })) {
+    watchDisplaysForRecordingStatusCapsule();
+    placeRecordingStatusCapsule(capsuleWindow);
+  }
   if (!recordingStatusWindowReady) {
     // The load failed; ensure() already logged it. Nothing to paint on.
     appendMainLog(`[recording-capsule] update dropped: window never loaded (status="${status}")`);
@@ -2171,7 +2175,6 @@ async function updateRecordingStatusCapsule(patch = {}) {
   const payload = {
     status,
     mode,
-    tone: presentation.tone,
     startedAt: recordingStatusCapsuleState.startedAt,
     elapsedMs: Math.max(0, Number(recordingStatusCapsuleState.elapsedMs || 0)),
     timerRunning: !!recordingStatusCapsuleState.timerRunning,
@@ -2210,21 +2213,52 @@ async function updateRecordingStatusCapsule(patch = {}) {
 // registerGlobalShortcuts.
 let desiredScreenShotHotkey = "";
 let registeredScreenShotHotkey = "";
+// Why the screenshot key could not be taken ("" = it can be / it is):
+// what the probe at registration time or the bind at take start said.
+// Settings shows it like any other slot's conflict (DM-24, S-09).
+let screenShotHotkeyError = "";
+
+/** Register ``accelerator``; returns "" on success or the refusal. */
+function registerScreenShotAccelerator(accelerator, handler) {
+  try {
+    return globalShortcut.register(accelerator, handler) ? "" : "already in use";
+  } catch (e) {
+    return String(e?.message || e) || "registration failed";
+  }
+}
+
+/**
+ * Outside a take the key is not held, but whether it CAN be held is a
+ * fact Settings needs: another app owning it means the key will be dead
+ * mid-dictation. Claim it for an instant and let it go.
+ */
+function probeScreenShotHotkey() {
+  if (!desiredScreenShotHotkey || registeredScreenShotHotkey) return;
+  const canonical = canonicalAcceleratorForPlatform(desiredScreenShotHotkey, process.platform);
+  screenShotHotkeyError = registerScreenShotAccelerator(canonical, () => { });
+  if (!screenShotHotkeyError) {
+    try { globalShortcut.unregister(canonical); } catch { }
+  }
+}
 
 function bindScreenShotHotkey() {
   unbindScreenShotHotkey();
   if (!desiredScreenShotHotkey) return;
   const canonical = canonicalAcceleratorForPlatform(desiredScreenShotHotkey, process.platform);
-  try {
-    const ok = globalShortcut.register(canonical, () => {
-      void screenMode.takeShot("hotkey").catch((e) => {
-        appendMainLog(`[screen-mode] hotkey shot failed: ${e?.message || e}`);
-      });
+  screenShotHotkeyError = registerScreenShotAccelerator(canonical, () => {
+    void screenMode.takeShot("hotkey").catch((e) => {
+      appendMainLog(`[screen-mode] hotkey shot failed: ${e?.message || e}`);
     });
-    if (ok) registeredScreenShotHotkey = canonical;
-    appendMainLog(`[shortcuts] screenshot hotkey ${ok ? "bound" : "FAILED"}: ${canonical}`);
-  } catch (e) {
-    appendMainLog(`[shortcuts] screenshot hotkey failed: ${canonical} (${e?.message || e})`);
+  });
+  if (!screenShotHotkeyError) registeredScreenShotHotkey = canonical;
+  appendMainLog(
+    `[shortcuts] screenshot hotkey ${screenShotHotkeyError ? `FAILED (${screenShotHotkeyError})` : "bound"}: ${canonical}`,
+  );
+  publishScreenShotHotkeyStatus();
+  if (screenShotHotkeyError) {
+    // The user is in a take and this is the key they will press: say so
+    // now, not by a press that does nothing.
+    notifyScreenModeWarning("screenshot-hotkey");
   }
 }
 
@@ -2232,6 +2266,33 @@ function unbindScreenShotHotkey() {
   if (!registeredScreenShotHotkey) return;
   try { globalShortcut.unregister(registeredScreenShotHotkey); } catch { }
   registeredScreenShotHotkey = "";
+  publishScreenShotHotkeyStatus();
+}
+
+/** Refresh the screenshot slot inside the published shortcut status. */
+function publishScreenShotHotkeyStatus() {
+  if (!lastShortcutStatus) return;
+  lastShortcutStatus = {
+    ...lastShortcutStatus,
+    screenShot: screenShotSlotStatus({
+      desired: desiredScreenShotHotkey,
+      supported: !!lastShortcutStatus.screenModeSupported,
+      error: screenShotHotkeyError,
+      bound: registeredScreenShotHotkey,
+    }),
+  };
+  publishShortcutStatusToRenderer();
+}
+
+/** Hand the current shortcut status to the main window (Settings badges). */
+function publishShortcutStatusToRenderer() {
+  if (!lastShortcutStatus || !win || win.isDestroyed() || !win.webContents) return;
+  win.webContents
+    .executeJavaScript(
+      `window.__transcriptorShortcutStatus = ${JSON.stringify(lastShortcutStatus)};`,
+      true,
+    )
+    .catch(() => { });
 }
 
 // The capsule stays the user's control surface in screen mode, so it is
@@ -2255,11 +2316,18 @@ function screenModeHelperPath() {
 // Where a take's screenshots are staged until its recording is saved; the
 // backend then moves them beside the recording (backend/screen_sessions.py).
 function screenModeStagingRoot() {
-  const dataDir = process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData");
-  return path.join(dataDir, SCREEN_MODE.stagingDirName);
+  return path.join(dataDir(), SCREEN_MODE.stagingDirName);
 }
 
 const SCREEN_MODE_WARNINGS = Object.freeze({
+  "start-failed": {
+    title: "Screen mode didn't start",
+    body: "The recording goes on as a voice recording. See the log for the reason, then try screen mode again.",
+  },
+  "screenshot-hotkey": {
+    title: "Screenshot key is taken",
+    body: "Another app holds the screenshot key, so it does nothing in this take. Use the camera button on the capsule, or pick another key in Settings.",
+  },
   accessibility: {
     title: "Screen mode can't draw",
     body: "Allow Transcriptor in System Settings → Privacy & Security → Accessibility, then start screen mode again.",
@@ -2289,15 +2357,7 @@ const screenMode = createScreenModeController({
       void updateRecordingStatusCapsule({}).catch(() => { });
     }
   },
-  onWarning: (kind) => {
-    const copy = SCREEN_MODE_WARNINGS[kind];
-    appendMainLog(`[screen-mode] warning ${kind}`);
-    if (!copy) return;
-    try {
-      const { Notification } = require("electron");
-      if (Notification.isSupported()) new Notification({ title: copy.title, body: copy.body }).show();
-    } catch { }
-  },
+  onWarning: (kind) => notifyScreenModeWarning(kind),
   screenCaptureAccess: () => {
     try {
       return String(systemPreferences.getMediaAccessStatus("screen") || "");
@@ -2306,6 +2366,16 @@ const screenMode = createScreenModeController({
     }
   },
 });
+
+function notifyScreenModeWarning(kind) {
+  const copy = SCREEN_MODE_WARNINGS[kind];
+  appendMainLog(`[screen-mode] warning ${kind}`);
+  if (!copy) return;
+  try {
+    const { Notification } = require("electron");
+    if (Notification.isSupported()) new Notification({ title: copy.title, body: copy.body }).show();
+  } catch { }
+}
 
 /**
  * The renderer that owns the take is gone (crashed, killed, reloaded):
@@ -2366,7 +2436,7 @@ function hideRecordingStatusCapsule() {
   recordingStatusCapsuleState.startedAt = 0;
   recordingStatusCapsuleState.elapsedMs = 0;
   recordingStatusCapsuleState.timerRunning = false;
-  recordingStatusCapsuleGeometry = null;
+  recordingStatusCapsulePlacedSize = null;
   recordingStatusCapsuleLastLevelSent = -1;
   recordingStatusCapsuleLastLevelSentAt = 0;
   if (recordingStatusWindow && !recordingStatusWindow.isDestroyed()) {
@@ -2393,8 +2463,14 @@ function stopRecordingStateMonitor() {
 
 function startRecordingStateMonitor() {
   stopRecordingStateMonitor();
+  // One probe at a time (DM-14): executeJavaScript cannot be cancelled,
+  // so on a wedged renderer an unguarded interval queued another pending
+  // evaluation every tick for as long as the take lasted.
+  let probeInFlight = false;
   recordingStateMonitor = setInterval(() => {
     if (!win || win.isDestroyed() || !win.webContents) return;
+    if (probeInFlight) return;
+    probeInFlight = true;
     win.webContents
       .executeJavaScript(
         `(() => {
@@ -2518,7 +2594,8 @@ function startRecordingStateMonitor() {
           guardedStopFromRecordingStatus("autostop-stale");
         }
       })
-      .catch(() => { });
+      .catch(() => { })
+      .finally(() => { probeInFlight = false; });
   }, RECORDING_STATUS_LEVEL_POLL_MS);
   try { recordingStateMonitor.unref?.(); } catch { }
 }
@@ -2682,37 +2759,12 @@ function macMicrophoneAccessGranted() {
  * capsule at a time — but there was no work worth blocking for.
  */
 async function dispatchRendererTogglePress(allowStart, startDetail = { mode: "voice" }) {
+  // The press expires with the budget main waits for it, so a renderer
+  // that unblocks after main gave up cannot run it late (DM-05).
   return execRendererJsWithTimeout(
-    `
-    (() => {
-      const uiReady = typeof window.__transcriptorLiveStatusSnapshot === 'function';
-      const isRec = !!(window.__transcriptorIsRecording);
-      const recordingId = Number(window.__transcriptorCurrentRecordingId || 0);
-      const auto = !!(document.getElementById('autoTranscribeToggle') && document.getElementById('autoTranscribeToggle').checked);
-      const liveSnapshot = uiReady ? window.__transcriptorLiveStatusSnapshot() : null;
-      const autoSendEnter = !!liveSnapshot?.autoSendEnter;
-      const timerText = String(liveSnapshot?.timerText || '00:00').trim();
-      // The renderer owns the recording clock and the floor under it.
-      // Asking it — rather than timing the press here — is what keeps
-      // the two processes from disagreeing about whether this stop
-      // produced anything.
-      const tooShort = isRec && typeof window.__transcriptorRecordingTooShort === 'function'
-        ? !!window.__transcriptorRecordingTooShort()
-        : false;
-      const state = { ok: true, uiReady, wasRecording: isRec, recording: isRec, dispatched: false, discarded: tooShort, auto, autoSendEnter, timerText, recordingId };
-      if (!uiReady) return state;
-      if (!isRec && !${allowStart ? "true" : "false"}) return state;
-      // The detail is read only when this press STARTS a recording: it says
-      // which kind (voice or screen) and, for screen mode, the session id
-      // the renderer hands back to main when the take stops.
-      window.dispatchEvent(new CustomEvent('transcriptor-hotkey-toggle', { detail: ${JSON.stringify(startDetail)} }));
-      state.dispatched = true;
-      state.recording = !isRec;
-      return state;
-    })();
-    `,
+    toggleDispatchScript({ allowStart, startDetail, notAfter: toggleNotAfter() }),
     null,
-    2000,
+    RENDERER_TOGGLE_BUDGET_MS,
   );
 }
 
@@ -2760,7 +2812,7 @@ async function toggleRecordingFromShortcut(mode = "voice") {
     if (result === null) {
       // Renderer didn't respond inside the budget — log, release the
       // inflight guard via the outer finally, and let the user retry.
-      appendMainLog("[shortcut] toggle aborted: renderer probe timed out (2s)");
+      appendMainLog(`[shortcut] toggle aborted: renderer probe timed out (${RENDERER_TOGGLE_BUDGET_MS}ms); the press expires unrun`);
       resetRecordingStatusState();
       traceEnd(trace, "failed", { reason: "renderer-probe-timeout" });
       return;
@@ -2893,6 +2945,23 @@ async function toggleRecordingFromShortcut(mode = "voice") {
           error: e?.message || String(e),
         }));
         traceStep(trace, "screen_mode_started", { ok: !!started?.ok, error: started?.error || "" });
+        // The take may have ended while its session was starting (DM-31):
+        // ask once more, and end an orphaned session now rather than at
+        // some later stop. A failed start is told to the user.
+        const after = decideAfterScreenStart({
+          started,
+          renderer: started?.ok ? await queryRendererRecordingState() : null,
+          recordingId: Number(confirmedStart.recordingId || 0),
+        });
+        if (after === AFTER_SCREEN_START.END_ORPHAN && screenMode.isActive()) {
+          appendMainLog(`[screen-mode] take ended while its session was starting; ending session ${startDetail.screenSessionId}`);
+          await screenMode.finish({ id: startDetail.screenSessionId, discard: false }).catch((e) => {
+            appendMainLog(`[screen-mode] finish of orphaned session failed: ${e?.message || e}`);
+          });
+        } else if (after === AFTER_SCREEN_START.FAILED) {
+          notifyScreenModeWarning("start-failed");
+        }
+        traceStep(trace, "screen_mode_after_start", { decision: after });
       }
       traceEnd(trace, "recording-started", { mode: startDetail.mode });
       return;
@@ -2933,8 +3002,11 @@ async function toggleRecordingFromShortcut(mode = "voice") {
  * resolve, reject, OR timeout — and resets recording status state if the stop
  * never completed.
  */
+/** Hard ceiling on a main-process stop before its in-flight flag is freed. */
+const GUARDED_STOP_DEADLINE_MS = 12000;
+
 function guardedStopFromRecordingStatus(reason) {
-  const deadlineMs = 12000;
+  const deadlineMs = GUARDED_STOP_DEADLINE_MS;
   let settled = false;
   const finish = (why, err) => {
     if (settled) return;
@@ -2971,8 +3043,10 @@ async function stopRecordingFromMainProcess() {
   // (activateCapturedPasteTarget), so the hide bought nothing and cost
   // the user their window.
 
+  let decision = null;
   try {
-    const snapshot = await queryRendererRecordingState().catch(() => ({ recording: false, recordingId: 0 }));
+    // ``null`` = the renderer did not answer — NOT "idle" (DM-03).
+    const snapshot = await queryRendererRecordingState();
     const expectedRecordingId = Number(snapshot?.recordingId || 0);
     const result = snapshot?.recording
       ? await execRendererJsWithTimeout(
@@ -2999,22 +3073,18 @@ async function stopRecordingFromMainProcess() {
         null,
         2000,
       )
-      : {
-        ok: false,
-        recording: false,
-        timerText: "",
-        recordingId: expectedRecordingId,
-        auto: false,
-        autoSendEnter: false,
-      };
+      : null;
+    decision = decideMainProcessStop({ snapshot, result });
 
-    if (!result) {
+    if (decision.action === STOP_ACTION.UNCONFIRMED) {
       appendMainLog("[recording-stop] renderer stop request timed out");
       await setRecordingStatus("App Loading", RECORDING_STATUS_KIND.WARN);
       resetRecordingStatusState();
-    } else if (result?.stale) {
+    } else if (decision.action === STOP_ACTION.KEEP_RECORDING) {
       appendMainLog(
-        `[recording-stop] stale stop ignored current=${Number(result.recordingId || 0)} expected=${Number(result.expectedRecordingId || 0)}`
+        decision.reason === "stale"
+          ? `[recording-stop] stale stop ignored current=${Number(result.recordingId || 0)} expected=${Number(result.expectedRecordingId || 0)}`
+          : "[recording-stop] renderer did not answer the recording-state probe; the recording continues",
       );
       // The recording continues, so the monitor must too. Both callers
       // that can reach a stale stop — the silence auto-stop and the
@@ -3028,26 +3098,23 @@ async function stopRecordingFromMainProcess() {
       // the monitor was half the recovery.
       startRecordingStateMonitor();
       await setRecordingStatus("Recording", RECORDING_STATUS_KIND.RECORDING);
-    } else if (result?.ok) {
-      if (result.auto) {
-        enqueuePostStopTask({
-          autoTranscribe: true,
-          autoSendEnter: !!result.autoSendEnter,
-          stopRequestedAt: Date.now(),
-          recordingId: Number(result.recordingId || 0),
-          target: pasteTarget,
-        });
-        stopRecordingStateMonitor();
-      } else {
-        await setRecordingStatus("Saved To App", RECORDING_STATUS_KIND.OK);
-        resetRecordingStatusState();
-      }
+    } else if (decision.action === STOP_ACTION.ENQUEUE) {
+      enqueuePostStopTask({
+        autoTranscribe: true,
+        autoSendEnter: !!result.autoSendEnter,
+        stopRequestedAt: Date.now(),
+        recordingId: Number(result.recordingId || 0),
+        target: pasteTarget,
+      });
+      stopRecordingStateMonitor();
     } else {
       await setRecordingStatus("Saved To App", RECORDING_STATUS_KIND.OK);
       resetRecordingStatusState();
     }
   } finally {
-    clearCapturedPasteTarget();
+    // The paste target is the app the user started in; a recording that
+    // goes on still needs it at its real stop (DM-22).
+    if (!decision?.keepsPasteTarget) clearCapturedPasteTarget();
   }
 }
 
@@ -3063,6 +3130,10 @@ const RENDERER_RECORDING_START_CONFIRM_POLL_MS = 80;
 
 async function queryRendererState() {
   if (!win || win.isDestroyed() || !win.webContents) return null;
+  // The paste-last lookup's view of the renderer: its newest paste-ready
+  // text and its newest ui-final publish (kind + text). Nothing else —
+  // the post-stop task reads the IPC hand-off, not the renderer's globals.
+  //
   // Attach a no-op ``.catch`` to the executeJavaScript promise up-front so
   // a late rejection (renderer crashes AFTER our Promise.race timeout
   // already gave up waiting) doesn't surface as an unhandledRejection in
@@ -3070,52 +3141,11 @@ async function queryRendererState() {
   // the queryPromise's eventual settlement is intentionally discarded.
   const queryPromise = win.webContents.executeJavaScript(
     `
-    (() => {
-      const finishedAt = Number(window.__transcriptorLastFinishedAt || 0);
-      const finishedRecordingId = Number(window.__transcriptorLastFinishedRecordingId || 0);
-      const finishedText = String(window.__transcriptorLastFinishedText || '').trim();
-      const uiFinalAt = Number(window.__transcriptorLastUiFinalAt || 0);
-      const uiFinalRecordingId = Number(window.__transcriptorLastUiFinalRecordingId || 0);
-      const uiFinalText = String(window.__transcriptorLastUiFinalText || '').trim();
-      const uiFinalKind = String(window.__transcriptorLastUiFinalKind || '').trim();
-      const finishedRecords = Array.isArray(window.__transcriptorFinishedRecords)
-        ? window.__transcriptorFinishedRecords
-          .map((x) => ({
-            recordingId: Number((x && x.recordingId) || 0),
-            finishedAt: Number((x && x.finishedAt) || 0),
-            text: String((x && x.text) || '').trim(),
-          }))
-          .filter((x) => x.recordingId > 0 && x.finishedAt > 0 && x.text.length > 0)
-          .slice(-${RENDERER_FINISHED_RECORDS_LIMIT})
-        : [];
-      const isRec = !!(window.__transcriptorIsRecording);
-      const liveSnapshot = typeof window.__transcriptorLiveStatusSnapshot === 'function'
-        ? window.__transcriptorLiveStatusSnapshot()
-        : null;
-      const status = String(liveSnapshot?.status || '').trim();
-      const statusKind = String(liveSnapshot?.statusKind || '').trim();
-      const finalText = (document.getElementById('finalOutput')?.textContent || '').trim();
-      const liveText = (document.getElementById('liveOutput')?.textContent || '').trim();
-      const busy = !!liveSnapshot?.busy;
-      const progressVisible = document.getElementById('progressRow') ? !document.getElementById('progressRow').hidden : false;
-      return {
-        finishedAt,
-        finishedRecordingId,
-        finishedText,
-        uiFinalAt,
-        uiFinalRecordingId,
-        uiFinalText,
-        uiFinalKind,
-        finishedRecords,
-        isRec,
-        status,
-        statusKind,
-        finalText,
-        liveText,
-        busy,
-        progressVisible,
-      };
-    })();
+    (() => ({
+      finishedText: String(window.__transcriptorLastFinishedText || '').trim(),
+      uiFinalText: String(window.__transcriptorLastUiFinalText || '').trim(),
+      uiFinalKind: String(window.__transcriptorLastUiFinalKind || '').trim(),
+    }))();
     `,
     true
   ).catch(() => null);
@@ -3137,15 +3167,18 @@ async function queryRendererState() {
   }
 }
 
+/**
+ * The renderer's recording state, or ``null`` when it did not answer
+ * within the budget. "No answer" is never reported as "not recording"
+ * (DM-03): a busy renderer is still recording.
+ */
 async function queryRendererRecordingState() {
   const state = await execRendererJsWithTimeout(
     `(() => ({ recording: !!window.__transcriptorIsRecording, recordingId: Number(window.__transcriptorCurrentRecordingId || 0) }))();`,
-    { recording: false, recordingId: 0 },
+    null,
     1000,
   );
-  return state && typeof state === "object"
-    ? state
-    : { recording: false, recordingId: 0 };
+  return state && typeof state === "object" ? state : null;
 }
 
 async function waitForRendererRecordingStart(
@@ -3154,7 +3187,8 @@ async function waitForRendererRecordingStart(
   const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
   let lastState = { recording: false, recordingId: 0 };
   while (Date.now() < deadline) {
-    lastState = await queryRendererRecordingState().catch(() => ({ recording: false, recordingId: 0 }));
+    // A probe without an answer says nothing; keep the last one.
+    lastState = (await queryRendererRecordingState()) || lastState;
     if (lastState?.recording && Number(lastState.recordingId || 0) > 0) {
       return {
         confirmed: true,
@@ -3249,7 +3283,7 @@ function pasteTargetSummary(target) {
 
 function getLastTranscriptPath() {
   try {
-    return path.join(app.getPath("userData"), LAST_TRANSCRIPT_FILE);
+    return path.join(dataDir(), LAST_TRANSCRIPT_FILE);
   } catch {
     return "";
   }
@@ -3372,16 +3406,27 @@ const pasteVerificationPolicy = createPasteVerificationPolicy({
   },
 });
 
+/**
+ * Is this process name our own app (DM-16)? Exact names, derived from
+ * the app's name rather than retyped: a substring check on the product
+ * name would exclude third-party apps whose name contains the word
+ * ("Audio Transcriptor Pro"). The one list both target checks use.
+ */
+function isOwnAppName(name) {
+  const n = String(name || "").trim().toLowerCase();
+  const own = String(app.getName() || "").trim().toLowerCase();
+  return !!n && !!own && (n === own || n === `${own} helper`);
+}
+
 function isBadActivationTarget(name) {
   const n = String(name || "").trim().toLowerCase();
   if (!n) return true;
-  // Exact matches only for our own process family. Previous substring
-  // check on "transcriptor" would exclude third-party apps whose name
-  // or window title contains the word (e.g. "Audio Transcriptor Pro",
-  // a browser tab titled "Transcriptor tutorial", another voice tool).
-  // Electron helpers have deterministic suffixes that substring match
-  // is correct for.
-  if (n === "electron" || n === "transcriptor" || n === "transcriptor helper") return true;
+  // Our own process family, plus "electron": by name alone a bare
+  // Electron process is not a safe target (it may be us in a dev run, or
+  // the shell of an app whose real window is elsewhere). Electron
+  // helpers have deterministic suffixes that substring match is correct
+  // for.
+  if (n === "electron" || isOwnAppName(n)) return true;
   if (n.includes("helper (renderer)") ||
       n.includes("helper (gpu)") ||
       n.includes("helper (plugin)") ||
@@ -3393,9 +3438,7 @@ function shouldUsePasteTarget(front) {
   const pid = Number(front?.pid || 0);
   const name = String(front?.name || "").trim().toLowerCase();
   if (pid > 0 && pid === process.pid) return false;
-  // Exact match for our own app; substring would block legitimate
-  // third-party apps with "transcriptor" in their window title.
-  if (name === "transcriptor" || name === "transcriptor helper") return false;
+  if (isOwnAppName(name)) return false;
   if (!name && pid <= 0) return false;
   return true;
 }
@@ -3465,8 +3508,8 @@ function recordingStatusForPasteFailure(reason, pasteAccel = pasteLastAccelerato
 
 function recordingStatusBadgeForPasteFailure(r) {
   // The transcript is ALWAYS written to the system clipboard before
-  // the paste attempt (see ``clipboard.writeText(transcript)`` in
-  // processPostStopTask), so every failure mode below still leaves
+  // the paste attempt (runPasteLadder, right after it snapshots the
+  // user's clipboard), so every failure mode below still leaves
   // the text available via Cmd+V. We prefer a status that tells the
   // user their text is safe rather than one that just says
   // "failed" — "In Clipboard" is the clearest signal that recovery
@@ -3650,7 +3693,7 @@ async function activateLinuxWindowById(windowId) {
     timeoutMs: activationTimeoutMs(),
   });
   if (wmctrlRes.ok) {
-    await sleep(X11_ACTIVATION_SETTLE_MS);
+    await sleep(WINDOW_ACTIVATION_SETTLE_MS);
     return true;
   }
   const decimalId = linuxWindowIdToDecimal(normalizedId);
@@ -3659,7 +3702,7 @@ async function activateLinuxWindowById(windowId) {
     timeoutMs: activationTimeoutMs(),
   });
   if (!xdotoolRes.ok) return false;
-  await sleep(X11_ACTIVATION_SETTLE_MS);
+  await sleep(WINDOW_ACTIVATION_SETTLE_MS);
   return true;
 }
 
@@ -3997,15 +4040,17 @@ async function getFrontmostAppInfoWithTimeout(timeoutMs = 1200) {
 }
 
 // How long an activation is given to take effect before the caller acts
-// on it. Distinct per mechanism because they differ by an order of
-// magnitude: a Win32 SetForegroundWindow is asynchronous and the shell
-// needs a moment to repaint, while an X11 activation is acknowledged by
-// the call itself.
-const WIN_ACTIVATION_SETTLE_MS = 350;
+// on it, named by what is activated rather than by one platform (DM-16:
+// the "WIN_" value also served macOS, the "X11_" value Windows hwnds).
+// Activating an APP (by process name or pid: Win32 SetForegroundWindow
+// of its main window, macOS `activate`) is asynchronous and the shell
+// needs a moment to repaint; activating one specific WINDOW by id (an
+// X11 window id, a Win32 hwnd) is acknowledged far sooner.
+const APP_ACTIVATION_SETTLE_MS = 350;
 // Auto-send re-raises the target before firing its chord; this is the
 // pause between that activation and the keystroke.
 const AUTO_SEND_ACTIVATION_SETTLE_MS = 110;
-const X11_ACTIVATION_SETTLE_MS = 180;
+const WINDOW_ACTIVATION_SETTLE_MS = 180;
 
 /** Wall-clock bound for one target-activation child, from PASTE_BUDGET. */
 function activationTimeoutMs() {
@@ -4063,7 +4108,7 @@ async function activateAppByName(name) {
     // usually Transcriptor itself.
     if (!res.ok) return false;
     if (String(res.stdout || "").trim() !== "1") return false;
-    await sleep(WIN_ACTIVATION_SETTLE_MS);
+    await sleep(APP_ACTIVATION_SETTLE_MS);
     return true;
   }
   if (process.platform === "linux") {
@@ -4076,7 +4121,7 @@ async function activateAppByName(name) {
     timeoutMs: activationTimeoutMs(),
   });
   if (!res.ok) return false;
-  await sleep(WIN_ACTIVATION_SETTLE_MS);
+  await sleep(APP_ACTIVATION_SETTLE_MS);
   return true;
 }
 
@@ -4163,7 +4208,7 @@ async function activateWindowsWindowByHwnd(hwnd) {
     timeoutMs: activationTimeoutMs(),
   });
   if (!res.ok) return false;
-  await sleep(X11_ACTIVATION_SETTLE_MS);
+  await sleep(WINDOW_ACTIVATION_SETTLE_MS);
   return String(res.stdout || "").trim() === "1";
 }
 
@@ -4890,43 +4935,13 @@ function snapshotClipboard() {
   }
 }
 
-// Reference-counted snapshot of the user's REAL clipboard, captured
-// at the FIRST paste of any chained-paste sequence. Without this,
-// rapid F9-stop → F9-stop within the 1500 ms restore window has
-// paste-2's `snapshotClipboard` capture paste-1's transcript as the
-// "original" — paste-2's eventual restore then writes paste-1's
-// transcript back onto the clipboard, permanently pinning it
-// (the user's real clipboard is gone forever).
-//
-// acquireClipboardSnapshot:
-//   - First paste: snapshots the clipboard (user's real content)
-//     and stores it module-wide.
-//   - Subsequent pastes during the restore window: return the SAME
-//     snapshot. Increment depth.
-//
-// releaseClipboardSnapshot:
-//   - Decrement depth. When the LAST outstanding paste finishes
-//     (depth=0), clear the cached snapshot so the next paste-cycle
-//     starts fresh.
-//
-// Both atomic under V8's single-threaded event loop — no extra lock
-// needed, the increment/decrement pair runs synchronously between
-// awaits.
-let _clipboardSnapshotDepth = 0;
-let _clipboardSnapshotCache = null;
-function acquireClipboardSnapshot() {
-  _clipboardSnapshotDepth += 1;
-  if (_clipboardSnapshotCache === null) {
-    _clipboardSnapshotCache = snapshotClipboard();
-  }
-  return _clipboardSnapshotCache;
-}
-function releaseClipboardSnapshot() {
-  _clipboardSnapshotDepth = Math.max(0, _clipboardSnapshotDepth - 1);
-  if (_clipboardSnapshotDepth === 0) {
-    _clipboardSnapshotCache = null;
-  }
-}
+// Leases on the snapshot of the user's REAL clipboard (./clipboard-lease).
+// A chain of pastes inside one restore window shares the snapshot the
+// first one took, so paste-2 never captures paste-1's transcript as the
+// "original"; each paste holds exactly one lease, released exactly once
+// (runPasteLadder's ``finally`` is the backstop for every exit, a throw
+// included).
+const clipboardLeases = createClipboardLeases(snapshotClipboard);
 
 /**
  * Smart clipboard restore.
@@ -4977,19 +4992,23 @@ function releaseClipboardSnapshot() {
  * is what makes that status true and what makes the paste-last hotkey
  * work as the recovery it is advertised as.
  */
-function keepTranscriptOnClipboardAfterFailure(logCtx) {
+function keepTranscriptOnClipboardAfterFailure(lease, logCtx) {
   appendMainLog(
     `[${logCtx}] paste failed; transcript left on the clipboard, previous clipboard NOT restored`
   );
-  releaseClipboardSnapshot();
+  lease.release();
 }
 
-function scheduleSmartClipboardRestore(snap, writtenText, logCtx = "paste:clipboardRestore", verified = false) {
+function scheduleSmartClipboardRestore(lease, writtenText, logCtx = "paste:clipboardRestore", verified = false) {
   if (verified !== true) {
     appendMainLog(`[${logCtx}] paste not verified; leaving transcript on the clipboard instead of restoring`);
-    releaseClipboardSnapshot();
+    lease.release();
     return;
   }
+  // The restore below runs after runPasteLadder has returned, so it takes
+  // the lease over from the ladder's ``finally``.
+  const releaseLease = lease.handOff();
+  const snap = lease.snapshot;
   const INITIAL_DELAY_MS = 400;
   const POLL_INTERVAL_MS = 200;
   const MAX_WAIT_MS = 1500;
@@ -5006,14 +5025,14 @@ function scheduleSmartClipboardRestore(snap, writtenText, logCtx = "paste:clipbo
       // snapshot is forever sacrificed here — acceptable trade-off,
       // otherwise we silently overwrite user intent.
       appendMainLog(`[${logCtx}] user copied new content during paste window; skipping restore`);
-      releaseClipboardSnapshot();
+      releaseLease();
       return;
     }
     if (elapsed >= MAX_WAIT_MS) {
       // Paste is settled, clipboard still has our text, no new user
       // copy arrived — safe to restore the original snapshot.
       safeExecSync(logCtx, () => restoreClipboard(snap));
-      releaseClipboardSnapshot();
+      releaseLease();
       return;
     }
     setTimeout(tryPollOrRestore, POLL_INTERVAL_MS);
@@ -5155,6 +5174,47 @@ async function awaitModifierRelease(options = {}) {
 }
 
 async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options = {}) {
+  const trace = createTrace("paste", {
+    target: pasteTargetSummary(normalizeCapturedPasteTarget(target)),
+    textLen: String(text || "").length,
+    textDigest: textDigest(text),
+  });
+  if (!text || !text.trim()) {
+    traceStep(trace, "input_rejected", { reason: "empty-text" });
+    logPasteTrace("start_skip", { reason: "empty-text" });
+    traceEnd(trace, "failed", { reason: "empty-text" });
+    return { ok: false, reason: "empty-text", method: "none", verified: false };
+  }
+  // The clipboard contract, in this order and in this one place (DM-02):
+  // snapshot the user's clipboard, THEN put the transcript on it. Every
+  // outcome below leaves the transcript there unless a verified paste
+  // lets the restore put the user's content back. Callers must not write
+  // the transcript themselves — a write before this snapshot is what
+  // made the "original" the restore returned the transcript itself.
+  const clipboardLease = clipboardLeases.acquire();
+  try {
+    clipboard.writeText(String(text));
+  } catch {
+    traceStep(trace, "clipboard_write_failed", {});
+    logPasteTrace("clipboard_write_failed", {});
+    traceEnd(trace, "failed", { reason: "clipboard-write-failed" });
+    safeExecSync("paste:clipboardRestore", () => restoreClipboard(clipboardLease.snapshot));
+    clipboardLease.release();
+    return { ok: false, reason: "clipboard-write-failed", method: "clipboard", verified: false };
+  }
+  traceStep(trace, "clipboard_write_ok", {});
+  logPasteTrace("clipboard_write_ok", {});
+  try {
+    return await pasteFromClipboard(text, target, options, trace, clipboardLease);
+  } finally {
+    // Backstop for every exit, a throw included (DM-26): an outcome that
+    // already released the lease, or handed it to a delayed restore,
+    // makes this a no-op.
+    clipboardLease.settle();
+  }
+}
+
+async function pasteFromClipboard(text, target, options, trace, clipboardLease) {
   // Every wall-clock bound this function spends comes from ONE table
   // (./paste-capability PASTE_BUDGET), so "how long can a paste take" has
   // a single answer, and a test can check that answer against the
@@ -5163,18 +5223,6 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
   const skipActivation = !!options.alreadyFront;
   const originalTarget = normalizeCapturedPasteTarget(target);
   let effectiveTarget = cloneCapturedPasteTarget(originalTarget);
-  const trace = createTrace("paste", {
-    target: pasteTargetSummary(originalTarget),
-    textLen: String(text || "").length,
-    textDigest: textDigest(text),
-    textPreview: compactLogText(text, 120),
-  });
-  if (!text || !text.trim()) {
-    traceStep(trace, "input_rejected", { reason: "empty-text" });
-    logPasteTrace("start_skip", { reason: "empty-text" });
-    traceEnd(trace, "failed", { reason: "empty-text" });
-    return { ok: false, reason: "empty-text", method: "none", verified: false };
-  }
   // Can we paste at all? ``isTrustedAccessibilityClient`` answers a
   // question about a TCC row, not about whether the events we synthesise
   // land — and after the app is re-signed and replaced, which is exactly
@@ -5183,7 +5231,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
   // same grant and looks at whether it worked. When the answer is no,
   // running the ladder anyway would spend seconds of Apple Events to end
   // up reporting a paste that never happened; the transcript is already
-  // on the clipboard (the caller wrote it there), so the honest outcome
+  // on the clipboard (runPasteLadder put it there), so the honest outcome
   // is to say so, with the click sequence that repairs it.
   const capability = await ensurePasteCapabilityForPaste();
   traceStep(trace, "paste_capability", {
@@ -5194,6 +5242,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
     const reason = `paste-capability-${capability.state}`;
     logPasteTrace("start_skip", { reason, capabilityReason: compactLogText(capability.reason, 120) });
     traceEnd(trace, "failed", { reason, method: "capability-preflight" });
+    keepTranscriptOnClipboardAfterFailure(clipboardLease, "paste:clipboardKeep:capability");
     return { ok: false, reason, method: "capability-preflight", verified: false };
   }
   const modifiers = await awaitModifierRelease(options);
@@ -5242,17 +5291,13 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
       reason: "generic-electron-without-safe-front",
     });
   }
+  // A target whose process is literally named "Electron" is routed by the
+  // concrete pid of the safe foreign front app (above), or loses its name
+  // when there is none. There used to be a third step here that emptied
+  // the target "to force the global frontmost route" — but an empty
+  // target is refused as no-target just below, so every paste into such
+  // an app failed with "In Clipboard · No Focus" (DM-17).
   const targetHint = `${effectiveTarget.appName} ${effectiveTarget.windowTitle} ${String(frontBefore.name || "")}`.toLowerCase();
-  const genericElectronTarget = /^electron$/i.test(effectiveTarget.appName);
-  if (genericElectronTarget) {
-    // For Electron-based third-party apps, process-level targeting can hit the shell process
-    // instead of the real focused webview/editor. Force global frontmost route.
-    traceStep(trace, "target_route_override", {
-      from: pasteTargetSummary(effectiveTarget),
-      reason: "generic-electron-use-frontmost-global",
-    });
-    effectiveTarget = emptyCapturedPasteTarget();
-  }
   traceStep(trace, "paste_strategy", { targetHint: compactLogText(targetHint, 80) });
   logPasteTrace("start", {
     target: pasteTargetSummary(effectiveTarget),
@@ -5261,32 +5306,12 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
     textLen: String(text).length,
   });
   if (!hasCapturedPasteTarget(effectiveTarget)) {
-    traceStep(trace, "target_missing_before_clipboard_write", {});
+    traceStep(trace, "target_missing", {});
     logPasteTrace("failed", { reason: "no-target" });
     traceEnd(trace, "failed", { reason: "no-target", method: "target-preflight" });
+    keepTranscriptOnClipboardAfterFailure(clipboardLease, "paste:clipboardKeep:no_target");
     return { ok: false, reason: "no-target", method: "target-preflight", verified: false };
   }
-  // Acquire the depth-counted shared snapshot. First paste captures
-  // the user's REAL clipboard; subsequent pastes during the
-  // 1500 ms restore window reuse the same snapshot so a chained
-  // paste can never accidentally capture our own transcript as
-  // the "original" content. Every code path below MUST eventually
-  // call releaseClipboardSnapshot() so the cache clears when the
-  // last outstanding paste resolves.
-  const savedClipboard = acquireClipboardSnapshot();
-  try {
-    clipboard.writeText(String(text));
-  } catch {
-    traceStep(trace, "clipboard_write_failed", {});
-    logPasteTrace("clipboard_write_failed", {});
-    traceEnd(trace, "failed", { reason: "clipboard-write-failed" });
-    // Restore original clipboard.
-    safeExecSync("paste:clipboardRestore", () => restoreClipboard(savedClipboard));
-    releaseClipboardSnapshot();
-    return { ok: false, reason: "clipboard-write-failed", method: "clipboard", verified: false };
-  }
-  traceStep(trace, "clipboard_write_ok", {});
-  logPasteTrace("clipboard_write_ok", {});
   if (skipActivation) {
     // The destination already owns focus — the caret is sitting in it.
     // Activating it would cost an Apple Event round trip to change
@@ -5347,8 +5372,6 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
 
       logPasteTrace("direct_attempt", { attempt: attempt + 1, method: "win_paste" });
       traceStep(trace, "method_begin", { method: "win_paste", attempt: attempt + 1 });
-
-      const cmdStarted = Date.now();
 
       // Fast path: VBS SendKeys — no compilation, no .NET assembly
       // loading, executes in <100 ms on all Windows versions.
@@ -5449,7 +5472,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
         const vbsOutcome = evaluatePasteOutcome({ method: "vbs_paste", ok: check.ok, stdout: check.stdout, stderr: check.stderr });
         if (vbsOutcome.success) {
           traceEnd(trace, "success", { method: "vbs_paste", attempt: attempt + 1, reason: vbsOutcome.reason, verified: vbsOutcome.verified });
-          scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:vbs", vbsOutcome.verified);
+          scheduleSmartClipboardRestore(clipboardLease, text, "paste:clipboardRestore:vbs", vbsOutcome.verified);
           return { ok: true, reason: vbsOutcome.reason || "OK:vbs-paste", method: "vbs_paste", verified: vbsOutcome.verified };
         }
         lastReason = (check.stderr || vbsOutcome.reason || "vbs-failed").trim();
@@ -5458,11 +5481,13 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
         lastReason = `vbs-error: ${e?.message || e}`;
       }
 
-      // Fallback: lightweight PowerShell (no C# compilation).
-      // Activate the captured target PID FIRST via SetForegroundWindow
-      // — otherwise SendKeys fires at whatever has focus when the
-      // hotkey was pressed (often Transcriptor itself), and the
-      // text lands in the wrong window.
+      // Fallback: PowerShell SetForegroundWindow + SendKeys (it compiles
+      // a small C# P/Invoke class with Add-Type, so it is not free). The
+      // script activates the captured window FIRST and refuses to send
+      // the keystroke if the OS did not bring it forward (DM-04) —
+      // otherwise SendKeys fires at whatever has focus (often Transcriptor
+      // itself) and the text lands in the wrong window. The rule and the
+      // script live in ./windows-paste-fallback.
       //
       // Runs right after EVERY VBS failure now (BUGS_AUDIT §6.4), not
       // only when attempt === 2. Gating it to the last attempt meant a
@@ -5470,43 +5495,25 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
       // before this — the actually-different fallback method — ever
       // ran, which is most of how the retry ladder reached ~30 s.
       {
-        const pidNum = Number.parseInt(String(effectiveTarget.pid || 0), 10) || 0;
-        const safePid = (Number.isFinite(pidNum) && pidNum > 0 && pidNum < 2 ** 31) ? Math.trunc(pidNum) : 0;
         const safeHwnd = normalizeWindowsHwnd(effectiveTarget.hwnd || "");
-        const hwndHex = safeHwnd ? safeHwnd.slice(2) : "";
-        // Inside a JS template literal (backtick-delimited), `"` is not
-        // a special character and MUST NOT be escaped. The over-escaped
-        // `\\"user32.dll\\"` version produced literal `\"user32.dll\"`
-        // in the PowerShell source, which was then invalid C# inside
-        // Add-Type (CS1056: unexpected character '\'). See the sibling
-        // PowerShell blocks in getFrontmostAppInfo / getFrontmostAppName
-        // for the correct unescaped form.
-        const activateBlock = safeHwnd ? (
-          `Add-Type @"\n` +
-          `using System;\n` +
-          `using System.Runtime.InteropServices;\n` +
-          `public class W { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr h, int cmd); }\n` +
-          `"@;\n` +
-          `try { $h = [IntPtr]::new([Int64]::Parse('${hwndHex}', [System.Globalization.NumberStyles]::AllowHexSpecifier)); [W]::ShowWindowAsync($h, 5) | Out-Null; [W]::SetForegroundWindow($h) | Out-Null; Start-Sleep -Milliseconds 120 } catch {};`
-        ) : safePid > 0 ? (
-          `Add-Type @"\n` +
-          `using System;\n` +
-          `using System.Runtime.InteropServices;\n` +
-          `public class W { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); }\n` +
-          `"@;\n` +
-          `try { $p = Get-Process -Id ${safePid} -ErrorAction Stop; [W]::SetForegroundWindow($p.MainWindowHandle) | Out-Null; Start-Sleep -Milliseconds 120 } catch {};`
-        ) : "";
-        const pwshSimple = `${activateBlock}Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait("^{v}"); Write-Output "OK:pwsh-paste"`;
-        const fallback = await runCommand("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", pwshSimple], {
-          timeoutMs: pasteMethodTimeoutMs(process.platform, 1),
+        const pwshScript = buildPwshPasteFallbackScript({
+          hwndHex: safeHwnd ? safeHwnd.slice(2) : "",
+          pid: Number.parseInt(String(effectiveTarget.pid || 0), 10) || 0,
         });
-        const pwshOutcome = evaluatePasteOutcome({ method: "pwsh_paste_fallback", ok: fallback.ok, stdout: fallback.stdout });
-        if (pwshOutcome.success) {
-          traceEnd(trace, "success", { method: "pwsh_paste_fallback", attempt: attempt + 1, verified: pwshOutcome.verified });
-          scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:pwsh_fallback", pwshOutcome.verified);
-          return { ok: true, reason: pwshOutcome.reason || "OK:pwsh-paste", method: "pwsh_paste_fallback", verified: pwshOutcome.verified };
+        if (!pwshScript) {
+          lastReason = "pwsh-fallback-no-window-to-activate";
+        } else {
+          const fallback = await runCommand("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", pwshScript], {
+            timeoutMs: pasteMethodTimeoutMs(process.platform, 1),
+          });
+          const pwshOutcome = evaluatePasteOutcome({ method: "pwsh_paste_fallback", ok: fallback.ok, stdout: fallback.stdout });
+          if (pwshOutcome.success) {
+            traceEnd(trace, "success", { method: "pwsh_paste_fallback", attempt: attempt + 1, verified: pwshOutcome.verified });
+            scheduleSmartClipboardRestore(clipboardLease, text, "paste:clipboardRestore:pwsh_fallback", pwshOutcome.verified);
+            return { ok: true, reason: pwshOutcome.reason || "OK:pwsh-paste", method: "pwsh_paste_fallback", verified: pwshOutcome.verified };
+          }
+          lastReason = (fallback.stderr || pwshOutcome.reason || "pwsh-fallback-failed").trim();
         }
-        lastReason = (fallback.stderr || pwshOutcome.reason || "pwsh-fallback-failed").trim();
       }
     }
   } else if (process.platform === "linux") {
@@ -5617,7 +5624,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
         if (linuxOutcome.success) {
           methodOk = true;
           traceEnd(trace, "success", { method: a.method, attempt: attempt + 1, reason: `${a.method}_ok`, verified: linuxOutcome.verified });
-          scheduleSmartClipboardRestore(savedClipboard, text, `paste:clipboardRestore:${a.method}`, linuxOutcome.verified);
+          scheduleSmartClipboardRestore(clipboardLease, text, `paste:clipboardRestore:${a.method}`, linuxOutcome.verified);
           return { ok: true, reason: `OK:${a.method}`, method: a.method, verified: linuxOutcome.verified };
         }
         lastPasteErr = (res.stderr || res.stdout || `${a.method}-failed`).trim();
@@ -5737,7 +5744,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
       traceEnd(trace, "success", { method: "robust_paste", attempt: attempt + 1, reason: out, verified: macOutcome.verified, sent: !!macOutcome.sent });
       // Restore previous clipboard only when the paste was verified —
       // see scheduleSmartClipboardRestore's doc comment (§6.4/§6.6).
-      scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:robust_paste", macOutcome.verified);
+      scheduleSmartClipboardRestore(clipboardLease, text, "paste:clipboardRestore:robust_paste", macOutcome.verified);
       return { ok: true, reason: out, method: "robust_paste", verified: macOutcome.verified };
     }
     if (check.ok) {
@@ -5752,7 +5759,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
         lastReason = "ERR:no-accessibility";
         traceEnd(trace, "failed", { reason: lastReason, method: "robust_paste", attempt: attempt + 1 });
         logPasteTrace("failed", { reason: lastReason, method: "robust_paste", attempt: attempt + 1 });
-        keepTranscriptOnClipboardAfterFailure("paste:clipboardKeep:robust_paste");
+        keepTranscriptOnClipboardAfterFailure(clipboardLease, "paste:clipboardKeep:robust_paste");
         return { ok: false, reason: lastReason, method: "robust_paste", verified: false };
       } else {
         lastReason = out || "paste-return-unknown";
@@ -5773,7 +5780,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
   // to the consolidated failure path which restores the clipboard +
   // releases the snapshot symmetrically with the success branches.
   if (process.platform !== "darwin") {
-    keepTranscriptOnClipboardAfterFailure("paste:clipboardKeep:exhausted");
+    keepTranscriptOnClipboardAfterFailure(clipboardLease, "paste:clipboardKeep:exhausted");
     traceEnd(trace, "failed", { reason: lastReason || "paste-no-attempt", method: "exhausted" });
     logPasteTrace("failed", { reason: compactLogText(lastReason || "paste-no-attempt") });
     return {
@@ -5808,7 +5815,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
       // robust_paste's menu-paste-primary/robust-paste branches), so
       // verified is always false here — the restore gate correctly
       // leaves the transcript on the clipboard rather than restoring.
-      scheduleSmartClipboardRestore(savedClipboard, text, "paste:clipboardRestore:menu", menuOutcome.verified);
+      scheduleSmartClipboardRestore(clipboardLease, text, "paste:clipboardRestore:menu", menuOutcome.verified);
       traceEnd(trace, "success", { method: "menu-paste", reason: out, verified: menuOutcome.verified });
       return { ok: true, reason: out, method: "menu-paste", verified: menuOutcome.verified };
     }
@@ -5816,7 +5823,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
       lastReason = out;
       traceEnd(trace, "failed", { reason: lastReason, method: "menu-paste" });
       logPasteTrace("failed", { reason: lastReason, method: "menu-paste" });
-      keepTranscriptOnClipboardAfterFailure("paste:clipboardKeep:menu_paste");
+      keepTranscriptOnClipboardAfterFailure(clipboardLease, "paste:clipboardKeep:menu_paste");
       return { ok: false, reason: lastReason, method: "menu-paste", verified: false };
     }
     lastReason = out || lastReason;
@@ -5843,7 +5850,7 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
     reason: compactLogText(lastReason),
     finalMethod: "failed",
   });
-  keepTranscriptOnClipboardAfterFailure("paste:clipboardKeep:failed");
+  keepTranscriptOnClipboardAfterFailure(clipboardLease, "paste:clipboardKeep:failed");
   return { ok: false, reason: lastReason, method: "failed", verified: false };
 }
 
@@ -5960,12 +5967,13 @@ async function sendCommandEnterToFocusedApp(target = emptyCapturedPasteTarget())
 // invoke both before either flag has been observed, producing TWO
 // enqueuePostStopTask calls for the SAME recordingId — two
 // transcript polls, two clipboard writes, two AppleScript Cmd+V's.
-// Dedup at the enqueue gate is the simplest enterprise-correct fix:
-// recordingId is monotonic (++liveRecordingSeq in startLive), unique
-// per recording, and already on the task. We track up to 4096
-// recordingIds (~weeks of normal usage) and roll the oldest out.
-const _enqueuedRecordingIds = new Set();
-const _ENQUEUED_RECORDING_IDS_CAP = 4096;
+// Dedup at the enqueue gate is the simplest enterprise-correct fix. The
+// key is (renderer epoch, recordingId): recordingId is monotonic only
+// within one renderer page (++liveRecordingSeq in startLive restarts at
+// 1 on every load), so the epoch is what makes it unique (DM-32) — and
+// what lets these sets live without ever being cleared. We track up to
+// 4096 keys (~weeks of normal usage) and roll the oldest out.
+const _enqueuedRecordings = createBoundedKeySet(4096);
 function enqueuePostStopTask(options = {}) {
   const task = {
     autoTranscribe: !!options.autoTranscribe,
@@ -5973,28 +5981,35 @@ function enqueuePostStopTask(options = {}) {
     stopRequestedAt: Number(options.stopRequestedAt || Date.now()),
     recordingId: Number(options.recordingId || 0),
     target: normalizeCapturedPasteTarget(options.target),
+    // The renderer page this recording belongs to, and its mailbox.
+    epoch: rendererEpoch,
+    slot: recordingFinalSlot,
   };
   if (!task.autoTranscribe) return false;
-  // Dedup by recordingId. recordingId === 0 is the legacy fallback
-  // (renderer didn't supply one, very old build); skip dedup for
-  // those so the legacy path still works at least once. Modern
-  // renderers always send a positive monotonic id.
-  if (task.recordingId > 0) {
-    if (_enqueuedRecordingIds.has(task.recordingId)) {
-      appendMainLog(
-        `[post-stop-queue] dedup-skipped rec=${task.recordingId} ` +
-        `(already enqueued; preventing double-paste)`
-      );
-      return false;
+  // A task is matched to its transcript by recordingId alone — the IPC
+  // hand-off carries nothing else (DM-15). The renderer always reports
+  // its positive monotonic id for the recording being stopped; a task
+  // without one could only wait out the deadline for a signal that can
+  // never match it, so it is refused, and the session is closed here
+  // rather than leaving the capsule on "Transcribing".
+  if (!(task.recordingId > 0)) {
+    appendMainLog(`[post-stop-queue] refused: no recording id (rec=${task.recordingId})`);
+    if (!hasActivePostStopWork()) {
+      void setRecordingStatus("Saved To App", RECORDING_STATUS_KIND.OK)
+        .catch(() => { })
+        .finally(() => resetRecordingStatusState());
     }
-    _enqueuedRecordingIds.add(task.recordingId);
-    // Roll the oldest entry out when the cap is reached.
-    if (_enqueuedRecordingIds.size > _ENQUEUED_RECORDING_IDS_CAP) {
-      const iter = _enqueuedRecordingIds.values();
-      const oldest = iter.next().value;
-      if (oldest !== undefined) _enqueuedRecordingIds.delete(oldest);
-    }
+    return false;
   }
+  const key = recordingKey(task.epoch, task.recordingId);
+  if (_enqueuedRecordings.has(key)) {
+    appendMainLog(
+      `[post-stop-queue] dedup-skipped rec=${key} ` +
+      `(already enqueued; preventing double-paste)`
+    );
+    return false;
+  }
+  _enqueuedRecordings.add(key);
   postStopQueue.push(task);
   pendingTranscriptionCount += 1;
   appendMainLog(`[post-stop-queue] enqueue pending=${pendingTranscriptionCount} rec=${task.recordingId} ${pasteTargetSummary(task.target)}`);
@@ -6053,7 +6068,7 @@ async function runPostStopQueue() {
 
 // Second-line dedup: tracks recordingIds that have ACTUALLY been pasted.
 //
-// The two gates are not one guard written twice. `_enqueuedRecordingIds`
+// The two gates are not one guard written twice. `_enqueuedRecordings`
 // is an idempotency key at queue ADMISSION — it stops the duplicate work
 // (a transcript poll, a clipboard write) before it is done. This one sits
 // at the IRREVERSIBLE boundary: injecting keystrokes into another
@@ -6062,31 +6077,20 @@ async function runPostStopQueue() {
 // this gate should never fire; that is the point of putting it in front of
 // the one action a future third entry point could not undo.
 //
-// It does NOT cover the legacy `recordingId === 0` path, and an earlier
-// version of this comment claimed it did: an id of 0 is exempt from BOTH
-// gates by the same rule, because a renderer old enough not to send an id
-// cannot be deduplicated at all.
-const _pastedRecordingIds = new Set();
-const _PASTED_RECORDING_IDS_CAP = 4096;
-function _markRecordingPasted(recordingId) {
-  if (!recordingId || recordingId <= 0) return;
-  _pastedRecordingIds.add(recordingId);
-  if (_pastedRecordingIds.size > _PASTED_RECORDING_IDS_CAP) {
-    const oldest = _pastedRecordingIds.values().next().value;
-    if (oldest !== undefined) _pastedRecordingIds.delete(oldest);
-  }
-}
+// Both gates key on a positive recordingId; enqueuePostStopTask admits no
+// other (the hand-off protocol has nothing to match a task to without one).
+const _pastedRecordings = createBoundedKeySet(4096);
 
 async function processPostStopTask(task) {
   const trace = createTrace("post_stop", { autoTranscribe: !!task.autoTranscribe, queuePending: pendingTranscriptionCount });
   // SECOND-LINE DEDUP — the guard in front of the irreversible action. If
   // the same recordingId reaches this function through any path that
   // bypassed the admission gate, refuse to paste a recording that already
-  // produced one. (Not the `recordingId === 0` path: an id of 0 is exempt
-  // from both gates, because there is nothing to key on.)
-  if (task.recordingId > 0 && _pastedRecordingIds.has(task.recordingId)) {
+  // produced one. Same (epoch, recordingId) key as the admission gate.
+  const recordingKeyOfTask = recordingKey(task.epoch, task.recordingId);
+  if (_pastedRecordings.has(recordingKeyOfTask)) {
     appendMainLog(
-      `[post-stop-paste] dedup-skipped rec=${task.recordingId} ` +
+      `[post-stop-paste] dedup-skipped rec=${recordingKeyOfTask} ` +
       `(already pasted; second-line guard fired)`,
     );
     traceEnd(trace, "skipped", { reason: "already-pasted" });
@@ -6105,25 +6109,9 @@ async function processPostStopTask(task) {
   // add latency to healthy recordings; it only prevents legitimate
   // slow recovery from degrading into "Saved To App" with no paste.
   const POST_STOP_TRANSCRIPT_TIMEOUT_MS = PASTE_POST_STOP_DEADLINE_MS;
-  // BUGS_AUDIT §6.7. The renderer's IPC hand-off is the primary path;
-  // the executeJavaScript poll is what happens when it never speaks.
-  // A renderer that has the bridge sends its first signal within
-  // milliseconds of publishing any output, so this window is generous
-  // for the case it covers and short enough that an OLDER renderer —
-  // one built before the bridge existed, which will never call it —
-  // loses at most this much before the poll takes over.
-  const POST_STOP_IPC_GRACE_MS = 2000;
-  // Poll cadence once the fallback is in charge. 30 ms cost up to ~1000
-  // synchronous evaluations in the renderer at exactly the moment it
-  // finalizes Deepgram, runs the paste upscale and serializes audio
-  // (§6.7). At 250 ms the fallback costs ~120 over the whole deadline,
-  // and it only runs at all when nothing better is available.
-  const POST_STOP_POLL_INTERVAL_MS = 250;
   const deadline = Date.now() + POST_STOP_TRANSCRIPT_TIMEOUT_MS;
   let transcript = "";
-  let pollCount = 0;
   const stopRequestedAt = Number(task.stopRequestedAt || Date.now());
-  let recordingStatusPhase = "transcribing";
   let terminalWithoutPasteStatus = "";
   // BUGS_AUDIT §6.9: the best text seen for THIS recording that was not
   // paste-ready — a pre-upscale provisional, or a status-only signal
@@ -6133,294 +6121,70 @@ async function processPostStopTask(task) {
   // Sequence of the last hand-off signal already accounted for, so the
   // same signal cannot be handled twice by the loop below.
   let handledSignalSeq = 0;
-  let heardIpcSignal = false;
 
   // One reading of a hand-off signal, used wherever a signal is picked
   // up, so the primary path cannot drift from the late-arrival case.
   // Returns "final" | "terminal" | "provisional".
   const consumeIpcSignal = (signal) => {
     handledSignalSeq = signal.seq;
-    heardIpcSignal = true;
-    const text = normalizeTranscriptText(signal.text);
-    const elapsedMs = Date.now() - stopRequestedAt;
-    if (signal.final) {
-      // §6.8: finality is stated, never inferred. This is the only
-      // thing on the IPC path that may be pasted.
-      transcript = text;
-      traceStep(trace, "ipc_final", {
-        elapsedMs,
-        recordingId: signal.recordingId,
-        source: signal.source,
-        textLen: text.length,
-      });
-      if (isMeaningfulTranscriptText(text)) return "final";
-      // The renderer called this final, but it is a no-speech/error
-      // string rather than something to paste — same outcome the poll
-      // reaches through uiFinalTerminalWithoutPaste.
-      transcript = "";
-      terminalWithoutPasteStatus = isNoSpeechFinalStatusText(text)
-        ? "Recording completed, no speech detected."
-        : text;
-      return "terminal";
-    }
-    const meaningful = isMeaningfulTranscriptText(text);
-    traceStep(trace, "ipc_provisional", {
-      elapsedMs,
+    // §6.8: finality is stated, never inferred — and so is everything
+    // else. The renderer's ``final`` flag and its "<kind>:<phase>" source
+    // label decide; the text is never read for clues (DM-01: a dictation
+    // that starts with "HTTP " or mentions "silence detected" is still a
+    // dictation). ./transcript-signal owns the rule.
+    const verdict = classifyRecordingSignal(signal);
+    traceStep(trace, signal.final ? "ipc_final" : "ipc_signal", {
+      elapsedMs: Date.now() - stopRequestedAt,
       recordingId: signal.recordingId,
       source: signal.source,
-      textLen: text.length,
-      meaningful,
+      textLen: normalizeTranscriptText(signal.text).length,
+      outcome: verdict.outcome,
     });
-    if (meaningful) {
+    if (verdict.outcome === SIGNAL_OUTCOME.FINAL) {
+      // The only thing on the IPC path that may be pasted.
+      transcript = verdict.text;
+    } else if (verdict.outcome === SIGNAL_OUTCOME.PROVISIONAL) {
       // Best-known text only (§6.8/§6.9) — keep waiting for the final.
-      bestKnownText = text;
-      return "provisional";
+      bestKnownText = verdict.text;
+    } else {
+      // A publish with nothing to paste (no speech, error, auto-transcribe
+      // off): the recording is over and there will be no final.
+      transcript = "";
+      terminalWithoutPasteStatus = verdict.status;
     }
-    // A status-only publish with nothing to paste (no speech, error):
-    // the recording is over and there will be no final. Reporting it
-    // now is what the poll's terminal branches do today.
-    terminalWithoutPasteStatus = isNoSpeechFinalStatusText(text)
-      ? "Recording completed, no speech detected."
-      : text;
-    return "terminal";
+    return verdict.outcome;
   };
 
-  // How the transcript arrives, in one loop with two sources and a
-  // strict order of preference (BUGS_AUDIT §6.7):
+  // How the transcript arrives: the renderer's IPC hand-off, and only
+  // that (DM-15, S-13). An executeJavaScript poll of ~14 renderer
+  // globals and 6 DOM ids used to take over after 2 s of IPC silence,
+  // for "an older renderer built before the bridge existed" — which
+  // cannot occur, because main and renderer ship in one bundle. It was a
+  // second owner of the same decision with its own vocabulary (status
+  // literals "Done"/"Idle"/"upscaling") and it started exactly when the
+  // renderer is legitimately still finalising (envelope wait, recovery).
+  // Every renderer publish for a recording sends a signal; the slot
+  // keeps them, so one published before this task started is not lost.
+  // If the renderer never publishes, the deadline hands bestKnownText to
+  // the §6.9 recovery, as before.
   //
-  //   1. The renderer's IPC hand-off. Primary. Once ANYTHING has come
-  //      over the bridge we know the renderer speaks the protocol, so we
-  //      stay on it until the deadline: it WILL publish the paste-ready
-  //      text, and if it dies before doing so, the provisional already
-  //      in hand is the best-known text §6.9 recovers with. Zero
-  //      evaluations are injected into the renderer on this path.
-  //   2. The executeJavaScript poll. Fallback, entered only after the
-  //      bridge has stayed silent for the whole grace window — an older
-  //      renderer, built before the bridge existed, which will never
-  //      call it. recordingId <= 0 is the same case one step further
-  //      back (a renderer too old even to supply an id): there is no id
-  //      to match a signal against, so it starts polling immediately.
-  //
-  // A late first signal still wins: the loop re-reads the slot on every
-  // pass, so a renderer that speaks up after the poll started takes the
-  // poll back out of charge.
-  const ipcGraceUntil = Date.now() + POST_STOP_IPC_GRACE_MS;
-  let pollFallbackStarted = false;
   // Sleep that ends the moment the renderer publishes something newer
-  // than what has already been handled. Used for every wait below, so a
-  // signal is never sitting in the slot while this task sleeps on a
-  // timer. With a legacy recordingId there is nothing to match, and the
-  // slot degrades to exactly that plain timer.
+  // than what has already been handled, so a signal is never sitting in
+  // the slot while this task sleeps on a timer.
   const restUntilSignalOr = (ms) =>
-    recordingFinalSlot.waitForSignal(task.recordingId, {
+    task.slot.waitForSignal(task.recordingId, {
       sinceSeq: handledSignalSeq,
       timeoutMs: Math.max(1, ms),
     });
 
   while (Date.now() < deadline) {
-    // 1. The primary path: anything the renderer has handed over.
-    const known = recordingFinalSlot.peek(task.recordingId);
+    const known = task.slot.peek(task.recordingId);
     if (known?.last && known.last.seq > handledSignalSeq) {
       // "provisional" is not an answer — keep waiting for the final.
-      if (consumeIpcSignal(known.last) !== "provisional") break;
+      if (consumeIpcSignal(known.last) !== SIGNAL_OUTCOME.PROVISIONAL) break;
       continue;
     }
-
-    // 2. The fallback poll takes over only when the bridge has stayed
-    //    silent for the whole grace window. Once the renderer HAS used
-    //    it, the poll never starts: the renderer will publish the
-    //    paste-ready text, and until it does there is nothing the poll
-    //    could learn that §6.8 would let us paste anyway.
-    const pollInCharge =
-      !heardIpcSignal && (task.recordingId <= 0 || Date.now() >= ipcGraceUntil);
-    if (!pollInCharge) {
-      const waitUntil = heardIpcSignal ? deadline : Math.min(ipcGraceUntil, deadline);
-      await restUntilSignalOr(waitUntil - Date.now());
-      continue;
-    }
-    if (!pollFallbackStarted) {
-      pollFallbackStarted = true;
-      traceStep(trace, "poll_fallback", {
-        elapsedMs: Date.now() - stopRequestedAt,
-        recordingId: task.recordingId || 0,
-        reason: task.recordingId > 0 ? "no-ipc-signal-within-grace" : "legacy-recording-id",
-      });
-    }
-
-    // Everything below is the pre-§6.7 poll, minus the two wall-clock
-    // guesses §6.8 removed: status-only text is best-known text, never
-    // a final.
-    pollCount += 1;
-    if (!win || win.isDestroyed() || !win.webContents) {
-      traceStep(trace, "poll_window_lost", { pollCount });
-      await restUntilSignalOr(70);
-      continue;
-    }
-    const state = await queryRendererState();
-    if (!state) {
-      traceStep(trace, "poll_js_error", { pollCount });
-      await restUntilSignalOr(70);
-      continue;
-    }
-    const statusLower = String(state.status || "").trim().toLowerCase();
-    if (!state.isRec) {
-      if (statusLower === "upscaling" && recordingStatusPhase !== "upscaling") {
-        await setRecordingStatus("Upscaling", RECORDING_STATUS_KIND.UPSCALING);
-        recordingStatusPhase = "upscaling";
-      } else if ((statusLower === "processing" || statusLower === "transcribing") && recordingStatusPhase !== "transcribing") {
-        await setRecordingStatus("Transcribing", RECORDING_STATUS_KIND.TRANSCRIBING);
-        recordingStatusPhase = "transcribing";
-      }
-    }
-    const finishedRecords = Array.isArray(state.finishedRecords) ? state.finishedRecords : [];
-    const byRecording = task.recordingId > 0
-      ? finishedRecords.find((x) => Number(x?.recordingId || 0) === task.recordingId)
-      : null;
-    const byTime = task.recordingId <= 0
-      ? [...finishedRecords]
-        .filter((x) => Number(x?.finishedAt || 0) > stopRequestedAt)
-        .sort((a, b) => Number(b?.finishedAt || 0) - Number(a?.finishedAt || 0))[0]
-      : null;
-    const uiFinalKind = String(state.uiFinalKind || "").trim().toLowerCase();
-    const uiFinalText = normalizeTranscriptText(state.uiFinalText || "");
-    const uiFinalBelongsToTask =
-      task.recordingId > 0
-        ? Number(state.uiFinalRecordingId || 0) === task.recordingId
-        : Number(state.uiFinalAt || 0) > stopRequestedAt;
-    const uiFinalStatusHasTranscript =
-      uiFinalKind === "status" &&
-      uiFinalBelongsToTask &&
-      isMeaningfulTranscriptText(uiFinalText);
-    const uiFinalTerminalWithoutPaste =
-      uiFinalBelongsToTask &&
-      (uiFinalKind === "status" || uiFinalKind === "error") &&
-      !!uiFinalText &&
-      !uiFinalStatusHasTranscript;
-    const uiFinalReadyByRecording =
-      uiFinalKind === "transcript" &&
-      isMeaningfulTranscriptText(uiFinalText) &&
-      task.recordingId > 0 &&
-      Number(state.uiFinalRecordingId || 0) === task.recordingId;
-    const uiFinalReadyByTime =
-      uiFinalKind === "transcript" &&
-      isMeaningfulTranscriptText(uiFinalText) &&
-      task.recordingId <= 0 &&
-      Number(state.uiFinalAt || 0) > stopRequestedAt;
-    const readyByRecording = !!byRecording || (task.recordingId > 0 && Number(state.finishedRecordingId || 0) === task.recordingId);
-    const readyByTime = !!byTime || (task.recordingId <= 0 && state.finishedAt > stopRequestedAt);
-    if (readyByRecording || readyByTime || uiFinalReadyByRecording || uiFinalReadyByTime) {
-      transcript = normalizeTranscriptText(
-        byRecording?.text || byTime?.text || state.finishedText || uiFinalText || ""
-      );
-      if (!isMeaningfulTranscriptText(transcript)) {
-        const terminalReason = isNoSpeechFinalStatusText(transcript)
-          ? "no-speech-ready-signal"
-          : !transcript && (byRecording || byTime || Number(state.finishedRecordingId || 0) === task.recordingId)
-            ? "empty-finished-record"
-            : uiFinalTerminalWithoutPaste
-              ? "ui-final-status"
-              : "";
-        if (terminalReason) {
-          terminalWithoutPasteStatus = isNoSpeechFinalStatusText(transcript) || terminalReason === "empty-finished-record"
-            ? "Recording completed, no speech detected."
-            : uiFinalText;
-          traceStep(trace, "signal_ready_terminal_without_paste", {
-            pollCount,
-            expectedRecordingId: task.recordingId || 0,
-            finishedRecordingId: Number(byRecording?.recordingId || state.finishedRecordingId || state.uiFinalRecordingId || 0),
-            reason: terminalReason,
-            textLen: transcript.length,
-            preview: compactLogText(transcript || uiFinalText, 80),
-          });
-          break;
-        }
-        traceStep(trace, "signal_ready_ignored_non_transcript", {
-          pollCount,
-          textLen: transcript.length,
-          preview: compactLogText(transcript, 80),
-        });
-        transcript = "";
-        await restUntilSignalOr(POST_STOP_POLL_INTERVAL_MS);
-        continue;
-      }
-      traceStep(trace, "signal_ready", {
-        pollCount,
-        finishedAt: Number(byRecording?.finishedAt || byTime?.finishedAt || state.finishedAt || 0),
-        finishedRecordingId: Number(byRecording?.recordingId || state.finishedRecordingId || state.uiFinalRecordingId || 0),
-        expectedRecordingId: task.recordingId || 0,
-        delay: Number(byRecording?.finishedAt || byTime?.finishedAt || state.finishedAt || state.uiFinalAt || 0) - stopRequestedAt,
-        source: byRecording ? "finished_record" : byTime ? "finished_record_by_time" : state.finishedText ? "finished_text" : "ui_final",
-        textLen: transcript.length,
-      });
-      break;
-    }
-    if (uiFinalStatusHasTranscript) {
-      // BUGS_AUDIT §6.8. This is the status-only publish: the renderer
-      // has text, but the paste-ready version (post-upscale) does not
-      // exist yet. It used to become the pasted transcript after 3500 ms
-      // of waiting, which made one recording produce two possible
-      // results depending on how long the upscale took. A wall clock
-      // cannot know whether text is final — only the renderer can, and
-      // it says so on the signal it publishes next. Until then this is
-      // best-known text: never pasted, but what §6.9 recovers with if
-      // the deadline expires.
-      bestKnownText = uiFinalText;
-    }
-    if (uiFinalTerminalWithoutPaste) {
-      terminalWithoutPasteStatus = isNoSpeechFinalStatusText(uiFinalText)
-        ? "Recording completed, no speech detected."
-        : uiFinalText;
-      traceStep(trace, "terminal_without_paste", {
-        pollCount,
-        expectedRecordingId: task.recordingId || 0,
-        uiFinalRecordingId: Number(state.uiFinalRecordingId || 0),
-        uiFinalKind,
-        status: compactLogText(state.status || "", 80),
-        statusKind: compactLogText(state.statusKind || "", 40),
-        reason: isNoSpeechFinalStatusText(uiFinalText) ? "no-speech" : "ui-final-status",
-      });
-      break;
-    }
-    const doneLike = !state.busy && !state.progressVisible && !state.isRec &&
-      (
-        state.status === "Done" ||
-        state.status === "Error" ||
-        state.status === "Idle" ||
-        state.statusKind === "done" ||
-        state.statusKind === "error" ||
-        state.statusKind === "idle"
-      );
-    if (doneLike && state.status === "Done" && uiFinalStatusHasTranscript) {
-      // Status "Done" with transcript text but no paste-ready signal
-      // yet. §6.8's second wall-clock guess lived here — 600 ms and the
-      // pre-upscale text was pasted. Keep waiting instead: the renderer
-      // publishes the paste-ready text within its own upscale SLA, and
-      // if it never does, the deadline hands bestKnownText to §6.9.
-      traceStep(trace, "done_waiting_for_paste_ready", {
-        pollCount,
-        expectedRecordingId: task.recordingId || 0,
-        uiFinalRecordingId: Number(state.uiFinalRecordingId || 0),
-        textLen: uiFinalText.length,
-      });
-      await restUntilSignalOr(POST_STOP_POLL_INTERVAL_MS);
-      continue;
-    }
-    if (doneLike) {
-      terminalWithoutPasteStatus = isNoSpeechFinalStatusText(uiFinalText)
-        ? "Recording completed, no speech detected."
-        : "";
-      traceStep(trace, "terminal_done_without_transcript", {
-        pollCount,
-        expectedRecordingId: task.recordingId || 0,
-        uiFinalRecordingId: Number(state.uiFinalRecordingId || 0),
-        uiFinalKind,
-        status: compactLogText(state.status || "", 80),
-        statusKind: compactLogText(state.statusKind || "", 40),
-        reason: terminalWithoutPasteStatus ? "no-speech" : "done-no-transcript",
-      });
-      break;
-    }
-    await restUntilSignalOr(POST_STOP_POLL_INTERVAL_MS);
+    await restUntilSignalOr(deadline - Date.now());
   }
 
   let recordingStatusText = "Saved To App";
@@ -6431,13 +6195,12 @@ async function processPostStopTask(task) {
     traceStep(trace, "transcript_ready", {
       len: transcript.length,
       digest: textDigest(transcript),
-      preview: compactLogText(transcript, 140),
     });
     lastTranscriptText = transcript;
     saveLastTranscriptToDisk(transcript);
-    try {
-      clipboard.writeText(transcript);
-    } catch { }
+    // No clipboard write here: runPasteLadder snapshots the user's
+    // clipboard and then writes the transcript, and leaves it there on
+    // every failure (DM-02).
 
     // Paste destination is current-focus-first — see
     // ``resolvePasteDestination``. The start target is only consulted
@@ -6487,12 +6250,11 @@ async function processPostStopTask(task) {
       // that bypass the enqueue dedup) is rejected by the second-line
       // guard at the top of processPostStopTask.
       //
-      // There is exactly ONE paste site in this function, reached by
-      // both hand-off paths — the IPC final and the poll fallback only
-      // differ in how ``transcript`` was filled. So paste-last and the
-      // double-paste guard cannot end up covering one path and not the
-      // other: adding a path can only mean filling in ``transcript``.
-      _markRecordingPasted(task.recordingId);
+      // There is exactly ONE paste site in this function, and the IPC
+      // hand-off is the only thing that fills ``transcript``. So
+      // paste-last and the double-paste guard cannot end up covering one
+      // path and not another.
+      _pastedRecordings.add(recordingKeyOfTask);
       // Show success immediately once the paste actually happened.
       await setRecordingStatus("Pasted", RECORDING_STATUS_KIND.OK);
     }
@@ -6541,7 +6303,7 @@ async function processPostStopTask(task) {
       recordingStatusText = terminalWithoutPasteStatus;
       recordingStatusKind = RECORDING_STATUS_KIND.OK;
     } else {
-      // BUGS_AUDIT §6.9: the poll deadline expired with no ready signal
+      // BUGS_AUDIT §6.9: the deadline expired with no ready signal
       // at all — previously this branch did nothing (no clipboard write,
       // no last_transcript.json, no status naming a way out), so a slow
       // recovery that finished moments later was invisible: the user's
@@ -6550,7 +6312,7 @@ async function processPostStopTask(task) {
       // would help. Recover whatever text the renderer or disk already
       // has through the same lookup the paste-last hotkey itself uses
       // (getLatestTranscriptText), so a transcript that exists is never
-      // silently dropped just because this poll gave up on it.
+      // silently dropped just because this task gave up on it.
       //
       // bestKnownText is the stronger half of that recovery: the
       // pre-upscale text this recording actually produced, which §6.8
@@ -6569,7 +6331,7 @@ async function processPostStopTask(task) {
   if (!isRecNow) {
     await setRecordingStatus(recordingStatusText, recordingStatusKind);
   }
-  traceEnd(trace, "done", { transcriptFound: !!transcript, pollCount });
+  traceEnd(trace, "done", { transcriptFound: !!transcript });
   return {
     dwellMs: isRecNow ? 0 : RECORDING_STATUS_TERMINAL_DWELL_MS,
   };
@@ -6581,8 +6343,8 @@ async function processPostStopTask(task) {
  * ui-final transcript, nothing terminal to report.
  *
  * ``bestKnownText`` is what THIS recording produced but never declared
- * paste-ready: a ``final:false`` IPC provisional, or the status-only
- * text the poll saw. §6.8 forbids pasting it — the renderer never said
+ * paste-ready: a ``final:false`` IPC provisional (the pre-upscale text).
+ * §6.8 forbids pasting it — the renderer never said
  * it was final — but it is the most specific thing that exists for this
  * recording, so it is preferred over the general lookup below, which
  * can only offer whatever transcript happens to be newest (and on a
@@ -6606,10 +6368,10 @@ async function processPostStopTask(task) {
  */
 async function handlePostStopTranscriptTimeout(trace, bestKnownText = "") {
   const best = normalizeTranscriptText(bestKnownText);
-  const fromBestKnown = isMeaningfulTranscriptText(best);
+  const fromBestKnown = isPasteableTranscript(best);
   const recovered = fromBestKnown ? best : await getLatestTranscriptText();
-  const pasteAccel = lastShortcutStatus?.paste?.active || lastShortcutStatus?.paste?.desired || "";
-  if (isMeaningfulTranscriptText(recovered)) {
+  const pasteAccel = pasteLastAccelerator();
+  if (isPasteableTranscript(recovered)) {
     // getLatestTranscriptText already persists what it returns; the
     // best-known path has to do it here so the paste-last hotkey (and
     // the next launch) find the same text this status points at.
@@ -6641,14 +6403,14 @@ async function handlePostStopTranscriptTimeout(trace, bestKnownText = "") {
 async function getLatestTranscriptText() {
   const s = await queryRendererState();
   const finished = normalizeTranscriptText(s?.finishedText || "");
-  if (isMeaningfulTranscriptText(finished)) {
+  if (isPasteableTranscript(finished)) {
     lastTranscriptText = finished;
     saveLastTranscriptToDisk(finished);
     return finished;
   }
   const uiFinalKind = String(s?.uiFinalKind || "").trim().toLowerCase();
   const uiFinalText = normalizeTranscriptText(s?.uiFinalText || "");
-  if (uiFinalKind === "transcript" && isMeaningfulTranscriptText(uiFinalText)) {
+  if (uiFinalKind === "transcript" && isPasteableTranscript(uiFinalText)) {
     lastTranscriptText = uiFinalText;
     saveLastTranscriptToDisk(uiFinalText);
     return uiFinalText;
@@ -6691,11 +6453,9 @@ async function pasteLatestTranscriptFromShortcut() {
     traceStep(trace, "text_ready", {
       len: text.length,
       digest: textDigest(text),
-      preview: compactLogText(text, 140),
     });
-    try {
-      clipboard.writeText(text);
-    } catch { }
+    // The clipboard is written by runPasteLadder, after it snapshots what
+    // the user had (DM-02).
 
     // The target was just read from the frontmost app, so it already
     // owns focus — re-activating it would only cost a round trip.
@@ -6704,7 +6464,7 @@ async function pasteLatestTranscriptFromShortcut() {
       // This paste is happening WHILE the hotkey chord is held — see
       // awaitModifierRelease.
       trigger: "hotkey",
-      accelerator: lastShortcutStatus?.paste?.active || lastShortcutStatus?.paste?.desired || "",
+      accelerator: pasteLastAccelerator(),
     });
     traceStep(trace, "paste_result", {
       ok: !!pasted.ok,
@@ -6912,7 +6672,7 @@ function getEngineSiteDir() {
   // OUTSIDE the signed .app: torch must never live inside the bundle
   // (writes break the code signature; updates would wipe it). The
   // backend imports the engine through PYTHONPATH instead.
-  return path.join(app.getPath("userData"), "engine-site");
+  return path.join(dataDir(), "engine-site");
 }
 
 // Written into a staging tree only AFTER pip + reconciliation succeed
@@ -7004,7 +6764,7 @@ async function pickBackendPort(host, preferred = DEFAULT_BACKEND_PORT) {
 
 // ── App-scoped venv (persists across app updates) ──
 function getAppVenvDir() {
-  return path.join(app.getPath("userData"), ".venv");
+  return path.join(dataDir(), ".venv");
 }
 
 /**
@@ -7020,8 +6780,8 @@ function getAppVenvDir() {
  * Only deletes if:
  *   1. We successfully booted with the bundled runtime this session
  *      (caller guarantees this via call site in resolvePython).
- *   2. The path really is ``userData/.venv`` — not some other `.venv`
- *      the user symlinked in via TRANSCRIPTOR_DATA_DIR shenanigans.
+ *   2. The path really is ``<dataDir>/.venv`` — not some other `.venv`
+ *      reached through a symlink or a misconfigured directory.
  *   3. We haven't already cleaned it in a prior session
  *      (idempotency marker).
  *
@@ -7030,7 +6790,7 @@ function getAppVenvDir() {
  */
 function _cleanupOrphanedLegacyVenv() {
   try {
-    const userData = path.resolve(app.getPath("userData"));
+    const userData = path.resolve(dataDir());
     const marker = path.join(userData, ".legacy-venv-cleaned");
     if (fs.existsSync(marker)) return;
     const venvDir = getAppVenvDir();
@@ -7486,6 +7246,9 @@ async function isEngineInstallNetworkAvailable() {
 // across window reloads", frontend/src/main.tsx syncEngineInstallState).
 // A channel with a sender and no receiver is not a contract; it is work
 // and a name that suggests a surface which does not exist.
+/** Ceiling for the multi-GB engine pip install (a quit kills it sooner). */
+const ENGINE_PIP_INSTALL_TIMEOUT_MS = 30 * 60 * 1000;
+
 const engineInstall = {
   phase: engineDeps.ENGINE_INSTALL_PHASES.IDLE,
   reason: "",
@@ -7546,119 +7309,130 @@ async function installGigaamEngine(python, repoRoot) {
   if (!fs.existsSync(req)) {
     return { ok: false, status: "disabled", reason: "requirements-gigaam.txt missing" };
   }
+  // Single flight, claimed on THIS synchronous turn — before the first
+  // await (DM-06). The flag used to be set only after the up-to-60 s
+  // import probe, so two invokes inside that window (double click, two
+  // windows, a StrictMode double effect) both passed the check above and
+  // ran two multi-GB pip installs into the same staging directory.
+  const run = runGigaamEngineInstall(python, repoRoot, req);
+  engineInstall.inFlight = run;
+  try {
+    return await run;
+  } finally {
+    if (engineInstall.inFlight === run) engineInstall.inFlight = null;
+  }
+}
 
+async function runGigaamEngineInstall(python, repoRoot, req) {
   setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.PROBING);
 
   if (await probeGigaamImportable(python, repoRoot)
     && fs.existsSync(path.join(getEngineSiteDir(), ENGINE_INSTALL_MARKER))) {
     setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.DONE, { reason: "already installed" });
-      return { ok: true, status: "already-installed", ...engineInstallSnapshot() };
+    return { ok: true, status: "already-installed", ...engineInstallSnapshot() };
   }
 
-  engineInstall.inFlight = (async () => {
-    setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.INSTALLING);
-      appendMainLog("[engine-install] started (user request)");
+  setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.INSTALLING);
+  appendMainLog("[engine-install] started (user request)");
 
+  try {
+    // Network gate first: ~2.5 s worst case offline, versus minutes of
+    // pip retries for a result we can predict (see BUG-39).
+    if (!(await isEngineInstallNetworkAvailable())) {
+      throw Object.assign(new Error("offline"), { userReason: "no network access" });
+    }
+    // Disk gate (BUG-33): constants are the SSOT values from engine-deps.
     try {
-      // Network gate first: ~2.5 s worst case offline, versus minutes of
-      // pip retries for a result we can predict (see BUG-39).
-      if (!(await isEngineInstallNetworkAvailable())) {
-        throw Object.assign(new Error("offline"), { userReason: "no network access" });
-      }
-      // Disk gate (BUG-33): constants are the SSOT values from engine-deps.
-      try {
-        const st = fs.statfsSync(path.dirname(getEngineSiteDir()));
-        const freeBytes = BigInt(st.bavail) * BigInt(st.bsize);
-        if (freeBytes < BigInt(engineDeps.ENGINE_MIN_FREE_BYTES)) {
-          const gb = Math.floor(Number(freeBytes / (1024 * 1024 * 1024)));
-          // ONE formatting of the requirement. The message the user sees
-          // used to carry a hardcoded "8 GB" while the log line derived
-          // its number from the constant, so changing the constant would
-          // have changed the log and left the user reading the old figure.
-          const neededGb = engineDeps.ENGINE_MIN_FREE_BYTES / (1024 ** 3);
-          throw Object.assign(
-            new Error(`only ${gb} GB free, need ${neededGb} GB`),
-            { userReason: `insufficient disk space (${gb} GB free, ${neededGb} GB needed)` },
-          );
-        }
-      } catch (e) {
-        if (e.userReason) throw e;
-        appendMainLog(`[engine-install] free-space check failed (${e?.message || e}); proceeding`);
-      }
-
-      // Staging + swap (BUG-36): --target upgrades never remove replaced
-      // files; a fresh staging dir swapped in with two renames is the
-      // canonical pip pattern.
-      const engineSite = getEngineSiteDir();
-      const staging = `${engineSite}.staging`;
-      fs.rmSync(staging, { recursive: true, force: true });
-      fs.mkdirSync(staging, { recursive: true });
-      let res;
-      try {
-        res = await runCommand(python, ["-m", "pip", "install", "--target", staging, "-r", req], {
-          cwd: repoRoot, timeoutMs: 1800000, env: buildPythonEnv(python),
-        });
-      } catch (e) {
-        res = { ok: false, stderr: e?.message || String(e), stdout: "" };
-      }
-      if (!res || !res.ok) {
-        // BUG-32 class: real diagnostics come from stderr, not a phantom field.
-        throw new Error(`pip failed: ${(res?.stderr || res?.stdout || "").slice(0, 400)}`);
-      }
-
-      // BUG-46 invariant: engine-site may only ADD names. Overlap with
-      // the release-pinned bundle is pruned when provably safe and ABORTS
-      // the install when not.
-      const reconcile = await reconcileEngineSiteWithBundle(staging, python, repoRoot, "install");
-      if (!reconcile.ok) {
-        throw new Error(
-          "dependency overlap cannot be resolved safely: "
-          + reconcile.conflicts.map((c) => `${c.name} needs ${c.required}, bundle ships ${c.have}`).join("; "),
+      const st = fs.statfsSync(path.dirname(getEngineSiteDir()));
+      const freeBytes = BigInt(st.bavail) * BigInt(st.bsize);
+      if (freeBytes < BigInt(engineDeps.ENGINE_MIN_FREE_BYTES)) {
+        const gb = Math.floor(Number(freeBytes / (1024 * 1024 * 1024)));
+        // ONE formatting of the requirement. The message the user sees
+        // used to carry a hardcoded "8 GB" while the log line derived
+        // its number from the constant, so changing the constant would
+        // have changed the log and left the user reading the old figure.
+        const neededGb = engineDeps.ENGINE_MIN_FREE_BYTES / (1024 ** 3);
+        throw Object.assign(
+          new Error(`only ${gb} GB free, need ${neededGb} GB`),
+          { userReason: `insufficient disk space (${gb} GB free, ${neededGb} GB needed)` },
         );
       }
-
-      // Completion marker (BUG-76): written INTO staging so a tree is
-      // only ever considered "installed" once it is fully assembled and
-      // reconciled. A half-installed site (crash mid-pip) whose `gigaam`
-      // happens to import would otherwise pass the probe and defer its
-      // breakage to model-load time with no installer re-trigger.
-      fs.writeFileSync(path.join(staging, ENGINE_INSTALL_MARKER), new Date().toISOString());
-
-      const retired = `${engineSite}.old-${Date.now()}`;
-      if (fs.existsSync(engineSite)) fs.renameSync(engineSite, retired);
-      fs.renameSync(staging, engineSite);
-      // Retired-tree cleanup is best-effort (BUG-60): on Windows AV and
-      // indexers routinely hold handles on a just-renamed ~7 GB tree, and
-      // an rmSync failure here must NOT report the install as FAILED —
-      // the new engine is already live. Orphans are swept at next boot.
-      try {
-        fs.rmSync(retired, { recursive: true, force: true });
-      } catch (cleanupErr) {
-        appendMainLog(`[engine-install] retired-tree cleanup deferred to next boot: ${cleanupErr?.message || cleanupErr}`);
-      }
-
-      setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.DONE);
-      appendMainLog("[engine-install] ok (engine-site swapped)");
-
-      // Activate NOW: killing the backend makes the exit handler respawn
-      // it with the refreshed PYTHONPATH — no app relaunch needed.
-      if (backend && !isQuitting) {
-        appendMainLog("[engine-install] restarting backend to activate engine");
-        killBackendHard("gigaam-engine-installed");
-      }
     } catch (e) {
-      setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.FAILED, {
-        reason: e.userReason || "",
-        error: e?.message || String(e),
-      });
-      appendMainLog(`[engine-install] FAILED: ${e.userReason ? `${e.userReason} — ` : ""}${e?.message || e}`);
-      try { fs.rmSync(`${getEngineSiteDir()}.staging`, { recursive: true, force: true }); } catch { /* best effort */ }
-    } finally {
-      engineInstall.inFlight = null;
-        }
-  })();
+      if (e.userReason) throw e;
+      appendMainLog(`[engine-install] free-space check failed (${e?.message || e}); proceeding`);
+    }
 
-  return engineInstall.inFlight.then(() => ({ ok: engineInstall.phase === engineDeps.ENGINE_INSTALL_PHASES.DONE, ...engineInstallSnapshot() }));
+    // Staging + swap (BUG-36): --target upgrades never remove replaced
+    // files; a fresh staging dir swapped in with two renames is the
+    // canonical pip pattern.
+    const engineSite = getEngineSiteDir();
+    const staging = `${engineSite}.staging`;
+    fs.rmSync(staging, { recursive: true, force: true });
+    fs.mkdirSync(staging, { recursive: true });
+    let res;
+    try {
+      res = await runCommand(python, ["-m", "pip", "install", "--target", staging, "-r", req], {
+        cwd: repoRoot, timeoutMs: ENGINE_PIP_INSTALL_TIMEOUT_MS, env: buildPythonEnv(python),
+      });
+    } catch (e) {
+      res = { ok: false, stderr: e?.message || String(e), stdout: "" };
+    }
+    if (!res || !res.ok) {
+      // BUG-32 class: real diagnostics come from stderr, not a phantom field.
+      throw new Error(`pip failed: ${(res?.stderr || res?.stdout || "").slice(0, 400)}`);
+    }
+
+    // BUG-46 invariant: engine-site may only ADD names. Overlap with
+    // the release-pinned bundle is pruned when provably safe and ABORTS
+    // the install when not.
+    const reconcile = await reconcileEngineSiteWithBundle(staging, python, repoRoot, "install");
+    if (!reconcile.ok) {
+      throw new Error(
+        "dependency overlap cannot be resolved safely: "
+        + reconcile.conflicts.map((c) => `${c.name} needs ${c.required}, bundle ships ${c.have}`).join("; "),
+      );
+    }
+
+    // Completion marker (BUG-76): written INTO staging so a tree is
+    // only ever considered "installed" once it is fully assembled and
+    // reconciled. A half-installed site (crash mid-pip) whose `gigaam`
+    // happens to import would otherwise pass the probe and defer its
+    // breakage to model-load time with no installer re-trigger.
+    fs.writeFileSync(path.join(staging, ENGINE_INSTALL_MARKER), new Date().toISOString());
+
+    const retired = `${engineSite}.old-${Date.now()}`;
+    if (fs.existsSync(engineSite)) fs.renameSync(engineSite, retired);
+    fs.renameSync(staging, engineSite);
+    // Retired-tree cleanup is best-effort (BUG-60): on Windows AV and
+    // indexers routinely hold handles on a just-renamed ~7 GB tree, and
+    // an rmSync failure here must NOT report the install as FAILED —
+    // the new engine is already live. Orphans are swept at next boot.
+    try {
+      fs.rmSync(retired, { recursive: true, force: true });
+    } catch (cleanupErr) {
+      appendMainLog(`[engine-install] retired-tree cleanup deferred to next boot: ${cleanupErr?.message || cleanupErr}`);
+    }
+
+    setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.DONE);
+    appendMainLog("[engine-install] ok (engine-site swapped)");
+
+    // Activate NOW: killing the backend releases its handle, and the exit
+    // handler restarts any backend that exits while the app is not
+    // quitting — whatever its exit code (./backend-exit, DM-09) — so the
+    // respawn picks up the refreshed PYTHONPATH without an app relaunch.
+    if (backend && !isQuitting) {
+      appendMainLog("[engine-install] restarting backend to activate engine");
+      killBackendHard("gigaam-engine-installed");
+    }
+  } catch (e) {
+    setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.FAILED, {
+      reason: e.userReason || "",
+      error: e?.message || String(e),
+    });
+    appendMainLog(`[engine-install] FAILED: ${e.userReason ? `${e.userReason} — ` : ""}${e?.message || e}`);
+    try { fs.rmSync(`${getEngineSiteDir()}.staging`, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+  return { ok: engineInstall.phase === engineDeps.ENGINE_INSTALL_PHASES.DONE, ...engineInstallSnapshot() };
 }
 
 /**
@@ -7995,7 +7769,7 @@ async function startBackend() {
   const envPath = ffmpegDir
     ? `${ffmpegDir}${path.delimiter}${process.env.PATH || ""}`
     : (process.env.PATH || "");
-  const pythonCacheDir = path.join(app.getPath("userData"), "python-cache");
+  const pythonCacheDir = path.join(dataDir(), "python-cache");
   try {
     fs.mkdirSync(pythonCacheDir, { recursive: true });
   } catch (e) {
@@ -8025,28 +7799,32 @@ async function startBackend() {
     // signed Resources envelope.
     PYTHONDONTWRITEBYTECODE: "1",
     PYTHONPYCACHEPREFIX: pythonCacheDir,
-    TRANSCRIPTOR_DATA_DIR: process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData"),
+    TRANSCRIPTOR_DATA_DIR: dataDir(),
     TRANSCRIPTOR_BOOT_NONCE: BACKEND_BOOT_NONCE,
     TRANSCRIPTOR_PARENT_WATCHDOG: "1",
   });
-  backend = spawn(python, args, {
+  // Every handler below closes over THIS child, never the mutable
+  // ``backend``: a late event from a previous child must not act on its
+  // replacement (DM-27).
+  const child = spawn(python, args, {
     cwd: repoRoot,
     stdio: ["pipe", "pipe", "pipe"],
     env: childEnv,
   });
+  backend = child;
   // Ignore any stdin errors — the pipe is only used for EOF-on-parent-
   // exit detection. If the write end gets EPIPE for some reason (backend
   // crashed, fd was closed), Node would otherwise emit an unhandled
   // 'error' event and crash the main process.
-  if (backend.stdin) {
-    backend.stdin.on("error", () => { /* intentional no-op */ });
+  if (child.stdin) {
+    child.stdin.on("error", () => { /* intentional no-op */ });
   }
 
-  backend.stdout.on("data", (d) => {
+  child.stdout.on("data", (d) => {
     const msg = d.toString();
     appendMainLog(`[backend-stdout] ${compactLogText(msg, 1400)}`);
   });
-  backend.stderr.on("data", (d) => {
+  child.stderr.on("data", (d) => {
     const msg = d.toString();
     appendMainLog(`[backend-stderr] ${compactLogText(msg, 1400)}`);
     // Keep the last ~4 KB of stderr so the fallback error page can
@@ -8055,18 +7833,21 @@ async function startBackend() {
     backendStderrTail = (backendStderrTail + msg).slice(-BACKEND_STDERR_TAIL_MAX);
   });
 
-  backend.on("exit", (code, signal) => {
-    appendMainLog(`[backend-exit] code=${code} signal=${signal || ""}`);
-    backend = null;
-    // Restart on either:
-    //   (a) non-zero exit (Python crash, sys.exit(1), broken venv, ...)
-    //   (b) signal exit (segfault, oom-kill, manual SIGKILL outside our
-    //       quit path) — code is null in that case so the old check
-    //       ``Number(code || 0) !== 0`` was 0 !== 0 → false → silently
-    //       skipped restart. A backend killed by SIGSEGV would not
-    //       come back without a manual app relaunch.
-    const abnormalExit = Number(code || 0) !== 0 || (signal != null && signal !== "");
-    if (!isQuitting && abnormalExit) {
+  child.on("exit", (code, signal) => {
+    // ./backend-exit decides (DM-09, DM-27): while the app is not
+    // quitting, ANY exit of the live backend — a crash, a signal, or a
+    // code-0 exit nobody asked for — is unexpected and it comes back; an
+    // exit of a child that has already been replaced changes nothing.
+    // Planned restarts (the engine install's activation) are the same
+    // event: the handle was released by killBackendHard, not quitting.
+    const handle = backendHandleOf(backend, child);
+    const decision = decideBackendExit({ code, signal, isQuitting, handle });
+    appendMainLog(
+      `[backend-exit] code=${code} signal=${signal || ""} handle=${handle} ` +
+      `abnormal=${decision.abnormal ? 1 : 0} restart=${decision.restart ? 1 : 0}`,
+    );
+    if (decision.forgetHandle) backend = null;
+    if (decision.restart) {
       if (backendRestartTimer) {
         clearTimeout(backendRestartTimer);
         backendRestartTimer = null;
@@ -8078,14 +7859,14 @@ async function startBackend() {
       // can't escape) would otherwise restart every 5s forever, growing
       // the log file unboundedly and masking the real failure. The user
       // sees a permanent backend error in the renderer instead.
-      if (attempt > 8) {
-        backendBootError = `Backend exited with code ${code} after ${attempt - 1} restart attempts — giving up.`;
+      if (attempt > BACKEND_RESTART_MAX_ATTEMPTS) {
+        backendBootError = `Backend exited (code ${code}, signal ${signal || "none"}) after ${attempt - 1} restart attempts — giving up.`;
         setBackendBootStatus("");
         appendMainLog(`[backend-restart-giving-up] ${backendBootError}`);
         broadcastBackendBootError();
         return;
       }
-      const delay = Math.min(800 * attempt, 5000);
+      const delay = Math.min(BACKEND_RESTART_BACKOFF_STEP_MS * attempt, BACKEND_RESTART_BACKOFF_MAX_MS);
       appendMainLog(`[backend-restart-scheduled] attempt=${attempt} delayMs=${delay}`);
       backendRestartTimer = setTimeout(() => {
         // 1.1.25 fix: previously nulled ``backendRestartTimer`` BEFORE
@@ -8124,20 +7905,19 @@ async function startBackend() {
           .catch((e) => appendMainLog(`[backend-restart-error] ${e?.message || e}`))
           .finally(() => { backendRestartTimer = null; });
       }, delay);
-    } else if (Number(code || 0) === 0) {
-      backendRestartAttempts = 0;
     }
   });
 
-  backend.on("error", (err) => {
+  child.on("error", (err) => {
     backendBootError = err.message;
     appendMainLog(`[backend-error] ${err.message}`);
     // A spawn error (missing python binary, EACCES, EMFILE) leaves the
     // ChildProcess object dead but still truthy, so startBackend's
     // "already running" guard would silently refuse every restart until
     // the app relaunches (BUG-62). Drop the dead handle so the normal
-    // retry/backoff path can bring the backend back.
-    backend = null;
+    // retry/backoff path can bring the backend back — but only if it is
+    // still this child's handle (DM-27).
+    if (backend === child) backend = null;
   });
   })();
 
@@ -8164,7 +7944,7 @@ function waitForBackendHealth(url, timeoutMs) {
     };
     const scheduleRetry = () => {
       if (settled) return;
-      setTimeout(tick, 250);
+      setTimeout(tick, BACKEND_HEALTH_RETRY_MS);
     };
     const tick = () => {
       if (settled) return;
@@ -8201,7 +7981,7 @@ function waitForBackendHealth(url, timeoutMs) {
       // dangling sockets against the loopback backend before the outer
       // reject fires. ``req.destroy()`` cancels the in-flight TCP
       // connection cleanly so the next tick reuses fresh sockets.
-      req.setTimeout(2000, () => {
+      req.setTimeout(BACKEND_HEALTH_REQUEST_TIMEOUT_MS, () => {
         try { req.destroy(); } catch { }
       });
       req.on("error", scheduleRetry);
@@ -8210,7 +7990,7 @@ function waitForBackendHealth(url, timeoutMs) {
   });
 }
 
-function trackMainWindowInitialLoad(browserWindow, reason = "initial-load") {
+function trackMainWindowInitialLoad(browserWindow, reason = "initial-load", timeoutMs = MAIN_WINDOW_PAGE_LOAD_TIMEOUT_MS) {
   if (!browserWindow || browserWindow.isDestroyed()) {
     mainWindowInitialLoadPromise = null;
     return null;
@@ -8245,7 +8025,7 @@ function trackMainWindowInitialLoad(browserWindow, reason = "initial-load") {
   browserWindow.webContents.once("did-finish-load", onDidFinishLoad);
   browserWindow.webContents.once("did-fail-load", onDidFailLoad);
   browserWindow.once("closed", onClosed);
-  timeoutHandle = setTimeout(() => settle("timeout"), 15000);
+  timeoutHandle = setTimeout(() => settle("timeout"), timeoutMs);
   timeoutHandle.unref?.();
   mainWindowInitialLoadPromise = promise;
   return promise;
@@ -8358,7 +8138,8 @@ async function createWindow(options = {}) {
       backgroundThrottling: false,
     }
   });
-  trackMainWindowInitialLoad(win, "create-window");
+  // The first load waits for the backend's cold start too (DM-20).
+  trackMainWindowInitialLoad(win, "create-window", MAIN_WINDOW_INITIAL_LOAD_TIMEOUT_MS);
 
   // Refuse navigation to any origin other than the backend. A
   // transcript containing an <a href="https://evil..."> that's clicked
@@ -8468,16 +8249,16 @@ async function createWindow(options = {}) {
       // archiveDir comes back from saveRecordingText which already
       // sanitises it via _resolve_recordings_target_dir on the backend
       // side, but defence-in-depth: only accept absolute paths under
-      // the userData root or under TRANSCRIPTOR_DATA_DIR / recordings.
+      // the data directory's recordings/ or the configured recordings root.
       const pathContains = (root, candidate) => {
         const rel = path.relative(root, candidate);
         return rel === "" || (!!rel && !rel.startsWith("..") && !path.isAbsolute(rel));
       };
-      const dataDir = process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData");
-      const recordingsRoot = path.resolve(dataDir, "recordings");
+      const appDataDir = dataDir();
+      const recordingsRoot = path.resolve(appDataDir, "recordings");
       const allowedRecordingRoots = [recordingsRoot];
       try {
-        const cfgPath = path.join(dataDir, "config.json");
+        const cfgPath = path.join(appDataDir, "config.json");
         if (fs.existsSync(cfgPath)) {
           const rawCfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
           const configuredRoot = String(rawCfg?.preferences?.recordings_dir || "").trim();
@@ -8485,7 +8266,7 @@ async function createWindow(options = {}) {
             allowedRecordingRoots.push(
               path.isAbsolute(configuredRoot)
                 ? path.resolve(configuredRoot)
-                : path.resolve(dataDir, configuredRoot)
+                : path.resolve(appDataDir, configuredRoot)
             );
           }
         }
@@ -8691,7 +8472,11 @@ async function createWindow(options = {}) {
   // A reload of the main document is the other way to lose the renderer
   // that owns a screen-mode take.
   win.webContents.on("did-start-navigation", (details) => {
-    if (details?.isMainFrame && !details?.isSameDocument) endScreenModeForLostRenderer("navigation");
+    if (!details?.isMainFrame || details?.isSameDocument) return;
+    // A new document is a new renderer page: its recording ids start
+    // again at 1, so they are a new epoch with a fresh mailbox (DM-32).
+    beginRendererEpoch("navigation");
+    endScreenModeForLostRenderer("navigation");
   });
   win.webContents.on("render-process-gone", (_event, details) => {
     const reason = String(details?.reason || "unknown");
@@ -8718,29 +8503,13 @@ async function createWindow(options = {}) {
       appendMainLog(`[render-process-gone] dropping pendingTranscriptionCount=${pendingTranscriptionCount}`);
       pendingTranscriptionCount = 0;
     }
-    // Drain any queued post-stop tasks — their renderer state is
-    // dead, polling them would just spin processPostStopTask for
-    // 15 s per task hitting executeJavaScript failures, then time
-    // out. Faster + cleaner to drop them now.
+    // Drain any queued post-stop tasks — the renderer that would have
+    // handed their transcripts over is gone, so each would only wait out
+    // its deadline. Faster + cleaner to drop them now.
     if (postStopQueue.length > 0) {
       const dropped = postStopQueue.length;
       postStopQueue = [];
       appendMainLog(`[render-process-gone] dropped postStopQueue=${dropped}`);
-    }
-    // Clear dedup Sets — the post-crash renderer's ``liveRecordingSeq``
-    // resets to 0 on reload, so the new recordings will reuse ids 1, 2,
-    // 3, ... that the pre-crash session already added to these Sets.
-    // Without this clear, the next recording's recordingId=1 silently
-    // collides with the dead-session entry and the dedup gate falsely
-    // skips the post-stop paste task — user records, stops, and sees
-    // NO paste happen until ids climb past the highest pre-crash id.
-    if (_enqueuedRecordingIds.size > 0 || _pastedRecordingIds.size > 0) {
-      appendMainLog(
-        `[render-process-gone] clearing dedup sets ` +
-        `enqueued=${_enqueuedRecordingIds.size} pasted=${_pastedRecordingIds.size}`,
-      );
-      _enqueuedRecordingIds.clear();
-      _pastedRecordingIds.clear();
     }
     // Tear down recording status state: it may be waiting on a transcript
     // that will never arrive.
@@ -8780,7 +8549,7 @@ async function createWindow(options = {}) {
     if (shortcutCaptureAbortHandler) {
       shortcutCaptureAbortHandler(`did-fail-load:${code}`);
     }
-    const logPath = path.join(app.getPath("userData"), "main.log");
+    const logPath = mainLogFilePath();
     const msg =
       "Transcriptor could not load the app window.\n\n" +
       `Error: ${desc} (${code})\n\n` +
@@ -8810,66 +8579,13 @@ async function createWindow(options = {}) {
     if (shortcutCaptureAbortHandler) {
       shortcutCaptureAbortHandler("did-finish-load");
     }
-    // Clear paste-dedup Sets on every renderer (re)load — but ONLY
-    // when no in-flight recording or queued post-stop work exists.
-    //
-    // ``liveRecordingSeq`` (the renderer-side monotonic counter that
-    // produces ``recordingId`` values) resets to 0 in every new
-    // renderer instance — initial window load AND after a user-
-    // initiated ``location.reload()`` (recoverFromBackendBoot,
-    // DevTools refresh, F5). Without a clear at that boundary, ids
-    // 1, 2, 3 from the new renderer collide with stale Set entries
-    // from the previous renderer — ``handleRecordingPostStop`` then
-    // falsely flags the next recording as a duplicate and silently
-    // drops the paste task.
-    //
-    // BUT: a careless unconditional clear is itself a regression
-    // surface. ``did-finish-load`` also fires when DevTools refreshes
-    // mid-recording (Cmd-R / F5 while a recording is active). At that
-    // moment ``pendingTranscriptionCount > 0`` (the in-flight stop is
-    // queued) and ``postStopQueue`` is non-empty — clearing the Sets
-    // there drops the active recording's id, then the post-stop
-    // signal arrives and bypasses dedup, allowing the SAME content
-    // to be pasted twice (once by the queued task, once by the
-    // post-reload retry). That is the exact paste-duplication
-    // regression the 1b05c52 / 1.1.10 hardening fixed.
-    //
-    // Idle-gate: clear only when both signals say "no work in
-    // flight". On a normal cold load both are zero / empty — clear
-    // runs as before. On a mid-recording reload the clear is
-    // skipped, the in-flight id stays in the Set, and the queued
-    // task's eventual paste is correctly deduped.
-    const idle = pendingTranscriptionCount === 0 && postStopQueue.length === 0;
-    if (!idle) {
-      appendMainLog(
-        `[did-finish-load] dedup clear SKIPPED ` +
-        `(pending=${pendingTranscriptionCount} queue=${postStopQueue.length}) — ` +
-        `mid-recording reload protected from paste-dup regression`,
-      );
-    } else if (_enqueuedRecordingIds.size > 0 || _pastedRecordingIds.size > 0) {
-      appendMainLog(
-        `[did-finish-load] clearing dedup sets ` +
-        `enqueued=${_enqueuedRecordingIds.size} pasted=${_pastedRecordingIds.size}`,
-      );
-      _enqueuedRecordingIds.clear();
-      _pastedRecordingIds.clear();
-    }
     // Replay the cached shortcut status. If the initial
     // registerGlobalShortcuts() call happened before this window
     // existed (the usual case — shortcuts register during app.whenReady
     // before createWindow), the renderer would otherwise render with
     // its "hotkey" Settings panel showing the configured accelerator
     // as healthy when in fact registration silently failed.
-    if (lastShortcutStatus && win && !win.isDestroyed() && win.webContents) {
-      try {
-        await win.webContents.executeJavaScript(
-          `window.__transcriptorShortcutStatus = ${JSON.stringify(lastShortcutStatus)};`,
-          true,
-        );
-      } catch (e) {
-        appendMainLog(`[did-finish-load] shortcut replay failed: ${e?.message || e}`);
-      }
-    }
+    publishShortcutStatusToRenderer();
     // Replay backendBootError if set — a window that was closed-
     // and-reopened after a failed boot attempt would otherwise
     // render its boot overlay in a "no error" state, hiding the
@@ -8934,20 +8650,11 @@ async function createWindow(options = {}) {
   win.on("moved", () => noteMainWindowUserGeometry("moved"));
 
   win.on("closed", () => {
-    // Drop webContents listeners explicitly before releasing the ref
-    // so nothing can re-bind them through a stale closure. Electron
-    // GCs the BrowserWindow's native resources on its own, but
-    // JavaScript closures that captured ``win.webContents`` would
-    // still hold references to the old listener set.
-    try {
-      if (win && !win.isDestroyed() && win.webContents) {
-        win.webContents.removeAllListeners("render-process-gone");
-        win.webContents.removeAllListeners("did-fail-load");
-        win.webContents.removeAllListeners("did-finish-load");
-      }
-    } catch (e) {
-      appendMainLog(`[win-closed-listener-cleanup] ${e?.message || e}`);
-    }
+    // The webContents and its listeners are destroyed with the window.
+    // (A removeAllListeners block used to sit here behind
+    // ``!win.isDestroyed()`` — always false inside "closed" — so it
+    // never ran; it was deleted rather than "fixed", because there is
+    // nothing left to remove.)
     win = null;
   });
 
@@ -8976,7 +8683,7 @@ async function createWindow(options = {}) {
     // 60 s ceiling: cold-start on a fresh install with bundled
     // runtime is typically <5 s; the budget just bounds the wait
     // before the catch branch surfaces a real error to the user.
-    await waitForBackendHealth(`${BASE_URL}/api/health`, 60_000);
+    await waitForBackendHealth(`${BASE_URL}/api/health`, BACKEND_COLD_START_HEALTH_TIMEOUT_MS);
     // Backend is up — clear the "Starting backend…" pill. Nothing ever
     // cleared it before, so the amber chip lingered next to the green
     // "Online" pill for the whole session (user-reported).
@@ -9020,7 +8727,7 @@ async function createWindow(options = {}) {
 
     // Platform-specific recovery instructions. Keep these tied to the
     // current root entrypoints instead of deleted legacy install scripts.
-    const logPath = path.join(app.getPath("userData"), "main.log");
+    const logPath = mainLogFilePath();
     let recoveryHtml;
     if (app.isPackaged) {
       recoveryHtml = (
@@ -9375,7 +9082,7 @@ for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
     isQuitting = true;
     killBackendHard(`signal-${sig}`, { escalateAfterMs: 250 });
     try {
-      app.quit();
+      quitApp(`signal-${sig}`);
     } catch {
       try { app.exit(SIGNAL_EXIT_CODES[sig] || 0); } catch { process.exit(SIGNAL_EXIT_CODES[sig] || 0); }
     }
@@ -9399,9 +9106,22 @@ app.whenReady().then(async () => {
   // registered once, before any window exists, so the very first render
   // can already query status. invoke-only: the renderer never receives
   // raw ipcRenderer and cannot initiate arbitrary channels.
-  const { ipcMain } = require("electron");
-  ipcMain.handle("engine:get-status", () => engineInstallSnapshot());
-  ipcMain.handle("engine:install", async () => {
+  // Every channel the preload exposes answers only the main window's own
+  // webContents (DM-28). Only that window has the preload today, so
+  // nothing else can reach these channels — but the rule was enforced by
+  // two handlers (screen-mode:finish, recording-final, which spell the
+  // same condition inline) and missing from the other four.
+  const isFromMainWindow = (event) =>
+    !!win && !win.isDestroyed() && event?.sender === win.webContents;
+  const refusedSender = (channel) => {
+    appendMainLog(`[ipc] ${channel} refused: sender is not the main window`);
+    return { ok: false, error: "sender" };
+  };
+
+  ipcMain.handle("engine:get-status", (event) =>
+    (isFromMainWindow(event) ? engineInstallSnapshot() : refusedSender("engine:get-status")));
+  ipcMain.handle("engine:install", async (event) => {
+    if (!isFromMainWindow(event)) return refusedSender("engine:install");
     // Every return carries the phase snapshot the renderer branches on.
     // Two of these three paths used to return an object WITHOUT `phase`
     // — so an install that failed because there was no usable Python, or
@@ -9446,7 +9166,8 @@ app.whenReady().then(async () => {
   // asks right after `probePasteCapability("boot")` already ran gets the
   // cached answer for free; the very first ask of a session pays for one
   // probe so the badge is never a beat behind the first recording.
-  ipcMain.handle("paste-capability:get-status", async () => {
+  ipcMain.handle("paste-capability:get-status", async (event) => {
+    if (!isFromMainWindow(event)) return refusedSender("paste-capability:get-status");
     const cap = await ensurePasteCapabilityFresh("renderer-query");
     const context = pasteCapabilityMessageContext();
     return {
@@ -9467,7 +9188,8 @@ app.whenReady().then(async () => {
   // (desktop/paste-capability.js builds it, including the refusal to run
   // it against anything that is not this app's own bundle id); the
   // renderer owns nothing but the click.
-  ipcMain.handle("permissions:repair", async () => {
+  ipcMain.handle("permissions:repair", async (event) => {
+    if (!isFromMainWindow(event)) return refusedSender("permissions:repair");
     try {
       return await repairPastePermissionsOnRequest();
     } catch (e) {
@@ -9483,8 +9205,8 @@ app.whenReady().then(async () => {
   //
   // Send-only and one-way: the renderer says "recording N's text is X,
   // and here is whether it is the paste-ready one". Everything about
-  // what that means — whether it may be pasted, when the fallback poll
-  // starts, what happens on deadline expiry — stays in the main process.
+  // what that means — whether it may be pasted, what happens on
+  // deadline expiry — stays in the main process (./transcript-signal).
   //
   // Two gates, both of them about not trusting renderer-controlled
   // input: the sender must be the main window's own webContents (the
@@ -9622,7 +9344,7 @@ app.whenReady().then(async () => {
     { type: "separator" },
     {
       label: "Quit",
-      click: () => app.quit()
+      click: () => quitApp("tray-quit")
     }
   ]);
   tray.on("click", () => {
@@ -9659,12 +9381,15 @@ app.whenReady().then(async () => {
   let registeredPasteHotkey = "";
   let registeredScreenHotkey = "";
   let shortcutsSuspendedForCapture = false;
+  // The accelerators bound at runtime — the ONE source every
+  // registration reads (S-11). config.json seeds it once, at the first
+  // registration; Settings updates replace it (./shortcut-runtime).
+  let activeShortcuts = null;
 
   function readShortcutsFromConfig() {
     const defaults = shortcutDefaultsForPlatform();
     try {
-      const dataDir = process.env.TRANSCRIPTOR_DATA_DIR || app.getPath("userData");
-      const cfgPath = path.join(dataDir, "config.json");
+      const cfgPath = path.join(dataDir(), "config.json");
       if (fs.existsSync(cfgPath)) {
         const raw = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
         const ui = raw?.preferences?.ui || {};
@@ -9780,45 +9505,19 @@ app.whenReady().then(async () => {
     }
   }
 
-  function registerGlobalShortcuts(override = null) {
-    if (shortcutsSuspendedForCapture && !override) {
+  function registerGlobalShortcuts() {
+    if (shortcutsSuspendedForCapture) {
       appendMainLog("[shortcuts] register skipped while Settings capture is active");
       return;
     }
-    // SSOT for the accelerators we actually bind:
-    //   - At startup → readShortcutsFromConfig() (disk-backed, pre-renderer).
-    //   - After a Settings-UI capture → the shortcuts bridge delivers an
-    //     "update" message carrying the accelerators the user just
-    //     typed. Passed in here as `override` so the registration uses
-    //     those IN-MEMORY values, NOT the disk config.
-    //
-    // Why the override exists (root cause of "не ставятся новые при
-    // нажатии клавиш"): the renderer queues a debounced (600 ms) save
-    // to /api/config which the backend writes to disk asynchronously.
-    // Re-reading disk on an update would therefore often return the OLD
-    // shortcut and re-register the very accelerator the user just
-    // changed away from — the displayed shortcut updates in the UI
-    // while the actual global hotkey stays on the previous binding.
-    // Routing the bridge payload through `override` removes the
-    // disk-write dependency
-    // entirely — registration uses exactly what the user pressed.
-    //
-    // Defensive fallback: if `override` is partial (only `record` or
-    // only `paste`) we fill the missing half from disk so we never
-    // unregister an accelerator without re-registering its replacement.
-    let shortcuts;
-    if (override && (override.record || override.paste)) {
-      const fromDisk = (override.record && override.paste) ? null : readShortcutsFromConfig();
-      const screenFromDisk = (override.screen && override.screenShot) ? null : readShortcutsFromConfig();
-      shortcuts = {
-        record: String(override.record || (fromDisk && fromDisk.record) || "").trim(),
-        paste: String(override.paste || (fromDisk && fromDisk.paste) || "").trim(),
-        screen: String(override.screen || (screenFromDisk && screenFromDisk.screen) || "").trim(),
-        screenShot: String(override.screenShot || (screenFromDisk && screenFromDisk.screenShot) || "").trim(),
-      };
-    } else {
-      shortcuts = readShortcutsFromConfig();
-    }
+    // Bind exactly the runtime set (S-11). It is read from disk ONCE, at
+    // the first registration — before the renderer exists, so the very
+    // first hotkey works — and from then on only a Settings update
+    // changes it. Re-reading disk here (resume, capture abort) used to
+    // revert a change whose debounced save had not landed, or had
+    // failed, while Settings kept showing the new keys.
+    if (!activeShortcuts) activeShortcuts = normalizeShortcutSet(readShortcutsFromConfig());
+    const shortcuts = activeShortcuts;
     // Unregister old shortcuts (keep devtools). Clear stored values
     // up-front — only set them back after a
     // successful registration, so a failed accelerator is never
@@ -9881,7 +9580,8 @@ app.whenReady().then(async () => {
       screenResult.error = "unsupported";
     }
     desiredScreenShotHotkey = screenSupported ? shortcuts.screenShot || "" : "";
-    if (screenMode.isActive()) bindScreenShotHotkey();
+    screenShotHotkeyError = "";
+    probeScreenShotHotkey();
 
     // Surface registration status to the renderer so the Settings
     // panel can show a red indicator next to any shortcut that the
@@ -9935,13 +9635,15 @@ app.whenReady().then(async () => {
         active: screenResult.ok ? screenResult.accelerator : "",
         error: screenResult.ok ? "" : screenResult.error,
       },
-      // Bound only during screen mode, so "active" is not meaningful at
-      // rest; Settings shows the configured key.
-      screenShot: {
+      // Bound only during a screen take; outside one, ``error`` is what
+      // a registration probe answered, so a key another app owns is
+      // reported before the take where it would be dead (DM-24, S-09).
+      screenShot: screenShotSlotStatus({
         desired: shortcuts.screenShot || "",
-        active: "",
-        error: screenSupported ? "" : "unsupported",
-      },
+        supported: screenSupported,
+        error: screenShotHotkeyError,
+        bound: registeredScreenShotHotkey,
+      }),
       screenModeSupported: screenSupported,
       // Renderer uses this to decide whether to show the "macOS is
       // intercepting F9/F10" hint. Only relevant on darwin and only
@@ -9950,14 +9652,9 @@ app.whenReady().then(async () => {
       platform: process.platform,
     };
     lastShortcutStatus = status;
-    if (win && !win.isDestroyed() && win.webContents) {
-      win.webContents
-        .executeJavaScript(
-          `window.__transcriptorShortcutStatus = ${JSON.stringify(status)};`,
-          true,
-        )
-        .catch(() => { });
-    }
+    publishShortcutStatusToRenderer();
+    // During a take the key is (re)bound now; the bind updates the slot.
+    if (screenMode.isActive()) bindScreenShotHotkey();
 
     appendMainLog(
       `[shortcuts] registered: record=${registeredRecordHotkey || "FAILED"} ` +
@@ -9982,21 +9679,24 @@ app.whenReady().then(async () => {
       return;
     }
     if (action === "update") {
-      const record = String(message?.record || "").trim();
-      const paste = String(message?.paste || "").trim();
-      const screen = String(message?.screen || "").trim();
-      const screenShot = String(message?.screenShot || "").trim();
-      if (!record || !paste) {
-        appendMainLog(`[shortcuts] bridge update rejected: record=${record || "-"} paste=${paste || "-"}`);
+      if (!activeShortcuts) activeShortcuts = normalizeShortcutSet(readShortcutsFromConfig());
+      const update = applyShortcutUpdate(activeShortcuts, message);
+      if (!update.ok) {
+        // The capture that preceded this update unregistered every
+        // hotkey; a rejected update must put them back now, not leave
+        // the app deaf until the 120 s capture failsafe (DM-23).
+        appendMainLog(`[shortcuts] bridge update rejected (${update.reason}); restoring the previous bindings`);
+        restoreShortcutsAfterCaptureAbort("update-rejected");
         return;
       }
+      activeShortcuts = update.shortcuts;
       shortcutsSuspendedForCapture = false;
       clearShortcutCaptureFailsafe();
       appendMainLog(
-        `[shortcuts] bridge live reload: record=${record} paste=${paste} ` +
-        `screen=${screen || "-"} screenShot=${screenShot || "-"}`,
+        `[shortcuts] bridge live reload: record=${activeShortcuts.record} paste=${activeShortcuts.paste} ` +
+        `screen=${activeShortcuts.screen || "-"} screenShot=${activeShortcuts.screenShot || "-"}`,
       );
-      registerGlobalShortcuts({ record, paste, screen, screenShot });
+      registerGlobalShortcuts();
     }
   }
 
@@ -10041,10 +9741,15 @@ app.whenReady().then(async () => {
   // user records, and paste asks for Accessibility/Automation when paste
   // actually needs them.
   refreshMacAccessibilityTrustState();
-  await startBackend();
+  // The backend is started by the window the startup event creates, not
+  // awaited here (DM-29): createWindow owns the boot and its failure
+  // UX — the in-window error page with the backend's stderr tail and the
+  // recovery poll. Awaiting startBackend here first meant a boot failure
+  // skipped the startup event entirely and ended in a bare modal with
+  // no window.
   await applyWindowLifecycleEvent(WINDOW_LIFECYCLE_EVENTS.startup);
 }).catch((err) => {
-  // The whenReady chain has many awaits — startBackend, permission
+  // The whenReady chain has many awaits — IPC and tray setup, permission
   // probes, accessibility checks, and any one of
   // them rejecting becomes an unhandled promise rejection that the
   // top-level ``unhandledRejection`` handler logs but cannot recover
