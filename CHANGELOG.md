@@ -3,6 +3,12 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.11] - 2026-11-20
+
+### Fixed
+
+- **The white flash shows on every screenshot.** It was started in a way that the browser often collapsed into a fade from nothing, so it appeared only some of the time.
+
 ## [1.6.10] - 2026-11-20
 
 ### Changed
