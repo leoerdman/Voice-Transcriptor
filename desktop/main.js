@@ -533,8 +533,13 @@ const RECORDING_STATUS_TERMINAL_DWELL_MS = 900;
 // parameter goes to stop being one: nothing named them, nothing could state
 // them, and one of them was retyped into the message the user reads.
 
-/** How long a click on the capsule suppresses the app-activate that
- *  would otherwise raise the main window behind it. */
+/** How long a click on the capsule makes the lifecycle table answer the
+ *  app's `activate` event with "do nothing". This is all it does: it
+ *  cannot stop macOS itself from bringing the app's windows forward on a
+ *  click in an inactive app — acbf737 measured the main window taking
+ *  focus ~0.5 s after a capsule click in voice mode. Only screen mode,
+ *  whose clicks are taken by the in-process mouse helper and never reach
+ *  the window server, avoids that (Ultra-Audit 2026-11-20 H-03). */
 const RECORDING_STATUS_CAPSULE_ACTIVATE_SUPPRESS_MS = 700;
 
 /** How often the monitor re-reads the renderer's auto-stop settings. The
