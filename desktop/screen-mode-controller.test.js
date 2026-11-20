@@ -851,7 +851,12 @@ test("the palette shows the two tools, a divider, then the colours, the selected
   assert.match(html, /class="tool sel" data-t="rect"/);
   assert.match(html, /class="tool" data-t="pen"/);
   assert.match(html, /\.dot\.sel, \.tool\.sel \{/, "one highlight for a selected tool and a selected colour");
-  assert.ok(paletteSize(6, 2).width > paletteSize(6, 0).width + 2 * 22, "the pill is wide enough for the tools");
+  // padding 2·10 + tools 2·22 + divider 1 + colours 6·18 + 8 gaps of 8 + border 2.
+  assert.deepEqual(paletteSize(6, 2), { width: 20 + 44 + 1 + 108 + 64 + 2, height: 30 });
+  // Every tool has an icon and a name: no blank button.
+  for (const tool of SCREEN_MODE.tools) {
+    assert.match(html, new RegExp(`data-t="${tool}" aria-label="[A-Z][a-z]+"><svg `), tool);
+  }
 });
 
 test("a rectangle is drawn live from the press to the pointer, in any direction", async () => {
@@ -903,6 +908,12 @@ test("a shot is the front window when every stroke touches it: placed, numbered 
     drawStroke(world, [[600, 300], [900, 700]]); // runs past its corner
     const shot = await world.controller.takeShot("capsule");
     assert.deepEqual(world.captures.map((c) => c.bounds), [world.frontWindow], "only the window is captured");
+    // The helper is asked with Transcriptor's own windows excluded and the
+    // shared minimum size (one number for both sides).
+    const { SCREEN_MODE } = require("./screen-mode");
+    const request = world.helper().stdin.written.map((l) => JSON.parse(l)).find((m) => m.cmd === "front-window");
+    assert.deepEqual(request.exclude, [process.pid]);
+    assert.equal(request.minSide, SCREEN_MODE.minWindowSide);
     const manifest = (await world.controller.finish({ id: ID })).manifest;
     assert.equal(manifest.version, 2);
     const shotEvent = manifest.events.find((e) => e.type === "shot");

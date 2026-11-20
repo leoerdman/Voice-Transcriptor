@@ -188,8 +188,7 @@ function overlayHtml() {
   const BADGE_R = ${badge.radius};
   // Clear of the stroke's line: the gap plus half the line's width.
   const BADGE_GAP = ${badge.gap + SCREEN_MODE.strokeWidth / 2};
-  const BADGE_FONT_PX = ${Number(/(\d+)px/.exec(badge.font)[1])};
-  const BADGE_FONT = ${JSON.stringify(badge.font.replace(/\d+px/, "{px}px"))};
+  const BADGE_FONT = (scale) => ${JSON.stringify(`${badge.fontWeight} `)} + (${badge.fontSize} * scale) + ${JSON.stringify(`px ${badge.fontFamily}`)};
   // One rule for where a number goes and how big a copy is, shared with
   // desktop/screen-mode.js (embedded from there, not retyped).
   const numberBadgeCenter = ${numberBadgeCenter.toString()};
@@ -264,9 +263,10 @@ function overlayHtml() {
     c.strokeStyle = "rgba(0,0,0,0.35)";
     c.stroke();
     c.fillStyle = digitColor(s.color);
-    c.font = BADGE_FONT.replace("{px}", String(BADGE_FONT_PX * scale));
+    c.font = BADGE_FONT(scale);
     c.textAlign = "center";
     c.textBaseline = "middle";
+    // "middle" centres the em box; digits sit half a point below it.
     c.fillText(String(s.n), x, y + 0.5 * scale);
     c.restore();
   }
@@ -398,9 +398,9 @@ const TOOL_ICONS = Object.freeze({
 
 const TOOL_LABELS = Object.freeze({ rect: "Rectangle", pen: "Pen" });
 
-function paletteHtml(colors, selected, tools = SCREEN_MODE.tools, selectedTool = SCREEN_MODE.tools[0]) {
+function paletteHtml(colors, selected, tools, selectedTool) {
   const toolButtons = tools
-    .map((t) => `<button class="tool${t === selectedTool ? " sel" : ""}" data-t="${t}" aria-label="${TOOL_LABELS[t] || t}">${TOOL_ICONS[t] || ""}</button>`)
+    .map((t) => `<button class="tool${t === selectedTool ? " sel" : ""}" data-t="${t}" aria-label="${TOOL_LABELS[t]}">${TOOL_ICONS[t]}</button>`)
     .join("");
   const dots = colors
     .map((c) => `<button class="dot${c === selected ? " sel" : ""}" data-c="${c}" style="background:${c}" aria-label="${c}"></button>`)
@@ -437,12 +437,15 @@ function paletteHtml(colors, selected, tools = SCREEN_MODE.tools, selectedTool =
 </script></body></html>`;
 }
 
-/** The palette's size: the tools, a divider, the colours. */
-function paletteSize(colorCount, toolCount = SCREEN_MODE.tools.length) {
-  const items = toolCount + (toolCount ? 1 : 0) + colorCount;
+/**
+ * The palette's size: the tools, a divider, the colours — every item
+ * spaced by the gap — inside the padding and a 1 px border each side.
+ */
+function paletteSize(colorCount, toolCount) {
+  const items = toolCount + 1 + colorCount;
   return {
     width:
-      PALETTE.padX * 2 + toolCount * PALETTE.tool + (toolCount ? PALETTE.divider : 0) +
+      PALETTE.padX * 2 + toolCount * PALETTE.tool + PALETTE.divider +
       colorCount * PALETTE.dot + (items - 1) * PALETTE.gap + 2,
     height: PALETTE.height,
   };
@@ -1030,7 +1033,7 @@ function createScreenModeController(deps) {
         clearTimeout(timer);
         resolve(bounds);
       });
-      sendHelper({ cmd: "front-window", id, exclude: [process.pid] });
+      sendHelper({ cmd: "front-window", id, exclude: [process.pid], minSide: SCREEN_MODE.minWindowSide });
     });
   }
 
@@ -1210,7 +1213,9 @@ function createScreenModeController(deps) {
         }
       }
     }
-    const area = plan[0] ? plan[0].area : "display";
+    // One plan, one area: a window shot is one image; a display shot is
+    // every display it names.
+    const area = plan[0].area;
     if (grabbed.length) {
       log(
         `[screen-mode] shot captured (${reason}) displays=${grabbed.length} area=${area} capture_ms=${captureMs} ` +

@@ -296,7 +296,15 @@ test("a rectangle's number sits outside its top-left corner, inside only when th
   const r = 10;
   const gap = 5;
   const c = numberBadgeCenter("rect", [[500, 400], [300, 200]], view, r, gap);
-  assert.ok(c.x + r <= 300 && c.y + r <= 200, "outside the corner, clear of both sides");
+  assert.ok(c.x < 300 && c.y < 200, "outside the corner");
+  assert.ok(Math.abs(Math.hypot(300 - c.x, 200 - c.y) - (r + gap)) < 1e-9, "its edge `gap` from the corner");
+  // Clear of both sides: wherever the circle reaches x >= 300 - gap/2
+  // (the left side's line), it is above that side's top, and vice versa.
+  for (let a = 0; a < 2 * Math.PI; a += 0.01) {
+    const px = c.x + r * Math.cos(a);
+    const py = c.y + r * Math.sin(a);
+    assert.ok(!(px >= 300 - 2 && py >= 200 - 2), "the circle does not touch the rectangle's lines");
+  }
   // Against the top edge: beside the corner instead, still outside the box.
   const top = numberBadgeCenter("rect", [[100, 5], [400, 300]], view, r, gap);
   assert.ok(top.x + r <= 100, "to the left of the box");

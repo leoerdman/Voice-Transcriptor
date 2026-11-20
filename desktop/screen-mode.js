@@ -47,9 +47,11 @@ const SCREEN_MODE = Object.freeze({
   borderColor: "#ff3b30",
   borderWidth: 3,
   // The number in a circle of the stroke's colour (DIP).
-  badge: Object.freeze({ radius: 10, gap: 3, font: "bold 12px -apple-system, system-ui, sans-serif" }),
+  badge: Object.freeze({ radius: 10, gap: 3, fontSize: 12, fontWeight: 700, fontFamily: "-apple-system, system-ui, sans-serif" }),
   // The front window is the captured area only if it is at least this
   // big on its display (DIP): a sliver is not "the window the user means".
+  // The helper is handed it with every request, so a tiny window on top is
+  // passed over there by the same number.
   minWindowSide: 40,
   // The agent's cheap copies. The preview stays inside the size an image
   // is read at without being scaled again (long side and pixel count);
@@ -273,8 +275,11 @@ function numberBadgeCenter(tool, points, view, radius, gap) {
   const off = radius + gap;
   let candidates;
   if (tool === "rect") {
+    // Diagonally off the corner, its edge `gap` from the corner point; the
+    // circle then clears both sides' lines, which start at the corner.
+    const diagonal = off * Math.SQRT1_2;
     candidates = [
-      { x: minX - off, y: minY - off },
+      { x: minX - diagonal, y: minY - diagonal },
       { x: minX + radius, y: minY - off },
       { x: minX - off, y: minY + radius },
       { x: minX + off, y: minY + off },

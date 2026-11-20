@@ -16,6 +16,8 @@ Transcriptor is a desktop voice transcription app for macOS, Windows, and Linux.
 
 Screen mode (macOS) extends the same recording to the screen: while dictating, the user draws over anything on screen without losing the ability to click through it, and takes screenshots with the drawings. The transcript carries a mark at the moment in speech each line was drawn and each screenshot taken, with the screenshot's path, and the screenshots are kept with the recording itself — one archive entry, one retention rule, one place to find them.
 
+Drawing has two tools, a rectangle (where every take starts) and a pen, and every stroke shows its number on the screen and in the picture. A screenshot is the window the user is looking at — not the menu bar, the Dock or the rest of the display — unless there is no such window or a stroke lies outside it, and the manifest says which. Beside each screenshot the app writes a downscaled copy and a close-up of each stroke, so the agent reading the feedback looks at a fraction of the pixels.
+
 ## Brand Personality
 
 Precise, restrained, operational.

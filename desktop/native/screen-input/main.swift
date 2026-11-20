@@ -16,8 +16,10 @@
 //
 // Protocol — one JSON object per line.
 //   stdin : {"cmd":"controls","rects":[[x,y,w,h],...]}  our controls, global points
-//           {"cmd":"front-window","id":n,"exclude":[pid,...]}  where is the front
-//                                                      window (FrontWindow.swift)?
+//           {"cmd":"front-window","id":n,"exclude":[pid,...],"minSide":pt}
+//                                                      where is the front window
+//                                                      (FrontWindow.swift)? Windows
+//                                                      under minSide are passed over
 //           {"cmd":"quit"}
 //   stdout: {"t":"ready"}
 //           {"t":"start","x":..,"y":..} {"t":"move","x":..,"y":..} {"t":"end","x":..,"y":..}
@@ -218,11 +220,11 @@ state.tap = tap
 
 // The answer to a front-window request, from the stdin thread (the window
 // list is safe to read from any thread; the tap callback never waits on it).
-func answerFrontWindow(id: Int, exclude: [Int]) {
+func answerFrontWindow(id: Int, exclude: [Int], minSide: Double) {
   var excluded = Set(exclude)
   excluded.insert(Int(getpid()))
   var answer: [String: Any] = ["t": "front-window", "id": id]
-  if let r = pickFrontWindow(onScreenWindows(), excluding: excluded, minSide: 40) {
+  if let r = pickFrontWindow(onScreenWindows(), excluding: excluded, minSide: minSide) {
     answer["x"] = Double(r.origin.x)
     answer["y"] = Double(r.origin.y)
     answer["w"] = Double(r.size.width)
@@ -243,7 +245,8 @@ Thread.detachNewThread {
     if cmd == "front-window" {
       let id = (obj["id"] as? NSNumber)?.intValue ?? 0
       let exclude = (obj["exclude"] as? [NSNumber])?.map { $0.intValue } ?? []
-      answerFrontWindow(id: id, exclude: exclude)
+      let minSide = (obj["minSide"] as? NSNumber)?.doubleValue ?? 0
+      answerFrontWindow(id: id, exclude: exclude, minSide: minSide)
       continue
     }
     if cmd == "controls", let rects = obj["rects"] as? [[Double]] {
