@@ -29,8 +29,9 @@ import { smartRecordingTitle } from "./recording-title";
 import {
   annotateTranscript,
   parseScreenManifest,
-  screenMarksFromManifest,
+  screenAnnotationFromManifest,
   screenSessionDurationMs,
+  stripScreenAnnotation,
   type ScreenManifest,
 } from "./screen-annotations";
 
@@ -79,7 +80,7 @@ export function parsePromotedTake(sessionId: string, body: unknown): PromotedTak
 export function recoveredTakeTranscript(spoken: string, screens: ScreenManifest | null): string {
   const words = String(spoken || "").trim();
   if (!screens) return words;
-  return annotateTranscript(words, screenMarksFromManifest(screens), {
+  return annotateTranscript(words, screenAnnotationFromManifest(screens), {
     durationMs: screenSessionDurationMs(screens),
   }).trim();
 }
@@ -128,7 +129,10 @@ export function planTakeRecovery(
   for (const take of promoted) {
     const fromDraft = !!draft && !!draftSession && take.sessionId === draftSession;
     if (fromDraft) draftMatched = true;
-    const spoken = fromDraft ? spokenInDraft : "";
+    // The draft's transcript is the panel's text, which can already be a
+    // screen take's annotated final: its words only, for the title and
+    // for the composer (which would take the marks off anyway).
+    const spoken = fromDraft ? stripScreenAnnotation(spokenInDraft) : "";
     const transcriptText = recoveredTakeTranscript(spoken, take.screens);
     if (!transcriptText) continue;
     const draftSource = fromDraft ? String(draft?.source_text || "").trim() : "";

@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { annotateTranscript } from "../src/screen-annotations";
+import {
+  EMPTY_SCREEN_ANNOTATION,
+  annotateTranscript,
+  parseScreenManifest,
+  screenAnnotationFromManifest,
+  type ScreenAnnotation,
+  type ScreenMark,
+} from "../src/screen-annotations";
 import {
   attemptFinalSave,
   createSessionMetadataSaver,
@@ -56,6 +63,10 @@ const noProviderPlan: StopEpiloguePlan = {
   summary: { status: "Audio saved. No transcription provider is selected.", tone: "warning" },
   conflictStatus: "No provider is selected, and the original archive changed before the session metadata could be finalized.",
 };
+
+
+/** Inline marks with no header or summary — what these suites place. */
+const marksOnlyAnnotation = (marks: ScreenMark[]): ScreenAnnotation => ({ marks, header: "", summary: "" });
 
 describe("attemptFinalSave — FL-02: every save failure is an outcome, not silence", () => {
   it("a successful save is 'saved'", async () => {
@@ -277,7 +288,7 @@ describe("createSessionMetadataSaver — the History entry a stop writes", () =>
 
   it("names a screen recording after what was said, while History keeps the marks", async () => {
     const spoken = "one two three four";
-    const marked = annotateTranscript(spoken, [{ atMs: 0, text: "[Screenshot 0:00]" }], { durationMs: 10_000 });
+    const marked = annotateTranscript(spoken, marksOnlyAnnotation([{ atMs: 0, text: "[Screenshot 0:00]" }]), { durationMs: 10_000 });
     expect(marked.startsWith("[Screenshot 0:00]")).toBe(true);
     const { save, requests } = saverWith({ liveSourceText: "" });
     await save({ spokenTranscript: spoken, transcriptText: marked, provider: "deepgram" });
@@ -322,10 +333,17 @@ describe("resolveSessionTitle — titles come from what was SAID", () => {
 });
 
 describe("keepLiveTranscript — a take without a final transcript keeps its live text and marks", () => {
-  const marks = [
-    { atMs: 1_000, text: "[✏️ 00:01 линия справа (74%, 53%) → скрин 1]" },
-    { atMs: 9_000, text: "[📸 00:09 скрин 1: /rec/take.screens/shot-01.png]" },
-  ];
+  const marks = screenAnnotationFromManifest(parseScreenManifest({
+    version: 2,
+    id: "screen-20261120-100000-000",
+    dir: "/rec/take.screens",
+    startedAt: 1_000_000,
+    audioStartedAt: 1_000_000,
+    events: [
+      { type: "stroke", at: 1_001_000, endedAt: 1_002_000, color: "#ff3b30", shot: 1, n: 1, tool: "pen", shape: "loop", box: { x: 70, y: 50, w: 8, h: 6 } },
+      { type: "shot", at: 1_009_000, shot: 1, files: ["/rec/take.screens/shot-01.png"], area: "window", strokes: 1 },
+    ],
+  })!);
 
   it("places the marks in the live text by the one composer", () => {
     const kept = keepLiveTranscript("вот тут кнопка съехала вправо", marks, 10_000);
@@ -337,12 +355,12 @@ describe("keepLiveTranscript — a take without a final transcript keeps its liv
 
   it("a screen take drawn without speaking keeps its marks alone", () => {
     const kept = keepLiveTranscript("  ", marks, 10_000);
-    expect(kept.text).toBe(marks.map((m) => m.text).join("\n"));
+    expect(kept.text).toBe([marks.header, marks.marks.map((m) => m.text).join("\n"), marks.summary].join("\n\n"));
     expect(kept.note).toBe("The screen marks are kept as the transcript.");
   });
 
   it("a voice take keeps its live text", () => {
-    expect(keepLiveTranscript(" hello there ", [], 5_000)).toEqual({
+    expect(keepLiveTranscript(" hello there ", EMPTY_SCREEN_ANNOTATION, 5_000)).toEqual({
       text: "hello there",
       note: "The live text is kept as the transcript.",
       spoken: true,
@@ -350,7 +368,7 @@ describe("keepLiveTranscript — a take without a final transcript keeps its liv
   });
 
   it("a take with neither keeps nothing", () => {
-    expect(keepLiveTranscript("", [], 5_000)).toEqual(NOTHING_KEPT);
+    expect(keepLiveTranscript("", EMPTY_SCREEN_ANNOTATION, 5_000)).toEqual(NOTHING_KEPT);
   });
 });
 
@@ -372,11 +390,11 @@ describe("runStopEpilogue — a failed stop keeps the live text with marks in th
     };
     return { published, saved, summaries, fx };
   }
-  const kept = keepLiveTranscript("live words [mark]", [], 1_000);
+  const kept = keepLiveTranscript("live words [mark]", EMPTY_SCREEN_ANNOTATION, 1_000);
 
   it("mic not delivering audio: the capsule gets the status, the panel and History the reason above the kept marks", async () => {
     const { published, saved, summaries, fx } = keptRecorder();
-    const marksOnly = keepLiveTranscript("", [{ atMs: 0, text: "[📸 00:00 скрин 1: /x/shot-01.png]" }], 1_000);
+    const marksOnly = keepLiveTranscript("", marksOnlyAnnotation([{ atMs: 0, text: "[📸 00:00 скрин 1: /x/shot-01.png]" }]), 1_000);
     await runStopEpilogue({
       signal: { domText: "[ Mic not delivering audio ]", kind: "error" },
       statusLabel: "Done",
@@ -448,7 +466,7 @@ describe("review findings, 2026-11-20", () => {
     expect(keptTranscriptText(marksOnly, "[ Silence ]")).toBe(`[ Silence ]\n\n${marksOnly.text}`);
     expect(keptTranscriptText({ ...marksOnly, spoken: true }, "[ Silence ]")).toBe(marksOnly.text);
     expect(keptTranscriptText({ text: "", note: "", spoken: false }, "[ Mic not delivering audio ]")).toBe("[ Mic not delivering audio ]");
-    expect(keepLiveTranscript("привет", [], 1000).spoken).toBe(true);
-    expect(keepLiveTranscript("", [], 1000).spoken).toBe(false);
+    expect(keepLiveTranscript("привет", EMPTY_SCREEN_ANNOTATION, 1000).spoken).toBe(true);
+    expect(keepLiveTranscript("", EMPTY_SCREEN_ANNOTATION, 1000).spoken).toBe(false);
   });
 });

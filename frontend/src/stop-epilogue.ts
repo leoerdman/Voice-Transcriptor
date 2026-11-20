@@ -18,7 +18,7 @@
  */
 
 import { smartRecordingTitle } from "./recording-title";
-import { annotateTranscript, type ScreenMark } from "./screen-annotations";
+import { annotateTranscript, hasScreenAnnotation, type ScreenAnnotation } from "./screen-annotations";
 
 export interface DrainedSilenceInput {
   /** ``captureSilenceSnapshot(...).silentCapture`` — the session's own
@@ -240,13 +240,13 @@ export function keptTranscriptText(kept: KeptTranscript, marker: string): string
 
 export function keepLiveTranscript(
   liveText: string,
-  marks: ReadonlyArray<ScreenMark>,
+  screen: ScreenAnnotation,
   durationMs: number,
 ): KeptTranscript {
   const live = String(liveText || "").trim();
-  const text = annotateTranscript(live, marks, { durationMs }).trim();
+  const text = annotateTranscript(live, screen, { durationMs }).trim();
   if (!text) return NOTHING_KEPT;
-  const note = live && marks.length
+  const note = live && hasScreenAnnotation(screen)
     ? "The live text and the screen marks are kept as the transcript."
     : live
       ? "The live text is kept as the transcript."

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { LIVE_DRAFT_SCHEMA_VERSION, type PersistedLiveDraft } from "../src/live-draft";
-import { annotateTranscript, parseScreenManifest, screenMarksFromManifest } from "../src/screen-annotations";
+import { annotateTranscript, parseScreenManifest, screenAnnotationFromManifest } from "../src/screen-annotations";
 import {
   draftSpokenText,
   parsePromotedTake,
@@ -77,7 +77,7 @@ describe("parsePromotedTake", () => {
 describe("recoveredTakeTranscript", () => {
   it("places the marks by the one composer, in the take's own time frame", () => {
     const spoken = "вот тут кнопка съехала и вот здесь тоже";
-    const marks = screenMarksFromManifest(screenTake.screens!);
+    const marks = screenAnnotationFromManifest(screenTake.screens!);
     expect(recoveredTakeTranscript(spoken, screenTake.screens)).toBe(
       annotateTranscript(spoken, marks, { durationMs: 20_000 }),
     );
@@ -102,8 +102,9 @@ describe("planTakeRecovery — after a crash mid-take", () => {
     expect(w.name).toBe(screenTake.name);
     expect(w.archiveDir).toBe(screenTake.archiveDir);
     expect(w.transcriptText).toContain("кнопка");
-    expect(w.transcriptText).toContain("[✏️ 00:05 линия справа (74%, 53%) → скрин 1]");
-    expect(w.transcriptText).toContain(`[📸 00:15 скрин 1: ${SHOT}]`);
+    expect(w.transcriptText).toContain("[✏️1 скрин 1: штрих, справа]");
+    expect(w.transcriptText).toContain("[📸 00:15 скрин 1]");
+    expect(w.transcriptText).toContain("Скрин 1 · shot-01.png · 00:00–00:15");
     expect(w.sourceText).toBe("вот тут кнопка съехала и вот здесь тоже");
     // The draft knows what the take was recorded with; the promotion does not.
     expect(w.provider).toBe("deepgram");
@@ -122,7 +123,10 @@ describe("planTakeRecovery — after a crash mid-take", () => {
   it("a screen take drawn without speaking keeps its marks alone", () => {
     const plan = planTakeRecovery(draft({ source_text: "" }), [screenTake]);
     expect(plan.writes).toHaveLength(1);
-    expect(plan.writes[0].transcriptText.split("\n")).toHaveLength(2);
+    // Header, the two marks one per line, the summary.
+    const text = plan.writes[0].transcriptText;
+    expect(text.split("\n\n")).toHaveLength(3);
+    expect(text.split("\n\n")[1]).toBe("[✏️1 скрин 1: штрих, справа]\n[📸 00:15 скрин 1]");
     expect(plan.writes[0].title).toBe(screenTake.title);
     expect(plan.writes[0].sourceText).toBe(screenTake.sourceText);
   });
@@ -131,7 +135,7 @@ describe("planTakeRecovery — after a crash mid-take", () => {
     const plan = planTakeRecovery(null, [screenTake]);
     expect(plan.writes).toHaveLength(1);
     expect(plan.writes[0].fromDraft).toBe(false);
-    expect(plan.writes[0].transcriptText).toContain(SHOT);
+    expect(plan.writes[0].transcriptText).toContain("папка: /rec/Screen Sessions/Recovered.screens");
     expect(plan.writes[0].provider).toBe("local");
     expect(plan.shown).toBe(plan.writes[0]);
   });
@@ -156,6 +160,19 @@ describe("planTakeRecovery — after a crash mid-take", () => {
     expect(draftSpokenText(draft({ transcript_text: "final" }))).toBe("final");
     expect(draftSpokenText(draft())).toBe("вот тут кнопка съехала и вот здесь тоже");
     expect(draftSpokenText(null)).toBe("");
+  });
+
+  // The draft autosaves the panel's text, which is the annotated final
+  // once it is shown: recovering it marks the words again, never the marks.
+  it("a draft holding the annotated final comes back with one header, one summary, and a title from its words", () => {
+    const shownFinal = recoveredTakeTranscript("вот тут кнопка съехала и вот здесь тоже", screenTake.screens);
+    const plan = planTakeRecovery(draft({ transcript_text: shownFinal }), [screenTake]);
+    const [w] = plan.writes;
+    expect(w.transcriptText).toBe(shownFinal);
+    expect(w.transcriptText.match(/Диктовка с рисованием по экрану/g)).toHaveLength(1);
+    expect(w.transcriptText.match(/Сводка по скринам/g)).toHaveLength(1);
+    expect(w.transcriptText.match(/\[✏️1 скрин 1/g)).toHaveLength(1);
+    expect(w.title.startsWith("вот тут кнопка")).toBe(true);
   });
 
   it("parses the archived manifest the same way the transcript composer does", () => {
