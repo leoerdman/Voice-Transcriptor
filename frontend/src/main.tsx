@@ -45,7 +45,7 @@ import {
   uploadSourceValidationError,
 } from "./upload-item";
 import { UPLOAD_QUEUE_SAVE_FAILED_STATUS, nextQueueSaveRetry } from "./upload-queue-persist";
-import { classifyBootError } from "./boot-error";
+import { classifyBootError, type BootFailure } from "./boot-error";
 import {
   captureElapsedMs,
   decidePreRoll,
@@ -716,7 +716,7 @@ declare global {
     __transcriptorRecordingTooShort?: () => boolean;
     __transcriptorSetMainStatus?: (status: string, kind?: StatusKind) => boolean;
     __setBackendBootStatus?: (msg: string) => void;
-    __setBackendBootError?: (msg: string) => void;
+    __setBackendBootError?: (failure: BootFailure) => void;
     /**
      * Electron preload bridge. Returns an absolute filesystem path for
      * a File obtained from the OS picker/drag-drop, or "" in browser dev
@@ -13620,9 +13620,9 @@ window.__setBackendBootStatus = (msg: string) => {
 
 // The raw-stderr → actionable-copy mapping lives in ./boot-error.
 
-window.__setBackendBootError = (msg: string) => {
-  const raw = String(msg || "").trim();
-  const { headline, detail } = classifyBootError(raw);
+window.__setBackendBootError = (failure: BootFailure) => {
+  const raw = String(failure?.raw || "").trim();
+  const { headline, detail } = classifyBootError(raw, String(failure?.code || ""));
   const overlay = document.getElementById("bootOverlay");
   if (overlay) {
     _bootOverlayHidden = false;

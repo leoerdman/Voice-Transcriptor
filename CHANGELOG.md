@@ -5,6 +5,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Documentation: the voice-mode capsule can still bring the window forward on macOS.** The 1.6.4 entry said the capsule never moves the main window. That holds for everything the app does with the capsule, and for screen mode, where a press on the capsule never reaches the window server. Outside screen mode a click on the capsule is an ordinary click on a window of an inactive app, and macOS answers it by activating the app; the app ignores that one activate (it is told apart by a short time window, so a genuine Dock click inside that window is ignored too), but macOS may already have raised the window. `desktop/window-lifecycle.js` states the limit; removing it needs the screen-mode tap path for the voice capsule as well.
+
 ## [1.6.6] - 2026-11-20
 
 ### Added
@@ -72,7 +76,7 @@ The window/Dock lifecycle rewrite, merged onto the 1.6.3 self-heal work it was b
   - Clicking the app — Dock, Finder, `open -a`, tray, a second launch — shows and focuses the window filling the display's work area. Not a macOS full-screen space, which would take the window away from the capsule and from the app being dictated into. Bounds are remembered and restored only once the user has resized or moved the window themselves; dragging it back to full size gives the default back.
   - The yellow button is a plain native minimise and the app keeps working: hotkeys, capsule, backend. A Dock click restores it.
   - The red button and `Cmd+W` quit, on every platform. "Closed" means "not running", and the existing `before-quit` path stops the backend child, the capsule and the tray.
-  - Nothing else moves the window. The recording capsule neither hides it, focuses away from it nor reorders it: a `focusable: false` panel shown with `showInactive()`, and the one activate it can still produce on macOS is answered with "do nothing".
+  - Nothing else moves the window. The recording capsule neither hides it, focuses away from it nor reorders it: a `focusable: false` panel shown with `showInactive()`, and the one activate it can still produce on macOS is answered with "do nothing". *(Corrected in a later release: macOS itself may still raise the window on that click outside screen mode — see Unreleased.)*
 
   Beyond the 17 tests over the decision table and the saved-bounds clamp, the suite now asserts at the source level what must not come back — no dock hiding, no app- or window-level hide, no reveal or protection crutches, exactly one activation-policy call, `window-all-closed` quitting with no platform branch, no `LSUIElement` in the build config, and every lifecycle event main.js reports being one the table defines (and every event the table defines having a caller). Desktop suite 256 → 273 on this branch, 270 → 287 merged onto 1.6.3.
 

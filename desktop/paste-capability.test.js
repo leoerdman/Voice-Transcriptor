@@ -756,3 +756,29 @@ test("the auto-send settle is in the table too, not a literal at its call site",
   const source = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
   assert.match(source, /await sleep\(pasteAutoSendSettleMs\(process\.platform\)\)/);
 });
+
+// DM-16 / DM-20: the activation settles are rows of PASTE_BUDGET, and the
+// worst case the table claims pays one per attempt where the ladder
+// re-activates the target — and still fits the post-stop deadline.
+test("the activation settles live in PASTE_BUDGET and are counted in the worst case", () => {
+  const cap = require("./paste-capability");
+  for (const platform of ["darwin", "win32", "linux"]) {
+    const b = cap.PASTE_BUDGET[platform];
+    for (const field of ["appActivationSettleMs", "windowActivationSettleMs", "autoSendActivationSettleMs"]) {
+      assert.ok(Number.isFinite(b[field]) && b[field] > 0, `${platform}.${field}`);
+    }
+    const settle = b.activationLadderSteps > 0 ? Math.max(b.appActivationSettleMs, b.windowActivationSettleMs) : 0;
+    const withoutSettle = cap.pasteBudgetWorstCaseMs(platform) - b.maxAttempts * settle;
+    // Removing the settles must leave exactly the old sum, i.e. they are counted once per attempt.
+    assert.equal(
+      withoutSettle,
+      b.preflightMs + b.preflightSettleMs
+        + b.attemptDelaysMs.slice(0, b.maxAttempts).reduce((a, x) => a + x, 0)
+        + b.maxAttempts * (b.methodTimeoutsMs.reduce((a, x) => a + x, 0) + b.verificationAllowanceMs
+          + b.activationLadderSteps * b.activationTimeoutMs + b.activationSettleMs)
+        + b.tailFallbackTimeoutMs,
+      platform,
+    );
+    assert.ok(cap.pasteBudgetWorstCaseMs(platform) <= cap.PASTE_POST_STOP_DEADLINE_MS, `${platform} fits the deadline`);
+  }
+});

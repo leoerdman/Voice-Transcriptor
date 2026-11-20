@@ -165,6 +165,7 @@ desktop/
 ├── windows-paste-fallback.js       # the Windows PowerShell paste fallback script; sends keys only after a confirmed foreground switch (pure, node --test)
 ├── renderer-toggle.js              # the record hotkey's one renderer round trip and its deadline (pure, node --test)
 ├── renderer-requests.js            # the main window's requests (shortcuts, record toggle, reveal) — what main accepts from each (pure, node --test); replaces the document.title channel
+├── auto-stop-config.js             # the silence auto-stop setting main applies: the renderer's, or off — no copy of its defaults (pure, node --test)
 ├── data-dir.js                     # the one rule for where the desktop shell keeps its data (pure, node --test)
 ├── backend-exit.js                 # what the shell does when the backend child exits: restart, report, or let it go on quit (pure, node --test)
 ├── single-flight.js                # at most one run of an operation at a time; check and claim in one step (engine install) (pure, node --test)

@@ -35,9 +35,11 @@
  *      global hotkeys, recording capsule, backend. A Dock click restores it.
  *   4. Closing the window (red button, Cmd+W) and Cmd+Q both quit — on
  *      every platform. "Closed" means "not running".
- *   5. Nothing else moves the window. The recording capsule in particular
- *      is a separate, non-focusable, always-on-top window: it never hides,
- *      focuses or reorders the main window.
+ *   5. Nothing else the APP does moves the window. The recording capsule
+ *      in particular is a separate, non-focusable, always-on-top window:
+ *      showing, updating or hiding it never hides, focuses or reorders the
+ *      main window. What macOS does on a click of it is another matter —
+ *      see the limit below (H-03).
  *
  * What rule 5 still rests on, stated so nobody mistakes it for solved:
  * outside screen mode, a click on the capsule is an ordinary click the

@@ -58,6 +58,18 @@ const AX_TRACE_PREFIX = "AXT:";
 /** Matches one complete AX trace line and captures label + edge. */
 const AX_TRACE_LINE_RE = new RegExp(`^${AX_TRACE_PREFIX}([A-Za-z0-9_-]+):(begin|end)$`);
 
+/**
+ * The Windows scripts' complete marker lines, built once from the parts
+ * above so the script that prints one and the parser that reads it cannot
+ * drift (DX-26): main.js's VBS and ./windows-paste-fallback print them,
+ * ./paste-result reads them.
+ */
+const VBS_PASTE_OK = `${PASTE_OK_PREFIX}${VBS_PASTE_METHOD}`;
+const VBS_PASTE_SENT = `${PASTE_SENT_PREFIX}${VBS_PASTE_METHOD}`;
+const PWSH_PASTE_OK = `${PASTE_OK_PREFIX}${PWSH_PASTE_METHOD}`;
+/** Both Windows scripts refuse to send keys into a window the OS did not raise. */
+const PASTE_ERR_ACTIVATE = `${PASTE_ERR_PREFIX}activate`;
+
 /** Matches a receipt anywhere in a stream, at the start of a line. */
 const PASTE_SENT_RECEIPT_RE = new RegExp(`(^|[\\r\\n])(${PASTE_SENT_PREFIX}[A-Za-z0-9_.+-]+)`);
 
@@ -65,6 +77,10 @@ module.exports = {
   PASTE_OK_PREFIX,
   VBS_PASTE_METHOD,
   PWSH_PASTE_METHOD,
+  VBS_PASTE_OK,
+  VBS_PASTE_SENT,
+  PWSH_PASTE_OK,
+  PASTE_ERR_ACTIVATE,
   PASTE_ERR_PREFIX,
   PASTE_SENT_PREFIX,
   AX_TRACE_PREFIX,

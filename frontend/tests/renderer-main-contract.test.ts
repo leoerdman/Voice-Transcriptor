@@ -512,7 +512,7 @@ describe("boot, update check and History bootstrap (FQ-13/FQ-14/FQ-15/FQ-22)", (
   });
 
   it("FQ-14: the classifier lives in ./boot-error and every raw error gets its disclosure", () => {
-    expect(mainTsx).toContain('import { classifyBootError } from "./boot-error";');
+    expect(mainTsx).toContain('import { classifyBootError, type BootFailure } from "./boot-error";');
     expect(mainTsx).not.toMatch(/function classifyBootError\(/);
     expect(mainTsx).not.toContain("raw !== detail");
   });

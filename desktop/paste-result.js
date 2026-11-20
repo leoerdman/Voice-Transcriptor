@@ -36,10 +36,8 @@ const {
   PASTE_OK_PREFIX,
   PASTE_ERR_PREFIX,
   PASTE_SENT_RECEIPT_RE,
-  VBS_PASTE_METHOD,
+  VBS_PASTE_OK,
 } = require("./paste-protocol");
-
-const VBS_PASTE_OK = `${PASTE_OK_PREFIX}${VBS_PASTE_METHOD}`;
 
 function outcomeOf(stdout) {
   return String(stdout == null ? "" : stdout).trim();

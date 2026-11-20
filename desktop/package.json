@@ -59,6 +59,7 @@
       "windows-paste-fallback.js",
       "renderer-toggle.js",
       "renderer-requests.js",
+      "auto-stop-config.js",
       "data-dir.js",
       "backend-exit.js",
       "single-flight.js",

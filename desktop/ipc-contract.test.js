@@ -83,51 +83,71 @@ test("permissions:repair is invoked by the renderer bridge and handled by main",
   assert.match(mainSource, /runCommand\(command\.cmd, command\.args\.slice\(\)/);
 });
 
-test("main subscribes the power events at app scope, not inside another handler", () => {
-  // Both power handlers once lived physically inside
-  // restoreShortcutsAfterCaptureAbort — a function that returns early
-  // unless the user aborts a hotkey capture in Settings. Nothing was
-  // subscribed in a normal session, so BUG-81's resume re-claim and the
-  // 1.6.0 warm-microphone release never ran, and the old version of this
-  // test stayed green because it matched a source string rather than
-  // asking where that string sat.
-  assert.match(mainSource, /subscribePowerEvents\(require\("electron"\)\.powerMonitor/);
-  assert.match(mainSource, /require\("\.\/power-events"\)/);
-
-  const body = functionBody(mainSource, "restoreShortcutsAfterCaptureAbort");
-  assert.ok(body, "restoreShortcutsAfterCaptureAbort must still exist");
-  for (const forbidden of ["powerMonitor", "subscribePowerEvents", "notifyRendererSystemSuspend"]) {
-    assert.ok(
-      !body.includes(forbidden),
-      `aborting a hotkey capture must not touch ${forbidden} — that nesting is the bug`,
-    );
-  }
-
-  // And the events themselves are declared once, as data, in the module.
-  const { POWER_EVENTS } = require("./power-events");
-  assert.deepEqual([...POWER_EVENTS].sort(), ["lock-screen", "resume", "suspend"]);
-});
-
 /**
- * The source text of one top-level-ish `function name(...) { ... }` body,
- * found by brace matching so the assertion survives reformatting.
+ * Brace depth of `index` inside the block that opens at `open` (the "{"),
+ * skipping strings, template literals and comments, so a "{" in a log
+ * message or a comment does not count. 1 = directly inside that block.
  */
-function functionBody(source, name) {
-  const start = source.indexOf(`function ${name}(`);
-  if (start < 0) return "";
-  const open = source.indexOf("{", start);
-  if (open < 0) return "";
+function blockDepthAt(source, open, index) {
   let depth = 0;
-  for (let i = open; i < source.length; i += 1) {
+  const templateStack = [];
+  for (let i = open; i < index; i += 1) {
     const ch = source[i];
-    if (ch === "{") depth += 1;
-    else if (ch === "}") {
-      depth -= 1;
-      if (depth === 0) return source.slice(open + 1, i);
+    const next = source[i + 1];
+    if (ch === "/" && next === "/") { i = source.indexOf("\n", i); if (i < 0) return -1; continue; }
+    if (ch === "/" && next === "*") { i = source.indexOf("*/", i + 2) + 1; if (i <= 0) return -1; continue; }
+    if (ch === "\"" || ch === "'") {
+      for (i += 1; i < index && source[i] !== ch; i += 1) if (source[i] === "\\") i += 1;
+      continue;
     }
+    if (ch === "`" || (ch === "}" && templateStack.length && templateStack[templateStack.length - 1] === depth)) {
+      if (ch === "}") { templateStack.pop(); depth -= 1; }
+      // Inside a template literal: run to its end or to the next ${.
+      for (i += 1; i < index; i += 1) {
+        if (source[i] === "\\") { i += 1; continue; }
+        if (source[i] === "`") break;
+        if (source[i] === "$" && source[i + 1] === "{") { depth += 1; templateStack.push(depth); i += 1; break; }
+      }
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    else if (ch === "}") depth -= 1;
   }
-  return "";
+  return depth;
 }
+
+test("main subscribes the power events once, directly inside app.whenReady, with the handlers they need (DX-28)", () => {
+  const ready = mainSource.indexOf("app.whenReady().then(async () => {");
+  assert.ok(ready >= 0, "app.whenReady() callback not found");
+  const open = mainSource.indexOf("{", ready);
+  const callAt = mainSource.indexOf("subscribePowerEvents(require(\"electron\").powerMonitor, {");
+  assert.ok(callAt > open, "the subscription must be inside app.whenReady");
+  assert.equal(mainSource.indexOf("subscribePowerEvents(", callAt + 1), -1, "subscribed from exactly one place");
+  assert.equal(blockDepthAt(mainSource, open, callAt), 1, "at the top of the whenReady callback, not nested in a handler");
+
+  // Run main's own call against a fake powerMonitor: every event the app
+  // depends on is subscribed, and each reaches the handler main wired.
+  const end = mainSource.indexOf("});", callAt) + 3;
+  const callText = mainSource.slice(callAt, end);
+  const listeners = new Map();
+  const powerMonitor = { on: (event, fn) => listeners.set(event, fn) };
+  const calls = [];
+  const run = new Function(
+    "subscribePowerEvents", "require", "registerGlobalShortcuts", "notifyRendererSystemSuspend", "appendMainLog",
+    callText,
+  );
+  run(
+    require("./power-events").subscribePowerEvents,
+    (name) => (name === "electron" ? { powerMonitor } : require(name)),
+    () => calls.push("reclaim"),
+    (reason) => calls.push(`release:${reason}`),
+    () => { },
+  );
+  const { POWER_EVENTS } = require("./power-events");
+  assert.deepEqual([...listeners.keys()].sort(), [...POWER_EVENTS].sort());
+  for (const event of ["resume", "suspend", "lock-screen"]) listeners.get(event)();
+  assert.deepEqual(calls, ["reclaim", "release:suspend", "release:lock-screen"]);
+});
 
 test("the preload exposes fixed channels only — never raw ipcRenderer", () => {
   // A bridge that hands the renderer `ipcRenderer` (or a send that takes

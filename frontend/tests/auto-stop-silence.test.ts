@@ -71,22 +71,16 @@ describe("the markup keeps no copy of the numbers", () => {
   }
 });
 
-describe("the main process agrees with the token", () => {
+describe("the main process keeps no copy of the numbers (FU-13c)", () => {
   /**
-   * `desktop/main.js` keeps a frozen fallback used when the renderer has
-   * not yet supplied a `liveStatusSnapshot`. It cannot import the
-   * renderer's tokens, so this is the cross-check that would have caught
-   * the four copies drifting.
+   * `desktop/main.js` used to keep `DEFAULT_RECORDING_AUTO_STOP_CONFIG`, a
+   * second copy of these defaults held in step only by a cross-check here.
+   * It now applies what the renderer publishes or nothing
+   * (desktop/auto-stop-config.js, behaviour-tested there), so there is no
+   * copy to agree with.
    */
-  it("DEFAULT_RECORDING_AUTO_STOP_CONFIG matches UI_TOKENS.autoStopSilence", () => {
-    const tokens = autoStopTokens();
-    const decl = /DEFAULT_RECORDING_AUTO_STOP_CONFIG\s*=\s*Object\.freeze\(\{([^}]*)\}\)/
-      .exec(desktopMain);
-    expect(decl, "DEFAULT_RECORDING_AUTO_STOP_CONFIG not found in desktop/main.js").toBeTruthy();
-    const body = String(decl?.[1]);
-    const num = (key: string): number => Number(new RegExp(`${key}:\\s*(-?\\d+)`).exec(body)?.[1]);
-    expect(/enabled:\s*false/.test(body)).toBe(tokens.defaultEnabled === false);
-    expect(num("seconds")).toBe(tokens.defaultSeconds);
-    expect(num("thresholdDb")).toBe(tokens.defaultThresholdDb);
+  it("desktop/main.js declares no auto-stop default of its own", () => {
+    expect(desktopMain).not.toContain("DEFAULT_RECORDING_AUTO_STOP_CONFIG");
+    expect(desktopMain).toContain("parseAutoStopConfig(");
   });
 });

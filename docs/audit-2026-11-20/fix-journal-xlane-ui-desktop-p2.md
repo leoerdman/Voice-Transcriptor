@@ -76,3 +76,60 @@ intermediate state would have needed its own full verification run on a shared, 
 - After: desktop `ℹ tests 433 · pass 433 · fail 0`; frontend `Test Files 47 passed · Tests 601 passed`; typecheck,
   lint, build clean; `node --check` main/preload OK.
 - Not done in this commit: the DM-14 recording-state push (see "Not done").
+
+## Commit 2 · DX-26, DX-12, DX-25, DX-28 #1, DM-16/DM-20, FU-13c, FQ-14 (a, desktop half), FQ-22(5), H-03 (docs)
+
+- **DX-26** — `paste-protocol.js` builds the complete Windows marker lines once (`VBS_PASTE_OK`, `VBS_PASTE_SENT`,
+  `PWSH_PASTE_OK`, `PASTE_ERR_ACTIVATE`); main.js's VBS, `windows-paste-fallback.js` and `paste-result.js` use them.
+  No `"OK:vbs-paste"` / `"OK:pwsh-paste"` / `"ERR:activate"` literal left in main.js.
+- **DX-12** — `screen-mode-controller.js` owns the stacking (`SCREEN_MODE_LAYERS`: "screen-saver", overlay 0 <
+  palette 1 < capsule 2; main.js lifts the capsule with it) and takes the capsule's geometry as
+  `deps.capsuleLayout = {bottomMargin, height}` from main's `RECORDING_STATUS_CAPSULE`. The palette fallback is the
+  pure `paletteBoundsFor` — no literal `54`.
+- **DX-25** — dev helper path is `native/build/mac-arm64`, the only macOS target `build-native.sh` builds; the
+  packaging test derives that target from the script and requires main.js to use it.
+- **DX-28 #1** — `ipc-contract.test.js` no longer text-matches the power subscription: it checks the call sits at
+  brace depth 1 of the `app.whenReady` callback (a comment/string/template-aware counter) and RUNS main's own call
+  text against a fake `powerMonitor`, asserting every `POWER_EVENTS` entry is subscribed and reaches the handler
+  main wired (resume → reclaim, suspend/lock-screen → release with the event name). (#2 was done in commit 1.)
+- **DM-16 / DM-20** — `appActivationSettleMs` (350), `windowActivationSettleMs` (180), `autoSendActivationSettleMs`
+  (110) are fields of every `PASTE_BUDGET` row (one declaration each, spread into the rows); main.js reads them via
+  `activationSettleMs(kind)`. `pasteBudgetWorstCaseMs` now counts one settle per attempt where the ladder
+  re-activates (win32 28 930 ms, linux 30 210 ms, darwin 26 435 ms — all inside `PASTE_POST_STOP_DEADLINE_MS` 32 000,
+  asserted).
+- **FU-13c** — `DEFAULT_RECORDING_AUTO_STOP_CONFIG` is gone. New pure `desktop/auto-stop-config.js`
+  (`parseAutoStopConfig`, `AUTO_STOP_OFF`): main applies the renderer's published setting or nothing. Behaviour
+  difference: a renderer answer that is enabled but has unusable numbers now means "off" instead of main's private
+  2 s / −42 dB (the renderer clamps every value it publishes, so this does not occur in practice).
+  `frontend/tests/auto-stop-silence.test.ts`'s cross-check of the copy becomes "there is no copy".
+- **FQ-14 (a), desktop half** — main sends `__setBackendBootError({code, raw})`; codes `BACKEND_BOOT_ERROR_CODES`
+  (PYTHON_MISSING, RUNTIME_UNAVAILABLE, BACKEND_EXITED, BACKEND_SPAWN_FAILED, APP_STARTUP_FAILED) set only through
+  `failBackendBoot`. Renderer `classifyBootError(raw, code)` decides PYTHON_MISSING by code and no longer matches
+  main's own sentence; Python/OS stderr in `raw` is still classified as text. A contract test pins the code names on
+  both sides. **(e)** (inline `style.*` on the disclosure) not done — see Not done.
+- **FQ-22(5)** — failure paths call `retireBackendBootStatusAfterFailure()` (drops the replayed status) instead of
+  `setBackendBootStatus("")`, which the renderer reads as success ("Ready"). Only the health-OK path sends "".
+- **H-03 (docs)** — `window-lifecycle.js` rule 5 now says the APP never moves the window and points at the stated
+  limit; CHANGELOG [Unreleased] gets a correction entry and the 1.6.4 bullet a pointer to it. The native-helper
+  change was not attempted (lead's brief).
+- Files: `desktop/{paste-protocol,paste-result,windows-paste-fallback,screen-mode-controller,paste-capability,
+  auto-stop-config,window-lifecycle,main}.js`, tests `desktop/{paste-result,screen-mode-controller,packaging,
+  ipc-contract,paste-capability,own-process-rules,auto-stop-config,startup-boot}.test.js`, `desktop/package.json`,
+  `frontend/src/{boot-error.ts,main.tsx}`, `frontend/tests/{boot-error,auto-stop-silence,renderer-main-contract}.test.ts`,
+  `CHANGELOG.md`, `PROJECT_STRUCTURE.md`.
+- Before (HEAD 8a9bc6b sources, new tests; unrelated packaging failures caused by the partial archive omitted):
+  ```
+  ✖ the markers the Windows scripts print are the ones the parser accepts
+  ✖ the palette sits above where the capsule is, or would be, from the injected capsule layout
+  ✖ the overlay, palette and capsule layers are one ordered fact
+  ✖ the helper's place in the bundle is one fact across build-native.sh, package.json, main.js and afterPack
+  ✖ the activation settles live in PASTE_BUDGET and are counted in the worst case
+  ✖ auto-stop-config.test.js            (module did not exist)
+  ✖ only the success path sends an empty boot status; failures carry a code
+  ```
+  frontend (HEAD `boot-error.ts`): `Tests 3 failed | 4 passed (7)` —
+  `× FQ-14 (a): main's own failures are told apart by code…`, `× the codes are the ones desktop/main.js sends`
+  (+1 TypeError from the missing export). The DX-28 #1 power test passes on HEAD too: it is a test rewrite (text
+  match → depth + behaviour), not a behaviour change.
+- After: desktop `ℹ tests 441 · pass 441 · fail 0`; frontend `Test Files 47 passed · Tests 603 passed`; typecheck,
+  lint, build clean; `node --check` OK.
