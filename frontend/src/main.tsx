@@ -34,6 +34,11 @@ import {
   type StopEpiloguePlan,
 } from "./stop-epilogue";
 import {
+  isUploadClearable,
+  uploadErrorView,
+  uploadRetryPlan,
+} from "./upload-item";
+import {
   captureElapsedMs,
   decidePreRoll,
   decideWarmHold,
@@ -14059,9 +14064,11 @@ interface UploadQueueItem {
   //   uploading → Uploading … (file body in flight to backend)
   //   processing → Processing … (backend is decoding video / running
   //                Deepgram REST / OpenRouter audio model)
+  //   saving    → Saving to History … (the job is done; the transcript
+  //                is being written to the archive — no longer stoppable)
   //   none      → status's own label (done/error/cancelled)
   status: UploadQueueStatus;
-  stage?: "queued" | "uploading" | "processing" | "done";
+  stage?: "queued" | "uploading" | "processing" | "saving" | "done";
   /**
    * 0..1 fraction of known upload progress. Browser fetch does not
    * expose request-body progress, so this remains undefined for the
@@ -14764,8 +14771,10 @@ function setupUploadView(): void {
       afterUploadQueueSnapshotLoaded(() => {
         // Drop only finished items so an in-flight transcription is
         // never aborted by an accidental Clear click.
+        // A transcript whose History save failed exists nowhere else, so
+        // the bulk clear keeps it (./upload-item); × removes it explicitly.
         for (let i = uploadQueue.length - 1; i >= 0; i--) {
-          if (isUploadTerminalStatus(uploadQueue[i].status)) {
+          if (isUploadClearable(uploadQueue[i])) {
             uploadQueue.splice(i, 1);
           }
         }
@@ -15042,53 +15051,11 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
       item.completedAt = Date.now();
       return;
     }
-    // Persist to the History tab's archive. We pass the original
-    // file so the audio is saved alongside the transcript and is
-    // playable from the History row. `refreshList: true` triggers a
-    // single archive reload at the end of each successful save.
-    const sourceName = sourceFile?.name || uploadPathBasename(sourcePath) || uploadItemName(item);
-    let saveOut: SavedRecordingRef;
-    try {
-      saveOut = await saveRecordingText({
-        title: (sourceName.replace(/\.[^.]+$/, "") || "Uploaded file").slice(0, 80),
-        sourceText: text,
-        transcriptText: text,
-        provider,
-        model: modelLabel,
-        language,
-        recordingCollection: RECORDING_COLLECTIONS.uploads,
-        audioFile: useSourcePath ? null : sourceFile,
-        audioSourcePath: useSourcePath ? saveAudioSourcePath : "",
-        consumeAudioSourcePath: useSourcePath ? consumeSaveAudioSourcePath : false,
-        refreshList: true,
-      });
-    } catch (saveErr) {
-      console.warn("Upload: saveRecordingText failed", saveErr);
-      item.text = text;
-      item.status = "error";
-      item.stage = undefined;
-      item.error = `Transcript finished, but History save failed: ${sanitizeUiErrorMessage(
-        saveErr,
-        "Could not save this upload to History.",
-      )}`;
-      item.endedAt = performance.now();
-      item.completedAt = Date.now();
-      return;
-    }
-    item.text = text;
-    item.status = "done";
-    item.stage = "done";
-    item.endedAt = performance.now();
-    item.completedAt = Date.now();
-    item.savedName = String(saveOut.name || "");
-    item.savedArchiveDir = String(saveOut.archiveDir || "");
-    // Auto-select the just-completed item in the result pane unless
-    // the user has already clicked another item — gives a clear
-    // visual confirmation of "this is your transcript" without
-    // them having to hunt for it.
-    if (uploadSelectedId === null) {
-      uploadSelectedId = item.id;
-    }
+    await saveUploadItemToHistory(item, text, {
+      file: useSourcePath ? null : sourceFile,
+      sourcePath: useSourcePath ? saveAudioSourcePath : "",
+      consumeSourcePath: useSourcePath ? consumeSaveAudioSourcePath : false,
+    });
   } catch (e) {
     // Distinguish user-cancelled from genuine error so the queue UI
     // shows "Cancelled" instead of "Failed" — and so the user
@@ -15110,6 +15077,68 @@ async function processUploadItem(item: UploadQueueItem): Promise<void> {
     item.abortController = undefined;
     item.cancelRequested = false;
     renderUploadQueue();
+  }
+}
+
+/**
+ * Persist a finished upload to the History archive and settle the item.
+ * One path for the processor and for a save-only Retry (FQ-05): on
+ * failure the transcript stays on the item, shown and copyable, and
+ * Retry comes back here instead of transcribing again (./upload-item).
+ * The ``saving`` stage takes the Stop button away: the job is done, and
+ * a stop pressed during the save used to be acknowledged ("Stopping")
+ * and then ignored (FQ-18).
+ */
+async function saveUploadItemToHistory(
+  item: UploadQueueItem,
+  text: string,
+  audio: { file: File | null; sourcePath: string; consumeSourcePath: boolean },
+): Promise<void> {
+  item.stage = "saving";
+  renderUploadQueue();
+  const sourceName = audio.file?.name || uploadPathBasename(audio.sourcePath) || uploadItemName(item);
+  try {
+    // The original file (or its path) goes with the transcript, so the
+    // audio is playable from the History row; ``refreshList`` reloads
+    // the archive once per successful save.
+    const saveOut = await saveRecordingText({
+      title: (sourceName.replace(/\.[^.]+$/, "") || "Uploaded file").slice(0, 80),
+      sourceText: text,
+      transcriptText: text,
+      provider: item.provider || "",
+      model: item.model || "",
+      language: item.language || "",
+      recordingCollection: RECORDING_COLLECTIONS.uploads,
+      audioFile: audio.file,
+      audioSourcePath: audio.sourcePath,
+      consumeAudioSourcePath: audio.consumeSourcePath,
+      refreshList: true,
+    });
+    item.text = text;
+    item.error = "";
+    item.status = "done";
+    item.stage = "done";
+    item.savedName = String(saveOut.name || "");
+    item.savedArchiveDir = String(saveOut.archiveDir || "");
+    // Auto-select the just-completed item in the result pane unless
+    // the user has already clicked another item — gives a clear
+    // visual confirmation of "this is your transcript" without
+    // them having to hunt for it.
+    if (uploadSelectedId === null) {
+      uploadSelectedId = item.id;
+    }
+  } catch (saveErr) {
+    console.warn("Upload: saveRecordingText failed", saveErr);
+    item.text = text;
+    item.status = "error";
+    item.stage = undefined;
+    item.error = `Transcript finished, but History save failed: ${sanitizeUiErrorMessage(
+      saveErr,
+      "Could not save this upload to History.",
+    )}`;
+  } finally {
+    item.endedAt = performance.now();
+    item.completedAt = Date.now();
   }
 }
 
@@ -15135,6 +15164,7 @@ function uploadStatusLabel(item: UploadQueueItem): string {
         return pct !== null ? `Uploading · ${pct}%` : "Uploading…";
       }
       if (item.stage === "processing") return "Processing…";
+      if (item.stage === "saving") return "Saving to History…";
       return "Transcribing…";
     case "done": {
       const ms = item.endedAt && item.startedAt ? item.endedAt - item.startedAt : 0;
@@ -15181,7 +15211,8 @@ function cancelUploadItem(id: string): void {
     return;
   }
   if (item.status === "transcribing") {
-    if (item.cancelRequested) return;
+    // Nothing left to stop once the job is done and the save is running.
+    if (item.cancelRequested || item.stage === "saving") return;
     item.cancelRequested = true;
     // Abort the in-flight fetch. The processor's catch will
     // see DOMException name === "AbortError" and mark it
@@ -15234,6 +15265,26 @@ function assignUploadRetryFile(item: UploadQueueItem, file: File): void {
 async function retryUploadItem(id: string): Promise<void> {
   const item = uploadQueue.find((it) => it.id === id);
   if (!item || item.status !== "error") return;
+  if (uploadRetryPlan(item) === "save") {
+    // The transcript exists; only the History save failed (FQ-05). The
+    // audio goes with it when its source is still at hand, else the
+    // transcript is saved on its own rather than paid for twice.
+    const keptPath = normalizeUploadSourcePath(item.sourcePath || "");
+    const pathUsable = !!keptPath && !uploadSourcePathValidationError(keptPath, uploadItemSize(item));
+    item.status = "transcribing";
+    item.error = "";
+    item.startedAt = performance.now();
+    item.endedAt = undefined;
+    uploadSelectedId = item.id;
+    await saveUploadItemToHistory(item, String(item.text || ""), {
+      file: pathUsable ? null : item.file || null,
+      sourcePath: pathUsable ? keptPath : "",
+      consumeSourcePath: false,
+    });
+    saveUploadQueueSnapshot();
+    renderUploadQueue();
+    return;
+  }
   if (!item.file && !normalizeUploadSourcePath(item.sourcePath || "")) {
     const file = await pickUploadRetryFile();
     if (!file) return;
@@ -15416,7 +15467,7 @@ function renderUploadQueue(): void {
       stopBtn.className = "upload-queue-item-stop";
       stopBtn.setAttribute("aria-label", "Stop transcription");
       stopBtn.title = "Stop transcription";
-      stopBtn.disabled = item.cancelRequested === true;
+      stopBtn.disabled = item.cancelRequested === true || item.stage === "saving";
       stopBtn.textContent = item.cancelRequested ? "Stopping" : "Stop";
       stopBtn.addEventListener("click", (ev) => {
         ev.stopPropagation();
@@ -15508,11 +15559,40 @@ function renderUploadQueue(): void {
       const revealItemBtn = createUploadRevealButton(item);
       if (revealItemBtn) actions.appendChild(revealItemBtn);
       li.appendChild(actions);
-    } else if (item.status === "error" && item.error) {
-      const err = document.createElement("div");
-      err.className = "upload-queue-item-error";
-      err.textContent = item.error;
-      li.appendChild(err);
+    } else if (item.status === "error") {
+      // FQ-01: a transcript whose History save failed is shown and
+      // copyable beside the error, not just mentioned by it.
+      const view = uploadErrorView(item);
+      if (view.error) {
+        const err = document.createElement("div");
+        err.className = "upload-queue-item-error";
+        err.textContent = view.error;
+        li.appendChild(err);
+      }
+      if (view.transcript) {
+        const body = document.createElement("div");
+        body.className = "upload-queue-item-body";
+        body.textContent = view.transcript;
+        li.appendChild(body);
+        const actions = document.createElement("div");
+        actions.className = "upload-queue-item-actions";
+        const copyBtn = document.createElement("button");
+        copyBtn.className = "btn btn-ghost upload-queue-item-action";
+        copyBtn.type = "button";
+        copyBtn.textContent = "Copy";
+        copyBtn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          void (async () => {
+            const ok = await writeTextToClipboard(view.transcript);
+            flashButtonFeedback(copyBtn, ok ? "Copied" : "Copy failed", "Copy transcript", {
+              durationMs: UI_TOKENS.feedback.flashMs,
+              swapLabel: true,
+            });
+          })();
+        });
+        actions.appendChild(copyBtn);
+        li.appendChild(actions);
+      }
     }
     list.appendChild(li);
   }
@@ -15604,10 +15684,28 @@ function renderUploadResultPane(): void {
         revealUploadItem(item);
       };
     }
-  } else if (item.status === "error" && item.error) {
-    textEl.textContent = item.error;
-    metaEl.hidden = true;
-    if (copyBtn) copyBtn.hidden = true;
+  } else if (item.status === "error" && (item.error || item.text)) {
+    // FQ-01: the held transcript is the body; the error is its one meta line.
+    const view = uploadErrorView(item);
+    textEl.textContent = view.transcript || view.error;
+    metaEl.innerHTML = "";
+    metaEl.hidden = !view.transcript || !view.error;
+    if (view.transcript && view.error) {
+      const line = document.createElement("span");
+      line.textContent = view.error;
+      metaEl.appendChild(line);
+    }
+    if (copyBtn) {
+      copyBtn.hidden = !view.copyable;
+      copyBtn.onclick = () => {
+        void (async () => {
+          const ok = await writeTextToClipboard(view.transcript);
+          flashButtonFeedback(copyBtn, ok ? "Copied" : "Copy failed", "Copy transcript", {
+            durationMs: UI_TOKENS.feedback.flashMs,
+          });
+        })();
+      };
+    }
     if (revealBtn) revealBtn.hidden = true;
   } else {
     // queued / transcribing / cancelled — show stage label as the

@@ -443,3 +443,43 @@ describe("the live preview defers to a resolved envelope, verbatim (B-041)", () 
     expect(ternaryCondition).toMatch(/resolvedEnvelopeText\s*!==\s*null\s*\n?\s*\?\s*$/);
   });
 });
+
+/** Slice one top-level function of main.tsx, from its header to the next marker. */
+function mainTsxSlice(header: string, next: string): string {
+  const start = mainTsx.indexOf(header);
+  const end = mainTsx.indexOf(next, start + header.length);
+  return start !== -1 && end > start ? mainTsx.slice(start, end) : "";
+}
+
+/**
+ * FQ-01 / FQ-05 / FQ-18: the upload queue's "transcript finished, History
+ * save failed" state. The decisions are behaviour-tested in
+ * upload-item.test.ts; this pins that the queue actually uses them.
+ */
+describe("upload queue wiring for a failed History save (FQ-01/FQ-05/FQ-18)", () => {
+  it("both the queue row and the result pane render the error state through uploadErrorView", () => {
+    const row = mainTsxSlice("function renderUploadQueue(): void {", "\nfunction renderUploadResultPane(");
+    const pane = mainTsxSlice("function renderUploadResultPane(): void {", "\ninstallRevealRecordingBridge();");
+    expect(row).toContain("uploadErrorView(item)");
+    expect(pane).toContain("uploadErrorView(item)");
+  });
+
+  it("Retry asks uploadRetryPlan and a save-only retry goes through the one save helper", () => {
+    const retry = mainTsxSlice("async function retryUploadItem(", "\n}\n");
+    expect(retry).toContain('uploadRetryPlan(item) === "save"');
+    expect(retry).toContain("await saveUploadItemToHistory(item,");
+    // The processor and the retry share the save; nothing else saves uploads.
+    const processor = mainTsxSlice("async function processUploadItem(", "\nasync function saveUploadItemToHistory(");
+    expect(processor).toContain("await saveUploadItemToHistory(item, text,");
+    expect(processor).not.toContain("saveRecordingText(");
+  });
+
+  it("'Clear done' filters by isUploadClearable", () => {
+    expect(mainTsx).toMatch(/if \(isUploadClearable\(uploadQueue\[i\]\)\) \{\s*uploadQueue\.splice\(i, 1\);/);
+  });
+
+  it("the save stage cannot be 'stopped': cancel ignores it and the Stop button is disabled", () => {
+    expect(mainTsx).toContain('if (item.cancelRequested || item.stage === "saving") return;');
+    expect(mainTsx).toContain('stopBtn.disabled = item.cancelRequested === true || item.stage === "saving";');
+  });
+});
