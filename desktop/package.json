@@ -67,6 +67,7 @@
       "quit-path.js",
       "post-stop-handoff.js",
       "session-permissions.js",
+      "own-process.js",
       "log-retention.js",
       "backend-auth.js",
       "private-log.js",

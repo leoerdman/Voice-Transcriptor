@@ -179,6 +179,7 @@ desktop/
 ├── quit-path.js                    # the one way a normal shutdown starts (quitApp → app.quit) and the SIGINT/SIGTERM/SIGHUP handlers (pure, node --test)
 ├── post-stop-handoff.js            # which stopped recordings get a post-stop task, and how it waits for the transcript: the recording-final mailbox only (pure, node --test)
 ├── session-permissions.js          # a session partition that grants no permission request or check (the capsule) (pure, node --test)
+├── own-process.js                  # the one "is this our own app" rule, from the app's name, for the activation and paste-target checks (pure, node --test)
 ├── renderer-epoch.js               # which renderer a recording id belongs to, so a reloaded renderer's ids are never confused (pure, node --test)
 ├── shortcut-runtime.js             # the accelerators bound right now and how a Settings update changes them (pure, node --test)
 ├── capsule-geometry.js             # the recording capsule's window size and placement (pure, node --test)

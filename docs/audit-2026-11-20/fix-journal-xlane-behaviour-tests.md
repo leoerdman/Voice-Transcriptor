@@ -199,3 +199,88 @@ Cut from `main` at 8e8f0a6.
   the naming test fails. Restored → green.
 - Suites: desktop 504/504, frontend 649/649, typecheck, lint, build,
   `node --check`: green.
+
+## 6. Own-process rules (DM-16)
+
+- New `desktop/own-process.js`: `createOwnProcessRules({ appName, pid })`
+  → `{ isOwnAppName, isBadActivationTarget, shouldUsePasteTarget }`, moved
+  verbatim from main.js; main.js takes the two it calls from it
+  (`appName: () => app.getName(), pid: process.pid`).
+- `own-process-rules.test.js` first test: the regexes
+  (`isOwnAppName` contains `app.getName()`, the two checks contain
+  `isOwnAppName(n)` / `isOwnAppName(name)`) replaced by behaviour: exact
+  name and helper only, never a substring ("Audio Transcriptor Pro" is not
+  us); a renamed app ("Dictate") changes what is "own" — the proof that no
+  product name is retyped; activation refuses own family, bare Electron
+  and Electron helpers only; a paste target is neither this pid nor our
+  app nor unidentified. Wiring kept textual: main.js builds the rules from
+  `app.getName()` / `process.pid`, has no second copy of the functions,
+  and no `=== "transcriptor"` literal.
+- Break-it evidence: substring match instead of exact → 2 tests fail;
+  the app name hard-coded to "transcriptor" → the rename test fails; the
+  own-pid check removed → the paste-target test fails; activation no
+  longer asking isOwnAppName → 2 tests fail. Restored → 7/7.
+- Suites: desktop 508/508, frontend 649/649, typecheck, lint, build,
+  `node --check`: green.
+
+## Kept as textual (why)
+
+- `ipc-sender.test.js` / `ipc-contract.test.js` / `recording-final-slot.test.js`
+  channel lists: which channel name is registered on which registrar, and
+  that preload and main spell it the same, is a fact of two source files
+  that cannot be loaded together outside Electron.
+- `main-dead-code.test.js` (all three): absence claims — "this dead
+  function / payload field / cleanup is not present". A behaviour test
+  cannot show that code does not exist. They are deliberately negative;
+  the review's "passes if the code is deleted" is the point here (the
+  claim is that it was deleted).
+- `log-privacy.test.js`: "no `textPreview:` / `preview: compactLogText(`"
+  is an absence claim; "the paste and post-stop traces carry `textLen` /
+  `textDigest(text)` / `digest: textDigest(transcript)`" would need
+  `runPasteLadder` (AppleScript, clipboard, activation) extracted to run
+  it with fakes — not worth it for a field name; positive and scoped to
+  the function, so it fails if the trace step is deleted.
+- `capsule-ipc.test.js` remaining two tests: the capsule page's HTML is a
+  string main.js builds (no `document.title =`, calls `window.__capsule.*`);
+  the preload sends exactly three fixed verbs and exposes no raw
+  ipcRenderer — both texts of files that only run inside Electron.
+- `own-process-rules.test.js` tests 2–3 (one accessor of the paste-last
+  accelerator, settle constants named for what they settle), `timing-budgets`
+  naming checks, `recording-monitor`'s "no 1 Hz wording", and
+  `post-stop-handoff`'s `queryRendererState` has no DOM ids (its probe is
+  an executeJavaScript *string*): naming / one-reader / wording facts.
+- `startup-boot.test.js`: see Not done.
+- `frontend/tests/renderer-main-contract.test.ts`: untouched. The review's
+  named weak pins ("exactly two `saveRecordingText({`",
+  "`isArchiveMutationConflict` count 1") are already gone — the ui lane
+  replaced them with `createSessionMetadataSaver` in ./stop-epilogue,
+  behaviour-tested in stop-epilogue.test.ts (the title that reaches the
+  save, review #1), plus a wiring check of what stopLive hands it. The
+  remaining counts ("one `kind: "transcript"` delivery", "five
+  `endWithoutTranscript` exits through one epilogue", "`session-stop`
+  observed once") are DRY/structure claims about stopLive's text; their
+  behaviour (the epilogue, the saver) is already module-tested. Turning
+  the rest into behaviour tests means extracting stopLive pieces from
+  main.tsx, which a parallel lane (FQ-06, FL-08, S-15) is editing — out of
+  scope for this lane by instruction.
+
+## Not done
+
+- `startup-boot.test.js` stays grep-based: "whenReady raises the startup
+  event without awaiting startBackend", "createWindow starts the backend
+  itself", "exactly one `setBackendBootStatus("")` after a healthy
+  `/api/health`", "five `failBackendBoot(CODE` sites", "only failBackendBoot
+  writes `backendBootError`". A behaviour test needs the boot sequence
+  (whenReady → createWindow → startBackend → health → status/error
+  broadcast) extracted into a module with injected window, backend and
+  health check — a refactor of the startup path larger than this lane's
+  remit and risky without a run of the app. Suggested shape: a
+  `createBootStatus({ publish })` owning `progress(msg)` (non-empty only),
+  `ready()` (the one empty status) and `fail(code, raw)`, with main.js's
+  boot steps calling it.
+- `log-privacy` positive checks (see above) and the renderer contract's
+  structural counts.
+- No app run: every change is covered by the desktop suite only
+  (main.js cannot be loaded outside Electron). The extracted functions
+  are moved verbatim except where noted (the monitor's synchronous-throw
+  fix).

@@ -161,6 +161,8 @@ const {
 // Each window's IPC channels are registered through one sender-guarded
 // registrar (DM-28).
 const { createSenderGuardedIpc } = require("./ipc-sender-guard");
+// The one "is this our own app" rule for the paste target checks (DM-16).
+const { createOwnProcessRules } = require("./own-process");
 // The one way a normal shutdown starts, and the signal handlers (DM-19).
 const { createQuitApp, installSignalQuitHandlers } = require("./quit-path");
 // The capsule window's size (one flag) and when it is placed (DM-13, DM-25).
@@ -3573,42 +3575,12 @@ const pasteVerificationPolicy = createPasteVerificationPolicy({
   },
 });
 
-/**
- * Is this process name our own app (DM-16)? Exact names, derived from
- * the app's name rather than retyped: a substring check on the product
- * name would exclude third-party apps whose name contains the word
- * ("Audio Transcriptor Pro"). The one list both target checks use.
- */
-function isOwnAppName(name) {
-  const n = String(name || "").trim().toLowerCase();
-  const own = String(app.getName() || "").trim().toLowerCase();
-  return !!n && !!own && (n === own || n === `${own} helper`);
-}
-
-function isBadActivationTarget(name) {
-  const n = String(name || "").trim().toLowerCase();
-  if (!n) return true;
-  // Our own process family, plus "electron": by name alone a bare
-  // Electron process is not a safe target (it may be us in a dev run, or
-  // the shell of an app whose real window is elsewhere). Electron
-  // helpers have deterministic suffixes that substring match is correct
-  // for.
-  if (n === "electron" || isOwnAppName(n)) return true;
-  if (n.includes("helper (renderer)") ||
-      n.includes("helper (gpu)") ||
-      n.includes("helper (plugin)") ||
-      n.includes("electron helper")) return true;
-  return false;
-}
-
-function shouldUsePasteTarget(front) {
-  const pid = Number(front?.pid || 0);
-  const name = String(front?.name || "").trim().toLowerCase();
-  if (pid > 0 && pid === process.pid) return false;
-  if (isOwnAppName(name)) return false;
-  if (!name && pid <= 0) return false;
-  return true;
-}
+// "Is this our own app?" — one rule for both target checks, derived from
+// the app's name (./own-process, DM-16).
+const { isBadActivationTarget, shouldUsePasteTarget } = createOwnProcessRules({
+  appName: () => app.getName(),
+  pid: process.pid,
+});
 
 /**
  * Does this failure name a macOS permission the user has to grant?
