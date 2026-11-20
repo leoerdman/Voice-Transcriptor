@@ -125,11 +125,16 @@ const { createRecordingFinalSlot } = require("./recording-final-slot");
 // decided from the renderer's explicit fields — never from the words the
 // user dictated (Ultra-Audit 2026-11-20 DM-01).
 const {
-  SIGNAL_OUTCOME,
   normalizeTranscriptText,
   isPasteableTranscript,
-  classifyRecordingSignal,
 } = require("./transcript-signal");
+// Which stopped recordings get a post-stop task, and how that task waits
+// for its transcript: the recording-final mailbox, nothing else (DM-15).
+const {
+  POST_STOP_ADMISSION,
+  decidePostStopAdmission,
+  awaitRecordingTranscript,
+} = require("./post-stop-handoff");
 // What a main-process stop does with the renderer's answer — or its
 // silence (DM-03, DM-22).
 const { STOP_ACTION, decideMainProcessStop } = require("./recording-stop");
@@ -6155,14 +6160,16 @@ function enqueuePostStopTask(options = {}) {
     epoch: rendererEpoch,
     slot: recordingFinalSlot,
   };
-  if (!task.autoTranscribe) return false;
+  const key = recordingKey(task.epoch, task.recordingId);
+  const admission = decidePostStopAdmission(task, () => _enqueuedRecordings.has(key));
+  if (admission === POST_STOP_ADMISSION.AUTO_TRANSCRIBE_OFF) return false;
   // A task is matched to its transcript by recordingId alone — the IPC
   // hand-off carries nothing else (DM-15). The renderer always reports
   // its positive monotonic id for the recording being stopped; a task
   // without one could only wait out the deadline for a signal that can
   // never match it, so it is refused, and the session is closed here
   // rather than leaving the capsule on "Transcribing".
-  if (!(task.recordingId > 0)) {
+  if (admission === POST_STOP_ADMISSION.NO_RECORDING_ID) {
     appendMainLog(`[post-stop-queue] refused: no recording id (rec=${task.recordingId})`);
     if (!hasActivePostStopWork()) {
       void setRecordingStatus("Saved To App", RECORDING_STATUS_KIND.OK)
@@ -6171,8 +6178,7 @@ function enqueuePostStopTask(options = {}) {
     }
     return false;
   }
-  const key = recordingKey(task.epoch, task.recordingId);
-  if (_enqueuedRecordings.has(key)) {
+  if (admission === POST_STOP_ADMISSION.DUPLICATE) {
     appendMainLog(
       `[post-stop-queue] dedup-skipped rec=${key} ` +
       `(already enqueued; preventing double-paste)`
@@ -6279,43 +6285,38 @@ async function processPostStopTask(task) {
   // add latency to healthy recordings; it only prevents legitimate
   // slow recovery from degrading into "Saved To App" with no paste.
   const POST_STOP_TRANSCRIPT_TIMEOUT_MS = PASTE_POST_STOP_DEADLINE_MS;
-  const deadline = Date.now() + POST_STOP_TRANSCRIPT_TIMEOUT_MS;
-  let transcript = "";
   const stopRequestedAt = Number(task.stopRequestedAt || Date.now());
-  let terminalWithoutPasteStatus = "";
-  // BUGS_AUDIT §6.9: the best text seen for THIS recording that was not
-  // paste-ready — a pre-upscale provisional, or a status-only signal
-  // carrying transcript text. Never pasted (§6.8), but it is what the
-  // deadline-expiry recovery hands to the user instead of nothing.
-  let bestKnownText = "";
-  // Sequence of the last hand-off signal already accounted for, so the
-  // same signal cannot be handled twice by the loop below.
-  let handledSignalSeq = 0;
-
-  // One reading of a hand-off signal, used wherever a signal is picked
-  // up, so the primary path cannot drift from the late-arrival case.
-  // Returns "final" | "terminal" | "provisional".
-  const consumeIpcSignal = (signal) => {
-    handledSignalSeq = signal.seq;
-    // §6.8: finality is stated, never inferred — and so is everything
-    // else. The renderer's ``final`` flag and its "<kind>:<phase>" source
-    // label decide; the text is never read for clues (DM-01: a dictation
-    // that starts with "HTTP " or mentions "silence detected" is still a
-    // dictation). ./transcript-signal owns the rule.
-    const verdict = classifyRecordingSignal(signal);
-    traceStep(trace, signal.final ? "ipc_final" : "ipc_signal", {
-      elapsedMs: Date.now() - stopRequestedAt,
-      recordingId: signal.recordingId,
-      source: signal.source,
-      textLen: normalizeTranscriptText(signal.text).length,
-      outcome: verdict.outcome,
-    });
-    if (verdict.outcome === SIGNAL_OUTCOME.FINAL) {
-      // The only thing on the IPC path that may be pasted.
-      transcript = verdict.text;
-    } else if (verdict.outcome === SIGNAL_OUTCOME.PROVISIONAL) {
-      // Best-known text only (§6.8/§6.9) — keep waiting for the final.
-      bestKnownText = verdict.text;
+  // How the transcript arrives: the renderer's IPC hand-off, and only
+  // that (DM-15, S-13) — ./post-stop-handoff takes the recording's
+  // mailbox and nothing else. An executeJavaScript poll of ~14 renderer
+  // globals and 6 DOM ids used to take over after 2 s of IPC silence,
+  // for "an older renderer built before the bridge existed" — which
+  // cannot occur, because main and renderer ship in one bundle. Every
+  // renderer publish for a recording sends a signal; the slot keeps
+  // them, so one published before this task started is not lost.
+  //
+  // §6.8: finality is stated, never inferred — ./transcript-signal reads
+  // the renderer's ``final`` flag and "<kind>:<phase>" label, never the
+  // text (DM-01). A PROVISIONAL text is best-known only (§6.9): never
+  // pasted, but what the deadline-expiry recovery hands to the user
+  // instead of nothing. A TERMINAL publish (no speech, error,
+  // auto-transcribe off) ends the recording with a status and no paste.
+  const {
+    transcript,
+    bestKnownText,
+    terminalStatus: terminalWithoutPasteStatus,
+  } = await awaitRecordingTranscript({
+    slot: task.slot,
+    recordingId: task.recordingId,
+    deadlineAt: Date.now() + POST_STOP_TRANSCRIPT_TIMEOUT_MS,
+    onSignal: (signal, verdict) => {
+      traceStep(trace, signal.final ? "ipc_final" : "ipc_signal", {
+        elapsedMs: Date.now() - stopRequestedAt,
+        recordingId: signal.recordingId,
+        source: signal.source,
+        textLen: normalizeTranscriptText(signal.text).length,
+        outcome: verdict.outcome,
+      });
       // The renderer's explicit phase: it has the transcript and is
       // running the paste upscale — the only signal of that state.
       if (verdict.upscaling) {
@@ -6323,46 +6324,8 @@ async function processPostStopTask(task) {
           appendMainLog(`[post-stop] upscaling-status failed: ${compactLogText(e?.message || e)}`);
         });
       }
-    } else {
-      // A publish with nothing to paste (no speech, error, auto-transcribe
-      // off): the recording is over and there will be no final.
-      transcript = "";
-      terminalWithoutPasteStatus = verdict.status;
-    }
-    return verdict.outcome;
-  };
-
-  // How the transcript arrives: the renderer's IPC hand-off, and only
-  // that (DM-15, S-13). An executeJavaScript poll of ~14 renderer
-  // globals and 6 DOM ids used to take over after 2 s of IPC silence,
-  // for "an older renderer built before the bridge existed" — which
-  // cannot occur, because main and renderer ship in one bundle. It was a
-  // second owner of the same decision with its own vocabulary (status
-  // literals "Done"/"Idle"/"upscaling") and it started exactly when the
-  // renderer is legitimately still finalising (envelope wait, recovery).
-  // Every renderer publish for a recording sends a signal; the slot
-  // keeps them, so one published before this task started is not lost.
-  // If the renderer never publishes, the deadline hands bestKnownText to
-  // the §6.9 recovery, as before.
-  //
-  // Sleep that ends the moment the renderer publishes something newer
-  // than what has already been handled, so a signal is never sitting in
-  // the slot while this task sleeps on a timer.
-  const restUntilSignalOr = (ms) =>
-    task.slot.waitForSignal(task.recordingId, {
-      sinceSeq: handledSignalSeq,
-      timeoutMs: Math.max(1, ms),
-    });
-
-  while (Date.now() < deadline) {
-    const known = task.slot.peek(task.recordingId);
-    if (known?.last && known.last.seq > handledSignalSeq) {
-      // "provisional" is not an answer — keep waiting for the final.
-      if (consumeIpcSignal(known.last) !== SIGNAL_OUTCOME.PROVISIONAL) break;
-      continue;
-    }
-    await restUntilSignalOr(deadline - Date.now());
-  }
+    },
+  });
 
   let recordingStatusText = "Saved To App";
   // The kind travels with the text all the way to setRecordingStatus, so

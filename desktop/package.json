@@ -65,6 +65,7 @@
       "single-flight.js",
       "ipc-sender-guard.js",
       "quit-path.js",
+      "post-stop-handoff.js",
       "log-retention.js",
       "backend-auth.js",
       "private-log.js",

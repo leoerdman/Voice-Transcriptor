@@ -8,8 +8,6 @@
 
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
 
 const {
   NO_SPEECH_STATUS,
@@ -19,7 +17,7 @@ const {
   classifyRecordingSignal,
 } = require("./transcript-signal");
 
-const mainSource = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
+const { mainSource, topLevelFunctionSource } = require("./main-source");
 
 const DICTATIONS_THAT_LOOK_LIKE_STATUSES = [
   "HTTP server returns 500 when the cache is cold",
@@ -95,10 +93,13 @@ test("the pre-upscale publish puts the capsule in Upscaling; nothing else does",
 });
 
 test("main.js moves the capsule to Upscaling on the verdict that says so (wiring)", () => {
-  const consume = /const consumeIpcSignal = \(signal\) => \{([\s\S]*?)\n {2}\};/.exec(mainSource)?.[1];
-  assert.ok(consume, "consumeIpcSignal not found in main.js");
+  // That every handled signal reaches onSignal with its verdict is
+  // behaviour-tested in post-stop-handoff.test.js; what onSignal does
+  // with it is main.js's.
+  const onSignal = /onSignal: \(signal, verdict\) => \{([\s\S]*?)\n {4}\},/.exec(topLevelFunctionSource("processPostStopTask"))?.[1];
+  assert.ok(onSignal, "processPostStopTask's onSignal not found in main.js");
   assert.match(
-    consume,
+    onSignal,
     /if \(verdict\.upscaling\) \{\s*void setRecordingStatus\("Upscaling", RECORDING_STATUS_KIND\.UPSCALING\)/,
   );
 });
@@ -110,8 +111,9 @@ test("kind and phase are read from their own fields, not from a label", () => {
 });
 
 test("main.js classifies hand-off signals through ./transcript-signal and sniffs no text", () => {
-  assert.match(mainSource, /require\("\.\/transcript-signal"\)/);
-  assert.match(mainSource, /classifyRecordingSignal\(signal\)/);
+  // The post-stop wait classifies through ./transcript-signal
+  // (post-stop-handoff.test.js runs it on a text that looks like an error).
+  assert.match(mainSource, /require\("\.\/post-stop-handoff"\)/);
   assert.doesNotMatch(mainSource, /function isMeaningfulTranscriptText/);
   assert.doesNotMatch(mainSource, /startsWith\("http "\)/);
   assert.doesNotMatch(mainSource, /startsWith\("network error"\)/);

@@ -42,7 +42,7 @@ test("main.js keys both guards by epoch, never clears them, and gives each epoch
   assert.match(enqueue, /epoch: rendererEpoch/);
   assert.match(enqueue, /slot: recordingFinalSlot/);
   const task = topLevelFunctionSource("processPostStopTask");
-  assert.match(task, /task\.slot\.peek\(task\.recordingId\)/);
+  assert.match(task, /slot: task\.slot,\s*recordingId: task\.recordingId,/);
   assert.match(topLevelFunctionSource("beginRendererEpoch"), /recordingFinalSlot = createRecordingFinalSlot\(\)/);
   assert.match(mainSource, /beginRendererEpoch\("navigation"\)/);
 });

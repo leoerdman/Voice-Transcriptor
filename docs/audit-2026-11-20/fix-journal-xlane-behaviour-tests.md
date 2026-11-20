@@ -85,3 +85,53 @@ Cut from `main` at 8e8f0a6.
   signal…" fails. Restored → 5/5.
 - Suites: desktop 493/493, frontend 649/649, typecheck, lint, build,
   `node --check`: green.
+
+## 3. Post-stop hand-off (DM-15 / S-13)
+
+- New `desktop/post-stop-handoff.js`:
+  - `awaitRecordingTranscript({ slot, recordingId, deadlineAt, now, onSignal })`
+    — the wait loop that was inline in `processPostStopTask`
+    (`consumeIpcSignal` + `restUntilSignalOr` + the `while`), unchanged in
+    behaviour. It takes the recording's mailbox and nothing else, so "the
+    IPC hand-off is the only source" is a property of its signature.
+    main.js keeps what is its own in `onSignal`: the trace step and the
+    "Upscaling" capsule status.
+  - `decidePostStopAdmission(task, isAlreadyEnqueued)` →
+    `POST_STOP_ADMISSION.{AUTO_TRANSCRIBE_OFF, NO_RECORDING_ID, DUPLICATE, ADMIT}`;
+    `enqueuePostStopTask` branches on it (its side effects — the log
+    lines, closing the session for a task without an id — are unchanged).
+- `desktop/post-stop-handoff.test.js` rewritten. Removed: the regexes
+  over `processPostStopTask`'s text (`task.slot.peek(...)` present;
+  `queryRendererState(`, `POST_STOP_IPC_GRACE_MS|pollFallbackStarted|heardIpcSignal`,
+  `state.status === "Done"`, `recordingId <= 0` absent) and over
+  `enqueuePostStopTask`'s `if (!(task.recordingId > 0)) {`. Replaced by
+  behaviour tests with a real `createRecordingFinalSlot` and a fake clock:
+  a final published before the wait is the transcript with no wait; one
+  published during the wait ends it, and the provisional before it is
+  best-known only (each signal handled once, the upscaling verdict reaches
+  `onSignal`); a provisional alone is never the transcript — the deadline
+  hands it to the recovery; a terminal publish ends with its status; a
+  dictation reading "HTTP 500 …" is still pasted (no text sniffing);
+  nothing published → nothing; another recording's final is ignored; the
+  admission order. Kept textual: `processPostStopTask` calls
+  `awaitRecordingTranscript({ slot: task.slot, recordingId: task.recordingId, …`
+  and contains no `queryRendererState(`/`executeJavaScript(` (absence);
+  `enqueuePostStopTask` branches on each admission outcome and the
+  no-id branch resets the status; `queryRendererState` has no
+  `getElementById` / `__transcriptorFinishedRecords` (it is an
+  executeJavaScript *string* — what it reads exists only as text).
+- Neighbouring textual tests re-pointed, not weakened:
+  `transcript-signal.test.js` "Upscaling on the verdict" now reads the
+  `onSignal` block in `processPostStopTask`; "classifies through
+  ./transcript-signal" now requires `./post-stop-handoff` (the
+  classification itself is behaviour-tested above);
+  `renderer-epoch.test.js` checks the task's slot reaches
+  `awaitRecordingTranscript`.
+- Break-it evidence: a provisional treated as the transcript → 2 tests
+  fail; the handled-sequence bookkeeping removed → the loop re-handles one
+  provisional forever and the file fails (times out); the
+  `recordingId > 0` admission check removed → the admission test fails;
+  main.js polling `queryRendererState()` beside the hand-off → the wiring
+  test fails. Restored → 10/10.
+- Suites: desktop 500/500, frontend 649/649, typecheck, lint, build,
+  `node --check`: green.
