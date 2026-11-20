@@ -5116,7 +5116,6 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
     target: pasteTargetSummary(normalizeCapturedPasteTarget(target)),
     textLen: String(text || "").length,
     textDigest: textDigest(text),
-    textPreview: compactLogText(text, 120),
   });
   if (!text || !text.trim()) {
     traceStep(trace, "input_rejected", { reason: "empty-text" });
@@ -6266,14 +6265,12 @@ async function processPostStopTask(task) {
             finishedRecordingId: Number(byRecording?.recordingId || state.finishedRecordingId || state.uiFinalRecordingId || 0),
             reason: terminalReason,
             textLen: transcript.length,
-            preview: compactLogText(transcript || uiFinalText, 80),
           });
           break;
         }
         traceStep(trace, "signal_ready_ignored_non_transcript", {
           pollCount,
           textLen: transcript.length,
-          preview: compactLogText(transcript, 80),
         });
         transcript = "";
         await restUntilSignalOr(POST_STOP_POLL_INTERVAL_MS);
@@ -6367,7 +6364,6 @@ async function processPostStopTask(task) {
     traceStep(trace, "transcript_ready", {
       len: transcript.length,
       digest: textDigest(transcript),
-      preview: compactLogText(transcript, 140),
     });
     lastTranscriptText = transcript;
     saveLastTranscriptToDisk(transcript);
@@ -6627,7 +6623,6 @@ async function pasteLatestTranscriptFromShortcut() {
     traceStep(trace, "text_ready", {
       len: text.length,
       digest: textDigest(text),
-      preview: compactLogText(text, 140),
     });
     // The clipboard is written by runPasteLadder, after it snapshots what
     // the user had (DM-02).
