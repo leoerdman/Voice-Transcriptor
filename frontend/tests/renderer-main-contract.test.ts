@@ -17,36 +17,35 @@ const shortcutDefaultsManifest = JSON.parse(
 );
 
 /**
- * `window.__transcriptorFinishedRecords` is a two-process contract: the
- * renderer trims the list when it writes, and `desktop/main.js` trims
- * again when it reads. Both trimmed to a depth written out as a literal
- * on each side, with nothing connecting them — a renderer that kept
- * fewer than the main process expects silently shortens the paste
- * history, and the main process cannot import the renderer's constants.
- * So the two are pinned here.
+ * The renderer's `window.__transcriptor*` mirrors are a two-process
+ * contract: a global is worth writing only while the main process reads
+ * it. Pinned here because neither side can import the other.
  */
 const mainTsx = readFileSync(resolve(process.cwd(), "src/main.tsx"), "utf8");
 const desktopMain = readFileSync(resolve(process.cwd(), "../desktop/main.js"), "utf8");
 
-describe("__transcriptorFinishedRecords depth", () => {
-  const declared = /FINISHED_RECORDS_KEPT\s*=\s*(\d+)/.exec(mainTsx)?.[1];
-
-  it("is a named constant on the renderer side", () => {
-    expect(declared, "FINISHED_RECORDS_KEPT not found in main.tsx").toBeTruthy();
-    expect(mainTsx).toContain("next.slice(-FINISHED_RECORDS_KEPT)");
+describe("renderer globals the main process reads", () => {
+  // The finished-records list and the …At / …RecordingId scalars had one
+  // reader — the main process's post-stop poll — and lost it when that
+  // poll was deleted (Ultra-Audit 2026-11-20 DM-15). A global nobody
+  // reads is a second, unchecked copy of the IPC hand-off; neither side
+  // may bring one back.
+  const dead = [
+    "__transcriptorFinishedRecords",
+    "__transcriptorLastFinishedAt",
+    "__transcriptorLastFinishedRecordingId",
+    "__transcriptorLastUiFinalAt",
+    "__transcriptorLastUiFinalRecordingId",
+  ];
+  it.each(dead)("%s is neither written by the renderer nor read by main", (name) => {
+    expect(mainTsx).not.toContain(name);
+    expect(desktopMain).not.toContain(name);
   });
 
-  it("matches the depth desktop/main.js trims to when it reads the list", () => {
-    // The main process names its own copy now
-    // (RENDERER_FINISHED_RECORDS_LIMIT), and interpolates it into the
-    // injected script — so read the constant, not the call site.
-    const block = desktopMain.slice(desktopMain.indexOf("__transcriptorFinishedRecords"));
-    const usesNamedLimit = /\.slice\(-\$\{RENDERER_FINISHED_RECORDS_LIMIT\}\)/.test(block);
-    const desktopDepth = usesNamedLimit
-      ? /RENDERER_FINISHED_RECORDS_LIMIT\s*=\s*(\d+)/.exec(desktopMain)?.[1]
-      : /\.slice\(-(\d+)\)/.exec(block)?.[1];
-    expect(desktopDepth, "no finished-records trim depth found in desktop/main.js").toBeTruthy();
-    expect(Number(desktopDepth)).toBe(Number(declared));
+  it("every global the renderer still mirrors has a reader in main", () => {
+    for (const name of ["__transcriptorLastFinishedText", "__transcriptorLastUiFinalText", "__transcriptorLastUiFinalKind"]) {
+      expect(desktopMain, `${name} has no reader`).toContain(name);
+    }
   });
 });
 

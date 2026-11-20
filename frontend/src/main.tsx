@@ -116,6 +116,7 @@ import {
   normalizeCliStatus,
   type CliAccessStatus,
 } from "./cli-section";
+import { recordingOutputIsPasteReady } from "./recording-output";
 import { smartRecordingTitle } from "./recording-title";
 import {
   annotateTranscript,
@@ -325,12 +326,6 @@ interface UpscalePresetItem {
   builtin: boolean;
   instruction?: string;
   default_instruction?: string;
-}
-
-interface FinishedRecordingEntry {
-  recordingId: number;
-  finishedAt: number;
-  text: string;
 }
 
 /**
@@ -670,13 +665,8 @@ declare global {
     __transcriptorLastFrameAt?: number;
     __transcriptorIsRecording?: boolean;
     __transcriptorLastFinishedText?: string;
-    __transcriptorLastFinishedAt?: number;
     __transcriptorCurrentRecordingId?: number;
-    __transcriptorLastFinishedRecordingId?: number;
-    __transcriptorFinishedRecords?: FinishedRecordingEntry[];
     __transcriptorLastUiFinalText?: string;
-    __transcriptorLastUiFinalAt?: number;
-    __transcriptorLastUiFinalRecordingId?: number;
     __transcriptorLastUiFinalKind?: RecordingFinalSignalKind;
     __transcriptorLiveStatusSnapshot?: () => LiveStatusSnapshot;
     __transcriptorRecordingTooShort?: () => boolean;
@@ -10707,31 +10697,23 @@ function logger_warn_client(message: string): void {
  *
  * There are two distinct semantic channels the rest of the system reads:
  *
- *   1. ``pasteReady`` — consumed by the Electron main process through
- *      ``window.__transcriptorLastFinished*`` and
- *      ``window.__transcriptorFinishedRecords``. This tells Electron main
- *      "a transcript is ready to paste NOW".
+ *   1. ``pasteReady`` — pushed to the Electron main process over the
+ *      ``recording-final`` IPC signal (the ONE hand-off of a transcript),
+ *      and mirrored on ``window.__transcriptorLastFinishedText`` for the
+ *      main process's renderer-state query.
  *
- *   2. ``uiFinal`` — consumed by the Electron main process through
- *      ``window.__transcriptorLastUiFinal*`` for recording state machines
- *      that need to know what the UI is currently showing. This is also
- *      what drives the ``$finalOutput`` DOM element.
+ *   2. ``uiFinal`` — ``window.__transcriptorLastUiFinalText`` / ``Kind``,
+ *      read by that same query to know what the UI is showing. This is
+ *      also what drives the ``$finalOutput`` DOM element.
+ *
+ * Only globals with a reader are written: the finished-records list and
+ * the ``…At`` / ``…RecordingId`` scalars lost theirs when the main
+ * process stopped polling (Ultra-Audit 2026-11-20 DM-15).
  *
  * All callers go through ``publishRecordingOutput`` (with a session
  * token where the call belongs to one). One call = one atomic update of
  * both channels plus the DOM.
  */
-/**
- * How many finished recordings stay on ``window.__transcriptorFinishedRecords``.
- *
- * Both sides of this contract trim to the same depth — the renderer here
- * and ``desktop/main.js`` again when it reads — and the number was
- * written out in both. This is the renderer's side of it; the main
- * process cannot import from here, so the two are pinned by a test
- * instead.
- */
-const FINISHED_RECORDS_KEPT = 30;
-
 interface RecordingOutputSignal {
   recordingId: number;
   /** The canonical, paste-ready text (post-upscale if upscaling was used).
@@ -10751,16 +10733,6 @@ interface RecordingOutputSignal {
   sessionToken?: string;
 }
 
-function recordingOutputIsInvalidTranscript(payload: string): boolean {
-  const lower = payload.toLowerCase();
-  const compact = lower.replace(/\s+/g, "");
-  if (!payload) return true;
-  if (lower === "error" || lower === "[websocket error]") return true;
-  if (lower.startsWith("http ")) return true;
-  if (compact === "[silence]") return true;
-  return false;
-}
-
 function publishRecordingOutput(signal: RecordingOutputSignal): void {
   const rid = Math.max(0, Number(signal.recordingId || 0));
   const pasteText = String(signal.pasteText || "").trim();
@@ -10769,24 +10741,13 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
   const kind: RecordingFinalSignalKind = pasteText
     ? signal.kind || "transcript"
     : signal.kind || "";
-  const now = Date.now();
   const uiFinalText = domText;
   const hasUiFinal = !!kind && !!uiFinalText;
 
   // Channel 1: paste-ready history (only for valid transcripts).
-  const isPasteReady = !!pasteText && !recordingOutputIsInvalidTranscript(pasteText);
+  const isPasteReady = recordingOutputIsPasteReady({ pasteText, kind });
   if (isPasteReady) {
     window.__transcriptorLastFinishedText = pasteText;
-    window.__transcriptorLastFinishedAt = now;
-    window.__transcriptorLastFinishedRecordingId = rid;
-    if (rid > 0) {
-      const list = Array.isArray(window.__transcriptorFinishedRecords)
-        ? window.__transcriptorFinishedRecords.slice()
-        : [];
-      const next = list.filter((entry) => Number(entry?.recordingId || 0) !== rid);
-      next.push({ recordingId: rid, finishedAt: now, text: pasteText });
-      window.__transcriptorFinishedRecords = next.slice(-FINISHED_RECORDS_KEPT);
-    }
   }
 
   // Channel 1b: the same fact, pushed to the Electron main process
@@ -10809,8 +10770,6 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
   // Channel 2: UI-final signal (always updated so Electron main can track
   // both transcript and error/status states).
   window.__transcriptorLastUiFinalText = hasUiFinal ? uiFinalText : "";
-  window.__transcriptorLastUiFinalAt = hasUiFinal ? now : 0;
-  window.__transcriptorLastUiFinalRecordingId = hasUiFinal ? rid : 0;
   window.__transcriptorLastUiFinalKind = hasUiFinal ? kind : "";
 
   // Channel 3: the DOM itself. Respects the active UI session so that a
@@ -10833,12 +10792,6 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
  * reads. Called when a new recording begins or when an explicit
  * ``resetOutputs()`` fires.
  *
- * The ``__transcriptorFinishedRecords`` history array is intentionally
- * NOT cleared here — it's keyed by recordingId and bounded at 30
- * entries, and Electron main uses it as a lookup table to recover the
- * text for a specific finished recordingId even after newer sessions
- * have overwritten the scalar pointers.
- *
  * Previously this function only reset Channel 2 (ui-final), leaving
  * Channel 1 (paste-ready: LastFinishedText/At/RecordingId) pointing at
  * the PREVIOUS session's transcript. During the startup window of a
@@ -10848,12 +10801,8 @@ function publishRecordingOutput(signal: RecordingOutputSignal): void {
 function clearRecordingOutput(): void {
   // Channel 1 — paste-ready scalars.
   window.__transcriptorLastFinishedText = "";
-  window.__transcriptorLastFinishedAt = 0;
-  window.__transcriptorLastFinishedRecordingId = 0;
   // Channel 2 — ui-final signal.
   window.__transcriptorLastUiFinalText = "";
-  window.__transcriptorLastUiFinalAt = 0;
-  window.__transcriptorLastUiFinalRecordingId = 0;
   window.__transcriptorLastUiFinalKind = "";
 }
 
