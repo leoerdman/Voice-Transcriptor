@@ -198,6 +198,13 @@ describe("stopLive has exactly one transcript delivery site (F/7 / U-022)", () =
     expect(around).toMatch(/domText:\s*transcriptRaw/);
   });
 
+  it("FL-01: the drained-silence branch asks decideDrainedSilence, so mic health cannot veto a spoken session", () => {
+    expect(stopLiveBody).toContain("decideDrainedSilence({");
+    expect(stopLiveBody).toMatch(/carriedSpeech:\s*summarizeCaptureLevel\(captureLevel\)\.carriedSpeech/);
+    // The pre-fix gate: any bad mic-health state ended the stop as empty.
+    expect(stopLiveBody).not.toMatch(/\(!!provider && micHealthBad\)/);
+  });
+
   it("the seven no-transcript epilogues share one bookkeeping helper, not a copy each", () => {
     const helperCalls = stopLiveBody.match(/releaseStopEpilogueBookkeeping\(\);/g) || [];
     // Six early returns extracted; the seventh (finalization-failed

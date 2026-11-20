@@ -24,6 +24,7 @@ import {
   type FinalizeBudgetAnnouncement,
   type StopTranscriptSource,
 } from "./envelope-deadline";
+import { decideDrainedSilence } from "./stop-epilogue";
 import {
   captureElapsedMs,
   decidePreRoll,
@@ -12769,14 +12770,22 @@ async function stopLive(
   const drainedSourceLiveText = latestSourceForSave();
   const drainedSilence = provider ? captureSilenceSnapshot(drainedSourceLiveText) : null;
   const drainedFailureReason = provider ? stopFailureReason(drainedSourceLiveText) : null;
-  const drainedIsSilent = !!drainedSilence?.silentCapture || (!!provider && micHealthBad);
-  if (drainedIsSilent) {
-    const drainedDomText = micHealthBad ? "[ Mic not delivering audio ]" : "[ Silence ]";
+  // The mic-health verdict explains an empty session; it never vetoes
+  // one that held speech (./stop-epilogue).
+  const drained = decideDrainedSilence({
+    silentCapture: !!drainedSilence?.silentCapture,
+    hasProvider: !!provider,
+    micHealthBad,
+    carriedSpeech: summarizeCaptureLevel(captureLevel).carriedSpeech,
+    liveText: drainedSourceLiveText,
+  });
+  if (drained.silent) {
+    const drainedDomText = drained.micFault ? "[ Mic not delivering audio ]" : "[ Silence ]";
     publishRecordingFinalSignal({
       recordingId,
       signalText: "",
       domText: drainedDomText,
-      kind: micHealthBad ? "error" : "status",
+      kind: drained.micFault ? "error" : "status",
       sessionToken: sessionUiToken,
     });
     setStatusScoped(sessionUiToken, "Done");
