@@ -740,6 +740,9 @@ test("every stdout line main.swift documents is understood by the controller", a
     move: { line: { t: "move", x: 150, y: 100 }, seen: () => true },
     end: { line: { t: "end", x: 200, y: 100 }, seen: () => true },
     tap: { line: { t: "tap", x: 5, y: 5 }, seen: (w) => w.capsule.webContents.scripts.length === 1 },
+    // Off every number: nothing to cross. The cross itself is driven by
+    // the number tests.
+    hover: { line: { t: "hover", x: 900, y: 700 }, seen: () => true },
     click: { line: { t: "click", x: 300, y: 300 }, seen: () => true },
     press: { line: { t: "press", outcome: "stroke", clicks: 1, drags: 9 }, seen: (w) => w.logs.some((l) => l.includes("press outcome=stroke clicks=1 drags=9")) },
     "tap-disabled": { line: { t: "tap-disabled", reason: "timeout", abandoned: "stroke" }, seen: (w) => w.logs.some((l) => l.includes("tap disabled reason=timeout abandoned=stroke")) },
@@ -759,7 +762,7 @@ test("every stdout line main.swift documents is understood by the controller", a
   };
   try {
     await world.controller.start(ID, { recordClicks: true });
-    for (const kind of ["ready", "start", "move", "end", "tap", "click", "press", "tap-disabled", "front-window", "error"]) {
+    for (const kind of ["ready", "start", "move", "end", "tap", "hover", "click", "press", "tap-disabled", "front-window", "error"]) {
       world.say(samples[kind].line);
       assert.ok(samples[kind].seen(world), `line ${kind} had no effect`);
     }
@@ -1024,7 +1027,7 @@ test("a stroke's number is a black digit whatever the colour (user, 2026-11-21)"
     const red = world.overlays()[0].page.screenCanvas.ctx.calls.filter((c) => c[0] === "fillText").pop();
     assert.equal(red[4], "#000000");
     const overlay = world.overlays()[0];
-    await overlay.webContents.executeJavaScript(`window.__apply([["b", 99, ${JSON.stringify(SCREEN_MODE.colors[5])}, 300, 300, "rect", 2], ["m", 99, 400, 400]])`);
+    await overlay.webContents.executeJavaScript(`window.__apply([["b", 99, ${JSON.stringify(SCREEN_MODE.colors[5])}, 300, 300, "rect", 2, { x: 0, y: 0, width: 1000, height: 800 }], ["m", 99, 400, 400]])`);
     const white = overlay.page.screenCanvas.ctx.calls.filter((c) => c[0] === "fillText").pop();
     assert.equal(white[4], "#000000");
   } finally {
@@ -1101,6 +1104,176 @@ test("with the setting off, a click leaves no trace: no ring, no event", async (
     assert.equal(painted(shot.files[0]).raw, true, "the capture as taken");
     const manifest = (await world.controller.finish({ id: ID })).manifest;
     assert.equal(manifest.events.some((e) => e.type === "click"), false);
+  } finally {
+    world.cleanup();
+  }
+});
+
+// ── deleting a stroke by its number (user, 2026-11-21) ─────────────────
+const BADGE_RADIUS = require("./screen-mode").SCREEN_MODE.badge.radius;
+
+// The numbers' circles the helper was last told about, as [cx, cy, r].
+function sentDiscs(world) {
+  const controls = world.helper().stdin.written
+    .map((line) => { try { return JSON.parse(line); } catch { return null; } })
+    .filter((cmd) => cmd && cmd.cmd === "controls");
+  return controls.length ? controls[controls.length - 1].discs : [];
+}
+
+// The numbers' circles the live canvas last drew, as [cx, cy].
+async function screenBadges(world) {
+  await tick(30);
+  const calls = world.overlays()[0].page.screenCanvas.ctx.calls;
+  const lastClear = calls.map((c) => c[0]).lastIndexOf("clearRect");
+  return calls.slice(lastClear).filter((c) => c[0] === "arc" && c[3] === BADGE_RADIUS).map((c) => [c[1], c[2]]);
+}
+
+test("the helper is told each number's circle exactly where the overlay draws it", async () => {
+  const world = createWorld();
+  try {
+    await world.controller.start(ID);
+    drawStroke(world, [[100, 100], [200, 200]]); // a rectangle
+    drawStroke(world, [[300, 100], [400, 200]]);
+    world.say({ t: "start", x: 500, y: 100 }); // being drawn: no number to tap yet
+    world.say({ t: "move", x: 600, y: 200 });
+    const drawn = await screenBadges(world);
+    assert.equal(drawn.length, 3);
+    assert.deepEqual(sentDiscs(world), drawn.slice(0, 2).map(([x, y]) => [x, y, BADGE_RADIUS]));
+    // The rectangle's number is outside its top-right corner.
+    const [x, y] = drawn[0];
+    assert.ok(x > 200 && y < 100);
+    world.say({ t: "end", x: 600, y: 200 });
+    await tick(5);
+    assert.equal(sentDiscs(world).length, 3, "a finished stroke's number can be tapped");
+  } finally {
+    world.cleanup();
+  }
+});
+
+test("a tap on a stroke's number deletes it everywhere, is never a click, and the rest renumber live", async () => {
+  const world = createWorld();
+  try {
+    await world.controller.start(ID, { recordClicks: true });
+    drawStroke(world, [[100, 100], [200, 200]]);
+    drawStroke(world, [[300, 100], [400, 200]]);
+    drawStroke(world, [[500, 100], [600, 200]]);
+    assert.deepEqual(await screenNumbers(world), ["1", "2", "3"]);
+    const [, second] = sentDiscs(world);
+    world.say({ t: "tap", x: second[0] + 3, y: second[1] - 3 });
+    assert.deepEqual(await screenNumbers(world), ["1", "2"], "the numbers close up on the screen");
+    const overlay = world.overlays()[0];
+    assert.equal(await overlay.webContents.executeJavaScript("window.__hasStrokes([2])"), false, "off the screen");
+    assert.equal(sentDiscs(world).length, 2, "the helper forgets its number");
+    assert.ok(world.logs.some((l) => l.includes("stroke 2 deleted by its number; 2 left on the screen")));
+    const shot = await world.controller.takeShot("hotkey");
+    assert.equal(paintedMoveTos(shot.files[0]).length, 2, "not in the screenshot");
+    assert.deepEqual(painted(shot.files[0]).calls.filter((c) => c[0] === "fillText").map((c) => c[1]), ["1", "2"]);
+    const manifest = (await world.controller.finish({ id: ID })).manifest;
+    const strokes = manifest.events.filter((e) => e.type === "stroke");
+    assert.deepEqual(strokes.map((e) => [e.shot, e.n, e.box.x]), [[1, 1, 10], [1, 2, 50]], "not in the manifest; 1..k");
+    assert.equal(manifest.events.find((e) => e.type === "shot").strokes, 2);
+    assert.equal(manifest.events.some((e) => e.type === "click"), false, "a tap on a number is not a click, setting on or not");
+  } finally {
+    world.cleanup();
+  }
+});
+
+test("the pointer on a stroke's number shows a cross in that same circle; off it, the digit again", async () => {
+  const world = createWorld();
+  try {
+    await world.controller.start(ID);
+    drawStroke(world, [[100, 100], [200, 200]]);
+    drawStroke(world, [[300, 100], [400, 200]]);
+    const before = await screenBadges(world);
+    const [first] = sentDiscs(world);
+    world.say({ t: "hover", x: first[0], y: first[1] + 2 });
+    assert.deepEqual(await screenNumbers(world), ["×", "2"], "a cross in place of the digit");
+    assert.deepEqual(await screenBadges(world), before, "in the same circle");
+    world.say({ t: "hover", x: first[0] + 30, y: first[1] }); // the helper's report on leaving it
+    assert.deepEqual(await screenNumbers(world), ["1", "2"]);
+    // Back on it, and tapped: the stroke goes, and so does the cross.
+    world.say({ t: "hover", x: first[0], y: first[1] });
+    world.say({ t: "tap", x: first[0], y: first[1] });
+    assert.deepEqual(await screenNumbers(world), ["1"]);
+    // A cross is never painted into a screenshot.
+    world.say({ t: "hover", x: sentDiscs(world)[0][0], y: sentDiscs(world)[0][1] });
+    const shot = await world.controller.takeShot("hotkey");
+    assert.deepEqual(painted(shot.files[0]).calls.filter((c) => c[0] === "fillText").map((c) => c[1]), ["1"]);
+  } finally {
+    world.cleanup();
+  }
+});
+
+test("a number tapped while a shot is being taken goes with the shot: the shot asked first", async () => {
+  const world = createWorld();
+  try {
+    await world.controller.start(ID);
+    drawStroke(world, [[100, 100], [200, 200]]);
+    await tick(30);
+    const [disc] = sentDiscs(world);
+    let release;
+    world.captureGate = new Promise((resolve) => { release = resolve; });
+    const shot = world.controller.takeShot("hotkey");
+    await tick(5);
+    world.say({ t: "tap", x: disc[0], y: disc[1] });
+    release();
+    await shot;
+    await tick(5);
+    assert.deepEqual(sentDiscs(world), [], "nothing left to tap");
+    const manifest = (await world.controller.finish({ id: ID })).manifest;
+    assert.deepEqual(manifest.events.filter((e) => e.type === "stroke").map((e) => e.shot), [1]);
+    assert.equal(world.logs.some((l) => l.includes("deleted by its number")), false);
+  } finally {
+    world.cleanup();
+  }
+});
+
+test("a number under the palette is not tapped: the palette is above it", async () => {
+  const world = createWorld({ hit: () => null });
+  try {
+    await world.controller.start(ID);
+    const b = world.palette().getBounds();
+    // A rectangle whose number lands on the palette.
+    drawStroke(world, [[b.x + 10, b.y + 20], [b.x + 20, b.y + 40]]);
+    await tick(30);
+    const [disc] = sentDiscs(world);
+    assert.ok(disc[0] >= b.x && disc[0] < b.x + b.width && disc[1] >= b.y && disc[1] < b.y + b.height, "the number is on the palette");
+    world.say({ t: "tap", x: disc[0], y: disc[1] });
+    assert.deepEqual(await screenNumbers(world), ["1"], "the stroke stays");
+  } finally {
+    world.cleanup();
+  }
+});
+
+// Every overlay is handed every stroke (a line across two displays is
+// drawn on both); the number used to be pulled inside EACH overlay's view,
+// so a stroke on one display also showed a stray number at the edge of
+// the other. It is kept inside the stroke's own display — the view the
+// controller hit-tests it in.
+test("a stroke's number shows on the display it was drawn on only", async () => {
+  const world = createWorld({
+    displays: [
+      { id: 1, bounds: { x: 0, y: 0, width: 1000, height: 800 }, workArea: { x: 0, y: 25, width: 1000, height: 775 } },
+      { id: 2, bounds: { x: 1000, y: 0, width: 1000, height: 800 }, workArea: { x: 1000, y: 0, width: 1000, height: 800 } },
+    ],
+  });
+  try {
+    await world.controller.start(ID);
+    drawStroke(world, [[1100, 100], [1200, 200]]);
+    await tick(30);
+    const numbersOn = (overlay) => {
+      const calls = overlay.page.screenCanvas.ctx.calls;
+      return calls.slice(calls.map((c) => c[0]).lastIndexOf("clearRect"))
+        .filter((c) => c[0] === "arc" && c[3] === BADGE_RADIUS)
+        .filter((c) => c[1] + BADGE_RADIUS > 0 && c[1] - BADGE_RADIUS < 1000 && c[2] + BADGE_RADIUS > 0 && c[2] - BADGE_RADIUS < 800);
+    };
+    const [first, second] = world.overlays();
+    assert.equal(numbersOn(first).length, 0, "no stray number on the other display");
+    assert.equal(numbersOn(second).length, 1);
+    const [disc] = sentDiscs(world);
+    const [arc] = numbersOn(second);
+    // The page works in display points, the helper in global ones.
+    assert.ok(Math.hypot(arc[1] + 1000 - disc[0], arc[2] - disc[1]) < 1e-9, "where the helper hit-tests it");
   } finally {
     world.cleanup();
   }

@@ -26,9 +26,10 @@ func play(_ name: String, _ c: inout PressClassifier, _ steps: [Step]) {
   }
 }
 
-func run(_ name: String, controls: [CGRect] = [], _ steps: [Step]) {
+func run(_ name: String, controls: [CGRect] = [], discs: [PressClassifier.Disc] = [], _ steps: [Step]) {
   var c = PressClassifier(dragThreshold: 5)
   c.controls = controls
+  c.discs = discs
   play(name, &c, steps)
   print("ok \(name)")
 }
@@ -148,6 +149,61 @@ run("a drag that ends on a control is still a stroke", controls: [capsule], [
   (.dragged, 610, 910, .strokeMove),
   (.up, 610, 910, .strokeEnd),
 ])
+
+// A stroke's number on the screen: a press on it deletes the stroke in the
+// shell, so it is a tap like the palette's — never a click the app
+// underneath gets, never the start of a stroke.
+let number = PressClassifier.Disc(center: CGPoint(x: 400, y: 300), radius: 10)
+
+run("a press on a stroke's number is a tap, not a click", discs: [number], [
+  (.down, 404, 303, .hold),
+  (.up, 404, 303, .tap(at: CGPoint(x: 404, y: 303))),
+])
+
+run("a press on a stroke's number that moves never draws", discs: [number], [
+  (.down, 400, 300, .hold),
+  (.dragged, 450, 340, .hold),
+  (.moved, 480, 360, .hold),
+  (.up, 480, 360, .hold),
+])
+
+// The corner of the number's bounding square is outside its circle.
+run("a press just outside a number's circle is a click", discs: [number], [
+  (.down, 408, 308, .hold),
+  (.up, 408, 308, .replayClick),
+])
+
+run("hover is reported on a number and once on leaving it", discs: [number], [
+  (.moved, 300, 300, .pass),
+  (.moved, 395, 300, .hover),
+  (.moved, 401, 301, .hover),
+  (.moved, 430, 300, .hover),
+  (.moved, 460, 300, .pass),
+])
+
+run("no hover is reported while a press is in progress", discs: [number], [
+  (.down, 300, 300, .hold),
+  (.moved, 302, 300, .hold),
+  (.dragged, 400, 300, .strokeStart(from: CGPoint(x: 300, y: 300))),
+  (.moved, 400, 301, .strokeMove),
+  (.up, 400, 301, .strokeEnd),
+  (.moved, 401, 301, .hover),
+])
+
+// The helper asks again when the shell sends new discs: a stroke that
+// ends, or is deleted, under a pointer that does not move.
+do {
+  let name = "a number appearing or vanishing under a still pointer is reported"
+  var c = PressClassifier(dragThreshold: 5)
+  let still = CGPoint(x: 400, y: 300)
+  if c.hover(at: still) { fail("\(name): reported with no number there") }
+  c.discs = [number]
+  if !c.hover(at: still) { fail("\(name): a number under the pointer was not reported") }
+  c.discs = []
+  if !c.hover(at: still) { fail("\(name): the number leaving was not reported") }
+  if c.hover(at: still) { fail("\(name): reported again with nothing to change") }
+  print("ok \(name)")
+}
 
 // A trackpad drag whose press this tap never saw as its own (drag lock,
 // three-finger drag, a double-tap-drag that starts with the movement).

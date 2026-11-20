@@ -47,6 +47,12 @@ const CASES = [
   "a jitter on a control is still a tap",
   "a press that wanders off a control taps nothing",
   "a drag that ends on a control is still a stroke",
+  "a press on a stroke's number is a tap, not a click",
+  "a press on a stroke's number that moves never draws",
+  "a press just outside a number's circle is a click",
+  "hover is reported on a number and once on leaving it",
+  "no hover is reported while a press is in progress",
+  "a number appearing or vanishing under a still pointer is reported",
   "a drag with no press seen still draws, and its release passes on",
   "a replayed click that comes back re-posted is passed, not pressed again",
   "a release with no press seen passes",
@@ -58,7 +64,7 @@ const CASES = [
   "an idle tap switched off abandons nothing",
 ];
 
-test("PressClassifier: clicks pass, drags draw, double-tap-drag draws, controls tap in-process, a switched-off tap abandons its press", { skip }, () => {
+test("PressClassifier: clicks pass, drags draw, double-tap-drag draws, controls and strokes' numbers tap in-process, a number reports hover, a switched-off tap abandons its press", { skip }, () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "screen-input-test-"));
   const bin = path.join(dir, "press-classifier-tests");
   const build = spawnSync(

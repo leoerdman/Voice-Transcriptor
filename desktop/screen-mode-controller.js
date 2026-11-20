@@ -17,7 +17,11 @@
  *     desktop/native/screen-input/) — a CGEventTap that passes a
  *     plain click through (and reports where it was: with the take's
  *     "record clicks" setting on, the next screenshot shows a ring there)
- *     and turns a press-and-drag into a stroke;
+ *     and turns a press-and-drag into a stroke. A press on our own
+ *     controls — the capsule, the palette, and the number beside each
+ *     stroke still on the screen — is a tap it delivers here instead: a
+ *     tap on a number deletes that stroke, and the pointer resting on a
+ *     number turns its digit into a cross (see `onHover`);
  *   * the session's staging directory, where every screenshot and
  *     `events.json` are written. Nothing here deletes a session except a
  *     discarded take's: on save the backend moves the folder beside the
@@ -25,7 +29,8 @@
  *
  * Event-driven, no polling: our controls' rectangles (sent to the helper)
  * and the palette are re-laid-out when main moves the capsule
- * (`refreshLayout`), overlays
+ * (`refreshLayout`), the numbers' circles whenever the strokes on the
+ * screen change (`sendControls`), overlays
  * follow displays being added, removed or rearranged, and a renderer that
  * dies or reloads mid-take ends the session through main's webContents
  * hooks (`finish`), not through a timer asking whether it is still alive.
@@ -62,13 +67,17 @@
  */
 
 const {
+  BADGE_LINE_GAP,
   SCREEN_MODE,
+  badgeAt,
   beginStroke,
   createScreenSession,
   cropFileName,
+  deleteStroke,
   endStroke,
   extendStroke,
   fitWithin,
+  liveBadges,
   numberBadgeCenter,
   pendingClicks,
   pendingStrokes,
@@ -192,8 +201,7 @@ function overlayHtml() {
   const LINE = ${SCREEN_MODE.strokeWidth};
   const BADGE_R = ${badge.radius};
   const BADGE_DIGIT = ${JSON.stringify(badge.digitColor)};
-  // Clear of the stroke's line: the gap plus half the line's width.
-  const BADGE_GAP = ${badge.gap + SCREEN_MODE.strokeWidth / 2};
+  const BADGE_GAP = ${BADGE_LINE_GAP};
   const BADGE_FONT = (scale) => ${JSON.stringify(`${badge.fontWeight} `)} + (${badge.fontSize} * scale) + ${JSON.stringify(`px ${badge.fontFamily}`)};
   const CLICK = ${JSON.stringify(SCREEN_MODE.clickMark)};
   // One rule for where a number goes and how big a copy is, shared with
@@ -248,10 +256,11 @@ function overlayHtml() {
     c.restore();
   }
   // The stroke's number in a circle of its colour, placed inside \`view\`
-  // (display points) by the shared rule.
-  function drawBadge(c, s, scale, view, ox, oy) {
+  // (display points) by the shared rule; \`crossed\`: a cross in place of
+  // the digit — the pointer is on it, and a tap deletes the stroke.
+  function drawBadge(c, s, scale, view, ox, oy, crossed) {
     if (!s.points.length || !s.n) return;
-    const at = numberBadgeCenter(s.points, view, BADGE_R, BADGE_GAP);
+    const at = numberBadgeCenter(s.tool, s.points, view, BADGE_R, BADGE_GAP);
     const x = (at.x - ox) * scale;
     const y = (at.y - oy) * scale;
     c.save();
@@ -267,7 +276,7 @@ function overlayHtml() {
     c.textAlign = "center";
     c.textBaseline = "middle";
     // "middle" centres the em box; digits sit half a point below it.
-    c.fillText(String(s.n), x, y + 0.5 * scale);
+    c.fillText(crossed ? "\\u00d7" : String(s.n), x, y + 0.5 * scale);
     c.restore();
   }
   // A click's ring, no number: a dark ring inside a light halo (p in
@@ -286,21 +295,39 @@ function overlayHtml() {
     c.stroke();
     c.restore();
   }
+  // The stroke whose number shows a cross (the pointer is on it), or 0.
+  let hovered = 0;
+  // Each number is kept inside the display its stroke was drawn on (the
+  // stroke's own \`view\`), the same view the controller hit-tests it in;
+  // on any other display's overlay it is simply off the canvas. Numbers
+  // are drawn in number order, so the one on top is the one a press on
+  // two overlapping circles hits (the higher number).
   function redraw() {
     ctx.clearRect(0, 0, innerWidth, innerHeight);
-    const view = { x: 0, y: 0, width: innerWidth, height: innerHeight };
     for (const s of strokes.values()) drawStroke(ctx, s, 1, 0, 0);
-    for (const s of strokes.values()) drawBadge(ctx, s, 1, view, 0, 0);
+    const numbered = [...strokes].sort((a, b) => a[1].n - b[1].n);
+    for (const [id, s] of numbered) drawBadge(ctx, s, 1, s.view, 0, 0, id === hovered);
   }
   window.__setOrigin = (x, y) => { origin = { x, y }; return true; };
-  // ops: ["b", id, color, gx, gy, tool, n] begin, ["m", id, gx, gy] move,
-  // ["n", id, n] the stroke's number changed. Points are kept relative to
-  // the display they were drawn on, as it was then. A rectangle is its
-  // two corners: a move replaces the second.
+  // ops: ["b", id, color, gx, gy, tool, n, view] begin (\`view\`: the
+  // global bounds of the display it is drawn on), ["m", id, gx, gy] move,
+  // ["n", id, n] the stroke's number changed, ["x", id] the stroke was
+  // deleted, ["h", id] the number under the pointer (0: none). Points are
+  // kept relative to the display they were drawn on, as it was then. A
+  // rectangle is its two corners: a move replaces the second.
   window.__apply = (ops) => {
     for (const op of ops) {
       if (op[0] === "b") {
-        strokes.set(op[1], { color: op[2], tool: op[5], n: op[6], points: [[op[3] - origin.x, op[4] - origin.y]] });
+        const v = op[7];
+        strokes.set(op[1], {
+          color: op[2], tool: op[5], n: op[6],
+          points: [[op[3] - origin.x, op[4] - origin.y]],
+          view: { x: v.x - origin.x, y: v.y - origin.y, width: v.width, height: v.height },
+        });
+      } else if (op[0] === "x") {
+        strokes.delete(op[1]);
+      } else if (op[0] === "h") {
+        hovered = op[1];
       } else if (op[0] === "m") {
         const s = strokes.get(op[1]);
         if (!s) continue;
@@ -518,6 +545,12 @@ function createScreenModeController(deps) {
   // Until then every window is created hidden; afterwards a window created
   // for the session (a display plugged in) shows as soon as it is ready.
   let presented = false;
+  // The strokes a shot in progress has taken off the screen: their numbers
+  // are no longer there to tap, though the strokes are pending until the
+  // shot is recorded.
+  let offScreen = new Set();
+  // The stroke whose number shows a cross on the overlays, or 0.
+  let hoveredId = 0;
 
   function serialize(fn) {
     const next = chain.then(fn, fn);
@@ -815,15 +848,69 @@ function createScreenModeController(deps) {
     if (palette && !palette.isDestroyed()) {
       try { palette.setBounds(paletteBounds(), false); } catch { }
     }
-    if (!helper) return;
+    sendControls();
+  }
+
+  // The numbers a press or the pointer can hit, now (./screen-mode.js,
+  // liveBadges: the same rule and numbers the overlay draws them with).
+  function badges() {
+    return session ? liveBadges(session, offScreen) : [];
+  }
+
+  // The helper's copy of our controls: the capsule's and palette's
+  // rectangles and the numbers' circles. Sent whenever either changes —
+  // the capsule moves, a stroke ends, is deleted or leaves with a shot.
+  function sendControls() {
+    if (!session || !helper) return;
     const rects = controlWindows().map((w) => {
       const b = w.getBounds();
       return [b.x, b.y, b.width, b.height];
     });
-    const key = JSON.stringify(rects);
+    const discs = badges().map((b) => [b.x, b.y, b.radius]);
+    const key = JSON.stringify([rects, discs]);
     if (key === lastControlsKey) return;
     lastControlsKey = key;
-    sendHelper({ cmd: "controls", rects });
+    sendHelper({ cmd: "controls", rects, discs });
+  }
+
+  function controlWindowAt(x, y) {
+    return controlWindows().find((w) => {
+      const b = w.getBounds();
+      return x >= b.x && x < b.x + b.width && y >= b.y && y < b.y + b.height;
+    }) || null;
+  }
+
+  // The number a point hits: the capsule and the palette lie above the
+  // overlays, so a point on one of them hits no number underneath.
+  function badgeUnder(x, y) {
+    return controlWindowAt(x, y) ? null : badgeAt(badges(), x, y);
+  }
+
+  function setHovered(id) {
+    if (id === hoveredId) return;
+    hoveredId = id;
+    queueOp(["h", id]);
+  }
+
+  /**
+   * The pointer is on a number, or has just left one: that number shows a
+   * cross while the pointer is on it.
+   *
+   * Why the helper reports the pointer, and not Electron's
+   * `setIgnoreMouseEvents(true, { forward: true })` on the overlays: the
+   * helper's event tap already sees every pointer motion, and decides
+   * whether a press is ours from the very circles it hover-tests (the
+   * ones `sendControls` hands it), so a cross can only show where a press
+   * would delete. Forwarding would make each overlay's page receive every
+   * motion over its whole display for the whole take, and decide the
+   * hover in the page — a second decider, apart from the one that makes
+   * the press a tap, free to disagree with it. The helper speaks only
+   * when the pointer is on a number or leaves one, and after the numbers
+   * change under a still pointer — no polling.
+   */
+  function onHover(x, y) {
+    const badge = badgeUnder(x, y);
+    setHovered(badge ? badge.id : 0);
   }
 
   /**
@@ -836,13 +923,15 @@ function createScreenModeController(deps) {
    *   * On the capsule: whatever is at that point inside its page is
    *     clicked, and the page's own click handlers do the rest — the same
    *     handlers a real click runs.
+   *   * On a stroke's number: that stroke is deleted.
    */
   function deliverTap(x, y) {
-    const target = controlWindows().find((w) => {
-      const b = w.getBounds();
-      return x >= b.x && x < b.x + b.width && y >= b.y && y < b.y + b.height;
-    });
-    if (!target) return;
+    const target = controlWindowAt(x, y);
+    if (!target) {
+      const badge = badgeAt(badges(), x, y);
+      if (badge) deleteByNumber(badge.id);
+      return;
+    }
     const b = target.getBounds();
     const localX = x - b.x;
     const localY = y - b.y;
@@ -872,6 +961,23 @@ function createScreenModeController(deps) {
       })()`,
       true,
     ).catch((e) => log(`[screen-mode] tap delivery failed: ${e?.message || e}`));
+  }
+
+  // Through the same queue as shots: a shot asked for before the tap has
+  // already decided which strokes it holds, and a stroke it took is in
+  // that picture, no longer on the screen to delete.
+  function deleteByNumber(id) {
+    serialize(() => {
+      if (!session) return;
+      const stroke = deleteStroke(session, id);
+      if (!stroke) return;
+      if (hoveredId === id) setHovered(0);
+      queueOp(["x", id]);
+      const left = unshotStrokes(session);
+      for (const s of left) queueOp(["n", s.id, s.n]);
+      sendControls();
+      log(`[screen-mode] stroke ${stroke.n} deleted by its number; ${left.length} left on the screen`);
+    });
   }
 
   // ── native helper ─────────────────────────────────────────────────────
@@ -1019,18 +1125,24 @@ function createScreenModeController(deps) {
     if (!Number.isFinite(x) || !Number.isFinite(y)) return;
     if (t === "tap") {
       deliverTap(x, y);
+    } else if (t === "hover") {
+      onHover(x, y);
     } else if (t === "click") {
       recordClick(session, { x, y });
     } else if (t === "start") {
       const display = screen.getDisplayNearestPoint({ x: Math.round(x), y: Math.round(y) });
       const stroke = beginStroke(session, { x, y, displayId: display.id, displayBounds: display.bounds });
-      queueOp(["b", stroke.id, stroke.color, x, y, stroke.tool, stroke.n]);
+      queueOp(["b", stroke.id, stroke.color, x, y, stroke.tool, stroke.n, stroke.displayBounds]);
     } else if (t === "move") {
       const stroke = extendStroke(session, { x, y });
       if (stroke) queueOp(["m", stroke.id, x, y]);
     } else if (t === "end") {
       const stroke = endStroke(session, { x, y });
-      if (stroke) queueOp(["m", stroke.id, x, y]);
+      if (stroke) {
+        queueOp(["m", stroke.id, x, y]);
+        // Its number can be tapped from now on.
+        sendControls();
+      }
     }
   }
 
@@ -1097,7 +1209,19 @@ function createScreenModeController(deps) {
     return Buffer.from(value.slice(prefix.length), "base64");
   }
 
+  // Whatever way a shot ends, the strokes it took off the screen are then
+  // either in it (recorded) or back on the screen (pending): the helper's
+  // numbers follow.
   async function takeShotNow(reason) {
+    try {
+      return await shoot(reason);
+    } finally {
+      offScreen = new Set();
+      sendControls();
+    }
+  }
+
+  async function shoot(reason) {
     if (!session) return null;
     flushOps();
     // The strokes this shot holds, decided once, now: helper lines keep
@@ -1155,6 +1279,8 @@ function createScreenModeController(deps) {
     // 2. the captured strokes leave the screen, now;
     const grabbedIds = grabbed.flatMap((target) => target.strokeIds);
     if (grabbedIds.length) {
+      offScreen = new Set(grabbedIds);
+      sendControls();
       await Promise.all([...overlays.values()].map((entry) => overlayCall(entry, `window.__detach(${JSON.stringify(grabbedIds)})`)));
     }
     if (grabbed.length) {
@@ -1414,6 +1540,8 @@ function createScreenModeController(deps) {
     palette = null;
     session = null;
     presented = false;
+    offScreen = new Set();
+    hoveredId = 0;
     if (announced) {
       announced = false;
       deps.onActiveChange(false);

@@ -27,8 +27,9 @@
  * The Electron half — overlay windows, the tool palette, the native
  * mouse helper, screen capture — is ./screen-mode-controller.js. Two
  * functions here (`numberBadgeCenter`, `fitWithin`) are also embedded
- * verbatim into the overlay page, so the number the user sees live and
- * the one painted into the image are placed by one rule: they are
+ * verbatim into the overlay page, so the number the user sees live, the
+ * one painted into the image and the circle a press must hit to delete
+ * its stroke (`liveBadge`) are placed by one rule: they are
  * self-contained on purpose (no outside names).
  *
  * Times are epoch milliseconds (`Date.now()`), never offsets: the renderer
@@ -289,39 +290,107 @@ function strokeShape(stroke) {
 }
 
 /**
- * Where a stroke's number goes: beside the point where the stroke BEGAN,
- * and nowhere else — up and to the left of it, its edge `gap` from that
- * point; when that would leave `view` (the display live, the captured
- * area in the image), the next corner around it that fits. It depends on
- * the start alone, so it stays put while the stroke is drawn: placed by
- * the stroke's middle or its box, it slid around the start as the line
- * grew (user, 2026-11-21: "пускай она просто около начала полоски стоит").
+ * Where a stroke's number goes — one rule for the screen live, the
+ * composed screenshot and the press that hits a number to delete it.
+ *   * rectangle — outside its TOP-RIGHT corner (of the box as normalised,
+ *     whichever way it was dragged): diagonally up and to the right, its
+ *     edge `gap` from the corner, so clear of both lines (user,
+ *     2026-11-21). It follows that corner while the box is dragged;
+ *   * pen — beside the point where the stroke BEGAN, and nowhere else: up
+ *     and to the left of it, its edge `gap` from that point. It depends
+ *     on the start alone, so it stays put while the stroke is drawn:
+ *     placed by the stroke's middle or its box, it slid around the start
+ *     as the line grew (user, 2026-11-21: "пускай она просто около начала
+ *     полоски стоит").
+ * When the first place would leave `view` (the stroke's display live, the
+ * captured area in the image), the next one around the same point that
+ * fits — mirrored left-right first, then up-down, then both — and the
+ * first one pulled inside `view` when none does: never off the picture.
+ * Around a rectangle's corner the mirrored places stand off every line
+ * they border by the whole `radius + gap` (above the top line, right of
+ * the right line, inside the corner): a diagonal offset there would lay
+ * the circle on the line it runs along.
  * Self-contained: embedded verbatim in the overlay page.
  *
+ * @param {string} tool        "rect" | "pen"
  * @param {number[][]} points  the stroke's points, in the same space as `view`
  * @param {{x:number,y:number,width:number,height:number}} view
  * @param {number} radius
- * @param {number} gap         space between the circle and the start point
+ * @param {number} gap         space between the circle and the line's centre
  *                             (half the line width included)
  */
-function numberBadgeCenter(points, view, radius, gap) {
+function numberBadgeCenter(tool, points, view, radius, gap) {
   const fits = (c) => (
     c.x - radius >= view.x && c.y - radius >= view.y &&
     c.x + radius <= view.x + view.width && c.y + radius <= view.y + view.height
   );
-  const start = points[0];
-  const d = (radius + gap) * Math.SQRT1_2;
-  const candidates = [
-    { x: start[0] - d, y: start[1] - d },
-    { x: start[0] + d, y: start[1] - d },
-    { x: start[0] - d, y: start[1] + d },
-    { x: start[0] + d, y: start[1] + d },
-  ];
+  const e = radius + gap;
+  const d = e * Math.SQRT1_2;
+  let candidates;
+  if (tool === "rect") {
+    let right = -Infinity;
+    let top = Infinity;
+    for (const p of points) {
+      if (p[0] > right) right = p[0];
+      if (p[1] < top) top = p[1];
+    }
+    candidates = [
+      { x: right + d, y: top - d },
+      { x: right - d, y: top - e },
+      { x: right + e, y: top + d },
+      { x: right - e, y: top + e },
+    ];
+  } else {
+    const start = points[0];
+    candidates = [
+      { x: start[0] - d, y: start[1] - d },
+      { x: start[0] + d, y: start[1] - d },
+      { x: start[0] - d, y: start[1] + d },
+      { x: start[0] + d, y: start[1] + d },
+    ];
+  }
   for (const c of candidates) if (fits(c)) return c;
   return {
     x: Math.min(Math.max(candidates[0].x, view.x + radius), view.x + view.width - radius),
     y: Math.min(Math.max(candidates[0].y, view.y + radius), view.y + view.height - radius),
   };
+}
+
+/**
+ * The space between a number's circle and the centre of the line it sits
+ * beside: the badge's gap plus half the line's width, so the circle clears
+ * the painted line. One value for the overlay page and the hit-test.
+ */
+const BADGE_LINE_GAP = SCREEN_MODE.badge.gap + SCREEN_MODE.strokeWidth / 2;
+
+/**
+ * A stroke's number on the screen, where the overlay draws it live: the
+ * circle's centre in global DIP, kept inside the display the stroke was
+ * drawn on (its `displayBounds`, the view the overlay is handed with it).
+ */
+function liveBadge(stroke) {
+  const radius = SCREEN_MODE.badge.radius;
+  const c = numberBadgeCenter(stroke.tool, stroke.points, stroke.displayBounds, radius, BADGE_LINE_GAP);
+  return { id: stroke.id, x: c.x, y: c.y, radius };
+}
+
+/**
+ * The numbers a press or the pointer can hit: those of the finished
+ * strokes still on the screen. A stroke being drawn holds the button, and
+ * one a shot has already taken off the screen (`offScreen` ids) is not
+ * there to hit. In drawing order, so the last one is on top.
+ */
+function liveBadges(session, offScreen = new Set()) {
+  return pendingStrokes(session).filter((s) => !offScreen.has(s.id)).map(liveBadge);
+}
+
+/** The topmost of `badges` whose circle holds the point, or null. */
+function badgeAt(badges, x, y) {
+  for (let i = badges.length - 1; i >= 0; i -= 1) {
+    const b = badges[i];
+    if (Math.hypot(x - b.x, y - b.y) <= b.radius) return b;
+  }
+  return null;
 }
 
 /**
@@ -513,7 +582,7 @@ function recordShot(session, { at = Date.now(), files, strokeIds, reason, area =
     stroke.crop = crops[stroke.id] || "";
     taken.push(stroke.id);
   }
-  unshotStrokes(session).forEach((stroke, i) => { stroke.n = i + 1; });
+  renumberUnshot(session);
   for (const click of pendingClicks(session)) {
     if (!Object.prototype.hasOwnProperty.call(clicks, click.id)) continue;
     click.shot = index;
@@ -522,6 +591,31 @@ function recordShot(session, { at = Date.now(), files, strokeIds, reason, area =
   const shot = { index, at, files: files.slice(), strokeIds: taken, reason, area, preview };
   session.shots.push(shot);
   return shot;
+}
+
+/**
+ * The strokes on the screen are numbered 1..k in drawing order, with no
+ * gap: the picture, the manifest's `n` and the transcript's marks name a
+ * stroke by this one number.
+ */
+function renumberUnshot(session) {
+  unshotStrokes(session).forEach((stroke, i) => { stroke.n = i + 1; });
+}
+
+/**
+ * The user deleted a stroke by its number (a tap on its circle). Only a
+ * finished stroke still on the screen can go: one in a screenshot is part
+ * of that picture, and one being drawn holds the button. It leaves the
+ * session record — so no screenshot, manifest or transcript mark ever has
+ * it — and the strokes still on the screen close up to 1..k. Returns the
+ * deleted stroke, or null when there was none to delete.
+ */
+function deleteStroke(session, id) {
+  const stroke = pendingStrokes(session).find((s) => s.id === id);
+  if (!stroke) return null;
+  session.strokes.splice(session.strokes.indexOf(stroke), 1);
+  renumberUnshot(session);
+  return stroke;
 }
 
 function shotFileName(index, displayOrdinal, displayCount) {
@@ -610,15 +704,20 @@ function screenSessionManifest(session) {
 }
 
 module.exports = {
+  BADGE_LINE_GAP,
   SCREEN_MODE,
   SHOT_AREA,
+  badgeAt,
   beginStroke,
   createScreenSession,
   cropFileName,
+  deleteStroke,
   endStroke,
   extendStroke,
   fitWithin,
   isScreenSessionId,
+  liveBadge,
+  liveBadges,
   numberBadgeCenter,
   pendingClicks,
   pendingStrokes,

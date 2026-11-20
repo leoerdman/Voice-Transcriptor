@@ -7,15 +7,20 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const {
+  BADGE_LINE_GAP,
   SCREEN_MODE,
   SHOT_AREA,
+  badgeAt,
   beginStroke,
   createScreenSession,
   cropFileName,
+  deleteStroke,
   endStroke,
   extendStroke,
   fitWithin,
   isScreenSessionId,
+  liveBadge,
+  liveBadges,
   numberBadgeCenter,
   pendingClicks,
   pendingStrokes,
@@ -323,35 +328,86 @@ test("a pen stroke's shape: dot, line, loop or curve", () => {
   assert.equal(shape([[100, 100], [300, 102], [100, 101]]), "line");
 });
 
-test("a stroke's number sits up-left of where the stroke began, for both tools", () => {
+test("a pen stroke's number sits up-left of where the stroke began", () => {
   const view = { x: 0, y: 0, width: 1000, height: 800 };
   const r = 10;
   const gap = 5;
-  const c = numberBadgeCenter([[500, 400], [300, 200]], view, r, gap);
+  const c = numberBadgeCenter("pen", [[500, 400], [300, 200]], view, r, gap);
   assert.ok(c.x < 500 && c.y < 400, "up and to the left of the start");
   assert.ok(Math.abs(Math.hypot(500 - c.x, 400 - c.y) - (r + gap)) < 1e-9, "its edge `gap` from the start");
 });
 
-test("the number does not move while the stroke is drawn, whichever way it goes (user, 2026-11-21)", () => {
+test("a pen stroke's number does not move while the stroke is drawn, whichever way it goes (user, 2026-11-21)", () => {
   const view = { x: 0, y: 0, width: 1000, height: 800 };
   const start = [400, 300];
-  const at = numberBadgeCenter([start], view, 10, 5);
+  const at = numberBadgeCenter("pen", [start], view, 10, 5);
   for (const end of [[700, 300], [100, 300], [400, 700], [400, 50], [700, 700], [100, 50]]) {
     const ring = [start, end, [end[0], start[1]], start];
-    assert.deepEqual(numberBadgeCenter([start, end], view, 10, 5), at, `line towards ${end}`);
-    assert.deepEqual(numberBadgeCenter(ring, view, 10, 5), at, `ring through ${end}`);
+    assert.deepEqual(numberBadgeCenter("pen", [start, end], view, 10, 5), at, `line towards ${end}`);
+    assert.deepEqual(numberBadgeCenter("pen", ring, view, 10, 5), at, `ring through ${end}`);
   }
 });
 
-test("near the edge of the view the number takes the next corner around the start, never off the picture", () => {
+test("near the edge of the view a pen number takes the next corner around the start, never off the picture", () => {
   const view = { x: 0, y: 0, width: 1000, height: 800 };
   const r = 10;
-  const top = numberBadgeCenter([[100, 5], [400, 300]], view, r, 5);
+  const top = numberBadgeCenter("pen", [[100, 5], [400, 300]], view, r, 5);
   assert.ok(top.y > 5 && top.x < 100, "below-left when there is no room above");
-  const corner = numberBadgeCenter([[2, 2], [400, 300]], view, r, 5);
+  const corner = numberBadgeCenter("pen", [[2, 2], [400, 300]], view, r, 5);
   assert.ok(corner.x > 2 && corner.y > 2, "below-right in the very corner");
-  const edge = numberBadgeCenter([[995, 795]], view, r, 5);
+  const edge = numberBadgeCenter("pen", [[995, 795]], view, r, 5);
   assert.ok(edge.x + r <= 1000 && edge.y + r <= 800, "up-left stays inside at the far corner");
+});
+
+// The distance from a circle's centre to a segment (a rectangle's side).
+function toSegment(c, a, b) {
+  const [dx, dy] = [b[0] - a[0], b[1] - a[1]];
+  const t = Math.max(0, Math.min(1, ((c.x - a[0]) * dx + (c.y - a[1]) * dy) / (dx * dx + dy * dy || 1)));
+  return Math.hypot(c.x - (a[0] + t * dx), c.y - (a[1] + t * dy));
+}
+
+test("a rectangle's number sits outside its top-right corner, clear of both lines, however it was dragged (user, 2026-11-21)", () => {
+  const view = { x: 0, y: 0, width: 1000, height: 800 };
+  const r = 10;
+  const gap = 5;
+  // The same box (300..500 × 200..400), dragged from each of its corners.
+  for (const [from, to] of [[[300, 200], [500, 400]], [[500, 400], [300, 200]], [[500, 200], [300, 400]], [[300, 400], [500, 200]]]) {
+    const c = numberBadgeCenter("rect", [from, to], view, r, gap);
+    assert.ok(c.x > 500 && c.y < 200, `up and to the right of the top-right corner (${from} → ${to})`);
+    assert.ok(Math.abs(c.x - 500 - (200 - c.y)) < 1e-9, "on the corner's diagonal");
+    assert.ok(Math.abs(Math.hypot(c.x - 500, c.y - 200) - (r + gap)) < 1e-9, "its edge `gap` from the corner");
+    assert.ok(toSegment(c, [300, 200], [500, 200]) >= r + gap - 1e-9, "clear of the top line");
+    assert.ok(toSegment(c, [500, 200], [500, 400]) >= r + gap - 1e-9, "clear of the right line");
+  }
+  // It follows the corner while the box is dragged.
+  assert.notDeepEqual(
+    numberBadgeCenter("rect", [[300, 200], [600, 400]], view, r, gap),
+    numberBadgeCenter("rect", [[300, 200], [500, 400]], view, r, gap),
+  );
+});
+
+test("near the edge of the view a rectangle's number takes the next place around its top-right corner, clear of the lines, never off the picture", () => {
+  const view = { x: 0, y: 0, width: 1000, height: 800 };
+  const r = 10;
+  const gap = 5;
+  const e = r + gap;
+  const inside = (c) => c.x - r >= 0 && c.y - r >= 0 && c.x + r <= 1000 && c.y + r <= 800;
+  const clear = (c, [x0, y0, x1, y1]) => (
+    toSegment(c, [x0, y0], [x1, y0]) >= e - 1e-9 && toSegment(c, [x1, y0], [x1, y1]) >= e - 1e-9
+  );
+  // Against the right edge: above the top line, left of the corner.
+  const a = numberBadgeCenter("rect", [[600, 300], [995, 500]], view, r, gap);
+  assert.ok(inside(a) && clear(a, [600, 300, 995, 500]) && a.y < 300 && a.x < 995, "up-left of the corner with no room to the right");
+  // Against the top edge: right of the right line, below the corner.
+  const b = numberBadgeCenter("rect", [[300, 5], [500, 400]], view, r, gap);
+  assert.ok(inside(b) && clear(b, [300, 5, 500, 400]) && b.x > 500 && b.y > 5, "down-right of the corner with no room above");
+  // In the top-right corner of the view: inside the box's corner.
+  const c = numberBadgeCenter("rect", [[600, 3], [997, 400]], view, r, gap);
+  assert.ok(inside(c) && clear(c, [600, 3, 997, 400]) && c.x < 997 && c.y > 3, "inside the corner when nothing outside fits");
+  // A view too small for any place: pulled inside, never off the picture.
+  const tiny = { x: 0, y: 0, width: 30, height: 30 };
+  const d = numberBadgeCenter("rect", [[2, 2], [28, 28]], tiny, r, gap);
+  assert.ok(d.x - r >= 0 && d.y - r >= 0 && d.x + r <= 30 && d.y + r <= 30);
 });
 
 test("the number is placed by the same function the overlay page embeds", () => {
@@ -359,10 +415,78 @@ test("the number is placed by the same function the overlay page embeds", () => 
   // eslint-disable-next-line no-new-func
   const copy = new Function(`return (${numberBadgeCenter.toString()})`)();
   const view = { x: 0, y: 0, width: 300, height: 300 };
-  assert.deepEqual(copy([[100, 100], [200, 200]], view, 10, 5), numberBadgeCenter([[100, 100], [200, 200]], view, 10, 5));
+  for (const tool of SCREEN_MODE.tools) {
+    assert.deepEqual(copy(tool, [[100, 100], [200, 200]], view, 10, 5), numberBadgeCenter(tool, [[100, 100], [200, 200]], view, 10, 5), tool);
+  }
   // eslint-disable-next-line no-new-func
   const fit = new Function(`return (${fitWithin.toString()})`)();
   assert.deepEqual(fit(3456, 2234, 1568, 1150000), fitWithin(3456, 2234, 1568, 1150000));
+});
+
+// ── deleting a stroke by its number ────────────────────────────────────
+test("a stroke's live number is the rule's circle inside its display, and a point hits the topmost one", () => {
+  const s = createScreenSession({ id: "x", dir: "/d" });
+  const rect = drawLine(s, [300, 200], [500, 400], 10);
+  const badge = liveBadge(rect);
+  const r = SCREEN_MODE.badge.radius;
+  assert.equal(BADGE_LINE_GAP, SCREEN_MODE.badge.gap + SCREEN_MODE.strokeWidth / 2, "clear of the painted line");
+  assert.deepEqual({ x: badge.x, y: badge.y }, numberBadgeCenter("rect", rect.points, DISPLAY_1, r, BADGE_LINE_GAP));
+  assert.equal(badge.radius, r);
+  assert.equal(badgeAt([badge], badge.x + r - 0.5, badge.y)?.id, rect.id, "inside the circle");
+  assert.equal(badgeAt([badge], badge.x + r * 0.8, badge.y + r * 0.8), null, "the corner of its square is outside");
+  const over = { ...badge, id: 99, x: badge.x + 4 };
+  assert.equal(badgeAt([badge, over], badge.x + 2, badge.y).id, 99, "the later number is on top");
+});
+
+test("only finished strokes still on the screen have numbers to hit", () => {
+  const s = createScreenSession({ id: "x", dir: "/d" });
+  drawLine(s, [100, 100], [200, 200], 10); // id 1, shot
+  shoot(s, { at: 20, files: ["/d/shot-01.png"] });
+  drawLine(s, [300, 100], [400, 200], 30); // id 2
+  drawLine(s, [500, 100], [600, 200], 40); // id 3, taken off the screen by a shot in progress
+  beginStroke(s, { x: 700, y: 100, at: 50, displayId: 1, displayBounds: DISPLAY_1 }); // id 4, being drawn
+  assert.deepEqual(liveBadges(s, new Set([3])).map((b) => b.id), [2]);
+});
+
+test("deleting a stroke by its number takes it out of the record and closes up the numbers on the screen", () => {
+  const s = createScreenSession({ id: "x", dir: "/d" });
+  drawLine(s, [0, 0], [100, 100], 10); // id 1, shot 1
+  shoot(s, { at: 15, files: ["/d/shot-01.png"] });
+  drawLine(s, [0, 0], [100, 100], 20); // id 2, number 1
+  drawLine(s, [200, 0], [300, 100], 30); // id 3, number 2
+  drawLine(s, [400, 0], [500, 100], 40); // id 4, number 3
+  const gone = deleteStroke(s, 3);
+  assert.equal(gone.id, 3);
+  assert.equal(gone.n, 2, "it goes with the number the user tapped");
+  assert.equal(s.strokes.some((st) => st.id === 3), false, "out of the session record");
+  assert.deepEqual(unshotStrokes(s).map((st) => [st.id, st.n]), [[2, 1], [4, 2]], "consecutive again");
+  assert.equal(s.strokes.find((st) => st.id === 1).n, 1, "a stroke in a screenshot keeps its number");
+  drawLine(s, [600, 0], [700, 100], 50);
+  assert.equal(s.strokes[s.strokes.length - 1].n, 3, "the next stroke follows the ones left");
+});
+
+test("a stroke in a screenshot, or still being drawn, cannot be deleted", () => {
+  const s = createScreenSession({ id: "x", dir: "/d" });
+  drawLine(s, [0, 0], [100, 100], 10);
+  shoot(s, { at: 15, files: ["/d/shot-01.png"] });
+  assert.equal(deleteStroke(s, 1), null);
+  beginStroke(s, { x: 5, y: 5, at: 20, displayId: 1, displayBounds: DISPLAY_1 });
+  assert.equal(deleteStroke(s, 2), null);
+  assert.equal(deleteStroke(s, 42), null);
+  assert.equal(s.strokes.length, 2);
+});
+
+test("the manifest of a shot after a deletion has no trace of the deleted stroke, and its numbers are 1..k", () => {
+  const s = createScreenSession({ id: "x", dir: "/d" });
+  drawLine(s, [0, 0], [100, 100], 10);
+  drawLine(s, [200, 0], [300, 100], 20);
+  drawLine(s, [400, 0], [500, 100], 30);
+  deleteStroke(s, 1);
+  const shot = shoot(s, { at: 40, files: ["/d/shot-01.png"] });
+  assert.deepEqual(shot.strokeIds, [2, 3]);
+  const m = screenSessionManifest(s);
+  assert.deepEqual(m.events.filter((e) => e.type === "stroke").map((e) => [e.at, e.n]), [[20, 1], [30, 2]]);
+  assert.equal(m.events.find((e) => e.type === "shot").strokes, 2);
 });
 
 // ── what a shot captures ───────────────────────────────────────────────

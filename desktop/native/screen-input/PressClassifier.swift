@@ -2,7 +2,8 @@
 //
 // One rule decides what every left-button press is:
 //
-//   * it starts on one of our own controls (capsule, palette) → TAP: the
+//   * it starts on one of our own controls (capsule, palette, a stroke's
+//     number) → TAP: the
 //     press and its release are swallowed and reported as a tap at the
 //     press point; the app clicks the control inside its own page. The
 //     window server never delivers a click to our windows, so macOS never
@@ -47,6 +48,16 @@
 // cursor motion, and the app underneath never saw the held press, so it
 // reads it as hover, not as a drag.
 //
+// The numbers beside the strokes on the screen (discs) are our controls
+// too: a press on one is a tap — the shell deletes that stroke — never a
+// click for the app underneath and never the start of a stroke, even if
+// it then moves (a press that wanders off a disc taps nothing, as on the
+// palette). The shell also shows a cross on the number under the
+// pointer, so while no press is in progress, cursor motion on a disc is
+// reported as HOVER — and once more on leaving it, so the cross goes —
+// and passes on like any other motion. Motion away from every disc is
+// not reported: the shell hears about the pointer only near a number.
+//
 // The click count plays no part in the decision, so a double-tap-and-drag
 // whose second press this tap does see is a press that moves: a stroke.
 //
@@ -83,6 +94,21 @@ struct PressClassifier {
     case strokeEndPassingUp
     /// Swallow; one of our controls was tapped at `at`.
     case tap(at: CGPoint)
+    /// Let the cursor motion through, and report its point: it is on a
+    /// disc, or has just left one.
+    case hover
+  }
+
+  /// A round control: a stroke's number, centre and radius in global points.
+  struct Disc: Equatable {
+    let center: CGPoint
+    let radius: Double
+
+    func contains(_ p: CGPoint) -> Bool {
+      let dx = p.x - center.x
+      let dy = p.y - center.y
+      return (dx * dx + dy * dy).squareRoot() <= radius
+    }
   }
 
   /// What the last finished press was, for the helper's one log line.
@@ -117,6 +143,10 @@ struct PressClassifier {
 
   let dragThreshold: Double
   var controls: [CGRect] = []
+  var discs: [Disc] = []
+  /// The last hover reported was on a disc: the next motion off every
+  /// disc is reported once, so the shell takes the cross away.
+  private var hovering = false
 
   private enum Phase { case idle, held, drawing, onControl, orphanDrawing, handedOver }
   private var phase: Phase = .idle
@@ -149,6 +179,21 @@ struct PressClassifier {
     let dx = p.x - downPoint.x
     let dy = p.y - downPoint.y
     return (dx * dx + dy * dy).squareRoot() >= dragThreshold
+  }
+
+  private func onControl(_ p: CGPoint) -> Bool {
+    controls.contains(where: { $0.contains(p) }) || discs.contains(where: { $0.contains(p) })
+  }
+
+  /// Whether the pointer at `p` is reported as hover: it is on a disc, or
+  /// the last report was. Asked on every motion with no press in
+  /// progress, and by the helper when the discs change under a still
+  /// pointer. During a press nothing is reported.
+  mutating func hover(at p: CGPoint) -> Bool {
+    guard phase == .idle else { return false }
+    let over = discs.contains(where: { $0.contains(p) })
+    defer { hovering = over }
+    return over || hovering
   }
 
   private mutating func remember(_ stamps: UInt64...) {
@@ -186,7 +231,8 @@ struct PressClassifier {
       // this classifier is holding makes it a drag.
       switch phase {
       case .held, .drawing, .onControl: kind = .dragged
-      case .idle, .orphanDrawing, .handedOver: return .pass
+      case .idle: return hover(at: p) ? .hover : .pass
+      case .orphanDrawing, .handedOver: return .pass
       }
     }
     if kind != .dragged, stamp != 0, replayed.contains(stamp) {
@@ -205,7 +251,7 @@ struct PressClassifier {
       drags = 0
       controlMoved = false
       lastOutcome = nil
-      phase = controls.contains(where: { $0.contains(p) }) ? .onControl : .held
+      phase = onControl(p) ? .onControl : .held
       return .hold
     case .dragged:
       drags += 1

@@ -15,7 +15,11 @@
 // the protocol around it.
 //
 // Protocol — one JSON object per line.
-//   stdin : {"cmd":"controls","rects":[[x,y,w,h],...]}  our controls, global points
+//   stdin : {"cmd":"controls","rects":[[x,y,w,h],...],"discs":[[cx,cy,r],...]}
+//                                                      our controls, global points:
+//                                                      the capsule and palette
+//                                                      (rects), the strokes'
+//                                                      numbers (discs)
 //           {"cmd":"front-window","id":n,"exclude":[pid,...],"minSide":pt}
 //                                                      where is the front window
 //                                                      (FrontWindow.swift)? Windows
@@ -24,6 +28,10 @@
 //   stdout: {"t":"ready"}
 //           {"t":"start","x":..,"y":..} {"t":"move","x":..,"y":..} {"t":"end","x":..,"y":..}
 //           {"t":"tap","x":..,"y":..}                  a press-and-release on a control
+//           {"t":"hover","x":..,"y":..}                the pointer, with no press in
+//                                                      progress, on a disc — or just
+//                                                      off one (once) — after a
+//                                                      motion or a new set of discs
 //           {"t":"click","x":..,"y":..}                a plain click, replayed to the
 //                                                      app underneath; the point is
 //                                                      where it was pressed (a press
@@ -171,6 +179,9 @@ let callback: CGEventTapCallBack = { _, type, event, _ in
   switch decision {
   case .pass:
     return Unmanaged.passUnretained(event)
+  case .hover:
+    emitPoint("hover", p)
+    return Unmanaged.passUnretained(event)
   case .hold:
     if passOn { return Unmanaged.passUnretained(event) }
     if kind == .down { state.heldDown = event.copy() }
@@ -260,9 +271,19 @@ Thread.detachNewThread {
       let parsed = rects.compactMap { r -> CGRect? in
         r.count == 4 ? CGRect(x: r[0], y: r[1], width: r[2], height: r[3]) : nil
       }
+      let discs = ((obj["discs"] as? [[Double]]) ?? []).compactMap { d -> PressClassifier.Disc? in
+        d.count == 3 ? PressClassifier.Disc(center: CGPoint(x: d[0], y: d[1]), radius: d[2]) : nil
+      }
+      // A number can appear under, or vanish from under, a pointer that
+      // does not move (a stroke ends there, a stroke is deleted or shot):
+      // the hover is decided again at the cursor, now.
+      let pointer = CGEvent(source: nil)?.location
       state.lock.lock()
       state.classifier.controls = parsed
+      state.classifier.discs = discs
+      let report = pointer.map { state.classifier.hover(at: $0) } ?? false
       state.lock.unlock()
+      if report, let pointer = pointer { emitPoint("hover", pointer) }
     }
   }
   CGEvent.tapEnable(tap: tap, enable: false)
