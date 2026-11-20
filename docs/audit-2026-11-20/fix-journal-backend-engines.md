@@ -1,0 +1,292 @@
+# Fix journal · backend engines + live WS (Ultra-Audit 2026-11-20)
+
+Lane: `backend/main.py` live-WS block (`_apply_live_recovery` … end of
+`_run_deepgram_live_session`) and the engine modules. Branch
+`worktree-agent-a4c6e7573d7aad16d`, cut from main `fb2cef4`.
+
+Verification for every commit: `/tmp/vt-tests-engines/bin/python -m unittest
+discover -s backend/tests` from the worktree root, fully green. Each check
+below was proven by §7.1: the fixed source files replaced by their `HEAD`
+version, the check run (BEFORE), the files restored byte-for-byte
+(`diff -q`), the check run again (AFTER).
+
+Real-audio validation of merge-rule changes: ONE paid real-time run per
+configuration (`python -m backend.tools.deepgram_live_ab screen.wav
+trilingual.wav --language multi --dual ru|en --words --full
+--dump-readings DIR`, on copies of the two takes named in the brief),
+then every rule variant replayed offline from the dumped readings
+(`python -m backend.tools.dual_replay`) — no second paid run.
+
+## Commits
+
+### 1d75d2a · dual merge: contested stretches need real coverage; speakers survive the merge
+- IDs: BE-01, BE-02, BE-03, BE-08, BE-12, BE-15 (stale `_language_disagreements`
+  reference, orphan comment, keyterms/to_query_string measurement copies,
+  finalize docstring claim), BE-25, BE-26 (sparse rivals, tie, en partner,
+  seam-fused word, cost of contested stretches, diarized merge).
+- Files: `backend/deepgram_dual.py`, `backend/remote_deepgram_live.py`,
+  `backend/deepgram_keyterms.py`, `backend/tools/deepgram_live_ab.py`,
+  `backend/tools/dual_replay.py` (new), `backend/tests/test_deepgram_dual.py`,
+  `backend/tests/test_deepgram_seam_tail.py`, `backend/tests/test_untested_units.py`.
+- Check: `ContestedStretchTests DiarizedMergeTests MergeCostTests
+  MergeSeamFragmentsTests` (+ `AbToolTests` for the tool).
+- Before (fix removed):
+```
+FAIL: test_a_single_partner_fragment_does_not_take_a_stretch
+AssertionError: 'да' != 'mot0 mot1 mot2 mot3 mot4 mot5 mot6 mot7'
+FAIL: test_segments_carry_the_primarys_speakers_and_split_at_a_turn
+AssertionError: Lists differ: [('hello there hi back', None)] != [('hello there', 0), ('hi back', 1)]
+FAIL: test_a_word_only_the_secondary_heard_takes_the_nearest_turn
+AssertionError: {'one': None, 'два': None, 'three': None} != {'one': 0, 'два': 1, 'three': 1}
+ERROR: test_an_english_partner_leaves_russian_speech_to_the_multilingual_reading
+TypeError: merge_readings() got an unexpected keyword argument 'secondary_language'. Did you mean 'secondary_source'?
+ERROR: test_a_fused_word_keeps_the_evidence_of_its_halves
+FAIL: test_contested_stretches_do_not_rescan_the_partner_per_stretch
+AssertionError: 1072.7089999999998 not less than 633.0239999999998 : 750 stretches cost 79.1 ms, 3000 cost 1072.7 ms
+FAIL: test_a_run_that_raises_still_shuts_its_session_down
+AssertionError: False is not true
+FAIL: test_dual_is_refused_for_a_configuration_the_app_never_runs
+AssertionError: '--dual applies only to a multilingual recording' not found in 'error: file not found: /nonexistent.wav\n'
+ERROR: test_dumped_readings_replay_offline_through_the_shipped_merge
+TypeError: merge_readings() got an unexpected keyword argument 'primary_language'
+```
+- After: `Ran 32 tests … OK`, `Ran 6 tests … OK`, `Ran 3 tests … OK`.
+- Real audio (dual ru), HEAD rule vs fixed rule replayed on the same readings —
+  decisions and text identical on both takes:
+```
+screen   HEAD     contested 10.83-13.55s multi(lt)=0.848 vs ru=0.886 → ru
+screen   FIXED    contested 10.83-13.55s multi(lt)=0.848 vs ru=0.886 coverage=0.97 → ru
+         text (both): Когда я нажимаю на значок компьютера, у меня окно транскиллера, Мне эта … не нужна.
+trilingual FIXED  uk 1.20-2.24 coverage=1.00 → ru · en 14.58-17.30 coverage=0.94 → multi ·
+                  bg 19.55-29.81 coverage=0.85 → ru · de 32.95-35.43 coverage=0.90 → ru ·
+                  en 56.56-60.27 coverage=0.97 → multi   (HEAD: the same five verdicts)
+         text (both) keeps "Agents workflow." and "la barida la capital De la franchise",
+         loses the bg/de junk.
+```
+  With `--dual en` (BE-02 evidence): the four contested stretches are multi's
+  Russian ones; en conf 0.39/0.77/0.36/0.67 vs multi 0.76/0.85/0.68/0.70,
+  coverage 0.92/0.17/0.86/0.12 → all stay with multi (HEAD: same text).
+  A first draft measured coverage from the midpoint rivals only; the replay
+  showed `ru`'s "слушай." (1.52-4.48 s) left the uk stretch at 0.31 coverage,
+  so coverage is taken from ALL partner words — the replay is why.
+
+### 3c3e4c1 · dual facade: own audio path for the second reading, ceiling clock, honest stats
+- IDs: BE-04, BE-05, BE-06, BE-07, BE-13, BE-14, BW-04 (part: one `SEND_WEDGE_SEC`
+  for every Deepgram write, renamed from `CONTROL_SEND_WEDGE_SEC`), BE-26 (drain
+  raises, ceiling clock).
+- Files: `backend/deepgram_dual.py`, `backend/live_envelope.py`,
+  `backend/remote_deepgram_live.py`, `contracts/live-final-envelope.json`
+  (+4 dual stats keys, regenerated by `UPDATE_CONTRACT_FIXTURES=1`), tests.
+- Check: `DualLiveSessionFanOutTests DualLiveSessionDrainTests test_live_envelope`.
+- Before (fix removed; `deepgram_dual.py` + fixture at HEAD):
+```
+ERROR: test_a_stalled_secondary_never_holds_up_the_primary
+ERROR: test_finalize_follows_every_chunk_queued_for_the_secondary
+FAIL: test_a_failing_primary_drain_does_not_orphan_the_secondary_drain
+AssertionError: Lists differ: [<Task pending name='deepgram-dual-seconda[335 chars]229>] != []
+FAIL: test_a_secondary_dropped_mid_recording_still_contributes_its_words
+AssertionError: False is not True
+FAIL: test_the_merged_envelope_carries_the_dual_stats
+AssertionError: 'words' unexpectedly found in {...}
+FAIL: test_the_secondary_ceiling_is_counted_from_the_stop
+AssertionError: 0.558811249997234 not less than 0.45 : stop took 0.56s against a 0.3s budget
+ERROR: test_live_envelope (import of DUAL_STATS_KEYS/dual_stats)
+Ran 21 tests … FAILED (failures=4, errors=5)
+```
+- After: `Ran 30 tests … OK`; full suite `OK (skipped=2)`.
+- Two existing fan-out tests now await `_secondary_flushed()` before reading
+  what the secondary received: delivery is asynchronous by design; the
+  assertions themselves are unchanged.
+
+### 3495abe · live WS stop path; bounded, shared close
+- IDs: BW-01, BW-03, BL-09, BW-06, BW-08 (`_ingest` helper), BW-10, BW-11, BW-12,
+  BW-15, BW-16.
+- Files: `backend/main.py` (inside `_release_abandoned_upstream` …
+  `_run_deepgram_live_session` only), `backend/remote_deepgram_live.py`
+  (`close()`/`_close_once`, `_close_socket_bounded`), tests.
+- Check: `backend.tests.test_deepgram_send_queue` (main.py at HEAD~ for BEFORE);
+  `backend.tests.test_live_teardown.BoundedCloseTests` (remote_deepgram_live.py).
+- Before:
+```
+FAIL: test_a_cancel_while_the_second_reading_connects_releases_everything
+AssertionError: False is not true : the primary upstream was left open
+FAIL: test_a_wedged_upstream_is_detected_and_reported
+AssertionError: True is not false : a fatal upstream ended the recording
+FAIL: test_a_client_gone_before_finalize_gets_no_paid_recovery
+AssertionError: Expected 'mock' to not have been called. Called 1 times.
+FAIL: test_a_failing_preconnect_reader_is_logged
+AssertionError: False is not true : ['WARNING:backend.main:ws deepgram connect failed: refused']
+FAIL: test_a_failing_sender_is_reported_as_the_upstream_dying
+AssertionError: [] is not true : the sender died silently
+FAIL: test_every_finalizing_announcement_precedes_the_final
+AssertionError: 'finalizing' not found in ['final']
+Ran 9 tests … FAILED (failures=6)
+---
+ERROR: test_a_close_that_is_never_accepted_aborts_the_connection   (TimeoutError: close never returned)
+FAIL: test_a_cancelled_close_still_finishes_the_teardown
+AssertionError: False is not true : the receive task outlived close()
+```
+- After: `Ran 9 tests … OK`; `Ran 2 tests … OK`; full suite `Ran 907 … OK (skipped=2)`.
+- Changed tests: `test_a_wedged_upstream_is_detected_and_reported` and
+  `test_dropped_audio_is_still_counted_as_offered` encoded "a fatal ends the
+  session without finalize" — the BW-01 bug. They now send the finalize the
+  renderer sends; the wedge test additionally asserts the session is still
+  open after the fatal, no `final` went out early, and audio after the fatal
+  reached the spool (stronger, not weaker).
+
+### 893b37b · engine logs (privacy, size, attribution) + dual recovery
+- IDs: BL-02 (engine half), BL-05, BL-07, BL-08 (subsumes BW-17's attribution part),
+  BL-10, BE-11, BE-19, BW-13 (spool read off the loop).
+- Files: `backend/remote_deepgram_live.py`, `backend/deepgram_recovery.py`,
+  `backend/live.py`, `backend/tests/test_live_log_privacy.py` (new),
+  `test_deepgram_recovery.py`, `test_deepgram_coverage_holes.py`.
+- Check: `test_live_log_privacy`, `test_deepgram_recovery.DualRecoveryTests`,
+  `test_deepgram_coverage_holes`.
+- Before:
+```
+ERROR: test_the_full_line_is_written_once_per_configuration_without_keyterms
+ERROR: test_a_dual_recording_re_decodes_in_both_languages_and_merges
+TypeError: recover_spans() got an unexpected keyword argument 'secondary_language'
+ERROR: test_recovered_words_keep_their_evidence
+FAIL: test_a_final_is_logged_by_its_size_and_tagged_with_its_reading
+AssertionError: 'секретная' unexpectedly found in "INFO:…is_final start=0.00 end=1.50 speech_final=True textLen=31 text='секретная диктовка польз…
+FAIL: test_the_multilingual_reading_is_tagged_multi
+FAIL: test_a_socket_retired_on_purpose_is_not_logged_as_an_upstream_close
+AssertionError: ['INFO:…upstream closed code=1011 reason=Deepgram did not receive audio data …'] is not false
+FAIL: test_run_recovery_reads_the_partner_from_the_envelope
+AssertionError: Lists differ: ['multi'] != ['multi', 'ru']
+FAIL: test_the_spool_is_read_off_the_event_loop
+AssertionError: 'MainThread' == 'MainThread' : BW-13
+FAIL: test_finalize_logs_the_hole_spans_and_the_interim_texts
+AssertionError: 'субагента' unexpectedly found in "…coverage holes at finalize …
+FAIL: test_finalize_logs_the_pair_with_both_times
+AssertionError: 'трёх' unexpectedly found in "…coverage holes at finalize …
+Ran 38 tests … FAILED (failures=7, errors=3)
+```
+- After: `Ran 38 tests … OK`; full suite `Ran 916 … OK (skipped=2)`.
+- Changed tests: the two hole-report tests asserted dictated words ARE in
+  main.log — the BL-02 defect; they now assert the words are absent and the
+  size form (`words=N chars=M`, `chars=N`) is present.
+- No dedicated check: the `live.py` overlap-trim line and the recovery
+  "no room" line (both now counts only) — verified by reading the diff.
+
+### bce6d6b · live WS accounting
+- IDs: BW-02, BW-04 (main half), BW-05, BW-09, BW-14, BW-17 (summary + drain
+  severity), BW-18 (documented).
+- Files: `backend/main.py` (live-WS block only), tests (`test_deepgram_send_queue`,
+  `test_deepgram_warm`, `test_deepgram_language` — the last two only follow the
+  removed `_live_config` alias to `live_config`).
+- Check: `RendererSendTests PreconnectBufferTests` +
+  `WarmSessionLivenessTests.test_audio_dropped_during_a_swap_is_declared_to_the_replacement`.
+- Before:
+```
+ERROR: test_audio_the_preconnect_buffer_drops_is_declared   (no byte bound existed to patch)
+FAIL: test_a_stalled_send_is_never_cancelled_and_the_socket_takes_no_more
+AssertionError: True is not false : the stalled write was cancelled mid-frame
+FAIL: test_a_lost_tail_on_finalize_is_a_warning
+AssertionError: False is not true : [… no "finalize drain: timed out" at WARNING …]
+FAIL: test_audio_dropped_during_a_swap_is_declared_to_the_replacement
+AssertionError: 0 not greater than 0 : the drop was not declared to the survivor
+Ran 4 tests … FAILED (failures=3, errors=1)
+```
+- After: `Ran 4 tests … OK`; full suite `Ran 920 … OK (skipped=2)`.
+- BW-14 (alias + boot defaults) and BW-18 (docstring): no behavioural check;
+  the existing pre-warm tests still pass against `live_config(keyterms=…)`.
+
+### 4826a4b · engine contracts
+- IDs: BE-15 (remote_deepgram alias), BE-17, BE-20 (a, b), BE-21, BE-22 (empty
+  duration, CPU threads), BE-24.
+- Files: `deepgram_language.py`, `remote_deepgram.py`, `remote_openrouter.py`,
+  `transcribe.py`, `transcribe_gigaam.py`, `deepgram_recovery.py`,
+  `backend/tests/test_engine_contracts.py` (new).
+- Check: `backend.tests.test_engine_contracts`.
+- Before:
+```
+ERROR: test_an_explicit_low_thread_count_is_honoured   (no _cpu_threads; =2 became 4)
+ERROR: test_the_default_stays_within_four_to_eight
+FAIL: test_an_empty_recognition_of_a_file_reports_the_files_duration
+AssertionError: 0.0 != 1.0 within 3 places (1.0 difference)
+FAIL: test_both_endpoints_receive_the_same_spelling
+AssertionError: {'language': 'RU'} != {'language': 'ru'}
+FAIL: test_both_calls_post_to_the_one_endpoint
+AssertionError: 2 != 1
+FAIL: test_content_of_an_unknown_shape_is_a_provider_error
+AssertionError: OpenRouterError not raised
+FAIL: test_multimodal_content_is_read_as_its_text_parts
+AssertionError: "[{'type': 'text', 'text': 'Привет, '}, {'type': 'text', 'text': 'мир'}]" != 'Привет, мир'
+FAIL: test_a_configured_zero_is_read_as_zero
+AssertionError: 0.3 != 0.0
+FAIL: test_cache_reads_and_writes_share_one_lock
+AssertionError: Lists differ: [False] != [True]
+FAIL: test_the_idle_sweep_never_holds_the_whisper_lock_while_asking_gigaam
+AssertionError: Lists differ: [True] != [False]
+```
+- After: all OK; full suite `Ran 931 tests … OK (skipped=2)`.
+- Frontend (contract fixture gained 4 dual stats keys in 3c3e4c1):
+  `npm --prefix frontend ci && npm --prefix frontend test` →
+  `Test Files 29 passed (29) · Tests 403 passed (403)`.
+
+## Not done
+
+- BE-09 (P2, hypothesis) — rivals by overlap instead of midpoint. Measured
+  against it: on the trilingual take `ru`'s "Да," (17.14-17.46 s) overlaps the
+  `en` stretch ending 17.30 s by 50 % of its duration; an overlap rule at
+  `SPLICE_COVERAGE_OVERLAP_FRACTION` (25 %) would remove it when multi wins —
+  the exact loss the midpoint rule was chosen to prevent. Needs a rule that
+  tells an edge word apart from a duplicate; not a mechanical fix.
+- BE-10 (P2, hypothesis) — split a contested run at every language change.
+  Measured against it: multi interleaves `lt`/`en`/`uk` tags word by word inside
+  ONE hallucinated stretch (trilingual 22.59-24.48 s: і uk, tai lt, Ти en,
+  mažaš lt, можеш en, detect en, taip lt …); splitting fragments it into 1-2-word
+  runs decided by single-word confidences — the failure BE-01 fixes.
+- BE-16 (P2, hypothesis) — three definitions of `uncoveredSpeechSec`. Unifying
+  changes the number the renderer reads on every stop shape; needs a decision
+  on which definition is the contract (0.25 s floor or not) and a renderer check.
+- BE-18 (P2, hypothesis) — the tail-guard retry can exceed the announced budget.
+  Deciding the retry only when budgeted would drop tail recoveries that happen
+  today; re-announcing needs the renderer's re-armable deadline semantics
+  checked. Behaviour change → left.
+- BE-20 (c) (P2) — OpenRouter/Deepgram HTTP timeout tiers as one policy: design
+  consolidation, no defect observed.
+- BE-22 (part) — `_env_int` defined in `transcribe.py` AND `main.py`: the
+  `main.py` copy is outside this lane (see cross-domain).
+- BE-23 (P2, hypothesis) — GigaAM per-chunk text fallback when other chunks have
+  words: changes transcripts; needs a measured chunk-seam case first.
+- BW-07 (P2) — polling watchdogs (0.1 s probe, 0.5 s wedge). Correct outcome,
+  cost is two wakeups/s; replacing them with an event on the session changes
+  wedge latency and every test that patches `_WARM_PROBE_POLL_SEC` /
+  `_SEND_WEDGE_POLL_SEC`. Design, not a defect.
+- BW-08 (part, hypothesis) — the post-finalize drain is moot with a renderer
+  that always sends counts; removing the legacy no-counts branch depends on the
+  renderer protocol (frontend main.tsx:12415), left as is.
+
+## Cross-domain, for the lead
+
+- BW-13 (writer half): `backend/main.py` `_record_recovery_chunk` (~4308, outside
+  the live-WS block) does an UNBUFFERED `write()` per renderer frame on the event
+  loop (`open(..., buffering=0)` at ~4276). Change to a buffered writer flushed by
+  `_finalize_live_recovery` (the spool is read back only at finalize, after a flush).
+- BL-02 (rest): `backend/main.py:_prune_recording_audio` logs `audio retention:
+  removed <file name with the dictation's first words>` → log `entry.stem[:26]`
+  (timestamp part) only; `_MutedPollingAccessFilter` should redact the name
+  segment of `GET /api/recordings/<name>/audio`; `desktop/main.js appendMainLog`
+  should create main.log with mode 0600.
+- BE-22: drop `main.py`'s own `_env_int` (~637) and import `backend.transcribe._env_int`
+  (or move it to one shared helper module).
+- BW-11 / BL-01 interplay: the WS handler (`ws_transcribe`, main.py ~4041-4212,
+  outside this lane) runs `_finalize_live_recovery` after the session returns.
+  A client-gone session now marks the spool `had_error` so it is retained; BL-01's
+  single-owner fix must keep that retention.
+- Renderer (no change required for parsing — frontend suite green): the
+  envelope's `stats` now also carries `dual_secondary_failed`,
+  `dual_duplicates_removed`, `dual_contested_to_secondary`,
+  `dual_contested_to_primary`; `stats.dual_stream` now means "the text is a
+  merge" (true when the second reading contributed words, even if it later
+  failed). BW-01: after a fatal `error` the backend keeps reading audio until the
+  renderer's `finalize`; the renderer must keep streaming the mic after a fatal
+  (frontend main.tsx:11553-11560 says it does) — worth a live check.
+- BL-16: renderer `discardLiveRecovery` after `saveRecordingText` (frontend).
+- Live verification not done here: the stop path changes (BW-01, BW-03/BL-09
+  abort, BE-05 secondary feeder) are proven by unit tests against fakes; one real
+  dictation with dual on (and one with a pulled network cable mid-recording)
+  would confirm them end to end.
