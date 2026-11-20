@@ -3,6 +3,22 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.8] - 2026-11-20
+
+What the first live day of 1.6.7 turned up.
+
+### Changed
+
+- **The start and stop tones play at the press, about six times louder.** The start tone sounds the moment the warm microphone is adopted; the stop tone no longer waits for the end of the take's tail (it was half a second late).
+
+### Fixed
+
+- **Screen mode: a double-tap drag on the trackpad draws one line again.** Another app's event tap (BetterTouchTool on this machine) re-posts the held click; the helper took each echo for a new press, so the cursor jumped back and the line broke into dozens of micro-strokes with as many identical marks. Echoes of a click the helper itself replayed are now passed through; the press log names the app that posted them.
+- **Screen mode: identical marks are written once.** Strokes of the same second, place and shot give a single mark in the transcript.
+- **Screen mode: the notebook button clears the drawings at once.** The strokes leave the screen before the screenshot is taken (the shot is drawn from their data), are removed after it, and come back if the capture fails.
+- **Dual-stream takes no longer say every clause twice in *Original*.** The stop envelope was being fed back into the live source text.
+- **No more false "Auto-paste could not reach macOS" alarm.** One slow permission check (1.15 s against a 1 s bound, on a busy machine) was read as a dead permission. A check that times out now counts as one strike, as a timed-out paste already did; two in a row, or an outright refusal from macOS, still raise the dialog.
+
 ## [1.6.7] - 2026-11-20
 
 The fixes of the 2026-11-20 audit (275 findings — `BUGSAUDIT-2026-11-20.md`), plus the requests made while they landed.

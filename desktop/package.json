@@ -1,6 +1,6 @@
 {
   "name": "transcriptor",
-  "version": "1.6.7",
+  "version": "1.6.8",
   "description": "Voice-to-text transcription with auto-paste",
   "author": "Leo Erdman",
   "license": "MIT",
