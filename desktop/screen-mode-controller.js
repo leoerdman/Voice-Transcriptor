@@ -237,6 +237,15 @@ function createScreenModeController(deps) {
   let displayListeners = null;
   let flushScheduled = false;
   let chain = Promise.resolve();
+  // Main was told the session is on (`onActiveChange(true)`); only then is
+  // it told it is off.
+  let announced = false;
+  // Pending helper start: settles on the helper's `ready`, or fails on its
+  // exit/error before it.
+  let helperStart = null;
+  // Every session id that ended or was asked to end. A `start` of one of
+  // these lost the race to its own stop and must not open a take.
+  const endedIds = new Set();
 
   function serialize(fn) {
     const next = chain.then(fn, fn);
@@ -292,18 +301,42 @@ function createScreenModeController(deps) {
     });
     const entry = { win: w, bounds, ready: false, ops: [] };
     overlays.set(display.id, entry);
-    try { w.setIgnoreMouseEvents(true); } catch { }
-    try { w.setContentProtection(true); } catch { }
-    try { w.setAlwaysOnTop(true, "screen-saver"); } catch { }
-    try { w.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }); } catch { }
-    await w.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(overlayHtml())}`);
-    if (w.isDestroyed()) return;
-    // The display bounds again: macOS may have nudged the window off the
-    // menu bar while it was created.
-    try { w.setBounds(bounds, false); } catch { }
-    await w.webContents.executeJavaScript(`window.__setOrigin(${bounds.x}, ${bounds.y})`, true);
+    try {
+      // An overlay that took the mouse would block the whole display; one
+      // that is not content-protected would be in every screenshot. Either
+      // failure means this overlay must not be shown.
+      required("setIgnoreMouseEvents", () => w.setIgnoreMouseEvents(true));
+      required("setContentProtection", () => w.setContentProtection(true));
+      optional("overlay setAlwaysOnTop", () => w.setAlwaysOnTop(true, "screen-saver"));
+      optional("overlay setVisibleOnAllWorkspaces", () => w.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }));
+      await w.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(overlayHtml())}`);
+      if (w.isDestroyed()) throw new Error("overlay window was destroyed while loading");
+      // The display bounds again: macOS may have nudged the window off the
+      // menu bar while it was created.
+      optional("overlay setBounds", () => w.setBounds(bounds, false));
+      await w.webContents.executeJavaScript(`window.__setOrigin(${bounds.x}, ${bounds.y})`, true);
+    } catch (e) {
+      if (overlays.get(display.id) === entry) destroyOverlay(display.id);
+      throw e;
+    }
     entry.ready = true;
     w.showInactive();
+  }
+
+  function required(what, fn) {
+    try {
+      fn();
+    } catch (e) {
+      throw new Error(`${what} failed: ${e?.message || e}`);
+    }
+  }
+
+  function optional(what, fn) {
+    try {
+      fn();
+    } catch (e) {
+      log(`[screen-mode] ${what} failed: ${e?.message || e}`);
+    }
   }
 
   function destroyOverlay(displayId) {
@@ -358,6 +391,15 @@ function createScreenModeController(deps) {
       entry.ops = [];
       entry.win.webContents.executeJavaScript(`window.__apply(${JSON.stringify(ops)})`, true).catch(() => { });
     }
+  }
+
+  // An overlay call whose answer the caller needs: rejects instead of
+  // answering null.
+  function overlayEval(entry, js) {
+    if (!entry || !entry.ready || entry.win.isDestroyed()) {
+      return Promise.reject(new Error("no overlay on this display"));
+    }
+    return entry.win.webContents.executeJavaScript(js, true);
   }
 
   function overlayCall(entry, js) {
@@ -429,10 +471,16 @@ function createScreenModeController(deps) {
         devTools: false,
       },
     });
+    try {
+      // A palette that is not content-protected would be in every shot.
+      required("palette setContentProtection", () => w.setContentProtection(true));
+    } catch (e) {
+      w.destroy();
+      throw e;
+    }
     palette = w;
-    try { w.setContentProtection(true); } catch { }
-    try { w.setAlwaysOnTop(true, "screen-saver", 1); } catch { }
-    try { w.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }); } catch { }
+    optional("palette setAlwaysOnTop", () => w.setAlwaysOnTop(true, "screen-saver", 1));
+    optional("palette setVisibleOnAllWorkspaces", () => w.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }));
     w.webContents.on("page-title-updated", (event, title) => {
       const raw = String(title || "");
       if (!raw.startsWith("__screen_palette__")) return;
@@ -506,12 +554,34 @@ function createScreenModeController(deps) {
     try { helper.stdin.write(`${JSON.stringify(obj)}\n`); } catch { }
   }
 
+  /**
+   * Spawn the helper and wait for its `ready` (the tap is live). Rejects
+   * when it fails to spawn, exits first (exit 2: no Accessibility grant,
+   * `err.warning = "accessibility"`) or stays silent past the bound. After
+   * `ready`, a helper that dies or errors mid-take is reported, not just
+   * logged: from then on nothing draws.
+   */
   function startHelper() {
     const bin = deps.helperPath();
     const child = childProcess.spawn(bin, [], { stdio: ["pipe", "pipe", "pipe"] });
     helper = child;
     helperBuffer = "";
     lastControlsKey = "";
+    const started = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        settle(new Error(`helper did not report ready within ${HELPER_READY_TIMEOUT_MS} ms`));
+      }, HELPER_READY_TIMEOUT_MS);
+      timer.unref?.();
+      function settle(error) {
+        if (helperStart !== pending) return;
+        helperStart = null;
+        clearTimeout(timer);
+        if (error) reject(error);
+        else resolve();
+      }
+      const pending = { child, settle };
+      helperStart = pending;
+    });
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
       helperBuffer += chunk;
@@ -524,20 +594,38 @@ function createScreenModeController(deps) {
     });
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (d) => log(`[screen-mode] helper stderr: ${String(d).trim()}`));
-    child.on("error", (e) => log(`[screen-mode] helper spawn failed: ${e?.message || e}`));
-    child.on("exit", (code, signal) => {
-      if (helper === child) helper = null;
-      log(`[screen-mode] helper exited code=${code} signal=${signal || ""}`);
-      if (code === 2) {
-        deps.onWarning("accessibility");
+    child.on("error", (e) => {
+      log(`[screen-mode] helper failed: ${e?.message || e}`);
+      if (helperStart && helperStart.child === child) {
+        helperStart.settle(new Error(`helper failed to start: ${e?.message || e}`));
+        return;
+      }
+      if (helper === child) {
+        helper = null;
+        deps.onWarning("helper");
       }
     });
+    child.on("exit", (code, signal) => {
+      log(`[screen-mode] helper exited code=${code} signal=${signal || ""}`);
+      if (helperStart && helperStart.child === child) {
+        const error = new Error(`helper exited before it was ready (code=${code} signal=${signal || ""})`);
+        if (code === 2) error.warning = "accessibility";
+        helperStart.settle(error);
+        return;
+      }
+      // stopHelper() lets go of the child before it exits: that exit is ours.
+      if (helper !== child) return;
+      helper = null;
+      deps.onWarning("helper");
+    });
+    return started;
   }
 
   function stopHelper() {
     const child = helper;
     helper = null;
     if (!child) return;
+    if (helperStart && helperStart.child === child) helperStart.settle(new Error("helper stopped before it was ready"));
     try { child.stdin.write(`${JSON.stringify({ cmd: "quit" })}\n`); } catch { }
     try { child.stdin.end(); } catch { }
     setTimeout(() => {
@@ -552,6 +640,7 @@ function createScreenModeController(deps) {
     const t = msg.t;
     if (t === "ready") {
       log("[screen-mode] mouse helper ready");
+      if (helperStart) helperStart.settle(null);
       refreshLayout();
       return;
     }
@@ -564,6 +653,13 @@ function createScreenModeController(deps) {
       // rule made of it — the record any "this gesture did not draw"
       // report is diagnosed from.
       log(`[screen-mode] press outcome=${msg.outcome} clicks=${msg.clicks} drags=${msg.drags}`);
+      return;
+    }
+    if (t === "tap-disabled") {
+      // macOS switched the tap off and the helper switched it back on; the
+      // press it cut was abandoned (a stroke ended, a held press handed to
+      // the app). The other half of the "did not draw" record.
+      log(`[screen-mode] tap disabled reason=${msg.reason} abandoned=${msg.abandoned}`);
       return;
     }
     const x = Number(msg.x);
@@ -617,38 +713,48 @@ function createScreenModeController(deps) {
     const allDisplays = screen.getAllDisplays();
     const at = Date.now();
     const files = [];
+    const captured = new Set();
+    const failures = [];
     for (const displayId of displayIds) {
       const display = allDisplays.find((d) => d.id === displayId);
-      if (!display) continue;
+      if (!display) {
+        failures.push(`display ${displayId} is gone`);
+        continue;
+      }
       const ordinal = allDisplays.indexOf(display) + 1;
       const file = path.join(session.dir, shotFileName(session.shots.length + 1, ordinal, displayIds.length));
+      const onDisplay = pending.filter((s) => s.displayId === displayId).map((s) => s.id);
       try {
         await captureRegion(display.bounds, file);
-        const entry = overlays.get(displayId);
-        const hasStrokes = await overlayCall(entry, `window.__hasStrokes(${JSON.stringify(ids)})`);
-        if (hasStrokes) {
+        if (onDisplay.length) {
+          // The strokes are part of the image: without them painted in,
+          // this file is not the shot the strokes are said to be in.
           const raw = fs.readFileSync(file).toString("base64");
-          const composed = await overlayCall(
-            entry,
-            `window.__composite(${JSON.stringify(`${PNG_DATA_URL_PREFIX}${raw}`)}, ${JSON.stringify(ids)})`,
+          const composed = await overlayEval(
+            overlays.get(displayId),
+            `window.__composite(${JSON.stringify(`${PNG_DATA_URL_PREFIX}${raw}`)}, ${JSON.stringify(onDisplay)})`,
           );
-          if (typeof composed === "string" && composed.startsWith(PNG_DATA_URL_PREFIX)) {
-            fs.writeFileSync(file, Buffer.from(composed.slice(PNG_DATA_URL_PREFIX.length), "base64"));
+          if (typeof composed !== "string" || !composed.startsWith(PNG_DATA_URL_PREFIX)) {
+            throw new Error("the overlay returned no image");
           }
+          fs.writeFileSync(file, Buffer.from(composed.slice(PNG_DATA_URL_PREFIX.length), "base64"));
         }
         files.push(file);
+        captured.add(displayId);
       } catch (e) {
-        log(`[screen-mode] capture failed display=${displayId}: ${e?.message || e}`);
-        if (/could not create image|not permitted|denied/i.test(String(e?.message || ""))) {
-          deps.onWarning("screen-recording");
-        }
+        failures.push(`display ${displayId}: ${e?.message || e}`);
+        fs.rmSync(file, { force: true });
       }
     }
-    // A capture that failed (no Screen Recording permission) still closes
-    // the batch: the strokes keep their times and places in the record and
-    // the transcript, and the screen is cleared as the user asked.
-    if (!files.length && !pending.length) return null;
-    const shot = recordShot(session, { at, files, strokeIds: ids, reason });
+    if (failures.length) {
+      // No screenshot is claimed for a display that was not captured: its
+      // strokes stay pending and on the screen for the next shot.
+      log(`[screen-mode] capture failed (${reason}): ${failures.join("; ")}`);
+      deps.onWarning("capture-failed");
+    }
+    if (!files.length) return null;
+    const taken = pending.filter((s) => captured.has(s.displayId)).map((s) => s.id);
+    const shot = recordShot(session, { at, files, strokeIds: taken, reason });
     // Only the strokes the shot took leave the screen. Queued ops are
     // kept: they belong to strokes still being drawn or begun since.
     for (const entry of overlays.values()) {
@@ -672,28 +778,58 @@ function createScreenModeController(deps) {
 
   // ── lifecycle ─────────────────────────────────────────────────────────
   async function startNow(id) {
-    if (session) return { ok: true, id: session.id };
+    if (endedIds.has(id)) {
+      // Its stop got here first (the renderer finished the take while main
+      // was still on its way to start it): nobody will ever finish it.
+      log(`[screen-mode] start ${id} refused: that take already ended`);
+      return { ok: false, error: "ended" };
+    }
+    if (session) {
+      if (session.id === id) return { ok: true, id };
+      // A new take while an old session is still up: the old take's
+      // recording is over (main starts a session only for a confirmed new
+      // recording), so its session is closed — screenshots kept staged —
+      // instead of answering the new id with the old one.
+      log(`[screen-mode] start ${id} while ${session.id} is live; finishing ${session.id}`);
+      await finishNow({ id: session.id });
+    }
     if (!isSupported()) return { ok: false, error: "unsupported" };
     const dir = path.join(deps.stagingRoot(), id);
     fs.mkdirSync(dir, { recursive: true });
     session = createScreenSession({ id, dir });
     lastManifest = null;
     try {
-      startHelper();
       watchDisplays();
-      await Promise.all(screen.getAllDisplays().map((d) => createOverlay(d)));
-      await createPalette();
+      await startHelper();
+      const results = await Promise.allSettled(screen.getAllDisplays().map((d) => createOverlay(d)));
+      for (const r of results) {
+        if (r.status === "rejected") log(`[screen-mode] overlay failed: ${r.reason?.message || r.reason}`);
+      }
+      if (![...overlays.values()].some((entry) => entry.ready)) {
+        throw new Error("no overlay could be shown");
+      }
     } catch (e) {
-      log(`[screen-mode] start failed: ${e?.message || e}`);
+      log(`[screen-mode] start ${id} failed: ${e?.message || e}`);
+      teardown();
+      fs.rmSync(dir, { recursive: true, force: true });
+      deps.onWarning(e?.warning || "start-failed");
+      return { ok: false, error: e?.message || String(e) };
     }
+    // Without a palette the take still draws, in the default colour.
+    await createPalette().catch((e) => log(`[screen-mode] palette failed: ${e?.message || e}`));
     // Once the overlays exist: main lifts the capsule above them, shows its
     // screen button and binds the screenshot hotkey.
+    announced = true;
     deps.onActiveChange(true);
     // Without Screen Recording, macOS does not fail a capture: it returns
-    // the wallpaper with no windows on it. Say so up front instead of
-    // saving screenshots of nothing.
+    // the wallpaper with no windows on it. Say so up front — for every
+    // state but "granted" ("not-determined" included) — instead of saving
+    // screenshots of nothing.
     const captureAccess = typeof deps.screenCaptureAccess === "function" ? deps.screenCaptureAccess() : "granted";
-    if (captureAccess === "denied" || captureAccess === "restricted") deps.onWarning("screen-recording");
+    if (captureAccess !== "granted") {
+      log(`[screen-mode] screen recording access=${captureAccess || "unknown"}`);
+      deps.onWarning("screen-recording");
+    }
     refreshLayout();
     writeEvents();
     log(`[screen-mode] started ${id} displays=${overlays.size}`);
@@ -711,18 +847,24 @@ function createScreenModeController(deps) {
       try { palette.destroy(); } catch { }
     }
     palette = null;
-    const wasActive = !!session;
     session = null;
-    if (wasActive) deps.onActiveChange(false);
+    if (announced) {
+      announced = false;
+      deps.onActiveChange(false);
+    }
   }
 
   async function finishNow({ id = "", discard = false } = {}) {
+    // Whatever state it finds, this id has ended: a start for it that is
+    // still on its way must not open it again.
+    if (id) endedIds.add(id);
     if (!session) {
       return lastManifest && (!id || lastManifest.id === id)
         ? { ok: true, manifest: lastManifest }
         : { ok: false, error: "no-session" };
     }
     if (id && session.id !== id) return { ok: false, error: "session-mismatch" };
+    endedIds.add(session.id);
     const dir = session.dir;
     session.endedAt = Date.now();
     if (!discard && pendingStrokes(session).length) {

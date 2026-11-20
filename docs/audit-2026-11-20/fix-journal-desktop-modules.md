@@ -96,3 +96,54 @@ a diagnostic field of events.json and the shot log line, set by every caller
 DX-09: the harness runs the shipped overlay page in a `vm` with a recording
 canvas; the controller takes `deps.platform` so the suite runs on every OS
 instead of joining the darwin-gated list in packaging.test.js.
+
+### C3 — S-02 = DX-03 = DM-31 (controller side), DX-02, DX-08 = H-08 = S-04 (controller side), DX-18, DX-06, S-03 (capture side), DX-10 (protocol golden lines)
+Files: `desktop/screen-mode-controller.js`, `desktop/screen-mode-controller.test.js`.
+Check: `node --test desktop/screen-mode-controller.test.js`.
+Before (controller at C2, new tests):
+```
+exit=1
+✖ a stop that reaches the controller before its start wins: the late start is refused (5.734209ms)
+    actual: { ok: true, id: 'screen-20261120-100000-000' },  expected: { ok: false, error: 'ended' },
+✖ a new take while an old session is still up closes the old one and starts the new id (3.770792ms)
+    actual: { ok: true, id: 'screen-20261120-100000-000' },  expected: { ok: true, id: 'screen-20261120-100500-000' },
+✖ a helper without Accessibility fails the start: not ok, warned, nothing left on screen (3.813667ms)
+    actual: true, expected: false,
+✖ a helper that cannot be spawned fails the start (4.43175ms)
+    actual: true, expected: false,
+✖ no overlay that can be shown fails the start (2.75575ms)
+    actual: true, expected: false,
+✖ an overlay that would take the mouse is never shown (5.093667ms)
+    actual: true, expected: false,
+✖ one display's overlay failing, or the palette failing, still starts the take (7.0295ms)
+    actual: 2, expected: 1,
+✖ a helper that dies mid-take is reported (5.611334ms)
+    actual: [], expected: [ 'helper' ],
+✖ a capture that fails claims no screenshot and keeps the strokes for the next one (4.271ms)
+    actual: { index: 1, files: [] }, expected: null,
+✖ a stroke on a display that is gone is not stamped into a shot of the others (5.503375ms)
+    actual: 2, expected: 1,
+✖ Screen Recording that is not granted yet is warned about at start (5.481709ms)
+    actual: [], expected: [ 'screen-recording' ],
+✖ every stdout line main.swift documents is understood by the controller (4.310416ms)
+  AssertionError [ERR_ASSERTION]: line tap-disabled had no effect
+ℹ pass 3
+ℹ fail 12
+```
+After:
+```
+exit=0
+ℹ pass 15
+ℹ fail 0
+```
+Behaviour changes the lead must know about (they need main.js, see Cross-domain):
+`start` now answers `{ok:false, error}` on failure and calls `onWarning` with
+`"start-failed"`, `"accessibility"`; mid-take helper death → `"helper"`;
+failed capture → `"capture-failed"` (the old regex-matched `"screen-recording"`
+on capture failure is gone; `"screen-recording"` is now raised at start for
+every access state but `"granted"`). main.js's `SCREEN_MODE_WARNINGS` has
+copy only for `accessibility` and `screen-recording`, so the three new kinds
+are logged (`[screen-mode] warning <kind>`) but not shown until main adds copy.
+A stroke whose display could not be captured stays pending; if the stop's own
+shot cannot capture it either, it is not in the manifest (it was never in an
+image) — the log line `capture failed (stop): …` records it.
