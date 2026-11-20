@@ -1449,6 +1449,11 @@ const RECORDING_STATUS_CAPSULE = Object.freeze((() => {
   // floor(30 / 2.4) = 12 bars in the narrowed column.
   waveBarWidth: 1.0,
   waveBarGap: 1.4,
+  // The line under the bars: drawn from the press for as long as the
+  // capsule is active, so a silent take still shows it is recording (user,
+  // 2026-11-20: "the thinnest red line must run at once, even if I say
+  // nothing"). Silence alone gives bars of height 0, which draw nothing.
+  waveBaselineHeight: 1,
   waveFrameMs: 16,
   waveLevelTickMs: 220,
   waveIdleTickMs: 360,
@@ -1802,6 +1807,8 @@ function recordingStatusCapsuleHtml() {
     let lastTimerText = "";
     let activeWave = true;
     let waveMode = "recording";
+    /** The baseline is on the canvas now (it is erased when the page goes inactive). */
+    let baselineDrawn = false;
     let stateIconModeClass = "";
     let pointerEmitLocked = false;
     function fmt(ms) {
@@ -1844,8 +1851,20 @@ function recordingStatusCapsuleHtml() {
       stateIcon.className = "";
       stateIcon.classList.add(nextClass);
     }
+    function waveColor() {
+      if (waveMode === "recording") return "rgba(255,77,77,.88)";
+      if (waveMode === "autostop") return "rgba(255,196,74,.92)";
+      if (waveMode === "transcribing") return "rgba(114,174,255,.92)";
+      if (waveMode === "upscaling") return "rgba(173,112,255,.92)";
+      return "rgba(170,170,170,.62)";
+    }
     function renderWave(now = Date.now()) {
       ctx.clearRect(0, 0, waveW, waveH);
+      baselineDrawn = pageIsActive();
+      if (!baselineDrawn) return;
+      ctx.fillStyle = waveColor();
+      const lineH = ${t.waveBaselineHeight};
+      ctx.fillRect(0, (waveH - lineH) / 2, waveW, lineH);
       const tickMs = (waveMode === "recording" || waveMode === "autostop")
         ? ${t.waveLevelTickMs}
         : ${t.waveIdleTickMs};
@@ -1861,11 +1880,6 @@ function recordingStatusCapsuleHtml() {
         const h = Math.min(waveH - 2, v * (waveH - 2));
         if (h <= 0) continue;
         const y = (waveH - h) / 2;
-        if (waveMode === "recording") ctx.fillStyle = "rgba(255,77,77,.88)";
-        else if (waveMode === "autostop") ctx.fillStyle = "rgba(255,196,74,.92)";
-        else if (waveMode === "transcribing") ctx.fillStyle = "rgba(114,174,255,.92)";
-        else if (waveMode === "upscaling") ctx.fillStyle = "rgba(173,112,255,.92)";
-        else ctx.fillStyle = "rgba(170,170,170,.62)";
         if (typeof ctx.roundRect === "function") {
           ctx.beginPath();
           ctx.roundRect(x, y, bw, h, Math.min(bw / 2, h / 2));
@@ -1892,7 +1906,7 @@ function recordingStatusCapsuleHtml() {
     }
     function tickWave(now) {
       if (!pageIsActive()) {
-        if (bars.length) {
+        if (bars.length || baselineDrawn) {
           bars.length = 0;
           renderWave(now);
         }
@@ -1939,7 +1953,7 @@ function recordingStatusCapsuleHtml() {
       animationFrameHandle = requestAnimationFrame(animationLoop);
     }
     function clearInactiveWave(now = Date.now()) {
-      if (!bars.length) return;
+      if (!bars.length && !baselineDrawn) return;
       bars.length = 0;
       renderWave(now);
     }
