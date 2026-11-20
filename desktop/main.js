@@ -127,6 +127,9 @@ const {
 const { STOP_ACTION, decideMainProcessStop } = require("./recording-stop");
 // The Windows PowerShell paste fallback: activate, verify, then Ctrl+V (DM-04).
 const { buildPwshPasteFallbackScript } = require("./windows-paste-fallback");
+// What a backend exit means: restart or not, and whose handle it clears
+// (DM-09, DM-27).
+const { backendHandleOf, decideBackendExit } = require("./backend-exit");
 // The record hotkey's renderer round trip, with a press that expires
 // when main stops waiting for it (DM-05).
 const {
@@ -7583,8 +7586,10 @@ async function runGigaamEngineInstall(python, repoRoot, req) {
     setEnginePhase(engineDeps.ENGINE_INSTALL_PHASES.DONE);
     appendMainLog("[engine-install] ok (engine-site swapped)");
 
-    // Activate NOW: killing the backend makes the exit handler respawn
-    // it with the refreshed PYTHONPATH — no app relaunch needed.
+    // Activate NOW: killing the backend releases its handle, and the exit
+    // handler restarts any backend that exits while the app is not
+    // quitting — whatever its exit code (./backend-exit, DM-09) — so the
+    // respawn picks up the refreshed PYTHONPATH without an app relaunch.
     if (backend && !isQuitting) {
       appendMainLog("[engine-install] restarting backend to activate engine");
       killBackendHard("gigaam-engine-installed");
@@ -7968,24 +7973,28 @@ async function startBackend() {
     TRANSCRIPTOR_BOOT_NONCE: BACKEND_BOOT_NONCE,
     TRANSCRIPTOR_PARENT_WATCHDOG: "1",
   });
-  backend = spawn(python, args, {
+  // Every handler below closes over THIS child, never the mutable
+  // ``backend``: a late event from a previous child must not act on its
+  // replacement (DM-27).
+  const child = spawn(python, args, {
     cwd: repoRoot,
     stdio: ["pipe", "pipe", "pipe"],
     env: childEnv,
   });
+  backend = child;
   // Ignore any stdin errors — the pipe is only used for EOF-on-parent-
   // exit detection. If the write end gets EPIPE for some reason (backend
   // crashed, fd was closed), Node would otherwise emit an unhandled
   // 'error' event and crash the main process.
-  if (backend.stdin) {
-    backend.stdin.on("error", () => { /* intentional no-op */ });
+  if (child.stdin) {
+    child.stdin.on("error", () => { /* intentional no-op */ });
   }
 
-  backend.stdout.on("data", (d) => {
+  child.stdout.on("data", (d) => {
     const msg = d.toString();
     appendMainLog(`[backend-stdout] ${compactLogText(msg, 1400)}`);
   });
-  backend.stderr.on("data", (d) => {
+  child.stderr.on("data", (d) => {
     const msg = d.toString();
     appendMainLog(`[backend-stderr] ${compactLogText(msg, 1400)}`);
     // Keep the last ~4 KB of stderr so the fallback error page can
@@ -7994,18 +8003,21 @@ async function startBackend() {
     backendStderrTail = (backendStderrTail + msg).slice(-BACKEND_STDERR_TAIL_MAX);
   });
 
-  backend.on("exit", (code, signal) => {
-    appendMainLog(`[backend-exit] code=${code} signal=${signal || ""}`);
-    backend = null;
-    // Restart on either:
-    //   (a) non-zero exit (Python crash, sys.exit(1), broken venv, ...)
-    //   (b) signal exit (segfault, oom-kill, manual SIGKILL outside our
-    //       quit path) — code is null in that case so the old check
-    //       ``Number(code || 0) !== 0`` was 0 !== 0 → false → silently
-    //       skipped restart. A backend killed by SIGSEGV would not
-    //       come back without a manual app relaunch.
-    const abnormalExit = Number(code || 0) !== 0 || (signal != null && signal !== "");
-    if (!isQuitting && abnormalExit) {
+  child.on("exit", (code, signal) => {
+    // ./backend-exit decides (DM-09, DM-27): while the app is not
+    // quitting, ANY exit of the live backend — a crash, a signal, or a
+    // code-0 exit nobody asked for — is unexpected and it comes back; an
+    // exit of a child that has already been replaced changes nothing.
+    // Planned restarts (the engine install's activation) are the same
+    // event: the handle was released by killBackendHard, not quitting.
+    const handle = backendHandleOf(backend, child);
+    const decision = decideBackendExit({ code, signal, isQuitting, handle });
+    appendMainLog(
+      `[backend-exit] code=${code} signal=${signal || ""} handle=${handle} ` +
+      `abnormal=${decision.abnormal ? 1 : 0} restart=${decision.restart ? 1 : 0}`,
+    );
+    if (decision.forgetHandle) backend = null;
+    if (decision.restart) {
       if (backendRestartTimer) {
         clearTimeout(backendRestartTimer);
         backendRestartTimer = null;
@@ -8018,7 +8030,7 @@ async function startBackend() {
       // the log file unboundedly and masking the real failure. The user
       // sees a permanent backend error in the renderer instead.
       if (attempt > 8) {
-        backendBootError = `Backend exited with code ${code} after ${attempt - 1} restart attempts — giving up.`;
+        backendBootError = `Backend exited (code ${code}, signal ${signal || "none"}) after ${attempt - 1} restart attempts — giving up.`;
         setBackendBootStatus("");
         appendMainLog(`[backend-restart-giving-up] ${backendBootError}`);
         broadcastBackendBootError();
@@ -8063,20 +8075,19 @@ async function startBackend() {
           .catch((e) => appendMainLog(`[backend-restart-error] ${e?.message || e}`))
           .finally(() => { backendRestartTimer = null; });
       }, delay);
-    } else if (Number(code || 0) === 0) {
-      backendRestartAttempts = 0;
     }
   });
 
-  backend.on("error", (err) => {
+  child.on("error", (err) => {
     backendBootError = err.message;
     appendMainLog(`[backend-error] ${err.message}`);
     // A spawn error (missing python binary, EACCES, EMFILE) leaves the
     // ChildProcess object dead but still truthy, so startBackend's
     // "already running" guard would silently refuse every restart until
     // the app relaunches (BUG-62). Drop the dead handle so the normal
-    // retry/backoff path can bring the backend back.
-    backend = null;
+    // retry/backoff path can bring the backend back — but only if it is
+    // still this child's handle (DM-27).
+    if (backend === child) backend = null;
   });
   })();
 

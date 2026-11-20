@@ -59,6 +59,7 @@
       "windows-paste-fallback.js",
       "renderer-toggle.js",
       "data-dir.js",
+      "backend-exit.js",
       "power-events.js",
       "child-io.js",
       "paste-protocol.js",
