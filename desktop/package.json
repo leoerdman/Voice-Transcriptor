@@ -60,6 +60,7 @@
       "renderer-toggle.js",
       "data-dir.js",
       "backend-exit.js",
+      "single-flight.js",
       "renderer-epoch.js",
       "shortcut-runtime.js",
       "capsule-geometry.js",

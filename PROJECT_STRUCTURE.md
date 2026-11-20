@@ -166,6 +166,7 @@ desktop/
 ├── renderer-toggle.js              # the record hotkey's one bounded renderer round trip (pure, node --test)
 ├── data-dir.js                     # the one rule for where the desktop shell keeps its data (pure, node --test)
 ├── backend-exit.js                 # what the shell does when a backend child exits: restart, release, cap (pure, node --test)
+├── single-flight.js                # at most one run of an operation at a time; check and claim in one step (engine install) (pure, node --test)
 ├── renderer-epoch.js               # which renderer page load a recording id belongs to (pure, node --test)
 ├── shortcut-runtime.js             # the accelerators bound right now and how a Settings update changes them (pure, node --test)
 ├── capsule-geometry.js             # the recording capsule's window size and placement (pure, node --test)
