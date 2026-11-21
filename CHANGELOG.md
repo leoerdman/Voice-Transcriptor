@@ -3,6 +3,12 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.21] - 2026-11-21
+
+### Fixed
+
+- **The window no longer stays black after macOS restarts its page process.** When the system kills the window's page process — and often the backend with it, as on memory pressure — the page now loads again by itself as soon as the backend answers, instead of trying once too early and staying black until the app was quit. The recording capsule and screen mode's overlays and palette are rebuilt the same way; a rebuilt overlay keeps the take's strokes.
+
 ## [1.6.20] - 2026-11-21
 
 ### Fixed
