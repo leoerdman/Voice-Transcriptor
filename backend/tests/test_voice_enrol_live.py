@@ -207,8 +207,11 @@ class TheSpecAndTheCardAgreeTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
     def test_the_press_is_described_as_a_recording_of_six_seconds(self):
+        # §5.5 carries two acts now: the six-second press and a recording the
+        # owner points at. Both are acts; neither is inferred.
         line = next(l for l in self.doc.splitlines() if l.startswith("5.5 "))
-        self.assertIn("six seconds are recorded", line)
+        self.assertIn("six seconds recorded on the spot", line)
+        self.assertIn("From last recording", line)
         self.assertNotIn("take becomes one", line)
 
     def test_the_settings_line_no_longer_learns_from_an_existing_take(self):

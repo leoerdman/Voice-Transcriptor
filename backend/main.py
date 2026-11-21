@@ -7284,11 +7284,44 @@ def enrol_voice_profile(
         embedder.close()
 
     try:
-        VOICE_PROFILES.save(slot, name, vector)
+        VOICE_PROFILES.save(slot, name, vector, capture=str(audio_path))
     except ProfileError as e:
         raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
     logger.info("voice profile saved in slot %s", slot)
     return _voice_profiles_payload()
+
+
+@app.post("/api/voice/profiles/{slot}/enrol-latest")
+def enrol_voice_profile_from_latest(
+    slot: int,
+    payload: dict = Body(default={}),
+    _auth: None = Depends(_require_api_auth),
+):
+    """Learn a voice from the newest recording — one press, no file picking.
+
+    The recording itself is the sample, so the profile is learned from the same
+    microphone and the same room the desk will judge (§5.5). Everything else is
+    the file route's own work: one place decides what a take can teach.
+    """
+    directory = _resolve_recordings_dir()
+    newest = None
+    newest_at = 0.0
+    for path in _iter_recording_text_files(directory):
+        try:
+            touched = path.stat().st_mtime
+        except OSError:
+            continue
+        if touched > newest_at:
+            newest, newest_at = path, touched
+    if newest is None:
+        raise HTTPException(status_code=400, detail="no recording to learn from yet")
+    name = str(payload.get("name") or "").strip()
+    request = {
+        "recording_name": newest.name,
+        "archive_dir": str(directory),
+        "name": name or newest.stem,
+    }
+    return enrol_voice_profile(slot, payload=request, _auth=None)
 
 
 #: How long the card gives a press to speak, in seconds. Solo's window is

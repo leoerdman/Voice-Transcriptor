@@ -7912,6 +7912,20 @@ function renderVoiceMask(): void {
       item.appendChild(forget);
     }
 
+    const fromTake = document.createElement("button");
+    fromTake.type = "button";
+    fromTake.className = "btn btn-ghost voice-slot-from-take";
+    fromTake.textContent = "From last recording";
+    fromTake.disabled = voiceProfilesBusy;
+    fromTake.setAttribute("aria-label", `Learn ${row.label} from the last recording`);
+    fromTake.title =
+      "Learn this slot from the newest recording: same microphone, same room, so the voice\n" +
+      "matches the audio Solo will judge";
+    fromTake.addEventListener("click", () => {
+      void learnFromLastRecording(row.slot, row.label);
+    });
+    item.appendChild(fromTake);
+
     list.appendChild(item);
   }
   restoreVoiceFocus(focusKey);
@@ -8276,6 +8290,16 @@ async function switchMask(on: boolean): Promise<void> {
     return;
   }
   await switchSlot(target, true);
+}
+
+async function learnFromLastRecording(slot: number, label: string): Promise<void> {
+  if (voiceProfilesBusy) return;
+  const asked = window.prompt("Whose voice is this?", label || `Voice ${slot}`);
+  if (asked === null) return;
+  await writeVoiceProfiles(
+    () => apiPost<unknown>(`/api/voice/profiles/${slot}/enrol-latest`, { name: asked.trim() }),
+    "Could not learn that voice from the recording.",
+  );
 }
 
 async function forgetSlot(slot: number, label: string): Promise<void> {

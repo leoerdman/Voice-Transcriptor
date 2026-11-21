@@ -30,7 +30,7 @@ Presumptive; the person running the app decides. Off is the default.
 5.2 A cold is one of the three, switched on like any other: no mark, no expiry, whoever runs it decides.
 5.3 A closed Solo is drawn: the refusal is visible, never silent.
 5.4 Silence reads as lost speech; a line of state costs less than a lost utterance.
-5.5 A profile is made in Settings, on the Solo card: six seconds are recorded by an act, never inferred from a take.
+5.5 A profile is made in Settings, on the Solo card, two ways and both by an act: six seconds recorded on the spot, or a recording the owner points at ("From last recording"). The second is the stronger one for Solo's purpose — the sample then comes through the same microphone and room the desk judges, and measured 2026-11-21 the condition mattered as much as the speaker (0.528-0.734 across conditions against 0.447-0.495 between two voices). A take that cannot teach still refuses with its reason: two voices in it, or speech shorter than the window.
 6.1 Tests: a word on the gate's edge, zeroing that keeps the timeline, off that changes nothing.
 6.2 A new model is its own decision; the weights here are a file, and whoever runs it decides.
 6.3 Never: a cut word, a dropped byte, a shifted timeline, a silent refusal, a fourth profile.
