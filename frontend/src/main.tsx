@@ -8319,6 +8319,22 @@ function learnName(slot: number): string {
   return (field?.value || "").trim();
 }
 
+/** Learn from the seconds just recorded, while the take is still running. */
+async function enrolFromLive(slot: number, name: string): Promise<void> {
+  try {
+    const response = await fetch(`/api/voice/profiles/${slot}/enrol-now`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ name }),
+    });
+    if (!response.ok) throw new Error(await parseError(response));
+    voiceProfilesStatus = normalizeVoiceProfiles(await response.json());
+    voiceProfilesKnown = true;
+    setVoiceProfilesError("");
+  } catch (e) {
+    setVoiceProfilesError(sanitizeUiErrorMessage(e, "Could not learn that voice."));
+  }
+}
 /** The recordings a row can learn from: audio present, no recovered fragments. */
 interface RecentTake {
   name: string;
@@ -8379,12 +8395,16 @@ async function learnFromThisRow(slot: number): Promise<void> {
   voiceProfilesBusy = true;
   renderVoiceMask();
   try {
-    if (chosen) {
-      // The chosen recording's middle: the same channel the gate will judge.
-      const [archive, recording] = chosen.split("\u0000");
+    // A take is running: the last ten seconds are the sample, so the press
+    // lands on the voice while it is speaking — no trip through History.
+    const live = $("recordToggleBtn").getAttribute("aria-pressed") === "true";
+    if (live) {
+      await enrolFromLive(slot, name);
+    } else if (chosen) {
+      const [archive, recordingName] = chosen.split("\u0000");
       const slider = document.getElementById(`voicePos-${slot}`) as HTMLInputElement | null;
       const at = Number(slider?.value ?? 50) / 100;
-      await enrolFromTake(slot, name, recording, archive, at);
+      await enrolFromTake(slot, name, recordingName, archive, at);
     } else {
       await learnInto(slot, name);
     }

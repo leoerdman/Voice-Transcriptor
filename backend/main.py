@@ -7291,6 +7291,48 @@ def enrol_voice_profile(
     return _voice_profiles_payload()
 
 
+@app.post("/api/voice/profiles/{slot}/enrol-now")
+def enrol_voice_profile_from_live(
+    slot: int,
+    payload: dict = Body(default={}),
+    _auth: None = Depends(_require_api_auth),
+):
+    """Learn a voice from the seconds just recorded — while the take runs.
+
+    The press happens when the other voice is actually talking, so the sample
+    is the same channel, the same room and the same moment the gate is judging.
+    A profile learned this way needs no second trip through History.
+    """
+    label = str(payload.get("name") or "").strip()
+    seconds = float(payload.get("seconds") or 10)
+    spool = sorted(
+        (path for path in LIVE_RECOVERY_DIR.glob("*.pcm16") if path.is_file()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not spool:
+        raise HTTPException(status_code=400, detail="no recording is running right now")
+    raw = spool[0].read_bytes()
+    span = int(seconds * LIVE_SAMPLE_RATE_HZ) * 2
+    if len(raw) < span // 2:
+        raise HTTPException(status_code=400, detail="not enough recorded yet; speak for a few seconds")
+    start = max(0, len(raw) - span)
+    start -= start % 2
+    embedder = SpeakerEmbedder()
+    try:
+        vector, self_floor = enrol_take_stats(embedder, raw[start:])
+    except EnrolmentError as e:
+        raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
+    finally:
+        embedder.close()
+    name = label or f"Voice {slot}"
+    if len(name) > NAME_MAX_CHARS:
+        name = f"Voice {slot}"
+    capture_path = _keep_enrolment_capture(slot, raw[start:])
+    VOICE_PROFILES.save(slot, name, vector, capture=str(capture_path), self_floor=self_floor)
+    logger.info("voice profile saved in slot %s from the live take", slot)
+    return _voice_profiles_payload()
+
 @app.post("/api/voice/profiles/{slot}/enrol-mid")
 def enrol_voice_profile_from_middle(
     slot: int,
