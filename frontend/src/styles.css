@@ -2812,6 +2812,20 @@ textarea:focus-visible,
 
 .voice-slot.is-empty {
   color: var(--text-3);
+  /* A learning row is four controls in one line: the name, the recording, the
+     place inside it, and the press. Without this they wrap into a stack and
+     the press lands under the field like a second row. */
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr) 96px auto;
+}
+
+.voice-slot.is-empty .voice-slot-name-input,
+.voice-slot.is-empty .voice-slot-take {
+  min-width: 0;
+  width: 100%;
+}
+
+.voice-slot.is-empty .voice-slot-pos {
+  width: 96px;
 }
 
 .voice-slot-copy {
