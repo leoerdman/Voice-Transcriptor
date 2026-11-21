@@ -81,6 +81,7 @@ between this gate and whatever turns audio into a similarity.
 from __future__ import annotations
 
 import math
+import time
 
 from collections import deque
 from typing import Callable, Deque, List, Optional, Tuple
@@ -226,6 +227,7 @@ class VoiceMask:
         # voicing model rely on.
         self._voiced = voiced
         self._hop_bytes = _ms_to_bytes(hop_ms, rate_hz)
+        self._hop_ms = max(1, hop_ms)
         self._window_bytes = _ms_to_bytes(window_ms, rate_hz)
         self._open_at = open_at
         self._close_at = close_at
@@ -319,7 +321,15 @@ class VoiceMask:
             self._hops_since_verdict += 1
             if self._worth_a_verdict(voiced):
                 self._hops_since_verdict = 0
+                started = time.perf_counter()
                 self._judge()
+                # The next verdict waits for three times what this one cost:
+                # the gate spends at most a third of the audio's own time on
+                # embeddings, on whatever machine it is running. A fixed
+                # interval either starves a fast host or falls behind on a slow
+                # one — measured here at 250 ms against a 35 ms embedding, five
+                # times more waiting than the hardware needed.
+                self._retune_interval((time.perf_counter() - started) * 1000.0)
             out.extend(self._release())
         return out
 
@@ -421,6 +431,12 @@ class VoiceMask:
         if arrived_voiced:
             return True
         return self._voice_share() >= MIN_VOICED_SHARE
+
+    def _retune_interval(self, judgement_ms: float) -> None:
+        """Keep the next verdict three judgements away, whatever they cost."""
+        if judgement_ms <= 0.0:
+            return
+        self._verdict_interval_hops = max(1, int(round(3.0 * judgement_ms / max(1, self._hop_ms))))
 
     def _voice_share(self) -> float:
         """How much of the window now held carries voice, in [0, 1]."""

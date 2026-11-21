@@ -114,22 +114,23 @@ class MaskTimelineTests(unittest.TestCase):
 
 
 class VerdicRateTests(unittest.TestCase):
-    def test_verdicts_are_rate_limited_when_asked(self):
-        # An embedding on every 50 ms hop costs more than the audio supplies:
-        # the mask worker fell behind and the app forwarded unmasked. With an
-        # interval of 250 ms, a second of audio gets four verdicts, not twenty.
-        calls = []
+    def test_the_gate_spends_at_most_a_third_of_the_audio_on_verdicts(self):
+        # A fixed interval either starves a fast host or falls behind a slow
+        # one. The gate re-tunes from what a judgement actually costs, so the
+        # time it spends stays a fraction of the time it gates.
+        import time
 
         def scorer(_window):
-            calls.append(1)
+            time.sleep(0.010)  # a 10 ms embedding
             return 0.9
 
-        mask = VoiceMask(scorer, verdict_interval_ms=250)
-        # 3 s of audio is 60 hops; a window is 40, so the first verdict can
-        # land at hop 40 and the cap is one per five hops after that.
-        drain(mask, pcm(OWNER_LEVEL, 3000), 1600)
-        self.assertLessEqual(len(calls), 13)
-        self.assertGreaterEqual(len(calls), 1)
+        mask = VoiceMask(scorer)
+        data = pcm(OWNER_LEVEL, 3000)  # 3 s of audio
+        started = time.perf_counter()
+        drain(mask, data, 1600)
+        spent = time.perf_counter() - started
+        self.assertLess(spent, 3.0 / 3.0, "the gate spent more than a third of realtime")
+        self.assertGreaterEqual(mask._verdict_interval_hops, 1)
 
 
 class MaskBoundaryTests(unittest.TestCase):
