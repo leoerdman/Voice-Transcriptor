@@ -285,7 +285,7 @@ class MaskBoundaryTests(unittest.TestCase):
         # clearly not. Measured on a handover: 0.62, with half the window
         # still the stranger, and the old rule zeroed the owner's first
         # 0.75 s of that sentence. §4.4 spends uncertainty as a leak.
-        script = iter([0.10] * 60 + [0.62] * 300)
+        script = iter([0.10] * 60 + [0.33] * 300)
         mask = VoiceMask(lambda _window: next(script), window_ms=100, hop_ms=25)
         data = pcm(OWNER_LEVEL, 3000)
         out = b""
@@ -342,7 +342,11 @@ class MeasuredThresholdTests(unittest.TestCase):
     """
 
     def test_the_thresholds_are_the_measured_pair(self):
-        self.assertEqual((DEFAULT_OPEN_AT, DEFAULT_CLOSE_AT), (0.65, 0.55))
+        # Re-measured 2026-11-21 on the desk's own references with a six-second
+        # press: the kept voice's windows scored 0.32-0.53 (median 0.39), the
+        # other voice's 0.09-0.33 (median 0.24). A pair 0.03 apart keeps the
+        # kept voice and refuses the rest, where 0.65/0.55 refused both.
+        self.assertEqual((DEFAULT_OPEN_AT, DEFAULT_CLOSE_AT), (0.36, 0.30))
 
     def test_the_owner_floor_clears_the_close_threshold(self):
         # 0.611 is the floor of a window with more than half its hops voiced

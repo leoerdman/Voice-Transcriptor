@@ -125,8 +125,8 @@ DEFAULT_HOP_MS = 50
 #: These move with the cohort: rebuild it and recalibrate, never copy them.
 DEFAULT_OPEN_AT_Z = 0.7
 DEFAULT_CLOSE_AT_Z = -0.3
-DEFAULT_OPEN_AT = 0.65
-DEFAULT_CLOSE_AT = 0.55
+DEFAULT_OPEN_AT = 0.36
+DEFAULT_CLOSE_AT = 0.30
 # A refusal needs the arriving hop to be voiced and the standing verdict to be
 # at or below ``close_at``. The voice share of the window is NOT part of that
 # decision any more: measured on the owner's desk (2026-11-19) with a stranger's
