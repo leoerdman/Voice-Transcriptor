@@ -8301,7 +8301,17 @@ async function learnFromThisRow(slot: number): Promise<void> {
     (document.getElementById(`voiceName-${slot}`) as HTMLInputElement | null)?.focus();
     return;
   }
-  await learnInto(slot, name);
+  voiceProfilesBusy = true;
+  renderVoiceMask();
+  try {
+    await learnInto(slot, name);
+  } finally {
+    // The store answered with the new slot list; the card has to paint it, or
+    // the row that just learned still says "Name this voice" with a Learn
+    // button, which reads as the press having done nothing.
+    voiceProfilesBusy = false;
+    renderVoiceMask();
+  }
 }
 
 async function forgetSlot(slot: number, label: string): Promise<void> {
