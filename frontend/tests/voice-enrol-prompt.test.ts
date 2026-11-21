@@ -288,7 +288,7 @@ describe("the card documents all of it before the press", () => {
     for (const id of ["voiceProfileSlots", "voiceEnrolLive", "voiceEnrolLiveText"]) {
       expect(html, `#${id} is missing from index.html`).toContain(`id="${id}"`);
     }
-    expect(html).toContain("Type a name, pick a recording");
+    expect(html).toContain("Type a name and press Learn");
     expect(html).toContain("six seconds");
     // No product copy names a person.
     expect(html).not.toContain("Leo");
