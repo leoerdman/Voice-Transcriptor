@@ -8298,21 +8298,24 @@ async function learnLatestInto(slot: number): Promise<void> {
     field?.focus();
     return;
   }
+  // Nothing recorded yet is not an error to paint: the same press asks for the
+  // six seconds instead. Asked BEFORE the write, because the write paints its
+  // own failure and does not rethrow — a fallback after it would never run.
+  let hasRecording = false;
   try {
-    await writeVoiceProfiles(
-      () => apiPost<unknown>(`/api/voice/profiles/${slot}/enrol-latest`, { name }),
-      "Could not learn that voice from the recording.",
-    );
-  } catch (error) {
-    // Nothing recorded yet: the same press asks for the six seconds instead of
-    // sending the user away to make a recording first. One control, two
-    // answers, and neither is a dialog.
-    if (/no recording/i.test(String(error))) {
-      await learnInto(slot, name);
-      return;
-    }
-    throw error;
+    const listing = await apiGet<{ items: unknown[] }>("/api/recordings");
+    hasRecording = Array.isArray(listing.items) && listing.items.length > 0;
+  } catch {
+    hasRecording = false;
   }
+  if (!hasRecording) {
+    await learnInto(slot, name);
+    return;
+  }
+  await writeVoiceProfiles(
+    () => apiPost<unknown>(`/api/voice/profiles/${slot}/enrol-latest`, { name }),
+    "Could not learn that voice from the recording.",
+  );
 }
 
 async function forgetSlot(slot: number, label: string): Promise<void> {
