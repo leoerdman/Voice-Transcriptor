@@ -3,11 +3,11 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [1.6.20] - 2026-11-21
 
 ### Fixed
 
-- **History's statistics count only the words said.** A screen take's header, screenshot headings, stroke frames and marks — and a silent take's "[ Silence ]" — no longer add to the word count, the average or the top words. A transcript that holds more than the speech now keeps the spoken words as their own `Spoken:` section; screen takes saved before it are recounted when History reads them.
+- **History counts and names a recording by the words said.** A screen take's header, screenshot headings, stroke frames and marks — and a silent take's "[ Silence ]" — no longer add to the word count, the average or the top words, and a screen take is named by its first words said instead of "Диктовка с рисованием по экрану". A transcript that holds more than the speech now keeps the spoken words as their own `Spoken:` section; screen takes saved before it are recounted when History reads them.
 
 ## [1.6.19] - 2026-11-21
 
