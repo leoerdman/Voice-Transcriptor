@@ -7304,22 +7304,24 @@ def enrol_voice_profile_from_latest(
     the file route's own work: one place decides what a take can teach.
     """
     directory = _resolve_recordings_dir()
+    # The same list History shows: the takes live in per-session folders, so a
+    # walk of the root finds none of them and the press would say "no
+    # recording" over a library of thirty.
+    items = _build_recordings_list_payload(directory).get("items") or []
     newest = None
-    newest_at = 0.0
-    for path in _iter_recording_text_files(directory):
-        try:
-            touched = path.stat().st_mtime
-        except OSError:
+    for item in items:
+        name = str(item.get("name") or "")
+        if not name or not str(item.get("modified_at") or ""):
             continue
-        if touched > newest_at:
-            newest, newest_at = path, touched
+        if newest is None or str(item["modified_at"]) > str(newest["modified_at"]):
+            newest = item
     if newest is None:
         raise HTTPException(status_code=400, detail="no recording to learn from yet")
     name = str(payload.get("name") or "").strip()
     request = {
-        "recording_name": newest.name,
-        "archive_dir": str(directory),
-        "name": name or newest.stem,
+        "recording_name": newest.get("name"),
+        "archive_dir": str(newest.get("archive_dir") or ""),
+        "name": name or Path(str(newest.get("name"))).stem,
     }
     return enrol_voice_profile(slot, payload=request, _auth=None)
 
