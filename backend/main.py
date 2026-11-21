@@ -7291,6 +7291,56 @@ def enrol_voice_profile(
     return _voice_profiles_payload()
 
 
+@app.post("/api/voice/profiles/{slot}/enrol-mid")
+def enrol_voice_profile_from_middle(
+    slot: int,
+    payload: dict = Body(default={}),
+    _auth: None = Depends(_require_api_auth),
+):
+    """Learn a voice from the MIDDLE of a recording the user chose.
+
+    The desk's calls have one shape: the owner speaks first, the other voice
+    joins in the middle. A profile learned from a press is a different channel
+    from the call's audio (measured: 0.38 to the kept voice against 0.59 for a
+    profile taken from a take), so the ten seconds in the middle of a real
+    recording are the sample that matches what the gate will hear.
+    """
+    label = str(payload.get("name") or "").strip()
+    recording = str(payload.get("recording_name") or "").strip()
+    if not recording:
+        raise HTTPException(status_code=400, detail="choose a recording first")
+    archive = str(payload.get("archive_dir") or "").strip() or str(_resolve_recordings_dir())
+    # The list names the transcript; the audio sits beside it under another
+    # extension. One resolver answers that question for the whole app.
+    path = _recording_audio_path(recording, target_dir=Path(archive))
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=400, detail="that recording has no audio")
+    pcm = decode_take(path)
+    seconds = float(payload.get("seconds") or 10)
+    span = int(seconds * LIVE_SAMPLE_RATE_HZ) * 2
+    if len(pcm) < span:
+        raise HTTPException(status_code=400, detail="that recording is shorter than the sample")
+    # Where in the recording the sample sits: 0 is the start, 1 the end. The
+    # owner knows where the other voice speaks; the middle is only a guess and
+    # measured wrong on the first call it was tried on (the middle was the
+    # owner's own voice).
+    position = min(1.0, max(0.0, float(payload.get("position", 0.5))))
+    start = int((len(pcm) - span) * position) // 2 * 2
+    embedder = SpeakerEmbedder()
+    try:
+        vector, self_floor = enrol_take_stats(embedder, pcm[start : start + span])
+    except EnrolmentError as e:
+        raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
+    finally:
+        embedder.close()
+    name = label or Path(recording).stem
+    if len(name) > NAME_MAX_CHARS:
+        name = f"Voice {slot}"
+    capture_path = _keep_enrolment_capture(slot, pcm[start : start + span])
+    VOICE_PROFILES.save(slot, name, vector, capture=str(capture_path), self_floor=self_floor)
+    logger.info("voice profile saved in slot %s from the middle of %s", slot, recording[:40])
+    return _voice_profiles_payload()
+
 @app.post("/api/voice/profiles/{slot}/enrol-latest")
 def enrol_voice_profile_from_latest(
     slot: int,

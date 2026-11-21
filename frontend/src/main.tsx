@@ -5322,6 +5322,7 @@ function switchView(view: ViewName): void {
     // or a profile the last visit enrolled, must show up on this one. The
     // take list comes from the History load that already ran at boot.
     void refreshVoiceProfiles();
+void loadRecentTakes();
   }
   // A popover belongs to the view that opened it.
   setTranscribeSettingsOpen(false);
@@ -7875,7 +7876,34 @@ function renderVoiceMask(): void {
       learn.addEventListener("click", () => {
         void learnFromThisRow(row.slot);
       });
-      item.append(nameField, learn);
+      const takePicker = document.createElement("select");
+      takePicker.id = `voiceTake-${row.slot}`;
+      takePicker.className = "voice-slot-take";
+      takePicker.disabled = voiceProfilesBusy;
+      takePicker.setAttribute("aria-label", "Which recording to learn from");
+      if (recentTakes.length === 0) {
+        const empty = document.createElement("option");
+        empty.value = "";
+        empty.textContent = "Record 6 seconds now";
+        takePicker.append(empty);
+      }
+      for (const take of recentTakes) {
+        const option = document.createElement("option");
+        option.value = `${take.archive}\u0000${take.name}`;
+        option.textContent = `From: ${take.display}`;
+        takePicker.append(option);
+      }
+      const position = document.createElement("input");
+      position.type = "range";
+      position.id = `voicePos-${row.slot}`;
+      position.min = "0";
+      position.max = "100";
+      position.value = "50";
+      position.className = "voice-slot-pos";
+      position.disabled = voiceProfilesBusy;
+      position.setAttribute("aria-label", "Where in the recording this voice speaks");
+      position.title = "Where in the recording this voice speaks: left is the start, right the end";
+      item.append(nameField, takePicker, position, learn);
       list.appendChild(item);
       continue;
     }
@@ -8291,7 +8319,54 @@ function learnName(slot: number): string {
   return (field?.value || "").trim();
 }
 
-/** The row's press: a name, six seconds of speech, and the slot is learned. */
+/** The recordings a row can learn from: audio present, no recovered fragments. */
+interface RecentTake {
+  name: string;
+  display: string;
+  archive: string;
+}
+
+let recentTakes: RecentTake[] = [];
+
+async function loadRecentTakes(): Promise<void> {
+  try {
+    const listing = await apiGet<{ items: Array<Record<string, unknown>> }>("/api/recordings");
+    recentTakes = (listing.items || [])
+      .filter((item) => item.has_audio && !String(item.name).includes("Recovered"))
+      .slice(0, 12)
+      .map((item) => ({
+        name: String(item.name),
+        display: String(item.display_name || item.name).slice(0, 46),
+        archive: String(item.archive_dir || ""),
+      }));
+    renderVoiceMask();
+  } catch {
+    recentTakes = [];
+  }
+}
+
+/** Learn from a chosen spot of a chosen recording: the sample matches the call. */
+async function enrolFromTake(
+  slot: number,
+  name: string,
+  recording: string,
+  archive: string,
+  position: number,
+): Promise<void> {
+  try {
+    const response = await fetch(`/api/voice/profiles/${slot}/enrol-mid`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ name, recording_name: recording, archive_dir: archive, position }),
+    });
+    if (!response.ok) throw new Error(await parseError(response));
+    voiceProfilesStatus = normalizeVoiceProfiles(await response.json());
+    voiceProfilesKnown = true;
+    setVoiceProfilesError("");
+  } catch (e) {
+    setVoiceProfilesError(sanitizeUiErrorMessage(e, "Could not learn that voice."));
+  }
+}
 async function learnFromThisRow(slot: number): Promise<void> {
   const name = learnName(slot);
   if (!name) {
@@ -8299,10 +8374,20 @@ async function learnFromThisRow(slot: number): Promise<void> {
     (document.getElementById(`voiceName-${slot}`) as HTMLInputElement | null)?.focus();
     return;
   }
+  const picker = document.getElementById(`voiceTake-${slot}`) as HTMLSelectElement | null;
+  const chosen = picker?.value || "";
   voiceProfilesBusy = true;
   renderVoiceMask();
   try {
-    await learnInto(slot, name);
+    if (chosen) {
+      // The chosen recording's middle: the same channel the gate will judge.
+      const [archive, recording] = chosen.split("\u0000");
+      const slider = document.getElementById(`voicePos-${slot}`) as HTMLInputElement | null;
+      const at = Number(slider?.value ?? 50) / 100;
+      await enrolFromTake(slot, name, recording, archive, at);
+    } else {
+      await learnInto(slot, name);
+    }
   } finally {
     // The store answered with the new slot list; the card has to paint it, or
     // the row that just learned still says "Name this voice" with a Learn
@@ -16219,3 +16304,4 @@ setupUploadView();
 // store has to be read at boot as well as on every visit: without this the
 // first press would land on a knob the renderer had never painted.
 void refreshVoiceProfiles();
+void loadRecentTakes();
