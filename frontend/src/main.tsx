@@ -8147,13 +8147,11 @@ async function captureEnrolment(label: string): Promise<Int16Array | null> {
  * refusal is the backend's own reason, which is actionable ("no speech Solo
  * could hear…"), so it is shown as it came.
  */
-async function learnInto(slot: number, label: string): Promise<boolean> {
-  // The same field the card shows: a press on an empty row learns into the
-  // name already typed there, so a voice has one name whichever way it was
-  // learned and nothing pops a dialog over the microphone.
-  const field = document.getElementById(`voiceName-${slot}`) as HTMLInputElement | null;
-  const name = (field?.value || "").trim();
-  const pcm = await captureEnrolment(label);
+async function learnInto(slot: number, name: string): Promise<boolean> {
+  // The name arrived from the row's own field BEFORE the card repainted: a
+  // re-read after the repaint finds a fresh, empty input and saves a voice
+  // called "Voice 2", which is what a user saw and could not explain.
+  const pcm = await captureEnrolment(name || `Voice ${slot}`);
   if (!pcm) return false;
   try {
     const query = name ? `?name=${encodeURIComponent(name)}` : "";

@@ -344,10 +344,10 @@ describe("the card's presses", () => {
   it("learns into the slot whose switch was pressed, from a capture", () => {
     // The press records the user for six seconds; it does not reach into the
     // archive. See voice-enrol-prompt.test.ts for what the card promises.
-    expect(main).toContain("async function learnInto(slot: number, label: string)");
+    expect(main).toContain("async function learnInto(slot: number, name: string)");
     expect(main).toContain("if (await learnInto(slot, voiceLabel(slot)))");
     expect(main).toContain("`/api/voice/profiles/${slot}/enrol-live${query}`");
-    expect(main).toContain("async function captureEnrolment(label: string)");
+    expect(main).toContain("async function captureEnrolment");
   });
 
   it("takes the voice's name from the row that is being learned", () => {
