@@ -282,13 +282,16 @@ describe("the card documents all of it before the press", () => {
   const main = readFileSync(resolve(process.cwd(), "src/main.tsx"), "utf8");
   const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
 
-  it("carries the expectation, the script and the live line in the markup", () => {
-    for (const id of ["voiceEnrolExpectation", "voiceEnrolScript", "voiceEnrolLive", "voiceEnrolLiveText"]) {
+  it("carries one named action and the live line in the markup", () => {
+    // The card asks one question and offers one press: a name, then learn it
+    // from the newest recording. There is no dropdown and nothing to find on
+    // another screen.
+    for (const id of ["voiceLearnName", "voiceLearnBtn", "voiceEnrolLive", "voiceEnrolLiveText"]) {
       expect(html, `#${id} is missing from index.html`).toContain(`id="${id}"`);
     }
-    expect(html).toContain("six seconds");
-    expect(html).toContain("never appears in History");
-    expect(html).toContain("count down");
+    expect(html).toContain("Whose voice is this?");
+    expect(html).toContain("Learn from the last recording");
+    expect(html).toContain("newest recording");
   });
 
   it("keeps the markup's six seconds equal to the constant", () => {
@@ -299,9 +302,12 @@ describe("the card documents all of it before the press", () => {
     expect(ENROL_SECONDS).toBe(6);
   });
 
-  it("paints both from the constants, not from literals", () => {
-    expect(main).toContain("$(\"voiceEnrolExpectation\").textContent = enrolExpectationText();");
-    expect(main).toContain("$(\"voiceEnrolScript\").textContent = `“${ENROL_SCRIPT}”`;");
+  it("wires the one press to the one route", () => {
+    // The card's button and the route it calls are one action: a name goes to
+    // the newest recording, and no second path exists for the same job.
+    expect(main).toContain('$("voiceLearnBtn").addEventListener("click"');
+    expect(main).toContain("enrol-latest");
+    expect(main).not.toContain("window.prompt(");
   });
 
   it("shows the window's own recording dot while it records", () => {

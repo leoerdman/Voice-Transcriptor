@@ -106,9 +106,7 @@ import {
 import {
   ENROL_MIN_SECONDS,
   ENROL_NO_CAPTURE_API,
-  ENROL_SCRIPT,
   ENROL_SECONDS,
-  enrolExpectationText,
   enrolLiveView,
   enrolMicErrorText,
   type EnrolLiveView,
@@ -7822,11 +7820,6 @@ function renderVoiceMask(): void {
   const view = voiceMaskView(voiceProfilesStatus, { unknown: !voiceProfilesKnown });
   $("voiceProfilesNote").textContent = view.summary;
 
-  // The expectation and the script are painted from their constants, so the
-  // seconds in the sentence and the seconds in the countdown are one number.
-  $("voiceEnrolExpectation").textContent = enrolExpectationText();
-  $("voiceEnrolScript").textContent = `“${ENROL_SCRIPT}”`;
-
   // A press in flight is painted as the answer it asked for, not as the one
   // still in the store: otherwise the button flicks on and back for as long as
   // enrolment takes, which reads as a rejection.
@@ -7911,20 +7904,6 @@ function renderVoiceMask(): void {
       });
       item.appendChild(forget);
     }
-
-    const fromTake = document.createElement("button");
-    fromTake.type = "button";
-    fromTake.className = "btn btn-ghost voice-slot-from-take";
-    fromTake.textContent = "From last recording";
-    fromTake.disabled = voiceProfilesBusy;
-    fromTake.setAttribute("aria-label", `Learn ${row.label} from the last recording`);
-    fromTake.title =
-      "Learn this slot from the newest recording: same microphone, same room, so the voice\n" +
-      "matches the audio Solo will judge";
-    fromTake.addEventListener("click", () => {
-      void learnFromLastRecording(row.slot, row.label);
-    });
-    item.appendChild(fromTake);
 
     list.appendChild(item);
   }
@@ -8152,12 +8131,10 @@ async function captureEnrolment(label: string): Promise<Int16Array | null> {
  * could hear…"), so it is shown as it came.
  */
 async function learnInto(slot: number, label: string): Promise<boolean> {
-  // Whose voice is being learned, asked before the microphone opens: the name
-  // is the only thing that later tells three slots apart, and a press that
-  // does not say it writes "Voice N" and leaves the analysis guessing.
-  const asked = window.prompt("Whose voice is this?", label || `Voice ${slot}`);
-  if (asked === null) return false;
-  const name = asked.trim();
+  // The same field the card shows: a press on an empty row learns into the
+  // name already typed there, so a voice has one name whichever way it was
+  // learned and nothing pops a dialog over the microphone.
+  const name = ($("voiceLearnName") as HTMLInputElement).value.trim();
   const pcm = await captureEnrolment(label);
   if (!pcm) return false;
   try {
@@ -8292,14 +8269,26 @@ async function switchMask(on: boolean): Promise<void> {
   await switchSlot(target, true);
 }
 
-async function learnFromLastRecording(slot: number, label: string): Promise<void> {
+/** The one press on the Solo card: a name, and the newest recording teaches it. */
+async function learnNamedVoice(): Promise<void> {
   if (voiceProfilesBusy) return;
-  const asked = window.prompt("Whose voice is this?", label || `Voice ${slot}`);
-  if (asked === null) return;
+  const field = $("voiceLearnName") as HTMLInputElement;
+  const name = field.value.trim();
+  if (!name) {
+    setVoiceProfilesError("Whose voice is this? Give it a name first.");
+    field.focus();
+    return;
+  }
+  const slot = nextFreeSlot(voiceProfilesStatus) ?? voiceMaskTarget(voiceProfilesStatus);
+  if (slot === null) {
+    setVoiceProfilesError("All three voices are taken. Remove one first.");
+    return;
+  }
   await writeVoiceProfiles(
-    () => apiPost<unknown>(`/api/voice/profiles/${slot}/enrol-latest`, { name: asked.trim() }),
+    () => apiPost<unknown>(`/api/voice/profiles/${slot}/enrol-latest`, { name }),
     "Could not learn that voice from the recording.",
   );
+  field.value = "";
 }
 
 async function forgetSlot(slot: number, label: string): Promise<void> {
@@ -8318,6 +8307,9 @@ async function forgetSlot(slot: number, label: string): Promise<void> {
   );
 }
 
+$("voiceLearnBtn").addEventListener("click", () => {
+  void learnNamedVoice();
+});
 $("soloToggleBtn").addEventListener("click", () => {
   void switchMask($("soloToggleBtn").getAttribute("aria-pressed") !== "true");
 });

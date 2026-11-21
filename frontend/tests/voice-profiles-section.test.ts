@@ -346,10 +346,12 @@ describe("the card's presses", () => {
     expect(main).toContain("async function captureEnrolment(label: string)");
   });
 
-  it("asks whose voice is being learned before the microphone opens", () => {
-    // Three slots and a name each: a press that does not ask writes "Voice N"
-    // and leaves a later sweep guessing whose capture it is holding (7.4).
-    expect(main).toContain('window.prompt("Whose voice is this?"');
+  it("takes the voice's name from the card's own field", () => {
+    // One field names a voice whichever way it was learned — the card's
+    // "Learn from the last recording" and the six-second press both read
+    // `#voiceLearnName`, so nothing pops a dialog over an open microphone.
+    expect(main).toContain('$("voiceLearnName") as HTMLInputElement');
+    expect(main).not.toContain("window.prompt(");
     expect(main).toContain("?name=${encodeURIComponent(name)}");
   });
 

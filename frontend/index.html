@@ -793,15 +793,21 @@
                 "this is what a press will ask of you" before it reads as a
                 list of voices, and it is visible before anything is fetched.
               -->
-              <p class="settings-note voice-enrol-expectation" id="voiceEnrolExpectation">
-                Press Keep on an empty row and read the line below out loud:
-                six seconds of your voice, once. The dot pulses and the seconds
-                count down while the microphone is open, exactly as they do for
-                a take. The capture is measured for Solo and thrown away — it
-                never appears in History.
+                            <!--
+                One action on this card: name the voice, learn it from the newest
+                recording. No dropdown, no prompt, nothing on another screen.
+              -->
+              <label class="settings-note" for="voiceLearnName">Whose voice is this?</label>
+              <div class="voice-learn">
+                <input id="voiceLearnName" type="text" maxlength="40" placeholder="Leo" autocomplete="off">
+                <button type="button" class="btn btn-primary" id="voiceLearnBtn">Learn from the last recording</button>
+              </div>
+              <p class="settings-note">
+                Record 10-15 seconds of one person talking alone, then press the
+                button. The voice is learned from your newest recording, so it
+                sounds like your room, not like a test.
               </p>
-              <blockquote class="voice-enrol-script" id="voiceEnrolScript">“This is my voice. Keep me in the room and leave everyone else out.”</blockquote>
-              <div class="voice-slots" id="voiceProfileSlots" role="list"></div>
+<div class="voice-slots" id="voiceProfileSlots" role="list"></div>
               <!--
                 The recording indication, while an enrolment is really
                 recording: the window's own dot (`.record-toggle-dot`, red and
