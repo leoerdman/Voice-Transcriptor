@@ -85,11 +85,15 @@ describe("normalizeVoiceProfiles", () => {
     expect(status.slots[0]).toBeNull();
   });
 
-  it("does not read the store's file label", () => {
-    // Nothing in this section shows a name, so a payload that carries one
-    // must not start showing it again by accident.
+  it("shows the name the user gave a voice", () => {
+    // A slot's handle is the name typed on its row, not a generated number:
+    // three rows that only say "Voice 1" are three rows nobody can tell apart.
     const status = normalizeVoiceProfiles(WITH_ONE_KEPT);
-    expect(JSON.stringify(status)).not.toContain("take-2026-11-13");
+    const rows = voiceMaskView(status).rows;
+    expect(rows[0].label).toBe("take-2026-11-13");
+    expect(rows[2].label).toBe("take-2026-11-12");
+    // An empty slot has no name to show, so it falls back to its number.
+    expect(rows[1].label).toBe("Voice 2");
   });
 
   it("refuses a kept slot that holds no profile", () => {
@@ -121,7 +125,7 @@ describe("voiceMaskView", () => {
       expect(voiceMaskView(normalizeVoiceProfiles(payload)).rows).toHaveLength(SLOT_COUNT);
     }
     const rows = voiceMaskView(normalizeVoiceProfiles(WITH_ONE_KEPT)).rows;
-    expect(rows.map((row) => row.label)).toEqual(["Voice 1", "Voice 2", "Voice 3"]);
+    expect(rows.map((row) => row.label)).toEqual(["take-2026-11-13", "Voice 2", "take-2026-11-12"]);
     expect(rows.map((row) => row.empty)).toEqual([false, true, false]);
     expect(rows.map((row) => row.enabled)).toEqual([true, false, false]);
     expect(rows[0].learnedOn).toBe("2026-11-13");
@@ -134,7 +138,7 @@ describe("voiceMaskView", () => {
     expect(view.disabled).toBe(false);
     expect(view.visible).toBe(true);
     expect(view.invite).toBe(false);
-    expect(view.summary).toContain("only Voice 1 is heard");
+    expect(view.summary).toContain("only take-2026-11-13 is heard");
     expect(view.summary).toContain("silence");
   });
 
@@ -143,7 +147,7 @@ describe("voiceMaskView", () => {
     expect(view.checked).toBe(false);
     expect(view.disabled).toBe(false);
     expect(view.summary).toContain("Off.");
-    expect(view.summary).toContain("Voice 1, Voice 2");
+    expect(view.summary).toContain("take-a, take-b");
     expect(view.summary).toContain("switch one on");
   });
 

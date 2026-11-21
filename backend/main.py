@@ -7311,7 +7311,12 @@ def enrol_voice_profile_from_latest(
     newest = None
     for item in items:
         name = str(item.get("name") or "")
-        if not name or not str(item.get("modified_at") or ""):
+        # A recovered fragment is the tail of an interrupted recording, not a
+        # sample of a voice: it has no audio of its own and teaching from it
+        # writes a profile of nothing. Only takes with audio can teach.
+        if not name or "Recovered" in name or not item.get("has_audio"):
+            continue
+        if not str(item.get("modified_at") or ""):
             continue
         if newest is None or str(item["modified_at"]) > str(newest["modified_at"]):
             newest = item

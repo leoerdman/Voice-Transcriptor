@@ -31,6 +31,8 @@ export interface VoiceProfileSlot {
   slot: number;
   /** The store's write stamp. Its presence is what makes a slot a profile. */
   createdAt: string;
+  /** The name the user gave this voice; empty when the store has none. */
+  name: string;
 }
 
 export interface VoiceProfilesStatus {
@@ -99,10 +101,11 @@ function slotLabel(slot: number): string {
 function normalizeSlot(raw: unknown, slot: number): VoiceProfileSlot | null {
   if (!raw || typeof raw !== "object") return null;
   const createdAt = text((raw as Record<string, unknown>).created_at);
+  const name = text((raw as Record<string, unknown>).name);
   // The store stamps every write. An object without a stamp is not a
   // profile, and a switch over no profile is a lie.
   if (!createdAt) return null;
-  return { slot, createdAt };
+  return { slot, createdAt, name };
 }
 
 /** The payload as this section may trust it. */
@@ -154,7 +157,7 @@ export function voiceMaskView(
 ): VoiceMaskView {
   const rows: VoiceSlotRow[] = status.slots.map((slot, index) => ({
     slot: index + 1,
-    label: slotLabel(index + 1),
+    label: slot?.name || slotLabel(index + 1),
     learnedOn: slot ? slot.createdAt.slice(0, 10) : "",
     empty: slot === null,
     enabled: status.enabledSlot === index + 1,
