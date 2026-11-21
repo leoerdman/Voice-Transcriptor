@@ -7511,17 +7511,21 @@ def recording_voice_mask() -> Optional[VoiceMask]:
     # The frame test is the session's own level (§4.3), not a constant: a
     # fixed floor classified this desk's speech as room and left the gate
     # unable to refuse anything.
+    from backend.voice_mask import DEFAULT_CLOSE_AT_Z, DEFAULT_OPEN_AT_Z, VERDICT_INTERVAL_MS
+
     session_voice = SessionVoice()
     cohort = _voice_cohort()
     scorer = SpeakerScorer(embedder, profile.vector, voiced=session_voice, cohort=cohort)
     if cohort is None:
-        return VoiceMask(scorer, voiced=session_voice)
-    from backend.voice_mask import DEFAULT_CLOSE_AT_Z, DEFAULT_OPEN_AT_Z
-
+        return VoiceMask(scorer, voiced=session_voice, verdict_interval_ms=VERDICT_INTERVAL_MS)
     # A cohort turns the score into a z, so the raw thresholds would read it
     # as a stranger forever: the pair moves together or not at all (§4.5).
     return VoiceMask(
-        scorer, voiced=session_voice, open_at=DEFAULT_OPEN_AT_Z, close_at=DEFAULT_CLOSE_AT_Z
+        scorer,
+        voiced=session_voice,
+        open_at=DEFAULT_OPEN_AT_Z,
+        close_at=DEFAULT_CLOSE_AT_Z,
+        verdict_interval_ms=VERDICT_INTERVAL_MS,
     )
 
 

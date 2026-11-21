@@ -137,6 +137,15 @@ DEFAULT_CLOSE_AT = 0.55
 # pause is worth a verdict (``_worth_a_verdict``), where it costs nothing.
 # The tail is what protects the owner's last word (§4.3).
 MIN_VOICED_SHARE = 0.5
+#: How often a new verdict may cost an embedding, in milliseconds. The
+#: embedding is 25-40 ms on this desk's CPU, so judging on every 50 ms hop —
+#: which is what a voiced arrival asked for — spends more than the audio
+#: supplies: the mask worker fell behind and the app forwarded UNMASKED
+#: (measured 2026-11-21, "forwarded unmasked after falling behind", with the
+#: owner's words in the transcript). Four verdicts a second is a tenth of the
+#: budget and still resolves a two-second window eight times over.
+VERDICT_INTERVAL_MS = 250
+
 # §4.3 asks for a 300 ms tail, and 300 ms is right for a lookahead of a few
 # hundred milliseconds. It is not right for two seconds, and the arithmetic
 # is not a matter of taste: a close cannot land before the window is half the
@@ -176,6 +185,7 @@ class VoiceMask:
         open_at: float = DEFAULT_OPEN_AT,
         close_at: float = DEFAULT_CLOSE_AT,
         tail_ms: int = DEFAULT_TAIL_MS,
+        verdict_interval_ms: int = 0,
     ) -> None:
         if hop_ms <= 0 or window_ms < hop_ms:
             raise ValueError("a window holds at least one hop")
@@ -198,6 +208,11 @@ class VoiceMask:
         self._open_at = open_at
         self._close_at = close_at
         self._tail_hops = max(0, tail_ms // hop_ms)
+        # A verdict costs an embedding; one per VERDICT_INTERVAL_MS keeps the
+        # thread ahead of the audio it is gating.
+        self._verdict_interval_hops = (max(1, verdict_interval_ms // max(1, hop_ms)) if verdict_interval_ms > 0 else 0)
+        self._hops_since_verdict = self._verdict_interval_hops
+
         # The queue carries audio and whether it had voice, never a label:
         # the label is read when the hop leaves (§4.7), so nothing queued
         # can go stale between arriving and being labelled.
@@ -279,7 +294,9 @@ class VoiceMask:
             self._held_bytes += len(hop)
             if voiced:
                 self._voiced_held += 1
+            self._hops_since_verdict += 1
             if self._worth_a_verdict(voiced):
+                self._hops_since_verdict = 0
                 self._judge()
             out.extend(self._release())
         return out
@@ -377,6 +394,8 @@ class VoiceMask:
         already pays for — is unchanged; the extra calls happen in pauses,
         where the thread was idle anyway.
         """
+        if self._verdict_interval_hops and self._hops_since_verdict < self._verdict_interval_hops:
+            return False
         if arrived_voiced:
             return True
         return self._voice_share() >= MIN_VOICED_SHARE

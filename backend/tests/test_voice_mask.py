@@ -113,6 +113,25 @@ class MaskTimelineTests(unittest.TestCase):
         self.assertEqual(drain(mask, data, 1600), data)
 
 
+class VerdicRateTests(unittest.TestCase):
+    def test_verdicts_are_rate_limited_when_asked(self):
+        # An embedding on every 50 ms hop costs more than the audio supplies:
+        # the mask worker fell behind and the app forwarded unmasked. With an
+        # interval of 250 ms, a second of audio gets four verdicts, not twenty.
+        calls = []
+
+        def scorer(_window):
+            calls.append(1)
+            return 0.9
+
+        mask = VoiceMask(scorer, verdict_interval_ms=250)
+        # 3 s of audio is 60 hops; a window is 40, so the first verdict can
+        # land at hop 40 and the cap is one per five hops after that.
+        drain(mask, pcm(OWNER_LEVEL, 3000), 1600)
+        self.assertLessEqual(len(calls), 13)
+        self.assertGreaterEqual(len(calls), 1)
+
+
 class MaskBoundaryTests(unittest.TestCase):
     def test_the_first_syllable_survives_a_late_verdict(self):
         other = pcm(OTHER_LEVEL, 1000)
