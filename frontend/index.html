@@ -797,15 +797,19 @@
                 One action on this card: name the voice, learn it from the newest
                 recording. No dropdown, no prompt, nothing on another screen.
               -->
-              <label class="settings-note" for="voiceLearnName">Whose voice is this?</label>
+                            <!--
+                One question and one press. Nothing here names a person:
+                the example is a role, not somebody's name.
+              -->
+              <label class="settings-note" for="voiceLearnName">Name this voice</label>
               <div class="voice-learn">
-                <input id="voiceLearnName" type="text" maxlength="40" placeholder="Leo" autocomplete="off">
-                <button type="button" class="btn btn-primary" id="voiceLearnBtn">Learn from the last recording</button>
+                <input id="voiceLearnName" type="text" maxlength="40" placeholder="e.g. me, my colleague" autocomplete="off">
+                <button type="button" class="btn btn-primary" id="voiceLearnBtn">Learn from the latest recording</button>
               </div>
               <p class="settings-note">
-                Record 10-15 seconds of one person talking alone, then press the
-                button. The voice is learned from your newest recording, so it
-                sounds like your room, not like a test.
+                Record 10-15 seconds of this person speaking alone, then press the
+                button. Solo learns from your most recent recording, so it hears the
+                voice the way it will hear it next time.
               </p>
 <div class="voice-slots" id="voiceProfileSlots" role="list"></div>
               <!--

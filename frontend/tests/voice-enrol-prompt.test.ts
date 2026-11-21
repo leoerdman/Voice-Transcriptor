@@ -289,9 +289,11 @@ describe("the card documents all of it before the press", () => {
     for (const id of ["voiceLearnName", "voiceLearnBtn", "voiceEnrolLive", "voiceEnrolLiveText"]) {
       expect(html, `#${id} is missing from index.html`).toContain(`id="${id}"`);
     }
-    expect(html).toContain("Whose voice is this?");
-    expect(html).toContain("Learn from the last recording");
-    expect(html).toContain("newest recording");
+    expect(html).toContain("Name this voice");
+    expect(html).toContain("Learn from the latest recording");
+    expect(html).toContain("most recent recording");
+    // No product copy names a person: the example is a role.
+    expect(html).not.toContain("Leo");
   });
 
   it("keeps the markup's six seconds equal to the constant", () => {

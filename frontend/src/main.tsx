@@ -7872,7 +7872,7 @@ function renderVoiceMask(): void {
     const toggle = document.createElement("label");
     toggle.className = "toggle-inline voice-slot-switch";
     const caption = document.createElement("span");
-    caption.textContent = "Keep";
+    caption.textContent = "Let through";
     const input = document.createElement("input");
     input.type = "checkbox";
     input.checked = pending && pending.slot === row.slot ? pending.on : row.enabled;
@@ -7884,7 +7884,7 @@ function renderVoiceMask(): void {
     input.disabled = voiceProfilesBusy;
     input.setAttribute(
       "aria-label",
-      row.empty ? `Learn ${row.label} in six seconds` : `Keep only ${row.label}`,
+      row.empty ? `Learn ${row.label} in six seconds` : `Let ${row.label} through, and nobody else`,
     );
     input.addEventListener("change", () => {
       void switchSlot(row.slot, input.checked);
@@ -7896,9 +7896,9 @@ function renderVoiceMask(): void {
       const forget = document.createElement("button");
       forget.type = "button";
       forget.className = "btn btn-ghost voice-slot-forget";
-      forget.textContent = "Forget";
+      forget.textContent = "Remove";
       forget.disabled = voiceProfilesBusy;
-      forget.setAttribute("aria-label", `Forget ${row.label}`);
+      forget.setAttribute("aria-label", `Remove ${row.label}`);
       forget.addEventListener("click", () => {
         void forgetSlot(row.slot, row.label);
       });
@@ -8275,7 +8275,7 @@ async function learnNamedVoice(): Promise<void> {
   const field = $("voiceLearnName") as HTMLInputElement;
   const name = field.value.trim();
   if (!name) {
-    setVoiceProfilesError("Whose voice is this? Give it a name first.");
+    setVoiceProfilesError("Name this voice first.");
     field.focus();
     return;
   }
