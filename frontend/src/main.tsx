@@ -7892,6 +7892,31 @@ function renderVoiceMask(): void {
     toggle.append(caption, input);
     item.append(copy, toggle);
 
+    // An empty row is a voice waiting to be learned: the name field and the
+    // press sit inside it, so the row IS the voice rather than a list that a
+    // button somewhere else writes into.
+    if (row.empty) {
+      const nameField = document.createElement("input");
+      nameField.type = "text";
+      nameField.id = `voiceName-${row.slot}`;
+      nameField.maxLength = 40;
+      nameField.placeholder = "Name this voice";
+      nameField.className = "voice-slot-name-input";
+      nameField.autocomplete = "off";
+      nameField.disabled = voiceProfilesBusy;
+      const learn = document.createElement("button");
+      learn.type = "button";
+      learn.className = "btn btn-primary voice-slot-learn";
+      learn.textContent = "Learn";
+      learn.disabled = voiceProfilesBusy;
+      learn.setAttribute("aria-label", `Learn ${row.label} from the latest recording`);
+      learn.title = "Uses your latest recording: same microphone, same room";
+      learn.addEventListener("click", () => {
+        void learnLatestInto(row.slot);
+      });
+      item.append(nameField, learn);
+    }
+
     if (!row.empty) {
       const forget = document.createElement("button");
       forget.type = "button";
@@ -8134,7 +8159,8 @@ async function learnInto(slot: number, label: string): Promise<boolean> {
   // The same field the card shows: a press on an empty row learns into the
   // name already typed there, so a voice has one name whichever way it was
   // learned and nothing pops a dialog over the microphone.
-  const name = ($("voiceLearnName") as HTMLInputElement).value.trim();
+  const field = document.getElementById(`voiceName-${slot}`) as HTMLInputElement | null;
+  const name = (field?.value || "").trim();
   const pcm = await captureEnrolment(label);
   if (!pcm) return false;
   try {
@@ -8269,26 +8295,20 @@ async function switchMask(on: boolean): Promise<void> {
   await switchSlot(target, true);
 }
 
-/** The one press on the Solo card: a name, and the newest recording teaches it. */
-async function learnNamedVoice(): Promise<void> {
+/** Learn one slot from the newest recording: the name is the row's own field. */
+async function learnLatestInto(slot: number): Promise<void> {
   if (voiceProfilesBusy) return;
-  const field = $("voiceLearnName") as HTMLInputElement;
-  const name = field.value.trim();
+  const field = document.getElementById(`voiceName-${slot}`) as HTMLInputElement | null;
+  const name = (field?.value || "").trim();
   if (!name) {
     setVoiceProfilesError("Name this voice first.");
-    field.focus();
-    return;
-  }
-  const slot = nextFreeSlot(voiceProfilesStatus) ?? voiceMaskTarget(voiceProfilesStatus);
-  if (slot === null) {
-    setVoiceProfilesError("All three voices are taken. Remove one first.");
+    field?.focus();
     return;
   }
   await writeVoiceProfiles(
     () => apiPost<unknown>(`/api/voice/profiles/${slot}/enrol-latest`, { name }),
     "Could not learn that voice from the recording.",
   );
-  field.value = "";
 }
 
 async function forgetSlot(slot: number, label: string): Promise<void> {
@@ -8307,9 +8327,6 @@ async function forgetSlot(slot: number, label: string): Promise<void> {
   );
 }
 
-$("voiceLearnBtn").addEventListener("click", () => {
-  void learnNamedVoice();
-});
 $("soloToggleBtn").addEventListener("click", () => {
   void switchMask($("soloToggleBtn").getAttribute("aria-pressed") !== "true");
 });

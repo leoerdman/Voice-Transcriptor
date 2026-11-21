@@ -346,11 +346,12 @@ describe("the card's presses", () => {
     expect(main).toContain("async function captureEnrolment(label: string)");
   });
 
-  it("takes the voice's name from the card's own field", () => {
-    // One field names a voice whichever way it was learned — the card's
-    // "Learn from the last recording" and the six-second press both read
-    // `#voiceLearnName`, so nothing pops a dialog over an open microphone.
-    expect(main).toContain('$("voiceLearnName") as HTMLInputElement');
+  it("takes the voice's name from the row that is being learned", () => {
+    // Each empty row owns its name field (`#voiceName-<slot>`), so the voice a
+    // press learns is the voice whose row it pressed — nothing pops a dialog
+    // and nothing guesses a slot.
+    expect(main).toContain("voiceName-${row.slot}");
+    expect(main).toContain("learnLatestInto(row.slot)");
     expect(main).not.toContain("window.prompt(");
     expect(main).toContain("?name=${encodeURIComponent(name)}");
   });

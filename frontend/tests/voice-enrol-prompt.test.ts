@@ -282,17 +282,15 @@ describe("the card documents all of it before the press", () => {
   const main = readFileSync(resolve(process.cwd(), "src/main.tsx"), "utf8");
   const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
 
-  it("carries one named action and the live line in the markup", () => {
-    // The card asks one question and offers one press: a name, then learn it
-    // from the newest recording. There is no dropdown and nothing to find on
-    // another screen.
-    for (const id of ["voiceLearnName", "voiceLearnBtn", "voiceEnrolLive", "voiceEnrolLiveText"]) {
+  it("tells the card where a voice is learned and keeps the live line", () => {
+    // The rows themselves hold the name field and the press, so the card only
+    // has to say what happens there — and the recording indication stays.
+    for (const id of ["voiceProfileSlots", "voiceEnrolLive", "voiceEnrolLiveText"]) {
       expect(html, `#${id} is missing from index.html`).toContain(`id="${id}"`);
     }
-    expect(html).toContain("Name this voice");
-    expect(html).toContain("Learn from the latest recording");
-    expect(html).toContain("most recent recording");
-    // No product copy names a person: the example is a role.
+    expect(html).toContain("Each empty slot below learns one voice");
+    expect(html).toContain("your latest recording");
+    // No product copy names a person.
     expect(html).not.toContain("Leo");
   });
 
@@ -304,11 +302,11 @@ describe("the card documents all of it before the press", () => {
     expect(ENROL_SECONDS).toBe(6);
   });
 
-  it("wires the one press to the one route", () => {
-    // The card's button and the route it calls are one action: a name goes to
-    // the newest recording, and no second path exists for the same job.
-    expect(main).toContain('$("voiceLearnBtn").addEventListener("click"');
+  it("wires each empty row to the one route", () => {
+    // The press lives in the row it fills: one route, one name field per slot.
+    expect(main).toContain("learnLatestInto(row.slot)");
     expect(main).toContain("enrol-latest");
+    expect(main).toContain("voiceName-${row.slot}");
     expect(main).not.toContain("window.prompt(");
   });
 
