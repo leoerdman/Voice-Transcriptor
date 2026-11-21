@@ -62,6 +62,8 @@
       "auto-stop-config.js",
       "data-dir.js",
       "backend-exit.js",
+      "backend-serving.js",
+      "window-liveness.js",
       "single-flight.js",
       "ipc-sender-guard.js",
       "quit-path.js",

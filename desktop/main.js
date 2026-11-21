@@ -143,6 +143,8 @@ const { buildPwshPasteFallbackScript } = require("./windows-paste-fallback");
 // What a backend exit means: restart or not, and whose handle it clears
 // (DM-09, DM-27).
 const { backendHandleOf, decideBackendExit, backendRestartPlan } = require("./backend-exit");
+const { createBackendServing, loadWhenServing } = require("./backend-serving");
+const { createWindowLiveness } = require("./window-liveness");
 const { createSingleFlight } = require("./single-flight");
 // A session that grants no permission request or check (the capsule, DM-35).
 const { denyAllSessionPermissions } = require("./session-permissions");
@@ -641,12 +643,16 @@ function beginRendererEpoch(reason) {
   appendMainLog(`[renderer-epoch] ${rendererEpoch} (${reason})`);
 }
 let backendRestartTimer = null;
-// Render-process-gone recovery timer. Schedules a loadURL to recreate
-// the renderer 500 ms after a crash. Tracked at module scope so
-// before-quit can clear it — if the user quits during the recovery
-// window the loadURL would otherwise fire against a teardown-in-progress
-// webContents and produce shutdown-log noise.
-let renderRecoveryTimer = null;
+// Whether the backend answers right now (./backend-serving). The main
+// window's page comes from the backend, so restoring a lost page waits on
+// this instead of loading against a backend that is still restarting.
+const backendServing = createBackendServing();
+// The one owner of "a window's page is alive" (./window-liveness). Every
+// BrowserWindow is registered with `windowLiveness.watch`.
+const windowLiveness = createWindowLiveness({
+  log: (line) => appendMainLog(line),
+  isQuitting: () => isQuitting,
+});
 let backendRestartAttempts = 0;
 
 /**
@@ -2186,6 +2192,18 @@ async function ensureRecordingStatusCapsuleWindow() {
     recordingStatusWindowLoadPromise = null;
     cancelRecordingStatusCapsuleTeardown();
   });
+  // A capsule whose page died is rebuilt, not reloaded: its readiness and
+  // pending paints belong to the dead page, and `updateRecordingStatusCapsule`
+  // already builds a fresh capsule from `recordingStatusCapsuleState`.
+  const capsuleWindow = recordingStatusWindow;
+  windowLiveness.watch(capsuleWindow, {
+    name: "recording-capsule",
+    restore: () => {
+      if (!capsuleWindow.isDestroyed()) capsuleWindow.destroy();
+      return rebuildRecordingStatusCapsule();
+    },
+    recreate: () => rebuildRecordingStatusCapsule(),
+  });
   installRecordingStatusCapsuleIpc();
 
   const html = recordingStatusCapsuleHtml();
@@ -2206,6 +2224,11 @@ async function ensureRecordingStatusCapsuleWindow() {
     });
   await recordingStatusWindowLoadPromise;
   return recordingStatusWindow && !recordingStatusWindow.isDestroyed() ? recordingStatusWindow : null;
+}
+
+function rebuildRecordingStatusCapsule() {
+  if (!String(recordingStatusCapsuleState.status || "").trim()) return Promise.resolve();
+  return updateRecordingStatusCapsule({});
 }
 
 async function updateRecordingStatusCapsule(patch = {}) {
@@ -2509,6 +2532,8 @@ const screenMode = createScreenModeController({
     }
   },
   onWarning: (kind) => notifyScreenModeWarning(kind),
+  // Its overlays and palette answer a lost page through the one owner.
+  watchWindow: (w, spec) => windowLiveness.watch(w, spec),
   // The capsule's part in the one-moment showing (desktop/screen-surfaces.js).
   prepareCapsule: () => (capsuleScreenHold ? capsuleScreenHold.painted : Promise.resolve(false)),
   showCapsule: () => showHeldScreenCapsule(),
@@ -8063,7 +8088,10 @@ async function startBackend() {
       `[backend-exit] code=${code} signal=${signal || ""} handle=${handle} ` +
       `abnormal=${decision.abnormal ? 1 : 0} restart=${decision.restart ? 1 : 0}`,
     );
-    if (decision.forgetHandle) backend = null;
+    if (decision.forgetHandle) {
+      backend = null;
+      backendServing.markDown();
+    }
     if (decision.restart) {
       if (backendRestartTimer) {
         clearTimeout(backendRestartTimer);
@@ -8083,6 +8111,7 @@ async function startBackend() {
         retireBackendBootStatusAfterFailure();
         appendMainLog(`[backend-restart-giving-up] ${backendBootError}`);
         broadcastBackendBootError();
+        backendServing.markFailed(backendBootError);
         return;
       }
       const delay = restartPlan.delayMs;
@@ -8116,9 +8145,11 @@ async function startBackend() {
             // install.
             try {
               await waitForBackendHealth(`${BASE_URL}/api/health`, BACKEND_RESTART_HEALTH_TIMEOUT_MS);
+              backendServing.markServing();
               noteBackendHealthy("backend-restart");
             } catch (e) {
               appendMainLog(`[backend-restart] not healthy after restart: ${e?.message || e}`);
+              backendServing.markFailed(`Backend did not answer after a restart: ${e?.message || e}`);
             }
           })
           .catch((e) => appendMainLog(`[backend-restart-error] ${e?.message || e}`))
@@ -8263,6 +8294,62 @@ async function waitForMainWindowInitialLoad(reason = "") {
   const waitedMs = Date.now() - startedAt;
   if (waitedMs > 50) {
     appendMainLog(`[main-window] waited-for-load reason=${label} ms=${waitedMs}`);
+  }
+}
+
+/**
+ * State in this process that only the main page would have cleared,
+ * dropped when that page is lost (./window-liveness `onGone`).
+ */
+function resetStateOwnedByLostMainPage() {
+  recordingStopInFlight = false;
+  shortcutToggleInFlight = false;
+  pasteShortcutInFlight = false;
+  if (pendingTranscriptionCount > 0) {
+    appendMainLog(`[render-process-gone] dropping pendingTranscriptionCount=${pendingTranscriptionCount}`);
+    pendingTranscriptionCount = 0;
+  }
+  // The renderer that would have handed these transcripts over is gone,
+  // so each would only wait out its deadline.
+  if (postStopQueue.length > 0) {
+    const dropped = postStopQueue.length;
+    postStopQueue = [];
+    appendMainLog(`[render-process-gone] dropped postStopQueue=${dropped}`);
+  }
+  // The capsule may be waiting on a transcript that will never arrive.
+  try {
+    resetRecordingStatusState();
+  } catch (e) {
+    appendMainLog(`[render-process-gone] resetRecordingStatusState failed: ${e?.message || e}`);
+  }
+}
+
+/**
+ * Load the main page again after its process was lost. The page is served
+ * by the backend, and the event that kills the renderer can kill the
+ * backend with it (2026-11-21: one SIGTERM to both), so the load waits for
+ * the backend to serve — settled by the backend's own restart, not by a
+ * timer. A backend that gave up gets the diagnostic page instead of a
+ * black window.
+ */
+async function restoreMainWindowPage() {
+  try {
+    await loadWhenServing({
+      serving: backendServing,
+      load: async () => {
+        if (isQuitting || !win || win.isDestroyed()) return;
+        trackMainWindowInitialLoad(win, "renderer-restore");
+        await win.loadURL(`${BASE_URL}/`);
+      },
+      confirmServing: async () => {
+        await waitForBackendHealth(`${BASE_URL}/api/health`, BACKEND_RESTART_HEALTH_TIMEOUT_MS);
+        backendServing.markServing();
+      },
+    });
+  } catch (e) {
+    if (e?.code === "ERR_ABORTED") return;
+    appendMainLog(`[window-liveness] window=main page not restored: ${e?.message || e}`);
+    if (!isQuitting) await showMainWindowBackendFailure(e, { present: false });
   }
 }
 
@@ -8542,63 +8629,27 @@ async function createWindow(options = {}) {
     beginRendererEpoch("navigation");
     endScreenModeForLostRenderer("navigation");
   });
-  win.webContents.on("render-process-gone", (_event, details) => {
-    const reason = String(details?.reason || "unknown");
-    const exitCode = details?.exitCode ?? "";
-    appendMainLog(`[render-process-gone] reason=${reason} exitCode=${exitCode}`);
-    endScreenModeForLostRenderer(`render-process-gone:${reason}`);
-    if (shortcutCaptureAbortHandler) {
-      shortcutCaptureAbortHandler(`render-process-gone:${reason}`);
-    }
-    // ``clean-exit`` happens on normal window close and does NOT
-    // require recovery. Every other reason (crashed, killed,
-    // oom, etc.) leaves the Electron main process holding stale
-    // references — the recording state machine, any in-flight
-    // ``recordingStopInFlight`` flag, the ``pendingTranscriptionCount``
-    // counter, and the ``shortcutToggleInFlight`` guard — that
-    // would otherwise block every future hotkey press.
-    if (reason === "clean-exit") return;
-    // Reset the state machine so the NEXT hotkey press starts
-    // cleanly instead of short-circuiting on a stale flag.
-    recordingStopInFlight = false;
-    shortcutToggleInFlight = false;
-    pasteShortcutInFlight = false;
-    if (pendingTranscriptionCount > 0) {
-      appendMainLog(`[render-process-gone] dropping pendingTranscriptionCount=${pendingTranscriptionCount}`);
-      pendingTranscriptionCount = 0;
-    }
-    // Drain any queued post-stop tasks — the renderer that would have
-    // handed their transcripts over is gone, so each would only wait out
-    // its deadline. Faster + cleaner to drop them now.
-    if (postStopQueue.length > 0) {
-      const dropped = postStopQueue.length;
-      postStopQueue = [];
-      appendMainLog(`[render-process-gone] dropped postStopQueue=${dropped}`);
-    }
-    // Tear down recording status state: it may be waiting on a transcript
-    // that will never arrive.
-    try {
-      resetRecordingStatusState();
-    } catch (e) {
-      appendMainLog(`[render-process-gone] resetRecordingStatusState failed: ${e?.message || e}`);
-    }
-    // The renderer is dead; ``reload()`` on a crashed webContents
-    // throws. Schedule a fresh load so the user sees a working UI
-    // on the next Spotlight/Dock click. Track the handle so the
-    // app-quit path can clear it — if the user quits within the
-    // 500 ms window after a crash, the timer would otherwise fire
-    // against a webContents that's already going through teardown
-    // and produce an unhandled rejection in the shutdown log.
-    if (renderRecoveryTimer) clearTimeout(renderRecoveryTimer);
-    renderRecoveryTimer = setTimeout(() => {
-      renderRecoveryTimer = null;
-      if (isQuitting) return;
-      if (!win || win.isDestroyed() || !win.webContents) return;
-      const baseUrl = `${BASE_URL}/`;
-      win.loadURL(baseUrl).catch((e) => {
-        appendMainLog(`[render-process-gone] reload failed: ${e?.message || e}`);
-      });
-    }, 500);
+  // The page process can die under the app (a crash, an OOM kill, macOS
+  // sending SIGTERM to every Chromium helper at once). ./window-liveness
+  // owns the answer; this window says what died with the page and how to
+  // bring it back.
+  windowLiveness.watch(win, {
+    name: "main",
+    onGone: (details, { recoverable }) => {
+      const reason = String(details?.reason || "unknown");
+      endScreenModeForLostRenderer(`render-process-gone:${reason}`);
+      if (shortcutCaptureAbortHandler) {
+        shortcutCaptureAbortHandler(`render-process-gone:${reason}`);
+      }
+      // ``clean-exit`` is the page closing with its window. Every other
+      // reason leaves this process holding state that only the dead page
+      // would have cleared — the in-flight flags, the pending-transcript
+      // counter, the post-stop queue, the capsule's status — and that
+      // would otherwise block every future hotkey press.
+      if (recoverable) resetStateOwnedByLostMainPage();
+    },
+    restore: () => restoreMainWindowPage(),
+    recreate: () => createWindow({ showWindow: true, revealReason: "renderer-recreate" }),
   });
   win.webContents.on("did-fail-load", (_event, code, desc, url) => {
     appendMainLog(`[did-fail-load] code=${code} desc=${desc} url=${url}`);
@@ -8762,6 +8813,7 @@ async function createWindow(options = {}) {
     // runtime is typically <5 s; the budget just bounds the wait
     // before the catch branch surfaces a real error to the user.
     await waitForBackendHealth(`${BASE_URL}/api/health`, BACKEND_COLD_START_HEALTH_TIMEOUT_MS);
+    backendServing.markServing();
     // Backend is up — clear the "Starting backend…" pill. Nothing ever
     // cleared it before, so the amber chip lingered next to the green
     // "Online" pill for the whole session (user-reported).
@@ -8794,128 +8846,140 @@ async function createWindow(options = {}) {
       presentMainWindow(revealReason);
     }
   } catch (err) {
-    const stderrTail = (backendStderrTail || "").trim();
-    const details = [
-      err.message,
-      backendBootError,
-      stderrTail ? `— Backend stderr (last ${stderrTail.length} chars) —\n${stderrTail}` : "",
-    ]
-      .filter(Boolean)
-      .join("\n\n");
-
-    // Platform-specific recovery instructions. Keep these tied to the
-    // current root entrypoints instead of deleted legacy install scripts.
-    const logPath = mainLogFilePath();
-    let recoveryHtml;
-    if (app.isPackaged) {
-      recoveryHtml = (
-        `<p style="color:#bbb;margin-bottom:6px">Troubleshooting:</p>` +
-        `<ol style="color:#ddd;margin:8px 0 14px 18px;padding:0;line-height:1.8">` +
-        `<li>Close Transcriptor fully and reopen it once.</li>` +
-        `<li>Reinstall the current release if the bundled runtime was quarantined or removed.</li>` +
-        `<li>If the problem persists, send the log file shown below.</li>` +
-        `</ol>` +
-        `<p style="color:#888;font-size:12px">Log file: <code style="background:#222;padding:2px 6px;border-radius:4px;user-select:all">${escapeHtml(logPath)}</code></p>`
-      );
-    } else if (process.platform === "win32") {
-      // The version comes from .python-version, not from a literal typed
-      // here: a source checkout that is one minor version behind would
-      // otherwise be told to install the interpreter the build no longer
-      // uses. If the file cannot be read we name no version at all rather
-      // than guess one.
-      const py = readPythonVersion(getRepoRoot());
-      const pythonStep = py
-        ? `<li>Make sure Python ${escapeHtml(py.xy)} is installed: <code style="background:#333;padding:2px 6px;border-radius:4px">winget install Python.Python.${escapeHtml(py.xy)}</code></li>`
-        : `<li>Make sure the Python version named in <code style="background:#333;padding:2px 6px;border-radius:4px">.python-version</code> is installed.</li>`;
-      recoveryHtml = (
-        `<p style="color:#bbb;margin-bottom:6px">Troubleshooting:</p>` +
-        `<ol style="color:#ddd;margin:8px 0 14px 18px;padding:0;line-height:1.8">` +
-        `<li>Close Transcriptor fully and reopen it.</li>` +
-        pythonStep +
-        `<li>If the problem persists, rebuild from the source checkout.</li>` +
-        `</ol>` +
-        `<p style="color:#888;font-size:12px">Log file: <code style="background:#222;padding:2px 6px;border-radius:4px;user-select:all">${escapeHtml(logPath)}</code></p>`
-      );
-    } else if (process.platform === "linux") {
-      recoveryHtml = (
-        `<p style="color:#bbb;margin-bottom:6px">Troubleshooting:</p>` +
-        `<ol style="color:#ddd;margin:8px 0 14px 18px;padding:0;line-height:1.8">` +
-        `<li>Install missing system deps: <code style="background:#333;padding:2px 6px;border-radius:4px">sudo apt install python3 python3-venv python3-pip ffmpeg xdotool zenity</code></li>` +
-        `<li>Close and relaunch the AppImage.</li>` +
-        `</ol>` +
-        `<p style="color:#888;font-size:12px">Log file: <code style="background:#222;padding:2px 6px;border-radius:4px;user-select:all">${escapeHtml(logPath)}</code></p>`
-      );
-    } else {
-      recoveryHtml = (
-        `<h3 style="margin:0 0 10px 0;color:#e0e0e0">If it doesn't recover automatically</h3>` +
-        `<p style="color:#bbb;margin-bottom:6px">Find the <b>Voice Transcriptor</b> folder you downloaded:</p>` +
-        `<p style="color:#ddd;margin:8px 0">Quit and reopen Transcriptor. For a source checkout, run the current root installer:</p>` +
-        `<pre style="background:#111;padding:10px 14px;border-radius:8px;border:1px solid #444;color:#7defa0;font-size:12px;user-select:all;cursor:text">cd ~/Downloads/Voice\\ Transcriptor && ./INSTALL.command</pre>` +
-        `<p style="color:#888;font-size:12px;margin-top:14px">Log file: <code style="background:#222;padding:2px 6px;border-radius:4px;user-select:all">${escapeHtml(logPath)}</code></p>`
-      );
-    }
-    await win.loadURL(
-      `data:text/html;charset=utf-8,${encodeURIComponent(`
-      <html>
-        <head><meta charset="utf-8"></head>
-        <body style="background:#1a1a1a;color:#cfcfcf;font-family:-apple-system,Segoe UI,Arial;padding:28px;line-height:1.6">
-          <h2 style="margin:0 0 16px 0">Transcriptor — Backend startup failed</h2>
-          <pre style="white-space:pre-wrap;background:#111;padding:14px;border-radius:8px;border:1px solid #333;margin-bottom:20px">${escapeHtml(details)}</pre>
-          <div id="status" style="padding:10px 14px;background:#1a2a1a;border:1px solid #2a4a2a;border-radius:8px;margin-bottom:16px;color:#7defa0;font-size:13px">⏳ Checking if backend is starting...</div>
-          ${recoveryHtml}
-        </body>
-      </html>
-    `)}`
-    );
-    if (showWindow && win && !win.isDestroyed()) {
-      presentMainWindow("create-window-error");
-    }
-    let recoveryAttempt = 0;
-    const updateRecoveryStatus = async (text, healthy = false) => {
-      if (!win || win.isDestroyed()) return;
-      const js = `
-        (() => {
-          const s = document.getElementById('status');
-          if (!s) return;
-          s.textContent = ${JSON.stringify(text)};
-          if (${healthy ? "true" : "false"}) {
-            s.style.background = '#1a3a1a';
-            s.style.borderColor = '#2a6a2a';
-          }
-        })();
-      `;
-      try { await win.webContents.executeJavaScript(js, true); } catch { /* page may have navigated */ }
-    };
-    const pollRecovery = async () => {
-      // Bounded, and it stops when the app is going away. The loop used
-      // to run `while (win && !win.isDestroyed())` with no ceiling and no
-      // isQuitting check: on a backend that is not coming back it polled
-      // every 3 s for the life of the process, printing an
-      // ever-increasing attempt number at the user.
-      while (win && !win.isDestroyed() && !isQuitting && recoveryAttempt < BACKEND_RECOVERY_MAX_ATTEMPTS) {
-        recoveryAttempt += 1;
-        await updateRecoveryStatus(`⏳ Waiting for backend... (attempt ${recoveryAttempt}/${BACKEND_RECOVERY_MAX_ATTEMPTS})`);
-        try {
-          await waitForBackendHealth(`${BASE_URL}/api/health`, BACKEND_RECOVERY_PROBE_TIMEOUT_MS);
-          await updateRecoveryStatus("✅ Backend is up! Loading app...", true);
-          if (win && !win.isDestroyed()) {
-            await win.loadURL(`${BASE_URL}/`);
-          }
-          return;
-        } catch {
-          await new Promise((resolve) => setTimeout(resolve, BACKEND_RECOVERY_POLL_INTERVAL_MS));
-        }
-      }
-      if (win && !win.isDestroyed() && !isQuitting) {
-        appendMainLog(`[backend-recovery] gave up after ${recoveryAttempt} attempts`);
-        await updateRecoveryStatus(
-          `The backend did not come back after ${recoveryAttempt} attempts. Reopen Transcriptor, or send the log file above.`,
-          true,
-        );
-      }
-    };
-    void pollRecovery();
+    await showMainWindowBackendFailure(err, { present: showWindow });
   }
+}
+
+/**
+ * The backend is not serving and is not coming back on its own: show the
+ * diagnostic page in the main window and keep checking (bounded) whether
+ * it recovers, loading the app the moment it does. Used by the cold start
+ * and by a lost page whose backend gave up (./window-liveness).
+ */
+async function showMainWindowBackendFailure(err, { present }) {
+  if (!win || win.isDestroyed()) return;
+  const stderrTail = (backendStderrTail || "").trim();
+  const details = [
+    err.message,
+    backendBootError,
+    stderrTail ? `— Backend stderr (last ${stderrTail.length} chars) —\n${stderrTail}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
+  // Platform-specific recovery instructions. Keep these tied to the
+  // current root entrypoints instead of deleted legacy install scripts.
+  const logPath = mainLogFilePath();
+  let recoveryHtml;
+  if (app.isPackaged) {
+    recoveryHtml = (
+      `<p style="color:#bbb;margin-bottom:6px">Troubleshooting:</p>` +
+      `<ol style="color:#ddd;margin:8px 0 14px 18px;padding:0;line-height:1.8">` +
+      `<li>Close Transcriptor fully and reopen it once.</li>` +
+      `<li>Reinstall the current release if the bundled runtime was quarantined or removed.</li>` +
+      `<li>If the problem persists, send the log file shown below.</li>` +
+      `</ol>` +
+      `<p style="color:#888;font-size:12px">Log file: <code style="background:#222;padding:2px 6px;border-radius:4px;user-select:all">${escapeHtml(logPath)}</code></p>`
+    );
+  } else if (process.platform === "win32") {
+    // The version comes from .python-version, not from a literal typed
+    // here: a source checkout that is one minor version behind would
+    // otherwise be told to install the interpreter the build no longer
+    // uses. If the file cannot be read we name no version at all rather
+    // than guess one.
+    const py = readPythonVersion(getRepoRoot());
+    const pythonStep = py
+      ? `<li>Make sure Python ${escapeHtml(py.xy)} is installed: <code style="background:#333;padding:2px 6px;border-radius:4px">winget install Python.Python.${escapeHtml(py.xy)}</code></li>`
+      : `<li>Make sure the Python version named in <code style="background:#333;padding:2px 6px;border-radius:4px">.python-version</code> is installed.</li>`;
+    recoveryHtml = (
+      `<p style="color:#bbb;margin-bottom:6px">Troubleshooting:</p>` +
+      `<ol style="color:#ddd;margin:8px 0 14px 18px;padding:0;line-height:1.8">` +
+      `<li>Close Transcriptor fully and reopen it.</li>` +
+      pythonStep +
+      `<li>If the problem persists, rebuild from the source checkout.</li>` +
+      `</ol>` +
+      `<p style="color:#888;font-size:12px">Log file: <code style="background:#222;padding:2px 6px;border-radius:4px;user-select:all">${escapeHtml(logPath)}</code></p>`
+    );
+  } else if (process.platform === "linux") {
+    recoveryHtml = (
+      `<p style="color:#bbb;margin-bottom:6px">Troubleshooting:</p>` +
+      `<ol style="color:#ddd;margin:8px 0 14px 18px;padding:0;line-height:1.8">` +
+      `<li>Install missing system deps: <code style="background:#333;padding:2px 6px;border-radius:4px">sudo apt install python3 python3-venv python3-pip ffmpeg xdotool zenity</code></li>` +
+      `<li>Close and relaunch the AppImage.</li>` +
+      `</ol>` +
+      `<p style="color:#888;font-size:12px">Log file: <code style="background:#222;padding:2px 6px;border-radius:4px;user-select:all">${escapeHtml(logPath)}</code></p>`
+    );
+  } else {
+    recoveryHtml = (
+      `<h3 style="margin:0 0 10px 0;color:#e0e0e0">If it doesn't recover automatically</h3>` +
+      `<p style="color:#bbb;margin-bottom:6px">Find the <b>Voice Transcriptor</b> folder you downloaded:</p>` +
+      `<p style="color:#ddd;margin:8px 0">Quit and reopen Transcriptor. For a source checkout, run the current root installer:</p>` +
+      `<pre style="background:#111;padding:10px 14px;border-radius:8px;border:1px solid #444;color:#7defa0;font-size:12px;user-select:all;cursor:text">cd ~/Downloads/Voice\\ Transcriptor && ./INSTALL.command</pre>` +
+      `<p style="color:#888;font-size:12px;margin-top:14px">Log file: <code style="background:#222;padding:2px 6px;border-radius:4px;user-select:all">${escapeHtml(logPath)}</code></p>`
+    );
+  }
+  await win.loadURL(
+    `data:text/html;charset=utf-8,${encodeURIComponent(`
+    <html>
+      <head><meta charset="utf-8"></head>
+      <body style="background:#1a1a1a;color:#cfcfcf;font-family:-apple-system,Segoe UI,Arial;padding:28px;line-height:1.6">
+        <h2 style="margin:0 0 16px 0">Transcriptor — Backend startup failed</h2>
+        <pre style="white-space:pre-wrap;background:#111;padding:14px;border-radius:8px;border:1px solid #333;margin-bottom:20px">${escapeHtml(details)}</pre>
+        <div id="status" style="padding:10px 14px;background:#1a2a1a;border:1px solid #2a4a2a;border-radius:8px;margin-bottom:16px;color:#7defa0;font-size:13px">⏳ Checking if backend is starting...</div>
+        ${recoveryHtml}
+      </body>
+    </html>
+  `)}`
+  );
+  if (present && win && !win.isDestroyed()) {
+    presentMainWindow("create-window-error");
+  }
+  let recoveryAttempt = 0;
+  const updateRecoveryStatus = async (text, healthy = false) => {
+    if (!win || win.isDestroyed()) return;
+    const js = `
+      (() => {
+        const s = document.getElementById('status');
+        if (!s) return;
+        s.textContent = ${JSON.stringify(text)};
+        if (${healthy ? "true" : "false"}) {
+          s.style.background = '#1a3a1a';
+          s.style.borderColor = '#2a6a2a';
+        }
+      })();
+    `;
+    try { await win.webContents.executeJavaScript(js, true); } catch { /* page may have navigated */ }
+  };
+  const pollRecovery = async () => {
+    // Bounded, and it stops when the app is going away. The loop used
+    // to run `while (win && !win.isDestroyed())` with no ceiling and no
+    // isQuitting check: on a backend that is not coming back it polled
+    // every 3 s for the life of the process, printing an
+    // ever-increasing attempt number at the user.
+    while (win && !win.isDestroyed() && !isQuitting && recoveryAttempt < BACKEND_RECOVERY_MAX_ATTEMPTS) {
+      recoveryAttempt += 1;
+      await updateRecoveryStatus(`⏳ Waiting for backend... (attempt ${recoveryAttempt}/${BACKEND_RECOVERY_MAX_ATTEMPTS})`);
+      try {
+        await waitForBackendHealth(`${BASE_URL}/api/health`, BACKEND_RECOVERY_PROBE_TIMEOUT_MS);
+        backendServing.markServing();
+        await updateRecoveryStatus("✅ Backend is up! Loading app...", true);
+        if (win && !win.isDestroyed()) {
+          await win.loadURL(`${BASE_URL}/`);
+        }
+        return;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, BACKEND_RECOVERY_POLL_INTERVAL_MS));
+      }
+    }
+    if (win && !win.isDestroyed() && !isQuitting) {
+      appendMainLog(`[backend-recovery] gave up after ${recoveryAttempt} attempts`);
+      await updateRecoveryStatus(
+        `The backend did not come back after ${recoveryAttempt} attempts. Reopen Transcriptor, or send the log file above.`,
+        true,
+      );
+    }
+  };
+  void pollRecovery();
 }
 
 app.on("window-all-closed", () => {
@@ -8929,6 +8993,13 @@ app.on("window-all-closed", () => {
 // cache-first: it spawns nothing unless the cached verdict is stale.
 app.on("browser-window-focus", () => {
   ensurePasteCapabilityFresh("focus").catch(() => { });
+});
+
+// GPU and utility processes (network, audio, storage) die under the app
+// too; Chromium restarts them itself. Logged by the one owner of window
+// liveness so a black window always has its cause in the log.
+app.on("child-process-gone", (_event, details) => {
+  windowLiveness.onChildProcessGone(details);
 });
 
 app.on("activate", () => {
@@ -9101,14 +9172,6 @@ app.on("before-quit", () => {
   if (backendRestartTimer) {
     clearTimeout(backendRestartTimer);
     backendRestartTimer = null;
-  }
-  // Same reasoning for the render-process-gone recovery timer:
-  // if the user quits during the 500 ms window after a renderer
-  // crash, the scheduled loadURL must NOT fire against a webContents
-  // that's already going through teardown.
-  if (renderRecoveryTimer) {
-    clearTimeout(renderRecoveryTimer);
-    renderRecoveryTimer = null;
   }
   // Same reasoning: a capsule teardown scheduled seconds before quit
   // must not fire against a window Electron is already tearing down.

@@ -237,7 +237,10 @@ test("CI runs the desktop suite where its osacompile tests can execute", () => {
     .readdirSync(__dirname)
     .filter((f) => f.endsWith(".test.js") && f !== path.basename(__filename))
     .filter((f) => fs.readFileSync(path.join(__dirname, f), "utf8").includes('process.platform !== "darwin"'));
-  assert.deepEqual(darwinGated.sort(), ["applescript.test.js", "paste-script.test.js"]);
+  // window-liveness.electron.test.js is darwin-gated for another reason: it
+  // drives real Electron windows, which need the macOS window server, and it
+  // skips itself where the electron binary is not installed.
+  assert.deepEqual(darwinGated.sort(), ["applescript.test.js", "paste-script.test.js", "window-liveness.electron.test.js"]);
 
   // AGENTS.md names this a required check before every commit, and CI had
   // never run it.

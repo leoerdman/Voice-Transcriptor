@@ -604,8 +604,16 @@ function createScreenModeController(deps) {
         backgroundThrottling: false,
       },
     });
-    const entry = { win: w, bounds, ready: false, ops: [] };
+    const entry = { win: w, bounds, ready: false, ops: strokeReplayOps() };
     overlays.set(display.id, entry);
+    // A page that dies under the take (./window-liveness) is replaced by a
+    // fresh overlay for the same display, which gets the take's strokes
+    // replayed from the session record.
+    deps.watchWindow?.(w, {
+      name: `screen-overlay:${display.id}`,
+      restore: () => replaceOverlay(display.id, w),
+      recreate: () => replaceOverlay(display.id, w),
+    });
     try {
       // An overlay that took the mouse would block the whole display; one
       // that is not content-protected would be in every screenshot. Either
@@ -642,6 +650,38 @@ function createScreenModeController(deps) {
     } catch (e) {
       log(`[screen-mode] ${what} failed: ${e?.message || e}`);
     }
+  }
+
+  // The ops that draw the strokes still on the screen, for an overlay that
+  // starts empty while the take is running.
+  function strokeReplayOps() {
+    if (!session) return [];
+    const ops = [];
+    for (const s of pendingStrokes(session)) {
+      if (offScreen.has(s.id) || !s.points.length) continue;
+      const [x0, y0] = s.points[0];
+      ops.push(["b", s.id, s.color, x0, y0, s.tool, s.n, s.displayBounds]);
+      for (const [x, y] of s.points.slice(1)) ops.push(["m", s.id, x, y]);
+    }
+    return ops;
+  }
+
+  function replaceOverlay(displayId, lost) {
+    const entry = overlays.get(displayId);
+    if (!entry || entry.win !== lost) return Promise.resolve();
+    destroyOverlay(displayId);
+    if (!session) return Promise.resolve();
+    const display = screen.getAllDisplays().find((d) => d.id === displayId);
+    if (!display) return Promise.resolve();
+    return createOverlay(display).then(() => scheduleFlush());
+  }
+
+  function replacePalette(lost) {
+    if (palette !== lost) return Promise.resolve();
+    try { if (!lost.isDestroyed()) lost.destroy(); } catch { }
+    palette = null;
+    if (!session) return Promise.resolve();
+    return createPalette();
   }
 
   function destroyOverlay(displayId) {
@@ -683,6 +723,10 @@ function createScreenModeController(deps) {
 
   function queueOp(op) {
     for (const entry of overlays.values()) entry.ops.push(op);
+    scheduleFlush();
+  }
+
+  function scheduleFlush() {
     if (flushScheduled) return;
     flushScheduled = true;
     setTimeout(flushOps, 16);
@@ -778,6 +822,11 @@ function createScreenModeController(deps) {
       throw e;
     }
     palette = w;
+    deps.watchWindow?.(w, {
+      name: "screen-palette",
+      restore: () => replacePalette(w),
+      recreate: () => replacePalette(w),
+    });
     optional("palette setAlwaysOnTop", () => w.setAlwaysOnTop(true, SCREEN_MODE_LAYERS.level, SCREEN_MODE_LAYERS.palette));
     optional("palette setVisibleOnAllWorkspaces", () => w.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }));
     const html = paletteHtml(

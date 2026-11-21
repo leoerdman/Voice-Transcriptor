@@ -174,6 +174,8 @@ desktop/
 ├── auto-stop-config.js             # the silence auto-stop setting main applies: the renderer's, or off — no copy of its defaults (pure, node --test)
 ├── data-dir.js                     # the one rule for where the desktop shell keeps its data (pure, node --test)
 ├── backend-exit.js                 # what the shell does when the backend child exits: restart (with the capped backoff), report, or let it go on quit (pure, node --test)
+├── backend-serving.js              # whether the backend serves right now (starting/serving/down/failed), and loading a backend-served page once it does (pure, node --test)
+├── window-liveness.js              # the one owner of "a window's page is alive": every window's render-process-gone → restore or recreate; child-process-gone logged (pure, node --test; Electron probe in window-liveness.electron.test.js)
 ├── log-retention.js                # which main.log archives the boot sweep deletes: newest 10, at most 50 MB (user decision; pure, node --test)
 ├── backend-auth.js                 # the backend API token: minted per launch, passed in the backend's env, handed only to the main window over IPC (pure, node --test)
 ├── private-log.js                  # main.log appends: the file is created 0600, an older world-readable one tightened once (pure, node --test)
@@ -191,6 +193,8 @@ desktop/
 ├── screen-surfaces.js              # a screen take's capsule, palette and frames are shown together, once, never a subset (pure, node --test)
 ├── capsule-preload.js              # the recording capsule's preload bridge to main (stop, screenshot, geometry) — replaces the document.title channel
 ├── ipc-contract.test.js            # main.js/preload.js IPC channel-name contract test (node --test)
+├── window-liveness.electron.test.js # real-Electron probe: a crashed page (forcefullyCrashRenderer) with its backend down loads again and paints; negative control without the owner (macOS)
+├── test-fixtures/                  # Electron apps the probes run (not shipped)
 ├── preload.js                      # safe renderer bridge (path-for-file, engine lifecycle invoke-only, recordingFinal / shortcuts / record-toggle / reveal send-only, system-suspend / shortcut-status receive-only)
 ├── package.json                    # electron-builder config and desktop scripts
 ├── shortcut-defaults.json          # per-platform default hotkey manifest
