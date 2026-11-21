@@ -76,7 +76,7 @@ from backend.model_catalog import (
 from backend.audio_mime import AUDIO_EXT_TO_MIME, audio_content_type
 from backend.audio_levels import SessionVoice
 from backend.voice_embed import SpeakerEmbedder, SpeakerScorer, default_model_path
-from backend.voice_enrol import EnrolmentError, decode_take, enrol_take
+from backend.voice_enrol import EnrolmentError, decode_take, enrol_take, enrol_take_stats
 from backend.voice_mask import VoiceMask
 from backend.voice_mask_worker import MaskState, MaskWorker
 from backend.voice_profiles import NAME_MAX_CHARS, ProfileError, VoiceProfileStore
@@ -7265,7 +7265,7 @@ def enrol_voice_profile(
         name = f"Voice {slot}"
     embedder = SpeakerEmbedder()
     try:
-        vector = enrol_take(embedder, decode_take(audio_path))
+        vector, self_floor = enrol_take_stats(embedder, decode_take(audio_path))
     except EnrolmentError as e:
         # Every refusal here is about the take the user chose, so it is a
         # 400 with the reason: "no speech in this take" is actionable, a
@@ -7284,7 +7284,7 @@ def enrol_voice_profile(
         embedder.close()
 
     try:
-        VOICE_PROFILES.save(slot, name, vector, capture=str(audio_path))
+        VOICE_PROFILES.save(slot, name, vector, capture=str(audio_path), self_floor=self_floor)
     except ProfileError as e:
         raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
     logger.info("voice profile saved in slot %s", slot)
@@ -7403,7 +7403,7 @@ def enrol_voice_profile_live(
 
     embedder = SpeakerEmbedder()
     try:
-        vector = enrol_take(embedder, pcm)
+        vector, self_floor = enrol_take_stats(embedder, pcm)
     except EnrolmentError as e:
         # "no speech Solo could hear" is the common one: the press was
         # held in a quiet room. It is about what was said, so it is a 400.
@@ -7423,7 +7423,7 @@ def enrol_voice_profile_live(
     asked = " ".join(name.split()) if isinstance(name, str) else ""
     label = asked or f"Voice {slot}"
     try:
-        VOICE_PROFILES.save(slot, label, vector, capture=str(capture_path))
+        VOICE_PROFILES.save(slot, label, vector, capture=str(capture_path), self_floor=self_floor)
     except ProfileError as e:
         raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
     logger.info(
@@ -7490,7 +7490,7 @@ def recording_voice_mask() -> Optional[VoiceMask]:
     # The frame test is the session's own level (§4.3), not a constant: a
     # fixed floor classified this desk's speech as room and left the gate
     # unable to refuse anything.
-    from backend.voice_mask import VERDICT_INTERVAL_MS
+    from backend.voice_mask import VERDICT_INTERVAL_MS, thresholds_for_floor
 
     # Raw cosines, and nothing else. A score normalised against an impostor
     # cohort (AS-Norm) was built and measured here: it held only while the
@@ -7501,7 +7501,16 @@ def recording_voice_mask() -> Optional[VoiceMask]:
     # bought; §4.5 keeps the record.
     session_voice = SessionVoice()
     scorer = SpeakerScorer(embedder, profile.vector, voiced=session_voice)
-    return VoiceMask(scorer, voiced=session_voice, verdict_interval_ms=VERDICT_INTERVAL_MS)
+    # The pair comes from the profile's own floor (§4.5), so every voice brings
+    # its own scale instead of borrowing one measured on another machine.
+    open_at, close_at = thresholds_for_floor(profile.self_floor)
+    return VoiceMask(
+        scorer,
+        voiced=session_voice,
+        open_at=open_at,
+        close_at=close_at,
+        verdict_interval_ms=VERDICT_INTERVAL_MS,
+    )
 
 
 @app.get("/api/config")

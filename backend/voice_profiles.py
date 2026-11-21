@@ -53,6 +53,10 @@ class VoiceProfile:
     #: nothing but itself: an absolute path under DATA_DIR, empty when the
     #: profile predates captures being kept.
     capture: str = ""
+    #: How alike this voice's own windows are (median cosine to its mean). The
+    #: gate's thresholds are a share of it, so a profile carries its own scale
+    #: instead of borrowing one from another machine.
+    self_floor: float = 0.0
 
     def as_vector(self) -> np.ndarray:
         return np.asarray(self.vector, dtype=np.float32)
@@ -153,6 +157,7 @@ class VoiceProfileStore:
                     vector=_clean_vector(entry.get("vector") or []),
                     created_at=str(entry.get("created_at") or ""),
                     capture=str(entry.get("capture") or ""),
+                    self_floor=float(entry.get("self_floor") or 0.0),
                 )
             except ProfileError as e:
                 logger.warning("voice profile slot %r skipped: %s", key, e)
@@ -195,6 +200,7 @@ class VoiceProfileStore:
                     "vector": list(profile.vector),
                     "created_at": profile.created_at,
                     "capture": profile.capture,
+                    "self_floor": profile.self_floor,
                 }
                 for slot, profile in sorted(profiles.items())
             },
@@ -208,6 +214,10 @@ class VoiceProfileStore:
         name: str,
         vector: Sequence[float] | np.ndarray,
         capture: str = "",
+        # How alike this voice's own windows are (median cosine to its mean).
+        # The gate's thresholds are a share of it, so a profile carries its own
+        # scale instead of borrowing one from another machine.
+        self_floor: float = 0.0,
     ) -> VoiceProfile:
         """Put a profile in a slot, replacing whatever was there."""
         profile = VoiceProfile(
@@ -216,6 +226,7 @@ class VoiceProfileStore:
             vector=_clean_vector(vector),
             created_at=_now(),
             capture=str(capture or ""),
+            self_floor=float(self_floor or 0.0),
         )
         profiles = self.profiles()
         profiles[profile.slot] = profile

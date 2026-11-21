@@ -53,8 +53,8 @@ class FakeStore:
         self.saved = []
         self._tmp = tempfile.TemporaryDirectory(prefix="vt-enrol-store-")
 
-    def save(self, slot, name, vector, capture=""):
-        self.saved.append((slot, name, np.asarray(vector), capture))
+    def save(self, slot, name, vector, capture="", self_floor=0.0):
+        self.saved.append((slot, name, np.asarray(vector), capture, self_floor))
 
     @property
     def captures_dir(self):
@@ -92,11 +92,11 @@ class EnrolLiveRouteTests(unittest.TestCase):
 
     def test_a_capture_is_embedded_and_saved_under_the_slots_name(self):
         vector = np.ones(192, dtype=np.float32)
-        with mock.patch.object(app_main, "enrol_take", return_value=vector) as embed:
+        with mock.patch.object(app_main, "enrol_take_stats", return_value=(vector, 0.9)) as embed:
             payload = self.call(2, pcm(6.0))
 
         self.assertEqual(len(self.store.saved), 1)
-        slot, name, saved, capture = self.store.saved[0]
+        slot, name, saved, capture, floor = self.store.saved[0]
         self.assertEqual(slot, 2)
         # No filename reached this route, so no label was derived from one.
         self.assertEqual(name, "Voice 2")
@@ -106,7 +106,7 @@ class EnrolLiveRouteTests(unittest.TestCase):
 
     def test_the_embedder_is_closed_even_when_the_take_is_refused(self):
         with mock.patch.object(
-            app_main, "enrol_take", side_effect=EnrolmentError("no speech Solo could hear")
+            app_main, "enrol_take_stats", side_effect=EnrolmentError("no speech Solo could hear")
         ):
             with self.assertRaises(HTTPException) as caught:
                 self.call(1, pcm(6.0))
@@ -138,7 +138,7 @@ class EnrolLiveRouteTests(unittest.TestCase):
     def test_a_half_sample_is_trimmed_rather_than_embedded_out_of_phase(self):
         odd = pcm(6.0) + b"\x01"
         with mock.patch.object(
-            app_main, "enrol_take", return_value=np.zeros(192, dtype=np.float32)
+            app_main, "enrol_take_stats", return_value=(np.zeros(192, dtype=np.float32), 0.9)
         ) as embed:
             self.call(1, odd)
 
@@ -164,7 +164,7 @@ class EnrolLiveRouteTests(unittest.TestCase):
         self.assertIn("beside the app", caught.exception.detail)
 
     def test_a_store_that_refuses_the_slot_is_a_400_with_its_reason(self):
-        with mock.patch.object(app_main, "enrol_take", return_value=np.zeros(192)):
+        with mock.patch.object(app_main, "enrol_take_stats", return_value=(np.zeros(192), 0.9)):
             self.store.save = mock.Mock(side_effect=ProfileError("that slot is not the store's"))
             with self.assertRaises(HTTPException) as caught:
                 self.call(1, pcm(6.0))

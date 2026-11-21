@@ -53,7 +53,7 @@ class RoundTripTests(StoreTestCase):
         # own WAV beside the file (7.4), so what the store holds is where it is.
         self.store.save(1, "Leo", vector(), capture="C:/data/voice_profiles/slot1.wav")
         entry = json.loads(self.path.read_text(encoding="utf-8"))["profiles"]["1"]
-        self.assertEqual(set(entry), {"name", "vector", "created_at", "capture"})
+        self.assertEqual(set(entry), {"name", "vector", "created_at", "capture", "self_floor"})
         self.assertEqual(entry["capture"], "C:/data/voice_profiles/slot1.wav")
 
     def test_the_capture_path_survives_a_reload(self):

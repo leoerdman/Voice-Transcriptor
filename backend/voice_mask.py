@@ -127,6 +127,28 @@ DEFAULT_OPEN_AT_Z = 0.7
 DEFAULT_CLOSE_AT_Z = -0.3
 DEFAULT_OPEN_AT = 0.36
 DEFAULT_CLOSE_AT = 0.30
+#: How much of the profile's own floor a window must reach (§4.5). A voice
+#: recorded well scores its own windows near 0.9 and a stranger near 0.4 of
+#: that; measured on this desk 2026-11-21, a six-second press gave a floor of
+#: 0.888 with the kept voice at 0.38 and the other at 0.24, i.e. 0.42 and 0.27
+#: of the floor. The shares below sit just above those two numbers.
+SELF_FLOOR_OPEN = 0.42
+SELF_FLOOR_CLOSE = 0.35
+
+
+def thresholds_for_floor(self_floor: float) -> Tuple[float, float]:
+    """``(open, close)`` for a profile, from how alike its own windows are.
+
+    A profile learned on one microphone cannot use another microphone's
+    constants (measured: 0.65/0.55 refused both voices here). Its own floor
+    carries the scale, so the same rule travels: 0.42 and 0.35 of it. A
+    profile stored before floors were kept falls back to the measured pair.
+    """
+    if not self_floor or self_floor <= 0.0:
+        return DEFAULT_OPEN_AT, DEFAULT_CLOSE_AT
+    open_at = min(0.95, max(0.05, SELF_FLOOR_OPEN * self_floor))
+    close_at = min(open_at - 0.01, max(0.04, SELF_FLOOR_CLOSE * self_floor))
+    return open_at, close_at
 # A refusal needs the arriving hop to be voiced and the standing verdict to be
 # at or below ``close_at``. The voice share of the window is NOT part of that
 # decision any more: measured on the owner's desk (2026-11-19) with a stranger's

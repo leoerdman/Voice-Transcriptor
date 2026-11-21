@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import tempfile
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -172,3 +172,27 @@ def enrol_take(
                 "press again and speak alone, with nobody else talking"
             )
     return profile
+
+
+def enrol_take_stats(
+    embedder: SpeakerEmbedder,
+    pcm: bytes,
+    *,
+    voiced: Optional[Callable[[bytes], bool]] = None,
+) -> Tuple[np.ndarray, float]:
+    """The profile, and the voice's own floor: how alike its windows are.
+
+    The floor is what makes a threshold portable. A voice recorded well scores
+    its own windows near 0.9 and a stranger near 0.4 of that; a voice recorded
+    badly scores its own near 0.6 and a stranger near 0.25. Absolute cut-offs
+    measured on one machine refused both voices on another (2026-11-21), so the
+    gate's thresholds are a share of this number instead of a constant.
+    """
+    profile = enrol_take(embedder, pcm, voiced=voiced)
+    heard = voiced if voiced is not None else _has_voice
+    windows = [window for window in enrol_windows(pcm) if heard(window)]
+    vectors = unit_vectors(embedder, windows)
+    if not vectors:
+        return profile, 0.0
+    against = [cosine(vector, profile) for vector in vectors]
+    return profile, float(np.median(against))
