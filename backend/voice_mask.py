@@ -117,11 +117,14 @@ DEFAULT_HOP_MS = 50
 # a close belongs. Fed the real gate, the held-out take lost 0 of 434 voiced
 # hops, so §4.4's "never a cut word" is measured too, not just intended.
 #: The thresholds when a cohort normalises the score (AS-Norm): a trial is a
-#: z against what this model scores on strangers. Measured 2026-11-21 on the
-#: owner's desk: one voice across two recording conditions 1.52, another voice
-#: in the same condition 0.43 — 1.0 sits between with room on both sides.
-DEFAULT_OPEN_AT_Z = 1.5
-DEFAULT_CLOSE_AT_Z = 1.0
+#: z against what this model scores on strangers. Calibrated 2026-11-21 on the
+#: owner's desk with a 385-vector impostor cohort: the best split of 44 kept-
+#: voice windows against 118 stranger windows sits at -0.3, where 14% of the
+#: kept voice is cut and 12% of the stranger passes; the open threshold is a
+#: full unit above it, so a window must be clearly the owner to reopen the gate.
+#: These move with the cohort: rebuild it and recalibrate, never copy them.
+DEFAULT_OPEN_AT_Z = 0.7
+DEFAULT_CLOSE_AT_Z = -0.3
 DEFAULT_OPEN_AT = 0.65
 DEFAULT_CLOSE_AT = 0.55
 # A refusal needs the arriving hop to be voiced and the standing verdict to be
