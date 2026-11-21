@@ -1716,3 +1716,15 @@ class SpokenWordsTests(_IsolatedMainCase):
             self._save("screen", transcript_text=transcript)
         expected = len(self._expected_words(_SCREEN_SPOKEN)) + len(self._expected_words("тут кнопка не нажимается"))
         self.assertEqual(self._stats()["total_words"], expected)
+
+    def test_screen_take_is_named_by_its_first_words_said_not_its_header(self):
+        older = "Диктовка с рисованием по экрану · 1 скрин\n\n[📸 00:01 скрин 1: /x/shot-01.png] тут кнопка не нажимается"
+        self._save("screen", transcript_text=_SCREEN_TRANSCRIPT, spoken_text=_SCREEN_SPOKEN)
+        self._save("screen", transcript_text=older)
+        root = (Path(self._tmp.name) / "recordings").resolve()
+        items = self.main._build_recordings_list_payload(root)["items"]
+        names = sorted(item["display_name"] for item in items)
+        self.assertEqual(names, sorted(["сейчас обведу вот эту кнопку она съехала и...", "тут кнопка не нажимается"]))
+        for item in items:
+            payload = self.main._read_recording_payload(Path(item["archive_dir"]) / item["name"], Path(item["archive_dir"]))
+            self.assertEqual(payload["display_name"], item["display_name"])

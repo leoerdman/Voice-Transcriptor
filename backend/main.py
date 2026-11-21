@@ -4254,7 +4254,9 @@ def _is_app_recording_text(path: Path) -> bool:
 # the spoken words and they are not the transcript itself, they are written
 # as their own ``Spoken:`` section, and History's word counts read that
 # section (``_recording_spoken_text``) — the transcript's extra parts are
-# never told apart from words by their look.
+# never told apart from words by their look. Nothing said is an EMPTY
+# section, not a missing one: a missing section means the transcript is the
+# speech, and "[ Silence ]" read as speech is a word.
 SPOKEN_SECTION_LABEL = "Spoken"
 
 
@@ -4389,17 +4391,24 @@ def _legacy_screen_spoken_text(transcript: str) -> str:
     return "\n\n".join(kept_blocks)
 
 
-def _recording_spoken_text(content: str, *, screen_take: bool) -> str:
-    """What was SAID in a recording — the one text History counts words in.
+def _recording_spoken_text(
+    content: str,
+    *,
+    screen_take: bool,
+    transcript_of: Callable[[str], str] = _extract_stats_text,
+) -> str:
+    """What was SAID in a recording — the one text History counts words in
+    and names a recording by.
 
     Its ``Spoken:`` section when it has one (possibly empty: nothing was
-    said); otherwise the transcript (``_extract_stats_text``), which for a
-    screen take saved before that section existed is read back by
+    said); otherwise the transcript (*transcript_of*: the stats read the
+    whole file when it has no section, the name reads nothing), which for
+    a screen take saved before that section existed is read back by
     ``_legacy_screen_spoken_text``."""
     spoken = _recording_section(content, SPOKEN_SECTION_LABEL)
     if spoken is not None:
         return spoken
-    text = _extract_stats_text(content)
+    text = transcript_of(content)
     return _legacy_screen_spoken_text(text) if screen_take else text
 
 
@@ -4418,9 +4427,9 @@ def _extract_transcript_text(content: str) -> str:
     return ""
 
 
-def _first_words(content: str, max_words: int = 8) -> str:
-    """Extract first N meaningful words from recording file content for display name."""
-    text = _extract_transcript_text(content)
+def _first_words(content: str, *, screen_take: bool, max_words: int = 8) -> str:
+    """The first N words SAID (``_recording_spoken_text``), for the display name."""
+    text = _recording_spoken_text(content, screen_take=screen_take, transcript_of=_extract_transcript_text)
     if not text:
         return ""
     # Strip bracketed markers like [Silence]
@@ -4442,7 +4451,7 @@ def _recording_source_file(content: str) -> str:
     return _extract_meta_field(content, "Source file")
 
 
-def _recording_display_name_from_content(content: str, fallback_stem: str) -> str:
+def _recording_display_name_from_content(content: str, fallback_stem: str, *, screen_take: bool) -> str:
     """What History calls a recording — always from the transcript itself
     (its header and its words), never from its file name while the
     transcript says anything: the source file it came from, else its first
@@ -4457,7 +4466,7 @@ def _recording_display_name_from_content(content: str, fallback_stem: str) -> st
     source_file = _recording_source_file(content)
     if source_file:
         return source_file
-    first = _first_words(content)
+    first = _first_words(content, screen_take=screen_take)
     if first:
         return first
     title = _extract_meta_field(content, "Title")
@@ -8438,7 +8447,9 @@ def _build_recordings_list_payload(d: "Path") -> dict:
                 else:
                     raw = p.read_text(encoding="utf-8", errors="replace")
                     parsed = {
-                        "display_name": _recording_display_name_from_content(raw, p.stem),
+                        "display_name": _recording_display_name_from_content(
+                            raw, p.stem, screen_take=collection == RECORDING_COLLECTION_SCREEN
+                        ),
                         "source_file": _recording_source_file(raw),
                         "provider": _extract_meta_field(raw, "Provider").lower() or "",
                         "language": _extract_meta_field(raw, "Language").lower() or "",
@@ -8659,7 +8670,9 @@ def _read_recording_payload(p: "Path", target_dir: Optional["Path"] = None) -> d
         # The same name History's list gives this recording: the viewer
         # opened from a path the list has not seen yet (a fresh save, a
         # deep link) shows it instead of the file name.
-        "display_name": _recording_display_name_from_content(raw, p.stem),
+        "display_name": _recording_display_name_from_content(
+            raw, p.stem, screen_take=_recording_collection_for_dir(archive_dir) == RECORDING_COLLECTION_SCREEN
+        ),
         "source_file": source_file,
         "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
         "size_bytes": st.st_size,
