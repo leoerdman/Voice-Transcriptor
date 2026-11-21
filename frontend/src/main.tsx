@@ -7854,48 +7854,10 @@ function renderVoiceMask(): void {
     item.dataset.slot = String(row.slot);
     item.setAttribute("role", "listitem");
 
-    const copy = document.createElement("div");
-    copy.className = "voice-slot-copy";
-    const label = document.createElement("span");
-    label.className = "voice-slot-name";
-    label.textContent = row.label;
-    const meta = document.createElement("span");
-    meta.className = "voice-slot-meta";
-    // The date is the only fact a slot has besides its number: no name was
-    // asked for, and none was invented. While the press is recording, the
-    // row says so in place of the date — the switch being on is not the same
-    // fact as "six seconds are being taken right now".
-    const learning = pending !== null && pending.slot === row.slot && pending.on;
-    meta.textContent = learning ? "Learning…" : row.empty ? "Empty" : row.learnedOn;
-    copy.append(label, meta);
-
-    const toggle = document.createElement("label");
-    toggle.className = "toggle-inline voice-slot-switch";
-    const caption = document.createElement("span");
-    caption.textContent = "Let through";
-    const input = document.createElement("input");
-    input.type = "checkbox";
-    input.checked = pending && pending.slot === row.slot ? pending.on : row.enabled;
-    // An empty slot is still pressable: pressing it is how a voice gets
-    // learned. A missing file or an unread store does NOT disable the row —
-    // a disabled switch answers nothing, and the press is the one place the
-    // reason can be said in the user's own hand. Only a write in flight
-    // takes the switch away.
-    input.disabled = voiceProfilesBusy;
-    input.setAttribute(
-      "aria-label",
-      row.empty ? `Learn ${row.label} in six seconds` : `Let ${row.label} through, and nobody else`,
-    );
-    input.addEventListener("change", () => {
-      void switchSlot(row.slot, input.checked);
-    });
-    toggle.append(caption, input);
-    item.append(copy, toggle);
-
-    // An empty row is a voice waiting to be learned: the name field and the
-    // press sit inside it, so the row IS the voice rather than a list that a
-    // button somewhere else writes into.
     if (row.empty) {
+      // An empty row IS the question: one field, one press. No slot number,
+      // no "Empty", no switch — a label beside a label beside a button is how
+      // "name" and "voice" started looking like two different things.
       const nameField = document.createElement("input");
       nameField.type = "text";
       nameField.id = `voiceName-${row.slot}`;
@@ -7909,13 +7871,44 @@ function renderVoiceMask(): void {
       learn.className = "btn btn-primary voice-slot-learn";
       learn.textContent = "Learn";
       learn.disabled = voiceProfilesBusy;
-      learn.setAttribute("aria-label", `Learn ${row.label} from the latest recording`);
+      learn.setAttribute("aria-label", `Learn a voice from the latest recording`);
       learn.title = "Uses your latest recording: same microphone, same room";
       learn.addEventListener("click", () => {
         void learnLatestInto(row.slot);
       });
       item.append(nameField, learn);
+      list.appendChild(item);
+      continue;
     }
+
+    const copy = document.createElement("div");
+    copy.className = "voice-slot-copy";
+    const label = document.createElement("span");
+    label.className = "voice-slot-name";
+    label.textContent = row.label;
+    const meta = document.createElement("span");
+    meta.className = "voice-slot-meta";
+    // The date is the only fact a filled slot has besides its name. While the
+    // press is recording, the row says so in place of the date — the switch
+    // being on is not the same fact as "six seconds are being taken now".
+    const learning = pending !== null && pending.slot === row.slot && pending.on;
+    meta.textContent = learning ? "Learning…" : row.learnedOn;
+    copy.append(label, meta);
+
+    const toggle = document.createElement("label");
+    toggle.className = "toggle-inline voice-slot-switch";
+    const caption = document.createElement("span");
+    caption.textContent = "Let through";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = pending && pending.slot === row.slot ? pending.on : row.enabled;
+    input.disabled = voiceProfilesBusy;
+    input.setAttribute("aria-label", `Let ${row.label} through, and nobody else`);
+    input.addEventListener("change", () => {
+      void switchSlot(row.slot, input.checked);
+    });
+    toggle.append(caption, input);
+    item.append(copy, toggle);
 
     if (!row.empty) {
       const forget = document.createElement("button");
@@ -8305,10 +8298,21 @@ async function learnLatestInto(slot: number): Promise<void> {
     field?.focus();
     return;
   }
-  await writeVoiceProfiles(
-    () => apiPost<unknown>(`/api/voice/profiles/${slot}/enrol-latest`, { name }),
-    "Could not learn that voice from the recording.",
-  );
+  try {
+    await writeVoiceProfiles(
+      () => apiPost<unknown>(`/api/voice/profiles/${slot}/enrol-latest`, { name }),
+      "Could not learn that voice from the recording.",
+    );
+  } catch (error) {
+    // Nothing recorded yet: the same press asks for the six seconds instead of
+    // sending the user away to make a recording first. One control, two
+    // answers, and neither is a dialog.
+    if (/no recording/i.test(String(error))) {
+      await learnInto(slot, name);
+      return;
+    }
+    throw error;
+  }
 }
 
 async function forgetSlot(slot: number, label: string): Promise<void> {

@@ -366,10 +366,10 @@ describe("the card's presses", () => {
 
   it("says the press is learning while it records", () => {
     // The switch being on is not the same fact as "six seconds are being
-    // taken right now": the row says which one it is.
-    expect(main).toContain(
-      'meta.textContent = learning ? "Learning…" : row.empty ? "Empty" : row.learnedOn;',
-    );
+    // taken right now": a filled row says which one it is. An empty row has
+    // no switch at all — it is the field and the press.
+    expect(main).toContain('meta.textContent = learning ? "Learning…" : row.learnedOn;');
+    expect(main).toContain('if (row.empty) {');
   });
 
   it("sends the pane's knob to the card instead of recording blind", () => {
@@ -426,12 +426,12 @@ describe("the card's presses", () => {
     );
   });
 
-  it("names the six seconds in the row's own label, not the old take", () => {
-    // The label still said "from your latest recording", which is what the
-    // card stopped doing: the press records the voice it asks for. (The
-    // sentence survives in the comments that explain why it went.)
-    expect(main).toContain('`Learn ${row.label} in six seconds`');
-    expect(main).not.toContain("`Learn ${row.label} from your latest recording`");
+  it("offers one way to learn, not two", () => {
+    // An empty row is a name field and a press. The six-second press and its
+    // label went with it: two paths to the same slot is how the card started
+    // asking the user to understand its plumbing.
+    expect(main).not.toContain("`Learn ${row.label} in six seconds`");
+    expect(main).toContain("learnLatestInto(row.slot)");
   });
 
   it("forgets the voice in the row it belongs to", () => {
