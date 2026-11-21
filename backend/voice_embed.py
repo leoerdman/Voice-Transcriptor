@@ -255,6 +255,10 @@ def mean_direction(vectors: Sequence[np.ndarray]) -> Optional[np.ndarray]:
     return mean / norm
 
 
+#: How many of the cohort's top scores normalise one trial (AS-Norm).
+AS_NORM_TOP = 100
+
+
 class SpeakerScorer:
     """``bytes -> Optional[float]``: the one callable the gate wants.
 
@@ -269,6 +273,7 @@ class SpeakerScorer:
         profile: np.ndarray,
         *,
         voiced: Optional[Callable[[bytes], bool]] = None,
+        cohort: Optional[np.ndarray] = None,
     ) -> None:
         vector = np.asarray(profile, dtype=np.float32)
         norm = float(np.linalg.norm(vector))
@@ -279,6 +284,20 @@ class SpeakerScorer:
         # Same injection the gate already takes, for the same reason: a test
         # of the arithmetic should not have to load a live audio stack.
         self._voiced = voiced if voiced is not None else _has_voice
+        # The impostor cohort (AS-Norm): unit rows of voices this profile is
+        # not. With it a score becomes a z against what this model scores on
+        # strangers, which is what carries a profile across recording
+        # conditions (measured 2026-11-21: raw 0.634 for one voice in another
+        # condition against 0.495 for another voice in the same one; the same
+        # pair normalised 1.52 against 0.43).
+        self._cohort: Optional[np.ndarray] = None
+        if cohort is not None:
+            rows = np.asarray(cohort, dtype=np.float32)
+            if rows.ndim == 2 and rows.shape[1] == self._profile.size and len(rows) >= 2:
+                norms = np.linalg.norm(rows, axis=1)
+                keep = norms > 0.0
+                if int(keep.sum()) >= 2:
+                    self._cohort = rows[keep] / norms[keep][:, None]
 
     @property
     def profile(self) -> np.ndarray:
@@ -294,7 +313,14 @@ class SpeakerScorer:
         # A cosine, not a dot: the embedder is expected to hand back unit
         # vectors, but a score that silently scales with someone else's norm
         # is a threshold nobody can reason about.
-        return cosine(embedding, self._profile)
+        raw = cosine(embedding, self._profile)
+        if self._cohort is None:
+            return raw
+        against = np.sort(self._cohort @ self._profile)[::-1][:AS_NORM_TOP]
+        spread = float(against.std())
+        if not np.isfinite(spread) or spread <= 1e-9:
+            return raw
+        return (raw - float(against.mean())) / spread
 
     @classmethod
     def enrol(

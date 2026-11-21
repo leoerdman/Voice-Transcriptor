@@ -7417,6 +7417,27 @@ def delete_voice_profile(slot: int, _auth: None = Depends(_require_api_auth)):
     return _voice_profiles_payload()
 
 
+def _voice_cohort():
+    """The impostor cohort beside the profile store, or ``None`` for raw scores.
+
+    Built by the skill's `assets/solo/cohort.py` from the desk's own voices;
+    absent means the gate compares raw cosines, which hold only while the
+    profile and the audio share recording conditions (§4.5).
+    """
+    import numpy as np
+
+    path = VOICE_PROFILES.captures_dir / "cohort.npz"
+    if not path.is_file():
+        return None
+    try:
+        rows = np.load(path)["vectors"]
+    except Exception:  # noqa: BLE001 — an unreadable cohort is not a refusal
+        logger.warning("voice-mask: %s unreadable; scores stay raw", path.name)
+        return None
+    logger.info("voice-mask: %d cohort vectors normalise this recording", len(rows))
+    return rows
+
+
 def recording_voice_mask() -> Optional[VoiceMask]:
     """The gate for the recording that is starting, or ``None``.
 
@@ -7451,8 +7472,17 @@ def recording_voice_mask() -> Optional[VoiceMask]:
     # fixed floor classified this desk's speech as room and left the gate
     # unable to refuse anything.
     session_voice = SessionVoice()
-    scorer = SpeakerScorer(embedder, profile.vector, voiced=session_voice)
-    return VoiceMask(scorer, voiced=session_voice)
+    cohort = _voice_cohort()
+    scorer = SpeakerScorer(embedder, profile.vector, voiced=session_voice, cohort=cohort)
+    if cohort is None:
+        return VoiceMask(scorer, voiced=session_voice)
+    from backend.voice_mask import DEFAULT_CLOSE_AT_Z, DEFAULT_OPEN_AT_Z
+
+    # A cohort turns the score into a z, so the raw thresholds would read it
+    # as a stranger forever: the pair moves together or not at all (§4.5).
+    return VoiceMask(
+        scorer, voiced=session_voice, open_at=DEFAULT_OPEN_AT_Z, close_at=DEFAULT_CLOSE_AT_Z
+    )
 
 
 @app.get("/api/config")

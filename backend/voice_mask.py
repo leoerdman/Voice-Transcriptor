@@ -80,6 +80,8 @@ between this gate and whatever turns audio into a similarity.
 
 from __future__ import annotations
 
+import math
+
 from collections import deque
 from typing import Callable, Deque, List, Optional, Tuple
 
@@ -114,6 +116,12 @@ DEFAULT_HOP_MS = 50
 # 21%), and a window like that is the room with a word in it, which is where
 # a close belongs. Fed the real gate, the held-out take lost 0 of 434 voiced
 # hops, so §4.4's "never a cut word" is measured too, not just intended.
+#: The thresholds when a cohort normalises the score (AS-Norm): a trial is a
+#: z against what this model scores on strangers. Measured 2026-11-21 on the
+#: owner's desk: one voice across two recording conditions 1.52, another voice
+#: in the same condition 0.43 — 1.0 sits between with room on both sides.
+DEFAULT_OPEN_AT_Z = 1.5
+DEFAULT_CLOSE_AT_Z = 1.0
 DEFAULT_OPEN_AT = 0.65
 DEFAULT_CLOSE_AT = 0.55
 # A refusal needs the arriving hop to be voiced and the standing verdict to be
@@ -168,8 +176,13 @@ class VoiceMask:
     ) -> None:
         if hop_ms <= 0 or window_ms < hop_ms:
             raise ValueError("a window holds at least one hop")
-        if not 0.0 <= close_at <= open_at <= 1.0:
-            raise ValueError("a hysteresis needs close_at <= open_at inside [0, 1]")
+        if not close_at <= open_at:
+            raise ValueError("a hysteresis needs close_at <= open_at")
+        if not (math.isfinite(open_at) and math.isfinite(close_at)):
+            # Not bracketed by [0, 1] any more: with an impostor cohort the
+            # score is a z against the model's own strangers, and a z lives on
+            # the whole line (§4.5).
+            raise ValueError("a hysteresis needs finite thresholds")
         self._scorer = scorer
         # Injected, never imported: the gate must stay a pure function of
         # its arguments so it can be tested without the provider stack.
