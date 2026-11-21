@@ -288,8 +288,8 @@ describe("the card documents all of it before the press", () => {
     for (const id of ["voiceProfileSlots", "voiceEnrolLive", "voiceEnrolLiveText"]) {
       expect(html, `#${id} is missing from index.html`).toContain(`id="${id}"`);
     }
-    expect(html).toContain("Each empty slot below learns one voice");
-    expect(html).toContain("your latest recording");
+    expect(html).toContain("Type a name, press Learn");
+    expect(html).toContain("six seconds");
     // No product copy names a person.
     expect(html).not.toContain("Leo");
   });
@@ -302,11 +302,12 @@ describe("the card documents all of it before the press", () => {
     expect(ENROL_SECONDS).toBe(6);
   });
 
-  it("wires each empty row to the one route", () => {
-    // The press lives in the row it fills: one route, one name field per slot.
-    expect(main).toContain("learnLatestInto(row.slot)");
-    expect(main).toContain("enrol-latest");
+  it("wires each empty row to its own press", () => {
+    // Learn records the voice on the spot: no latest-recording lookup, no
+    // dependency on what History happens to hold.
+    expect(main).toContain("learnFromThisRow(row.slot)");
     expect(main).toContain("voiceName-${row.slot}");
+    expect(main).not.toContain("enrol-latest");
     expect(main).not.toContain("window.prompt(");
   });
 

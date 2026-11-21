@@ -7871,10 +7871,9 @@ function renderVoiceMask(): void {
       learn.className = "btn btn-primary voice-slot-learn";
       learn.textContent = "Learn";
       learn.disabled = voiceProfilesBusy;
-      learn.setAttribute("aria-label", `Learn a voice from the latest recording`);
-      learn.title = "Uses your latest recording: same microphone, same room";
+      learn.setAttribute("aria-label", `Record a voice for this slot`);
       learn.addEventListener("click", () => {
-        void learnLatestInto(row.slot);
+        void learnFromThisRow(row.slot);
       });
       item.append(nameField, learn);
       list.appendChild(item);
@@ -8288,34 +8287,21 @@ async function switchMask(on: boolean): Promise<void> {
   await switchSlot(target, true);
 }
 
-/** Learn one slot from the newest recording: the name is the row's own field. */
-async function learnLatestInto(slot: number): Promise<void> {
-  if (voiceProfilesBusy) return;
+/** The name typed on an empty row, trimmed; "" when it is still empty. */
+function learnName(slot: number): string {
   const field = document.getElementById(`voiceName-${slot}`) as HTMLInputElement | null;
-  const name = (field?.value || "").trim();
+  return (field?.value || "").trim();
+}
+
+/** The row's press: a name, six seconds of speech, and the slot is learned. */
+async function learnFromThisRow(slot: number): Promise<void> {
+  const name = learnName(slot);
   if (!name) {
     setVoiceProfilesError("Name this voice first.");
-    field?.focus();
+    (document.getElementById(`voiceName-${slot}`) as HTMLInputElement | null)?.focus();
     return;
   }
-  // Nothing recorded yet is not an error to paint: the same press asks for the
-  // six seconds instead. Asked BEFORE the write, because the write paints its
-  // own failure and does not rethrow — a fallback after it would never run.
-  let hasRecording = false;
-  try {
-    const listing = await apiGet<{ items: unknown[] }>("/api/recordings");
-    hasRecording = Array.isArray(listing.items) && listing.items.length > 0;
-  } catch {
-    hasRecording = false;
-  }
-  if (!hasRecording) {
-    await learnInto(slot, name);
-    return;
-  }
-  await writeVoiceProfiles(
-    () => apiPost<unknown>(`/api/voice/profiles/${slot}/enrol-latest`, { name }),
-    "Could not learn that voice from the recording.",
-  );
+  await learnInto(slot, name);
 }
 
 async function forgetSlot(slot: number, label: string): Promise<void> {

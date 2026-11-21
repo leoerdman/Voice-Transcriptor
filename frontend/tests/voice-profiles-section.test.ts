@@ -351,11 +351,11 @@ describe("the card's presses", () => {
   });
 
   it("takes the voice's name from the row that is being learned", () => {
-    // Each empty row owns its name field (`#voiceName-<slot>`), so the voice a
-    // press learns is the voice whose row it pressed — nothing pops a dialog
-    // and nothing guesses a slot.
+    // Each empty row owns its name field (`#voiceName-<slot>`) and records the
+    // voice on the spot, so a press learns the row it pressed with the name
+    // typed in it.
     expect(main).toContain("voiceName-${row.slot}");
-    expect(main).toContain("learnLatestInto(row.slot)");
+    expect(main).toContain("learnFromThisRow(row.slot)");
     expect(main).not.toContain("window.prompt(");
     expect(main).toContain("?name=${encodeURIComponent(name)}");
   });
@@ -431,11 +431,13 @@ describe("the card's presses", () => {
   });
 
   it("offers one way to learn, not two", () => {
-    // An empty row is a name field and a press. The six-second press and its
-    // label went with it: two paths to the same slot is how the card started
-    // asking the user to understand its plumbing.
+    // An empty row is a name field and a press, and that press records the
+    // voice on the spot. The latest-recording lookup and its label went with
+    // it: two paths to the same slot is how the card started asking the user
+    // to understand its plumbing.
     expect(main).not.toContain("`Learn ${row.label} in six seconds`");
-    expect(main).toContain("learnLatestInto(row.slot)");
+    expect(main).toContain("learnFromThisRow(row.slot)");
+    expect(main).not.toContain("enrol-latest");
   });
 
   it("forgets the voice in the row it belongs to", () => {
