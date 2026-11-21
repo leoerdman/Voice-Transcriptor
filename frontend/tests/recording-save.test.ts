@@ -33,6 +33,15 @@ function input(extra: Partial<RecordingSaveInput> = {}): RecordingSaveInput {
 }
 
 describe("planRecordingSave (FU-21)", () => {
+  it("sends the spoken words on every route only when the caller has them", () => {
+    for (const extra of [{}, { audioSourcePath: "/a.wav" }, { hasAudioFile: true }]) {
+      expect(planRecordingSave(input(extra)).fields).not.toHaveProperty("spoken_text");
+      expect(planRecordingSave(input({ ...extra, spokenText: "сказанное" })).fields.spoken_text).toBe("сказанное");
+      // Nothing said is an answer too (a marks-only take), not an omission.
+      expect(planRecordingSave(input({ ...extra, spokenText: "" })).fields.spoken_text).toBe("");
+    }
+  });
+
   it("refuses a screen session on a save without the audio file instead of dropping it", () => {
     expect(() => planRecordingSave(input({ screenSessionId: "scr-1" }))).toThrow(/screen/);
     expect(() => planRecordingSave(input({ audioSourcePath: "/a.wav", screenSessionId: "scr-1" }))).toThrow(/screen/);

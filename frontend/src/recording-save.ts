@@ -36,6 +36,12 @@ export interface RecordingSaveInput {
   title: string;
   sourceText: string;
   transcriptText: string;
+  /**
+   * The words said, when the transcript holds more than them (screen
+   * marks, a status line): History counts words in these (backend
+   * ``SPOKEN_SECTION_LABEL``). Absent: the transcript is what was said.
+   */
+  spokenText?: string;
   provider: string;
   model: string;
   language: string;
@@ -81,6 +87,7 @@ export function planRecordingSave(input: RecordingSaveInput): RecordingSavePlan 
     model: input.model,
     language: input.language,
   };
+  if (input.spokenText !== undefined) common.spoken_text = input.spokenText;
   if (input.archiveDir) common.archive_dir = input.archiveDir;
   if (recordedAtMs > 0) common.recorded_at_ms = String(Math.round(recordedAtMs));
   if (route === "save-from-path") {

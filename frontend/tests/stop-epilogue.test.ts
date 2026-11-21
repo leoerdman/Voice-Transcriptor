@@ -295,6 +295,8 @@ describe("createSessionMetadataSaver — the History entry a stop writes", () =>
     await save({ spokenTranscript: spoken, transcriptText: marked, provider: "deepgram" });
     expect(requests[0].title).toBe("one two three four");
     expect(requests[0].transcriptText).toBe(marked);
+    // History counts words in what was said, not in the marks.
+    expect(requests[0].spokenText).toBe(spoken);
   });
 
   it("without a transcript falls back to the live text, then to the default name", async () => {
@@ -368,6 +370,7 @@ describe("keepLiveTranscript — a take without a final transcript keeps its liv
       text: "hello there",
       note: "The live text is kept as the transcript.",
       spoken: true,
+      words: "hello there",
       screen: EMPTY_SCREEN_ANNOTATION,
     });
   });
@@ -381,24 +384,26 @@ describe("runStopEpilogue — a failed stop keeps the live text with marks in th
   function keptRecorder() {
     const published: Array<{ domText: string; panelText: string }> = [];
     const saved: string[] = [];
+    const spoken: string[] = [];
     const summaries: Array<{ status: string; tone: string }> = [];
     const fx: StopEpilogueEffects = {
       publish: (signal, panelText) => published.push({ domText: signal.domText, panelText }),
       hideProgress: () => {},
       setStatus: () => {},
-      save: async (transcriptText) => {
+      save: async (transcriptText, spokenTranscript) => {
         saved.push(transcriptText);
+        spoken.push(spokenTranscript);
         return { kind: "saved" };
       },
       release: () => {},
       patchSummary: (summary) => summaries.push(summary),
     };
-    return { published, saved, summaries, fx };
+    return { published, saved, spoken, summaries, fx };
   }
   const kept = keepLiveTranscript("live words [mark]", EMPTY_SCREEN_ANNOTATION, 1_000);
 
   it("mic not delivering audio: the capsule gets the status, the panel and History the reason above the kept marks", async () => {
-    const { published, saved, summaries, fx } = keptRecorder();
+    const { published, saved, spoken, summaries, fx } = keptRecorder();
     const marksOnly = keepLiveTranscript("", marksOnlyAnnotation([{ atMs: 0, text: "[📸 00:00 скрин 1: /x/shot-01.png]" }]), 1_000);
     await runStopEpilogue({
       signal: { domText: "[ Mic not delivering audio ]", kind: "error" },
@@ -411,6 +416,8 @@ describe("runStopEpilogue — a failed stop keeps the live text with marks in th
     const stored = `[ Mic not delivering audio ]\n\n${marksOnly.text}`;
     expect(published).toEqual([{ domText: "[ Mic not delivering audio ]", panelText: stored }]);
     expect(saved).toEqual([stored]);
+    // Nothing was said: the marks and the reason are not words.
+    expect(spoken).toEqual([""]);
     expect(summaries[0].status).toBe("The microphone delivered no audio. The screen marks are kept as the transcript.");
   });
 

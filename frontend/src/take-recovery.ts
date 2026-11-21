@@ -91,6 +91,8 @@ export interface TakeTextWrite {
   title: string;
   sourceText: string;
   transcriptText: string;
+  /** The words alone, without the screen marks. */
+  spokenText: string;
   provider: string;
   model: string;
   language: string;
@@ -138,6 +140,7 @@ export function planTakeRecovery(
       title: spoken ? `${smartRecordingTitle(spoken, take.title)} (Recovered)` : take.title,
       sourceText: draftSource || take.sourceText,
       transcriptText,
+      spokenText: spoken,
       provider: fromDraft && draft ? recoveredDraftProvider(draft) : take.provider,
       model: (fromDraft && String(draft?.model || "").trim()) || take.model,
       language: (fromDraft && String(draft?.language || "").trim()) || take.language,

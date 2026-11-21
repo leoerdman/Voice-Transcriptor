@@ -6172,6 +6172,7 @@ async function recoverLiveDraftIfAny(promoted: ReadonlyArray<PromotedTake> = [])
         title: write.title,
         sourceText: write.sourceText,
         transcriptText: write.transcriptText,
+        spokenText: write.spokenText,
         provider: write.provider,
         model: write.model,
         language: write.language,
@@ -8926,6 +8927,8 @@ async function saveRecordingText(opts: {
   title: string;
   sourceText: string;
   transcriptText: string;
+  /** ./recording-save ``spokenText``. */
+  spokenText?: string;
   provider: string;
   model: string;
   language: string;
@@ -8975,6 +8978,7 @@ async function saveRecordingText(opts: {
     title: opts.title,
     sourceText,
     transcriptText,
+    spokenText: opts.spokenText === undefined ? undefined : opts.spokenText.trim(),
     provider: opts.provider,
     model: opts.model,
     language: opts.language,
@@ -9245,6 +9249,7 @@ $("retranscribeBtn").addEventListener("click", async () => {
           title: smartRecordingTitle(spokenText, audioState.savedName || "Recording"),
           sourceText: spokenText,
           transcriptText: text,
+          spokenText,
           provider: usedProvider,
           model: decoded.model,
           language: lang,
@@ -12618,8 +12623,8 @@ async function stopLive(
       }
     },
     setStatus: (label) => setStatusScoped(sessionUiToken, label),
-    save: (transcriptText) => saveSessionMetadata({
-      spokenTranscript: "",
+    save: (transcriptText, spokenTranscript) => saveSessionMetadata({
+      spokenTranscript,
       transcriptText,
       provider: metadataProviderForSave,
     }),
@@ -12786,6 +12791,8 @@ async function stopLive(
   /** The final transcript (with its marks) once it has been shown: a stop
    *  that fails after this point keeps the final, not the live draft. */
   let finalTranscriptShown = "";
+  /** Its words alone, without the marks. */
+  let finalSpokenShown = "";
 
   if (startupAbortReason && !savedAudioFile && !transcribeInputFile && captureLevel.frames === 0) {
     await endWithoutTranscript({
@@ -13274,7 +13281,7 @@ async function stopLive(
         $("progressRow").hidden = true;
       }
       setStatusScoped(sessionUiToken, "Done");
-      const keptSave = await saveSessionMetadata({ spokenTranscript: "", transcriptText: kept.text, provider });
+      const keptSave = await saveSessionMetadata({ spokenTranscript: kept.words, transcriptText: kept.text, provider });
       patchCurrentRecordingSummary({
         title: resolveSessionTitle("", latestSourceForSave(), defaultTitle),
         ...resolveEmptyFinalSummary(kept, keptSave),
@@ -13320,7 +13327,10 @@ async function stopLive(
       transcribeLatencyMs: transcriptReadyLatencyMs,
     }, sessionUiToken);
 
-    if (transcriptRaw) finalTranscriptShown = transcriptRaw;
+    if (transcriptRaw) {
+      finalTranscriptShown = transcriptRaw;
+      finalSpokenShown = plainTranscriptRaw;
+    }
     publishRecordingOutput({
       recordingId,
       pasteText: "",
@@ -13388,7 +13398,7 @@ async function stopLive(
     // A throw after the final transcript was shown (a later save or paste
     // step) keeps that final; before it, the live text with its marks.
     const kept: KeptTranscript = finalTranscriptShown
-      ? { text: finalTranscriptShown, note: "The final transcript is kept.", spoken: true, screen: screenAnnotation }
+      ? { text: finalTranscriptShown, note: "The final transcript is kept.", spoken: true, words: finalSpokenShown, screen: screenAnnotation }
       : keptLiveTranscript();
     publishRecordingOutput({
       recordingId,
@@ -13402,7 +13412,7 @@ async function stopLive(
       $("progressRow").hidden = true;
     }
     setStatusScoped(sessionUiToken, "Error");
-    const fallbackSave = await saveSessionMetadata({ spokenTranscript: "", transcriptText: kept.text, provider });
+    const fallbackSave = await saveSessionMetadata({ spokenTranscript: kept.words, transcriptText: kept.text, provider });
     patchCurrentRecordingSummary({
       title: provisionalTitle,
       ...withKeptNote(resolveFailedStopSummary({

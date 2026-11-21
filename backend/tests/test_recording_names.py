@@ -1620,3 +1620,99 @@ class RecordingStartNameTests(_IsolatedMainCase):
                 screen_session_id="screen-20261121-034611-000", recorded_at_ms=RECORDED_AT_MS,
             ))
         self.assertEqual(seen["audio_started_at"], RECORDED_AT_MS)
+
+
+# A screen take's transcript as the composer writes it
+# (frontend/src/screen-annotations.ts): header, a section per screenshot
+# with its frames line, marks among the words, the run after the last shot.
+_SCREEN_TRANSCRIPT = (
+    "Диктовка с рисованием по экрану · 1 скрин · папка: /Users/someone/Library/Application Support/"
+    "Transcriptor/recordings/Screen Sessions/20261121-034611.screens\n"
+    "Как читать: «### Скрин K» — снимок и сказанное с прошлого снимка до него; [✏️N …] — штрих N "
+    "(на картинке тот же номер в кружке), стоит там, где начато рисование, [/N] — где отпущено; "
+    "цвет только различает штрихи; рамки — в % снятой области. Файлы: shot-NN.png — скрин.\n"
+    "\n"
+    "### Скрин 1 · 00:01–00:09 · shot-01-preview.jpg\n"
+    "Штрихи: 1 — 67–86% × 65–100%\n"
+    "сейчас обведу [✏️1 жёлтый, вверху справа] вот эту кнопку [/1]\n"
+    "\n"
+    "### После последнего скрина\n"
+    "она съехала и тут [🖱 клик, в центре] ничего не происходит"
+)
+_SCREEN_SPOKEN = "сейчас обведу вот эту кнопку она съехала и тут ничего не происходит"
+
+
+class SpokenWordsTests(_IsolatedMainCase):
+    """History counts only what was SAID (``_recording_spoken_text``)."""
+
+    def _save(self, collection: str, **fields):
+        return self.main.save_recording({
+            "recorded_at_ms": RECORDED_AT_MS,
+            "title": "Take",
+            "source_text": "",
+            "provider": "deepgram",
+            "model": "nova-3",
+            "language": "ru",
+            "recording_collection": collection,
+            **fields,
+        })
+
+    def _stats(self):
+        root = (Path(self._tmp.name) / "recordings").resolve()
+        return self.main._build_recordings_stats_payload(root)
+
+    def _expected_words(self, text: str) -> list[str]:
+        return self.main._tokenize_words(text)
+
+    def test_screen_take_counts_its_spoken_section_not_header_headings_or_marks(self):
+        saved = self._save("screen", transcript_text=_SCREEN_TRANSCRIPT, spoken_text=_SCREEN_SPOKEN)
+
+        content = (Path(saved["archive_dir"]) / saved["name"]).read_text(encoding="utf-8")
+        self.assertEqual(self.main._recording_section(content, "Spoken"), _SCREEN_SPOKEN)
+        # The transcript History shows is the composed one, untouched.
+        self.assertEqual(self.main._extract_transcript_text(content), _SCREEN_TRANSCRIPT)
+
+        stats = self._stats()
+        self.assertEqual(stats["total_words"], len(self._expected_words(_SCREEN_SPOKEN)))
+        self.assertEqual(stats["total_chars"], len(_SCREEN_SPOKEN))
+        top = {item["word"] for item in stats["top_words"]}
+        for service_word in ("скрин", "штрих", "клик", "users", "library", "shot", "png", "jpg"):
+            self.assertNotIn(service_word, top)
+
+    def test_spoken_section_is_the_count_whatever_the_transcript_holds(self):
+        # The count is the section, not a reading of the transcript's shape:
+        # a transcript of any form adds nothing to it.
+        self._save("screen", transcript_text="один два три четыре пять шесть семь", spoken_text="восемь девять")
+        self.assertEqual(self._stats()["total_words"], 2)
+
+    def test_nothing_said_counts_nothing(self):
+        self._save("live", transcript_text="[ Silence ]", spoken_text="")
+        self.assertEqual(self._stats()["total_words"], 0)
+
+    def test_spoken_equal_to_transcript_writes_no_extra_section(self):
+        saved = self._save("live", transcript_text="обычная запись голосом", spoken_text="обычная запись голосом")
+        content = (Path(saved["archive_dir"]) / saved["name"]).read_text(encoding="utf-8")
+        self.assertIsNone(self.main._recording_section(content, "Spoken"))
+        self.assertEqual(self._stats()["total_words"], 3)
+
+    def test_voice_take_without_spoken_counts_its_transcript_as_before(self):
+        self._save("live", transcript_text="обычная запись голосом")
+        self.assertEqual(self._stats()["total_words"], 3)
+
+    def test_screen_take_saved_before_the_spoken_section_is_recounted(self):
+        # Two past composer forms: 1.6.12+ (header, sections, frames) and the
+        # one before it (header, marks with full paths, a summary block).
+        older = (
+            "Диктовка с рисованием по экрану · 1 скрин · папка: /Users/someone/x.screens\n"
+            "Как читать: [✏️N …] — штрих N по порядку рисования на скрине.\n"
+            "\n"
+            "[📸 00:01 скрин 1: /Users/someone/Library/x.screens/shot-01.png] тут кнопка "
+            "[✏️ 00:02 штрих 1, вверху справа] не нажимается\n"
+            "\n"
+            "Сводка по скринам:\n"
+            "1. shot-01.png — /Users/someone/Library/x.screens/shot-01.png, штрихов: 1"
+        )
+        for transcript in (_SCREEN_TRANSCRIPT, older):
+            self._save("screen", transcript_text=transcript)
+        expected = len(self._expected_words(_SCREEN_SPOKEN)) + len(self._expected_words("тут кнопка не нажимается"))
+        self.assertEqual(self._stats()["total_words"], expected)

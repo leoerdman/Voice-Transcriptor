@@ -109,6 +109,8 @@ describe("planTakeRecovery — after a crash mid-take", () => {
     expect(w.transcriptText.match(/Диктовка с рисованием по экрану/g)).toHaveLength(1);
     expect(w.transcriptText.match(/^### Скрин /gm)).toHaveLength(1);
     expect(w.sourceText).toBe("вот тут кнопка съехала и вот здесь тоже");
+    // History counts words in the words alone, not in the header and marks.
+    expect(w.spokenText).toBe("вот тут кнопка съехала и вот здесь тоже");
     // The draft knows what the take was recorded with; the promotion does not.
     expect(w.provider).toBe("deepgram");
     expect(w.language).toBe("ru");

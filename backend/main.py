@@ -4247,6 +4247,17 @@ def _is_app_recording_text(path: Path) -> bool:
     return bool(_APP_RECORDING_HEADER_RE.match(head.decode("utf-8", errors="replace")))
 
 
+# The words said, kept apart from what the transcript adds to them. A screen
+# take's transcript carries a header, one heading per screenshot and marks
+# placed among the words (frontend/src/screen-annotations.ts); a take with
+# nothing said stores a status line ("[ Silence ]"). Whenever the save hands
+# the spoken words and they are not the transcript itself, they are written
+# as their own ``Spoken:`` section, and History's word counts read that
+# section (``_recording_spoken_text``) — the transcript's extra parts are
+# never told apart from words by their look.
+SPOKEN_SECTION_LABEL = "Spoken"
+
+
 def _render_recording_content(
     *,
     title: str,
@@ -4256,6 +4267,7 @@ def _render_recording_content(
     provider: str,
     model: str,
     language: str,
+    spoken_text: Optional[str] = None,
 ) -> str:
     lines = [
         f"Title: {title}",
@@ -4267,6 +4279,10 @@ def _render_recording_content(
     if source_file:
         lines.append(f"Source file: {source_file}")
     lines.append("")
+    # First after the header: the two older sections are read up to the
+    # end of the file (Transcription) or up to "Transcription:" (Original).
+    if spoken_text is not None and spoken_text != transcript_text:
+        lines.extend([f"{SPOKEN_SECTION_LABEL}:", spoken_text, ""])
     if source_text:
         lines.extend(["Original:", source_text, ""])
     if transcript_text:
@@ -4284,6 +4300,7 @@ def _write_recording_text_file(
     provider: str,
     model: str,
     language: str,
+    spoken_text: Optional[str] = None,
 ) -> None:
     claim = _recording_text_claim_path(out)
     try:
@@ -4297,6 +4314,7 @@ def _write_recording_text_file(
                 provider=provider,
                 model=model,
                 language=language,
+                spoken_text=spoken_text,
             ),
         )
     finally:
@@ -4322,6 +4340,67 @@ def _extract_stats_text(content: str) -> str:
         if result:
             return result
     return text
+
+
+_RECORDING_SECTION_LABEL_RE = re.compile(
+    rf"^({SPOKEN_SECTION_LABEL}|Original|Transcription):[ \t]*\r?$", flags=re.MULTILINE
+)
+
+
+def _recording_section(content: str, label: str) -> Optional[str]:
+    """The body of section *label* ("Spoken", "Original", "Transcription")
+    of a transcript, or None when it has none. A section is a line holding
+    only its label, after the header (which ends at the first blank line),
+    up to the next such line."""
+    text = content or ""
+    header_end = text.find("\n\n")
+    body = text[header_end:] if header_end >= 0 else ""
+    labels = list(_RECORDING_SECTION_LABEL_RE.finditer(body))
+    for i, m in enumerate(labels):
+        if m.group(1) == label:
+            end = labels[i + 1].start() if i + 1 < len(labels) else len(body)
+            return body[m.end():end].strip()
+    return None
+
+
+# Screen takes saved before the ``Spoken:`` section existed hold only the
+# composed transcript. Their words are read back by the shapes every past
+# composer used (frozen: a take saved now carries its Spoken section, so
+# nothing new is ever added here): a block opening with the header title or
+# the old summary title, a heading line, a frames line, and a bracketed mark.
+_LEGACY_SCREEN_BLOCK_TITLES = ("Диктовка с рисованием по экрану", "Сводка по скринам:")
+_LEGACY_SCREEN_LINE_PREFIXES = ("### ", "Штрихи:")
+_LEGACY_SCREEN_MARK_RE = re.compile(r"\[[^\]\n]*\]")
+
+
+def _legacy_screen_spoken_text(transcript: str) -> str:
+    kept_blocks: list[str] = []
+    for block in re.split(r"\n\s*\n", transcript or ""):
+        if block.lstrip().startswith(_LEGACY_SCREEN_BLOCK_TITLES):
+            continue
+        lines = [
+            _LEGACY_SCREEN_MARK_RE.sub(" ", line)
+            for line in block.splitlines()
+            if not line.lstrip().startswith(_LEGACY_SCREEN_LINE_PREFIXES)
+        ]
+        kept = "\n".join(re.sub(r"[ \t]+", " ", line).strip() for line in lines).strip()
+        if kept:
+            kept_blocks.append(kept)
+    return "\n\n".join(kept_blocks)
+
+
+def _recording_spoken_text(content: str, *, screen_take: bool) -> str:
+    """What was SAID in a recording — the one text History counts words in.
+
+    Its ``Spoken:`` section when it has one (possibly empty: nothing was
+    said); otherwise the transcript (``_extract_stats_text``), which for a
+    screen take saved before that section existed is read back by
+    ``_legacy_screen_spoken_text``."""
+    spoken = _recording_section(content, SPOKEN_SECTION_LABEL)
+    if spoken is not None:
+        return spoken
+    text = _extract_stats_text(content)
+    return _legacy_screen_spoken_text(text) if screen_take else text
 
 
 def _extract_transcript_text(content: str) -> str:
@@ -8759,7 +8838,9 @@ def _build_recordings_stats_payload(d: "Path") -> dict:
         language = _extract_meta_field(raw, "Language").lower() or "auto"
         providers[provider] += 1
         languages[language] += 1
-        text = _extract_stats_text(raw)
+        text = _recording_spoken_text(
+            raw, screen_take=_recording_collection_for_dir(p.parent) == RECORDING_COLLECTION_SCREEN
+        )
         total_chars += len(text)
         tokens = _tokenize_words(text)
         total_words += len(tokens)
@@ -8845,6 +8926,8 @@ class _SaveFields:
     provider: str
     model: str
     language: str
+    # None: the save did not say what was spoken (``SPOKEN_SECTION_LABEL``).
+    spoken_text: Optional[str] = None
 
 
 # The longest title the ``Title:`` header keeps. A title is the first
@@ -8880,6 +8963,7 @@ def _normalize_save_fields(
     provider: object,
     model: object,
     language: object,
+    spoken_text: object = None,
 ) -> _SaveFields:
     """The text fields of a recording save, normalised ONCE for both save
     routes (BM-16): the title made one header line, the rest stripped,
@@ -8893,6 +8977,7 @@ def _normalize_save_fields(
         provider=safe_provider,
         model=str(model or "").strip(),
         language=str(language or "").strip(),
+        spoken_text=None if spoken_text is None else str(spoken_text).strip(),
     )
 
 
@@ -8913,6 +8998,7 @@ def save_recording(
         provider=payload.get("provider"),
         model=payload.get("model"),
         language=payload.get("language"),
+        spoken_text=payload.get("spoken_text"),
     )
     title, source_text, transcript_text = fields.title, fields.source_text, fields.transcript_text
     provider, model, language = fields.provider, fields.model, fields.language
@@ -8943,6 +9029,7 @@ def save_recording(
             provider=provider,
             model=model,
             language=language,
+            spoken_text=fields.spoken_text,
         )
     except Exception:
         if claimed_new_text:
@@ -8973,6 +9060,7 @@ async def _save_recording_audio_source(
     live_session_id: str = "",
     screen_session_id: str = "",
     recorded_at_ms: float = 0.0,
+    spoken_text: Optional[str] = None,
 ) -> dict[str, Any]:
     """File a recording with its audio (save-with-audio, save-from-path).
 
@@ -8990,6 +9078,7 @@ async def _save_recording_audio_source(
         provider=provider,
         model=model,
         language=language,
+        spoken_text=spoken_text,
     )
     safe_title, safe_source_text, safe_transcript_text = fields.title, fields.source_text, fields.transcript_text
     safe_provider, safe_model, safe_language = fields.provider, fields.model, fields.language
@@ -9069,6 +9158,7 @@ async def _save_recording_audio_source(
             provider=safe_provider,
             model=safe_model,
             language=safe_language,
+            spoken_text=fields.spoken_text,
         )
 
     try:
@@ -9178,6 +9268,7 @@ async def save_recording_with_audio(
     live_session_id: str = Form(""),
     screen_session_id: str = Form(""),
     recorded_at_ms: str = Form(""),
+    spoken_text: Optional[str] = Form(None),
 ):
     orig_name = _normalize_filename(file.filename or "recording.wav")
     return await _save_recording_audio_source(
@@ -9196,6 +9287,7 @@ async def save_recording_with_audio(
         live_session_id=_form_text(live_session_id, ""),
         screen_session_id=_form_text(screen_session_id, ""),
         recorded_at_ms=_form_float(recorded_at_ms),
+        spoken_text=_form_default_value(spoken_text, None),
     )
 
 
@@ -9237,6 +9329,7 @@ async def save_recording_from_path(
         language=str((payload or {}).get("language") or ""),
         live_session_id="",
         recorded_at_ms=_form_float((payload or {}).get("recorded_at_ms")),
+        spoken_text=(payload or {}).get("spoken_text"),
     )
     if consume_source_path and _is_backend_owned_upload_path(source_path):
         _best_effort_unlink(source_path, context="recording consumed upload source cleanup")

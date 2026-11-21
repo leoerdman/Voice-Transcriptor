@@ -151,12 +151,16 @@ export interface SessionSaveRequest {
   title: string;
   sourceText: string;
   transcriptText: string;
+  /** The words said, without screen marks or a status line: what History
+   *  counts words in (backend ``SPOKEN_SECTION_LABEL``). */
+  spokenText: string;
   provider: string;
 }
 
 export interface SessionMetadataInput {
-  /** The final transcript as SPOKEN — without screen marks. Empty when
-   *  the stop has no transcript. */
+  /** What was SAID — without screen marks: the final transcript, else the
+   *  live words the take kept (``KeptTranscript.words``). Empty when
+   *  nothing was said. */
   spokenTranscript: string;
   /** What History stores as the transcript: screen marks included; a
    *  status line ("[ Silence ]") on an empty session; "" otherwise. */
@@ -199,6 +203,7 @@ export function createSessionMetadataSaver(
       title: resolveSessionTitle(input.spokenTranscript, sourceText, deps.fallbackTitle),
       sourceText,
       transcriptText: input.transcriptText,
+      spokenText: input.spokenTranscript,
       provider: input.provider,
     });
   }, deps.classify);
@@ -228,6 +233,8 @@ export interface KeptTranscript {
   note: string;
   /** ``text`` holds words that were said, not only screen marks. */
   spoken: boolean;
+  /** The live words alone, without the marks; "" with none. */
+  words: string;
   /** The take's screen annotation (empty for a voice take): what a
    *  marks-only text is recomposed from when a reason joins it. */
   screen: ScreenAnnotation;
@@ -237,6 +244,7 @@ export const NOTHING_KEPT: KeptTranscript = Object.freeze({
   text: "",
   note: "",
   spoken: false,
+  words: "",
   screen: EMPTY_SCREEN_ANNOTATION,
 });
 
@@ -266,7 +274,7 @@ export function keepLiveTranscript(
     : live
       ? "The live text is kept as the transcript."
       : "The screen marks are kept as the transcript.";
-  return { text, note, spoken: !!live, screen };
+  return { text, note, spoken: !!live, words: live, screen };
 }
 
 /** A summary that says what the take kept, when it kept anything. */
@@ -320,8 +328,8 @@ export interface StopEpilogueEffects {
   hideProgress(): void;
   setStatus(label: string): void;
   /** The metadata save, already classified (``attemptFinalSave``), of the
-   *  transcript the epilogue resolved. */
-  save(transcriptText: string): Promise<FinalSaveOutcome>;
+   *  transcript the epilogue resolved and the words said in it. */
+  save(transcriptText: string, spokenTranscript: string): Promise<FinalSaveOutcome>;
   /** Ends the session: live draft, mic-health session, busy flag, stop
    *  transition. Runs exactly once, whatever the save did. */
   release(): void;
@@ -367,7 +375,7 @@ export async function runStopEpilogue(
   fx.setStatus(plan.statusLabel);
   let outcome: FinalSaveOutcome = { kind: "not-attempted" };
   try {
-    if (plan.save) outcome = await fx.save(keptTranscriptText(kept, plan.transcriptText || ""));
+    if (plan.save) outcome = await fx.save(keptTranscriptText(kept, plan.transcriptText || ""), kept.words);
   } finally {
     fx.release();
   }
