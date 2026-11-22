@@ -230,6 +230,35 @@ test("ClipboardLedger: the user's clipboard comes back only while the change cou
   assert.deepEqual(run.stdout.trim().split("\n").map((line) => line.replace(/^ok /, "")), LEDGER_CASES);
 });
 
+const HOTKEY_MATCHER_CASES = [
+  "a chord fires once and its key-up is swallowed",
+  "modifiers must match exactly",
+  "holding the chord never fires twice",
+  "a repeat of a press the tap never saw is swallowed but does not fire",
+  "other keys and their repeats pass untouched",
+  "a lost key-up never makes the next ordinary press stick",
+  "either Option key is Alt, as in an Electron accelerator",
+  "Fn, the numeric-pad flag and Caps Lock do not count as modifiers",
+  "a new table keeps a held key's key-up swallowed",
+  "the protocol's chord list is read whole or refused",
+  "the press instant reads the event timestamp in either unit",
+];
+
+test("HotkeyMatcher: our chords fire once and are swallowed whole, everything else passes", { skip }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hotkey-matcher-test-"));
+  const bin = path.join(dir, "hotkey-matcher-tests");
+  const build = spawnSync(
+    "xcrun",
+    ["swiftc", "-o", bin, path.join(helperDir, "HotkeyMatcher.swift"), path.join(__dirname, "native", "tests", "hotkey-matcher", "main.swift")],
+    { encoding: "utf8" },
+  );
+  assert.equal(build.status, 0, build.stderr);
+  const run = spawnSync(bin, [], { encoding: "utf8" });
+  fs.rmSync(dir, { recursive: true, force: true });
+  assert.equal(run.status, 0, run.stderr);
+  assert.deepEqual(run.stdout.trim().split("\n").map((line) => line.replace(/^ok /, "")), HOTKEY_MATCHER_CASES);
+});
+
 test("the dictation helper compiles from the sources build-native.sh names", { skip }, () => {
   const buildNative = fs.readFileSync(path.join(__dirname, "scripts", "build-native.sh"), "utf8");
   const block = buildNative.slice(buildNative.lastIndexOf("xcrun swiftc"), buildNative.indexOf('-o "$OUT_DIR/dictation-helper"'));
