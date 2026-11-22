@@ -9193,9 +9193,10 @@ async function saveRecordingText(opts: {
     response = await apiPost<unknown>(`/api/recordings/${plan.route}`, plan.fields);
   }
   // Audio-retention observability (BUG-02): the backend deletes older
-  // recordings' audio on every save (policy: newest keeps audio,
-  // transcripts are forever). The count comes back in every save
-  // response; surface it so the deletion is never silent.
+  // recordings' audio per its retention policy (transcripts are
+  // forever), in a pass that runs just after a save has answered. What
+  // the passes removed comes back in the next save response; surface it
+  // so the deletion is never silent.
   const saved = parseRecordingSaveResponse(response, { name: existingName, archiveDir });
   const savedName = saved.name;
   const savedArchiveDir = saved.archiveDir;

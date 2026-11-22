@@ -1827,10 +1827,11 @@ def _promote_live_recovery(
                 audio_started_at=audio_started_at,
                 audio_ended_at=audio_ended_at,
             )
-            # Same retention policy as ``save_recording_with_audio``. The
-            # freshly promoted stem is exempt so a clock skew can never
-            # collect the audio we just recovered.
-            _prune_recording_audio(target_dir, keep_stems=(stem,))
+            # Same retention policy and schedule as
+            # ``save_recording_with_audio``. The freshly promoted stem is
+            # exempt so a clock skew can never collect the audio we just
+            # recovered.
+            _audio_retention_after_save.request(target_dir, keep_stems=(stem,))
             _invalidate_recordings_cache()
             result = {
                 "name": text_out.name,
@@ -3612,6 +3613,12 @@ AUDIO_RETENTION_SWEEP_INTERVAL_SEC = max(
 )
 _audio_retention_sweeper_lock = threading.Lock()
 _audio_retention_sweeper_thread: Optional[threading.Thread] = None
+# Held while one folder is ranked and pruned (``_prune_recording_audio``).
+_audio_retention_run_lock = threading.Lock()
+# How long the per-save retention pass waits after the last save before it
+# runs: a burst of saves (a re-save, a screen take and its recovery) is
+# pruned once, and never while the save that asked for it is answering.
+AUDIO_RETENTION_AFTER_SAVE_DELAY_SEC = 2.0
 
 
 def _audio_retention_policy_for_dir(directory: Path) -> AudioRetentionPolicy:
@@ -3732,18 +3739,32 @@ def _dir_identity(path: Path) -> object:
         return str(path)
 
 
+def _scan_dir_entries(directory: Path) -> list[os.DirEntry]:
+    """One listing of *directory* as ``os.DirEntry`` objects.
+
+    ``DirEntry.is_file()`` / ``is_dir()`` answer from the type the
+    listing already returned, so asking them costs no ``stat`` (only a
+    symlink is followed with one). ``Path.is_file()`` stats every entry:
+    on the Live Capsule folder (8 300 transcripts, 2026-11-22) that was
+    ~1.8 s with a cold metadata cache, paid on every save's retention
+    pass. Raises ``OSError`` when the directory cannot be listed.
+    """
+    with os.scandir(directory) as it:
+        return list(it)
+
+
 def _iter_recording_files_by_suffix(directory: Path, suffixes: set[str]) -> list[Path]:
     files: list[Path] = []
     try:
-        entries = list(directory.iterdir())
+        entries = _scan_dir_entries(directory)
     except OSError:
         return files
     for entry in entries:
-        if entry.suffix.lower() not in suffixes:
+        if os.path.splitext(entry.name)[1].lower() not in suffixes:
             continue
         try:
             if entry.is_file():
-                files.append(entry)
+                files.append(Path(entry.path))
         except OSError:
             continue
     return files
@@ -3900,18 +3921,42 @@ def _prune_recording_audio(
     effective = policy if policy is not None else _audio_retention_policy_for_dir(target_dir)
     if not effective.enabled:
         return 0
+    # One run at a time: the deferred per-save pass and the boot / periodic
+    # sweeps may otherwise rank and unlink the same folder concurrently.
+    with _audio_retention_run_lock:
+        return _prune_recording_audio_locked(target_dir, keep_stems=keep_stems, now=now, policy=effective)
+
+
+def _prune_recording_audio_locked(
+    target_dir: Path,
+    *,
+    keep_stems: Iterable[str],
+    now: Optional[float],
+    policy: AudioRetentionPolicy,
+) -> int:
+    effective = policy
+    # ONE listing, typed by ``os.scandir``: the transcript index, the
+    # audio files and the screenshot folders all come from it, and none
+    # of the thousands of transcripts is stat-ed (``_scan_dir_entries``).
+    # Only the media — a policy's worth of files — is stat-ed, for its
+    # mtime. The previous form listed the folder twice and stat-ed every
+    # entry twice, and before that re-listed it per entry — O(N²) — which
+    # the user experiences as the app stalling right after Stop.
     try:
-        entries = list(target_dir.iterdir())
+        entries = _scan_dir_entries(target_dir)
     except OSError as e:
         logger.warning("audio retention scan failed for %s: %s", target_dir, e)
         return 0
-    # Build the transcript-stem index ONCE. The previous form called
-    # ``_recording_text_sibling_exists`` inside the loop, and that helper
-    # re-listed the whole directory on every iteration — O(N²) syscalls.
-    # On an archive with a few thousand entries this turned every save
-    # (and every startup retention sweep) into seconds of blocking I/O,
-    # which the user experiences as the app stalling right after Stop.
-    text_by_stem = {p.stem: p for p in _iter_recording_text_files(target_dir)}
+    text_by_stem: dict[str, Path] = {}
+    for entry in entries:
+        stem, ext = os.path.splitext(entry.name)
+        if ext.lower() != ".txt":
+            continue
+        try:
+            if entry.is_file():
+                text_by_stem[stem] = Path(entry.path)
+        except OSError:
+            continue
     # Ownership is checked only for stems that have media beside them (a
     # header read per media file, not per transcript), once per stem.
     owned_cache: dict[str, bool] = {}
@@ -3934,20 +3979,25 @@ def _prune_recording_audio(
     orphan_screens: list[Path] = []
     for entry in entries:
         try:
-            if screen_sessions.is_screens_dir(entry):
-                stem = screen_sessions.screens_stem(entry)
-                if _owned(stem):
-                    screens_by_stem[stem] = entry
-                elif stem not in text_by_stem:
-                    orphan_screens.append(entry)
+            if entry.name.endswith(screen_sessions.SCREENS_DIR_SUFFIX):
+                path = Path(entry.path)
+                if screen_sessions.is_screens_dir(path):
+                    stem = screen_sessions.screens_stem(path)
+                    if _owned(stem):
+                        screens_by_stem[stem] = path
+                    elif stem not in text_by_stem:
+                        orphan_screens.append(path)
+                    continue
+            stem, ext = os.path.splitext(entry.name)
+            # The extension first: it rules out every transcript without
+            # asking the entry anything.
+            if ext.lower() not in _RECORDING_AUDIO_EXTS:
                 continue
             if not entry.is_file():
                 continue
-            if entry.suffix.lower() not in _RECORDING_AUDIO_EXTS:
+            if not _owned(stem):
                 continue
-            if not _owned(entry.stem):
-                continue
-            audio_by_stem.setdefault(entry.stem, []).append(entry)
+            audio_by_stem.setdefault(stem, []).append(Path(entry.path))
         except OSError as e:
             logger.debug("audio retention: skip %s: %s", _log_safe_recording_name(entry.name), e.strerror or type(e).__name__)
     candidates: list[tuple[float, str]] = []
@@ -4189,6 +4239,96 @@ def _sweep_recording_audio_retention(
     if total > 0:
         logger.info("audio retention sweep: removed %d audio file(s)", total)
     return total
+
+
+class _DeferredAudioRetention:
+    """The per-save retention pass, run after the save has answered.
+
+    A save used to prune its folder inside the request — a listing of the
+    whole collection — so the user's take waited on the archive's size:
+    ``file=2347ms`` of a 2404 ms save on 2026-11-22 for one deleted file.
+    The save now only *asks* (``request``) and returns. One background
+    thread, started on demand and gone when idle, runs the asked-for
+    folders once no save has asked for ``delay_sec`` — one pass at a time,
+    each folder once per pass, with the union of the stems its saves
+    exempted. The policy and the evaluator (``_prune_recording_audio``)
+    are unchanged; only when and where it runs moved.
+
+    What a pass removed is not lost to the user: ``take_removed_count``
+    hands it to the next save's response (``pruned_audio_count``), which
+    the app reports, and every removal is logged as before.
+    """
+
+    def __init__(self, *, delay_sec: float, prune: Callable[..., int]) -> None:
+        self._delay_sec = max(0.0, float(delay_sec))
+        self._prune = prune
+        self._cond = threading.Condition()
+        self._pending: dict[Path, set[str]] = {}
+        self._due_at = 0.0
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+        self._removed_unreported = 0
+
+    def request(self, target_dir: Path, *, keep_stems: Iterable[str] = ()) -> None:
+        with self._cond:
+            self._pending.setdefault(Path(target_dir), set()).update(s for s in keep_stems if s)
+            self._due_at = time.monotonic() + self._delay_sec
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run, name="audio-retention-after-save", daemon=True
+                )
+                self._thread.start()
+            self._cond.notify_all()
+
+    def take_removed_count(self) -> int:
+        with self._cond:
+            removed, self._removed_unreported = self._removed_unreported, 0
+            return removed
+
+    def wait_idle(self, timeout: float) -> bool:
+        """Block until nothing is pending or running (tests, shutdown)."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._cond:
+            while self._pending or self._running:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(remaining)
+            return True
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                while True:
+                    if not self._pending:
+                        # Idle: the thread ends; the next request starts one.
+                        self._thread = None
+                        self._cond.notify_all()
+                        return
+                    wait = self._due_at - time.monotonic()
+                    if wait <= 0:
+                        break
+                    self._cond.wait(wait)
+                batch, self._pending = self._pending, {}
+                self._running = True
+            removed = 0
+            try:
+                for target_dir, keep_stems in batch.items():
+                    try:
+                        removed += int(self._prune(target_dir, keep_stems=tuple(keep_stems)) or 0)
+                    except Exception:
+                        logger.exception("audio retention after save failed for %s", target_dir)
+            finally:
+                with self._cond:
+                    self._removed_unreported += removed
+                    self._running = False
+                    self._cond.notify_all()
+
+
+_audio_retention_after_save = _DeferredAudioRetention(
+    delay_sec=AUDIO_RETENTION_AFTER_SAVE_DELAY_SEC,
+    prune=lambda target_dir, keep_stems: _prune_recording_audio(target_dir, keep_stems=keep_stems),
+)
 
 
 def _any_audio_retention_enabled() -> bool:
@@ -9475,15 +9615,19 @@ async def _save_recording_audio_source(
         # Persist this dir only after transcript + audio are durable so startup
         # retroactive retention does not learn failed/empty archive targets.
         _register_archive_dir(target_dir)
-        # Audio retention, per the collection's own policy (voice notes keep
-        # the newest N, uploaded media ages out); transcripts stay forever.
-        # The stem we just wrote is exempt — a save must never be able to
-        # delete its own audio — but it still counts toward a count limit.
-        return manifest, adopt_error, _prune_recording_audio(target_dir, keep_stems=(stem,))
+        return manifest, adopt_error
 
     phase = time.perf_counter()
-    screens_manifest, screens_error, pruned = await asyncio.to_thread(_file_the_saved_recording)
+    screens_manifest, screens_error = await asyncio.to_thread(_file_the_saved_recording)
     file_ms = (time.perf_counter() - phase) * 1000.0
+    # Audio retention, per the collection's own policy (voice notes keep
+    # the newest N, uploaded media ages out); transcripts stay forever.
+    # Run after this save has answered (``_DeferredAudioRetention``). The
+    # stem just written is exempt — a save must never be able to delete
+    # its own audio — but it still counts toward a count limit.
+    _audio_retention_after_save.request(target_dir, keep_stems=(stem,))
+    # What earlier passes removed, reported now (the app tells the user).
+    pruned = _audio_retention_after_save.take_removed_count()
     _invalidate_recordings_cache()
     logger.info(
         "recording save timing: total=%.0fms recv=%.0fms prep=%.0fms write=%.0fms "
