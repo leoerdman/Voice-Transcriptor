@@ -577,6 +577,20 @@ describe("boot, update check and History bootstrap (FQ-13/FQ-14/FQ-15/FQ-22)", (
     expect(recover).toContain("if (draft && draftSaved) {");
   });
 
+  it("the start waits only for the archive folder: the draft read and the capture storage run beside the socket and the microphone (OPTIMIZATION.md §3.4)", () => {
+    const start = mainTsxSlice("async function startLive(", "\nasync function ");
+    expect(start).not.toMatch(/await createPcmSink\(/);
+    expect(start).not.toMatch(/await Promise\.race\(\[readStaleLiveDraftOnce\(\)/);
+    expect(start).toContain("pcmSink = new DeferredPcmSink(");
+    // The socket is requested before the microphone is asked for.
+    expect(start.indexOf("new WebSocket(")).toBeGreaterThan(0);
+    expect(start.indexOf("new WebSocket(")).toBeLessThan(start.indexOf('markStartPhase("getUserMedia")'));
+    // The phases stay visible in the start line.
+    for (const phase of ["archiveReady", "staleDraftRead", "pcmSink", "wsRequested"]) {
+      expect(start).toContain(`markStartPhase("${phase}")`);
+    }
+  });
+
   it("a crashed take's draft is joined with the entry its audio was promoted into (./take-recovery)", () => {
     const boot = mainTsxSlice("async function initRecordingsBootstrap(): Promise<void> {", "\n}\n");
     const promote = boot.indexOf("promoted = await recoverBackendAudioSessions();");

@@ -166,6 +166,7 @@ import {
   transcriptScreenManifest,
 } from "./recording-save";
 import { skippedAudioPersistence, startAudioPersistence, type AudioPersistence } from "./audio-persistence";
+import { DeferredPcmSink } from "./deferred-pcm-sink";
 import {
   RECORDING_COLLECTIONS,
   liveRecordingCollection,
@@ -11312,10 +11313,23 @@ async function startLive(
   // not at the first frame).
   console.log(`[cue] start ${playRecordingCue("start")}`);
   const startAttemptSeq = ++liveStartAttemptSeq;
+  // What the start needs from disk and the backend is asked for at once,
+  // not one after another (OPTIMIZATION.md §3.4). The archive folder is
+  // the one answer the start waits for — the socket's query names it —
+  // and it is memoized after the first start. The previous run's draft
+  // (FG-08) gates only this session's first autosave, never the
+  // microphone; the capture storage is opened beside the socket and the
+  // microphone, and frames that arrive first are held in memory
+  // (./deferred-pcm-sink).
+  const archiveReady = ensureRecordingsArchiveReady();
+  const staleDraftRead = Promise.race([
+    readStaleLiveDraftOnce(),
+    sleepUnlessAborted(UI_TOKENS.draft.staleReadWaitMs, undefined),
+  ]).then(() => { markStartPhase("staleDraftRead"); }, () => {});
   try {
   let sessionArchiveDir = "";
   try {
-    sessionArchiveDir = await ensureRecordingsArchiveReady();
+    sessionArchiveDir = await archiveReady;
     markStartPhase("archiveReady");
   } catch (e) {
     const message = (e as Error).message || "Recordings archive is not ready yet.";
@@ -11328,10 +11342,6 @@ async function startLive(
     patchCurrentRecordingSummary({ status: message, tone: "error" });
     return;
   }
-  // FG-08: the previous run's draft is captured before this session's
-  // first autosave can replace it (memoized: free after the first start).
-  await Promise.race([readStaleLiveDraftOnce(), sleepUnlessAborted(UI_TOKENS.draft.staleReadWaitMs, undefined)]);
-  markStartPhase("staleDraftRead");
   liveStartAbortReason = "";
   const throwIfStartCancelled = (): void => {
     if (startAttemptSeq === liveStartAttemptSeq) return;
@@ -11375,11 +11385,19 @@ async function startLive(
     pcmSink = null;
     void prior.destroy();
   }
-  // Await the sink so it is ready BEFORE the first audio frame. The
-  // old fire-and-forget path dropped frames that arrived before the
-  // async OPFS init resolved (~50 ms, but up to 500 ms on slow devices).
-  pcmSink = await createPcmSink(sessionUiToken);
-  markStartPhase("pcmSink");
+  // Not awaited: the storage opens (13–190 ms measured, up to ~500 ms on
+  // slow devices) while the socket and the microphone open. Frames that
+  // arrive before it is ready are held in memory and written into it in
+  // order — the old fire-and-forget path dropped them, the old await
+  // put the whole open in front of the first frame.
+  pcmSink = new DeferredPcmSink(
+    createPcmSink(sessionUiToken),
+    () => new MemoryPcmSink(),
+    (_sink, heldFrames) => {
+      markStartPhase("pcmSink");
+      if (heldFrames > 0) console.log(`[trace startLive] capture storage ready; ${heldFrames} early frame(s) written into it`);
+    },
+  );
   workletLastFrameAt = 0;
   captureLevel = createCaptureLevel();
   captureRmsEma = 0;
@@ -11415,12 +11433,21 @@ async function startLive(
   window.__transcriptorLastFrameAt = 0;
 
   startAt = 0;
-  persistLiveDraft(true);
   if (draftSaveTimer) {
     clearInterval(draftSaveTimer);
     draftSaveTimer = null;
   }
-  draftSaveTimer = window.setInterval(() => persistLiveDraft(true), UI_TOKENS.draft.autosaveIntervalMs);
+  // FG-08: the previous run's draft is captured before this session's
+  // first autosave can replace it (memoized: free after the first start).
+  // Waited for here, off the path to the microphone; a take that ended
+  // before the read answered has nothing left to autosave.
+  const draftRecordingId = currentRecordingId;
+  void staleDraftRead.then(() => {
+    if (currentRecordingId !== draftRecordingId || !isCurrentUiSession(sessionUiToken)) return;
+    persistLiveDraft(true);
+    if (draftSaveTimer) clearInterval(draftSaveTimer);
+    draftSaveTimer = window.setInterval(() => persistLiveDraft(true), UI_TOKENS.draft.autosaveIntervalMs);
+  });
   timer = window.setInterval(() => {
     const durationSec = startAt > 0 ? (Date.now() - startAt) / 1000 : 0;
     if (isCurrentUiSession(sessionUiToken)) {
