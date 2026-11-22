@@ -15,6 +15,7 @@ import {
 import { decideLiveTranscriptAdoption } from "./live-coverage";
 import { playRecordingCue, recordingCueLengthMs } from "./recording-cues";
 import { StopTailWait, VoiceTimeline, type StopTailOutcome } from "./stop-tail";
+import { WorkletDeliveryWatchdog } from "./worklet-watchdog";
 import {
   languageHintLabel,
   parseLanguageHintDefaults,
@@ -1190,24 +1191,18 @@ const UI_TOKENS = {
   },
   capture: {
     /**
-     * Start the ScriptProcessor fallback ALONGSIDE the worklet, held
-     * back, instead of waiting to find out whether the worklet works.
+     * How long a connected AudioWorklet may deliver nothing before the
+     * ScriptProcessor fallback is armed (./worklet-watchdog says why the
+     * fallback is no longer pre-armed on every start).
      *
-     * The watchdog this replaces armed nothing for 1.3 s and only then
-     * asked whether any frame had arrived: on the one host where it
-     * fired (2026-08-31 21:12) the first 1.3 s of the recording did not
-     * exist, and for a moment both capture paths were connected and
-     * every sample was captured twice (BUGS_AUDIT_2026-09-03 §4.5). The
-     * pre-armed fallback buffers from the first buffer period and
-     * commits only if the worklet has produced nothing by then; the
-     * worklet's first frame disposes of it. Exactly one path is ever
-     * committed, and neither window exists.
-     *
-     * Off: the fallback is only constructed when the worklet cannot be,
-     * and a worklet that connects but never delivers is left to the
-     * pipeline failsafe. A kill switch, not a second behaviour.
+     * 400 ms sits just past the 99th percentile (382 ms) of the worklet's
+     * first frame after connect across 1450 cold starts — the tail is a
+     * Bluetooth input waking up, when nothing captures earlier anyway —
+     * so the deprecated node is built in about one start in a hundred and
+     * only lives until its first buffer. A worklet that is truly dead
+     * loses the audio up to here; one that is merely late loses nothing.
      */
-    preArmScriptProcessorFallback: true,
+    workletFirstFrameDeadlineMs: 400,
     /**
      * How much the capsule's waveform magnifies the input level — display
      * only: the level it scales (`__transcriptorVuLevel`) feeds nothing but
@@ -10017,7 +10012,7 @@ let pcmSink: PcmSink | null = null;
 let draftSaveTimer: number | null = null;
 let workletLastFrameAt = 0;
 /**
- * Frames the pre-armed ScriptProcessor has captured while the worklet
+ * Frames the standby ScriptProcessor has captured while the worklet
  * was still being given the chance to prove itself, and which of the
  * three states that fallback is in.
  *
@@ -10028,6 +10023,12 @@ let workletLastFrameAt = 0;
  *               delivered first.
  */
 type ScriptFallbackState = "off" | "armed" | "committed";
+// Arms the fallback only for a worklet that connected and stayed silent
+// (./worklet-watchdog). Cancelled at Stop and on every teardown.
+const workletDeliveryWatchdog = new WorkletDeliveryWatchdog({
+  setTimeout: (callback, ms) => window.setTimeout(callback, ms),
+  clearTimeout: (handle) => window.clearTimeout(handle as number),
+});
 let scriptFallbackState: ScriptFallbackState = "off";
 let scriptFallbackPending: Float32Array[] = [];
 /**
@@ -10110,6 +10111,7 @@ function resolvePendingWorkletFlushes(): void {
 }
 
 function detachWorkletCapture(reason: string): void {
+  workletDeliveryWatchdog.cancel();
   const node = workletNode;
   if (!node) {
     resolvePendingWorkletFlushes();
@@ -10139,11 +10141,11 @@ function teardownScriptProcessorCapture(): void {
 }
 
 /**
- * The worklet has delivered. Throw the pre-armed fallback away —
+ * The worklet has delivered. Throw the standby fallback away —
  * including everything it captured, which is the same audio the worklet
  * already delivered, and which double-counts if it is committed too.
  */
-function disarmPreArmedFallback(): void {
+function disarmStandbyFallback(): void {
   if (scriptFallbackState !== "armed") return;
   teardownScriptProcessorCapture();
 }
@@ -10155,7 +10157,7 @@ function disarmPreArmedFallback(): void {
  * blind window closing: the audio from the start of the recording is
  * still here.
  */
-function commitPreArmedFallback(): void {
+function commitStandbyFallback(): void {
   if (scriptFallbackState !== "armed") return;
   scriptFallbackState = "committed";
   detachWorkletCapture("AudioWorklet connected but delivered no frames");
@@ -10187,11 +10189,12 @@ function showMicFallbackNotice(): void {
 /**
  * Connect the ScriptProcessor capture path.
  *
- * ``armed`` connects it as the STANDBY path: it captures into
- * ``scriptFallbackPending`` and delivers nothing until the first of its
- * own buffers arrives, at which point exactly one of two things is
- * true — the worklet has delivered frames (dispose of this) or it has
- * not (commit this, replaying what it holds). Not armed, it is the
+ * ``armed`` connects it as the STANDBY path, for a worklet that is
+ * connected but has delivered nothing by the watchdog's deadline: it
+ * captures into ``scriptFallbackPending`` and delivers nothing until the
+ * first of its own buffers arrives, at which point exactly one of two
+ * things is true — the worklet has delivered frames (dispose of this) or
+ * it has not (commit this, replaying what it holds). Not armed, it is the
  * capture path from the first buffer, which is the case where the
  * worklet could not be constructed at all.
  */
@@ -10220,8 +10223,8 @@ function startScriptProcessorCapture(
       // Arbitration, decided by evidence rather than by a clock: a
       // working worklet posts its first batch within a few ms, long
       // before this buffer completed.
-      if (captureLevel.frames > 0) disarmPreArmedFallback();
-      else commitPreArmedFallback();
+      if (captureLevel.frames > 0) disarmStandbyFallback();
+      else commitStandbyFallback();
     };
     localSrc.connect(scriptNode);
     scriptNode.connect(scriptSinkGain);
@@ -10489,7 +10492,7 @@ function commitWarmCaptureHold(plan: WarmHoldPlan): boolean {
   if (!heldAc || !heldStream || !heldSrc || !heldNode) return false;
   // Per-session edges come off HERE, while ``src`` is still in the
   // module slot: the teardown steps that follow all read that slot, and
-  // this function is about to empty it. The analyser and the pre-armed
+  // this function is about to empty it. The analyser and the standby
   // ScriptProcessor belong to the recording that is ending — left
   // connected they would accumulate one dead node per warm session on a
   // source node that now outlives them all. The worklet edge is the one
@@ -10694,10 +10697,10 @@ function attachMicTrackWatchers(target: MediaStream): void {
 function handleWorkletMessage(ev: MessageEvent): void {
   const msg = ev.data as unknown;
   if (msg instanceof Float32Array) {
-    // The worklet works. Whatever the pre-armed fallback has captured
+    // The worklet works. Whatever the standby fallback has captured
     // is this same audio; committing both would double every sample,
     // so it goes away here and now (§4.5).
-    disarmPreArmedFallback();
+    disarmStandbyFallback();
     pushCapturedFrame(msg);
     return;
   }
@@ -10740,7 +10743,7 @@ function acceptPreRoll(samples: unknown, lastWriteTime: number): void {
     return;
   }
   sessionPreRollMs = verdict.durationMs;
-  disarmPreArmedFallback();
+  disarmStandbyFallback();
   pushCapturedFrame(samples, verdict.durationMs);
 }
 
@@ -12111,13 +12114,17 @@ async function startLive(
       if (!fallbackStarted) {
         throw new Error("Microphone capture is unavailable in this browser runtime.");
       }
-    } else if (UI_TOKENS.capture.preArmScriptProcessorFallback) {
-      // The worklet is connected but has proved nothing yet. Connect the
-      // fallback alongside it, held back: it captures from now — there
-      // is no window in which nothing is capturing — and its own first
-      // buffer decides which of the two is the capture path (§4.5).
-      startScriptProcessorCapture(sessionAc, sessionSrc, "pre-armed alongside AudioWorklet", true);
-      markStartPhase("scriptProcessorPreArmed");
+    } else {
+      // The worklet is connected but has proved nothing yet. Its first
+      // frame normally lands within tens of ms; only a worklet still
+      // silent at the deadline gets the fallback, in standby, whose own
+      // first buffer then decides which of the two is the capture path.
+      const deadlineMs = UI_TOKENS.capture.workletFirstFrameDeadlineMs;
+      workletDeliveryWatchdog.arm(deadlineMs, () => captureLevel.frames > 0, () => {
+        if (startAttemptSeq !== liveStartAttemptSeq || ac !== sessionAc || src !== sessionSrc || !workletNode) return;
+        console.warn(`AudioWorklet delivered no frames within ${deadlineMs} ms; arming the ScriptProcessor fallback`);
+        startScriptProcessorCapture(sessionAc, sessionSrc, "AudioWorklet delivered no frames", true);
+      });
     }
 
   } catch (e) {
@@ -12207,6 +12214,7 @@ async function stopLive(
     return;
   }
   liveStartAttemptSeq += 1;
+  workletDeliveryWatchdog.cancel();
   const stopTransitionToken = createClientSessionId();
   stopTransitionInFlight = true;
   // At the press: the stop tone answers the user's action. It overlaps
