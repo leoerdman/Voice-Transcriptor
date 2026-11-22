@@ -142,30 +142,90 @@ describe("VoiceTimeline", () => {
 describe("StopTailWait", () => {
   it("ends at the minimum (plus grace) when the capture stops delivering", () => {
     const timeline = take(() => true, STOP);
-    const wait = new StopTailWait(timeline, STOP, TONE_MS, 5_000, CONFIG);
+    const wait = new StopTailWait(timeline, STOP, 0, TONE_MS, 5_000, CONFIG);
     expect(wait.poll(5_000)).toBeNull();
     expect(wait.poll(5_219)).toBeNull();
-    expect(wait.poll(5_220)).toEqual({ tailMs: 120, reason: "timeout" });
+    expect(wait.poll(5_220)).toEqual({ tailMs: 120, latencyMs: 0, reason: "timeout" });
   });
 
   it("a growing tail waits up to the maximum (plus grace)", () => {
     const timeline = take(() => true, STOP + 300);
-    const wait = new StopTailWait(timeline, STOP, TONE_MS, 0, CONFIG);
+    const wait = new StopTailWait(timeline, STOP, 0, TONE_MS, 0, CONFIG);
     expect(wait.poll(300)).toBeNull();
     expect(wait.poll(699)).toBeNull();
-    expect(wait.poll(700)).toEqual({ tailMs: 600, reason: "timeout" });
+    expect(wait.poll(700)).toEqual({ tailMs: 600, latencyMs: 0, reason: "timeout" });
   });
 
   it("answers as soon as the audio decides, whatever the clock", () => {
     const timeline = take((at) => at < STOP - 300, STOP + 120);
-    const wait = new StopTailWait(timeline, STOP, TONE_MS, 0, CONFIG);
-    expect(wait.poll(0)).toEqual({ tailMs: 120, reason: "quiet-at-min" });
+    const wait = new StopTailWait(timeline, STOP, 0, TONE_MS, 0, CONFIG);
+    expect(wait.poll(0)).toEqual({ tailMs: 120, latencyMs: 0, reason: "quiet-at-min" });
   });
 
   it("names the deadlines at which it is certain to answer", () => {
-    const wait = new StopTailWait(new VoiceTimeline(), 0, TONE_MS, 1_000, CONFIG);
+    const wait = new StopTailWait(new VoiceTimeline(), 0, 0, TONE_MS, 1_000, CONFIG);
     expect(wait.deadlines()).toEqual([1_220, 1_700]);
     expect(wait.poll(1_700)).not.toBeNull();
+  });
+});
+
+describe("StopTailWait on an input with latency", () => {
+  /** Liberty 5 BT: the 300 ms Bluetooth floor plus one ~11 ms worklet batch. */
+  const LATENCY = 311;
+
+  it("counts the tail from the press as placed in the audio", () => {
+    // Quiet throughout: the minimum is kept past the press's place in the
+    // audio, which is LATENCY past what had been delivered.
+    const timeline = take(() => false, STOP + LATENCY + 110);
+    const wait = new StopTailWait(timeline, STOP, LATENCY, TONE_MS, 0, CONFIG);
+    expect(wait.poll(0)).toBeNull();
+    take(() => false, STOP + LATENCY + 120, timeline);
+    expect(wait.poll(0)).toEqual({ tailMs: 120, latencyMs: LATENCY, reason: "quiet-at-min" });
+  });
+
+  it("waits out the latency on the wall clock before giving up on the audio", () => {
+    const timeline = take(() => false, STOP);
+    const wait = new StopTailWait(timeline, STOP, LATENCY, TONE_MS, 5_000, CONFIG);
+    expect(wait.deadlines()).toEqual([5_000 + LATENCY + 220, 5_000 + LATENCY + 700]);
+    expect(wait.poll(5_000 + LATENCY + 219)).toBeNull();
+    expect(wait.poll(5_000 + LATENCY + 220)).toEqual({ tailMs: 120, latencyMs: LATENCY, reason: "timeout" });
+  });
+
+  it("ignores a latency that is not a positive number", () => {
+    const timeline = take(() => false, STOP + 120);
+    for (const latency of [Number.NaN, -50, 0]) {
+      const wait = new StopTailWait(timeline, STOP, latency, TONE_MS, 0, CONFIG);
+      expect(wait.poll(0)).toEqual({ tailMs: 120, latencyMs: 0, reason: "quiet-at-min" });
+    }
+  });
+});
+
+describe("the last word on a Bluetooth headset (2026-11-22 20:00:19, take 030022)", () => {
+  // The take ended on a word just starting: its last 100 ms rise from the
+  // headset's floor (RMS 0.004) to 0.022. Spoken right before the press,
+  // that word was still crossing the HFP link when the press landed. In
+  // delivered audio: the previous word ends 100 ms before the press, a
+  // 150 ms pause, then the last word from +50 ms to +300 ms.
+  const lastWord = (at: number): boolean => at < STOP - 100 || (at >= STOP + 50 && at < STOP + 300);
+
+  it("was cut at the delivered position: 70 ms of the word is not a speech run", () => {
+    const timeline = take(lastWord, STOP + 120);
+    const wait = new StopTailWait(timeline, STOP, 0, TONE_MS, 0, CONFIG);
+    // The capture froze 120 ms past the delivered position, inside the word.
+    expect(wait.poll(0)).toEqual({ tailMs: 120, latencyMs: 0, reason: "quiet-at-min" });
+  });
+
+  it("is kept whole once the press is placed by the headset's latency", () => {
+    const latency = 311;
+    const timeline = take(lastWord, STOP + 120);
+    const wait = new StopTailWait(timeline, STOP, latency, TONE_MS, 0, CONFIG);
+    // Not decided at the old point: the press's audio has not arrived.
+    expect(wait.poll(0)).toBeNull();
+    take(lastWord, STOP + latency + 120, timeline);
+    const outcome = wait.poll(0);
+    expect(outcome).not.toBeNull();
+    // Audio kept past the delivered position covers the whole word.
+    expect(outcome!.latencyMs + outcome!.tailMs).toBeGreaterThanOrEqual(300);
   });
 });
 

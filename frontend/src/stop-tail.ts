@@ -27,6 +27,12 @@
  * busy) is judged by what it contains, not by when it arrived. The wall
  * clock only bounds the wait, for a capture that stops delivering.
  *
+ * The press itself is placed in that audio one input latency past what
+ * had been delivered when it landed (./capture-latency): the audio of
+ * the moment of the press is still on its way. On a Bluetooth headset
+ * that is 300 ms or more, and a tail counted from the delivered position
+ * closed before the last word arrived.
+ *
  * The speech verdict per frame is `observeCaptureFrame`'s
  * (./audio-levels), the one place the renderer decides "speech or not".
  *
@@ -187,40 +193,53 @@ export function decideStopTail(
 
 /** What a finished wait settled on, for the stop's log line. */
 export interface StopTailOutcome {
+  /** Audio kept past the press (its position in the audio). */
   tailMs: number;
+  /** Input latency the press was placed by; the audio kept past what had
+   *  been delivered at the press is `latencyMs + tailMs`. */
+  latencyMs: number;
   reason: StopTailReason | "timeout";
 }
 
 /**
  * One stop waiting for its tail. `poll` is called on every delivered
  * frame and on the wall-clock deadlines; it answers once the tail is
- * decided, or once the wait for its audio is over (the bound plus
- * `graceMs`) — a capture that stopped delivering ends the wait with what
- * it has.
+ * decided, or once the wait for its audio is over (the input latency,
+ * the bound and `graceMs`) — a capture that stopped delivering ends the
+ * wait with what it has.
  */
 export class StopTailWait {
+  private readonly latencyMs: number;
+  private readonly stopAtMs: number;
+
+  /**
+   * @param heardAtPressMs audio delivered when the press landed
+   * @param inputLatencyMs how far that audio lags the press (./capture-latency)
+   */
   constructor(
     private readonly timeline: VoiceTimeline,
-    private readonly stopAtMs: number,
+    heardAtPressMs: number,
+    inputLatencyMs: number,
     private readonly toneMs: number,
     private readonly startedAt: number,
     private readonly config: StopTailConfig,
-  ) {}
+  ) {
+    this.latencyMs = Number.isFinite(inputLatencyMs) && inputLatencyMs > 0 ? inputLatencyMs : 0;
+    this.stopAtMs = heardAtPressMs + this.latencyMs;
+  }
 
   poll(now: number): StopTailOutcome | null {
     const state = decideStopTail(this.timeline, this.stopAtMs, this.toneMs, this.config);
-    if (state.kind === "through") return { tailMs: state.tailMs, reason: state.reason };
-    if (now >= this.startedAt + state.boundMs + this.config.graceMs) {
-      return { tailMs: state.boundMs, reason: "timeout" };
+    if (state.kind === "through") return { tailMs: state.tailMs, latencyMs: this.latencyMs, reason: state.reason };
+    if (now >= this.startedAt + this.latencyMs + state.boundMs + this.config.graceMs) {
+      return { tailMs: state.boundMs, latencyMs: this.latencyMs, reason: "timeout" };
     }
     return null;
   }
 
   /** The wall-clock instants at which `poll` is certain to answer. */
   deadlines(): number[] {
-    return [
-      this.startedAt + this.config.minMs + this.config.graceMs,
-      this.startedAt + this.config.maxMs + this.config.graceMs,
-    ];
+    const from = this.startedAt + this.latencyMs + this.config.graceMs;
+    return [from + this.config.minMs, from + this.config.maxMs];
   }
 }

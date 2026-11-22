@@ -16,6 +16,7 @@ import {
 import { decideLiveTranscriptAdoption } from "./live-coverage";
 import { playRecordingCue, recordingCueLengthMs } from "./recording-cues";
 import { StopTailWait, VoiceTimeline, type StopTailOutcome } from "./stop-tail";
+import { captureInputLatency, type CaptureLatency } from "./capture-latency";
 import { WorkletDeliveryWatchdog } from "./worklet-watchdog";
 import {
   languageHintLabel,
@@ -1294,6 +1295,10 @@ const UI_TOKENS = {
      * The fixed 200 ms this replaces was too long for every stop pressed
      * after the user went quiet and too short for a long last word.
      *
+     * Every bound counts from the press as placed in the audio — what had
+     * been delivered at the press plus the input latency (``inputLatency``
+     * below) — not from the delivered position itself.
+     *
      *  - minMs 120: always kept. Speech still running at this point is
      *    what extends the tail, so it has to reach past the press by more
      *    than a syllable gap (speechGapMs) plus one worklet batch (~11 ms)
@@ -1318,6 +1323,23 @@ const UI_TOKENS = {
       speechGapMs: 40,
       toneMarginMs: 60,
       graceMs: 100,
+    },
+    /**
+     * Input latency of the capture path (./capture-latency): the press
+     * is placed in the audio this far past what had been delivered when
+     * it landed, and every bound of ``stopTail`` counts from there.
+     *
+     *  - bluetoothFloorMs 300: the least a Bluetooth (HFP) microphone is
+     *    taken to lag. Neither Core Audio nor ``MediaTrackSettings``
+     *    includes the radio link or the headset's call DSP — Core Audio
+     *    reports 30 ms for the Liberty 5 BT — while HFP input runs
+     *    150–300 ms. With the tail counted from the delivered audio, the
+     *    2026-11-22 takes on that headset closed 120 ms past a position
+     *    the last word had not reached yet. Wired and built-in inputs use
+     *    what the track reports.
+     */
+    inputLatency: {
+      bluetoothFloorMs: 300,
     },
     /**
      * Below this length, "the session was silent" is not a conclusion
@@ -10382,6 +10404,26 @@ function micTrackLabel(s: MediaStream | null): string {
   }
 }
 
+/**
+ * The live capture's input latency (./capture-latency), from the track's
+ * own report, its label and the delivering node's buffer period.
+ */
+function currentCaptureInputLatency(): CaptureLatency {
+  let reportedLatencySec: unknown;
+  try {
+    reportedLatencySec = (stream?.getAudioTracks()[0]?.getSettings() as { latency?: unknown } | undefined)?.latency;
+  } catch {
+    // An unreadable report is no report; the label still decides.
+    reportedLatencySec = undefined;
+  }
+  return captureInputLatency({
+    reportedLatencySec,
+    deviceLabel: micTrackLabel(stream),
+    bufferPeriodMs: captureBufferPeriodMs,
+    bluetoothFloorMs: UI_TOKENS.capture.inputLatency.bluetoothFloorMs,
+  });
+}
+
 function micTrackDeviceId(s: MediaStream | null): string {
   if (!s) return "";
   try {
@@ -12199,8 +12241,20 @@ async function startLive(
  * every delivered frame (``pushCapturedFrame``) and at the wall-clock
  * deadlines that end the wait for a capture that stopped delivering.
  */
-function waitForStopTail(stopAtAudioMs: number, toneMs: number, startedAt: number): Promise<StopTailOutcome> {
-  const wait = new StopTailWait(voiceTimeline, stopAtAudioMs, toneMs, startedAt, UI_TOKENS.capture.stopTail);
+function waitForStopTail(
+  heardAtPressMs: number,
+  inputLatencyMs: number,
+  toneMs: number,
+  startedAt: number,
+): Promise<StopTailOutcome> {
+  const wait = new StopTailWait(
+    voiceTimeline,
+    heardAtPressMs,
+    inputLatencyMs,
+    toneMs,
+    startedAt,
+    UI_TOKENS.capture.stopTail,
+  );
   return new Promise((resolve) => {
     const timers: number[] = [];
     let check: () => void = () => {};
@@ -12270,7 +12324,11 @@ async function stopLive(
   // the tail does not take what the microphone hears of it for speech.
   const stopCue = playRecordingCue("stop");
   console.log(`[cue] stop ${stopCue}`);
-  const stopAtAudioMs = voiceTimeline.heardMs;
+  // What had been delivered at the press, and how far it lags the press
+  // (./capture-latency): read now, while the track is live and before
+  // anything awaits.
+  const heardAtPressMs = voiceTimeline.heardMs;
+  const pressLatency = currentCaptureInputLatency();
   const stopToneMs = stopCue === "played" || stopCue === "resuming" ? recordingCueLengthMs("stop") : 0;
   stopTransitionOwnerToken = stopTransitionToken;
   // ``_wsToCloseAtEnd`` is hoisted to function scope so the outer
@@ -12361,7 +12419,7 @@ async function stopLive(
   // there is nothing to preserve.
   if (!discarding && stream) {
     const holdStarted = performance.now();
-    tailOutcome = await waitForStopTail(stopAtAudioMs, stopToneMs, holdStarted);
+    tailOutcome = await waitForStopTail(heardAtPressMs, pressLatency.ms, stopToneMs, holdStarted);
     tailHoldMs = performance.now() - holdStarted;
   }
   const recordedMs = startAt > 0 ? Math.max(0, Date.now() - startAt) : 0;
@@ -13823,7 +13881,11 @@ async function stopLive(
     console.log(
       `[trace stopLive] total=${totalMs.toFixed(0)}ms | ` +
       `tailHold: ${tailHoldMs.toFixed(0)}ms` +
-      (tailOutcome ? ` (tail=${tailOutcome.tailMs.toFixed(0)}ms ${tailOutcome.reason})` : "") +
+      (tailOutcome
+        ? ` (tail=${(tailOutcome.latencyMs + tailOutcome.tailMs).toFixed(0)}ms = latency ` +
+          `${tailOutcome.latencyMs.toFixed(0)}ms ${pressLatency.source} reported=${pressLatency.reportedMs.toFixed(0)}ms + ` +
+          `${tailOutcome.tailMs.toFixed(0)}ms ${tailOutcome.reason})`
+        : "") +
       ` → ${labels}`,
     );
     (window as unknown as { __transcriptorStopTimings?: unknown }).__transcriptorStopTimings = {
