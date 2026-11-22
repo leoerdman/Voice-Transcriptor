@@ -18,10 +18,12 @@ from pathlib import Path
 from typing import Optional
 
 from backend.auto_keyterms import (
+    BUILTIN_TERMS,
     AutoKeytermStore,
     CorpusEntry,
     extract_candidates,
 )
+from backend.english_frequent_words import is_frequent_english
 
 
 def _terms(texts, **kwargs) -> list[str]:
@@ -139,6 +141,66 @@ class CandidateTests(unittest.TestCase):
             ["Транскриптор"],
         )
 
+    def test_everyday_english_inside_russian_speech_is_not_offered_but_jargon_is(self):
+        texts = [
+            f"открой main и поправь code в source, потом model и pop-up, а worktree удали {i}"
+            for i in range(4)
+        ]
+        self.assertEqual(_terms(texts), ["worktree"])
+
+    def test_a_capitalised_everyday_word_alone_is_not_a_name_inside_a_two_word_name_it_is(self):
+        texts = [f"сделай Liquid Glass на кнопке, и Glass ещё раз, и Motion тоже {i}" for i in range(3)]
+        terms = _terms(texts)
+        self.assertIn("Liquid Glass", terms)
+        self.assertNotIn("Glass", terms)
+        self.assertNotIn("Motion", terms)
+
+    def test_shape_wins_over_frequency(self):
+        texts = [f"поправь MainActor, потом API и CODE-2 тут {i}" for i in range(3)]
+        terms = _terms(texts)
+        for expected in ("MainActor", "API", "CODE-2"):
+            self.assertIn(expected, terms)
+
+    def test_pieces_split_off_a_compound_name_are_not_offered(self):
+        texts = [
+            f"запусти Deep DeepSeek на полосе, пусть DeepSeek Seek доделает, а Deep Seek проверит {i}"
+            for i in range(3)
+        ]
+        terms = _terms(texts)
+        self.assertIn("DeepSeek", terms)
+        for piece in ("Deep", "Seek", "DeepSeek Seek", "Deep DeepSeek"):
+            self.assertNotIn(piece, terms)
+
+    def test_a_stutter_is_not_a_two_word_name(self):
+        texts = [f"скажи Claude Claude, что всё готово {i}" for i in range(3)]
+        terms = _terms(texts)
+        self.assertIn("Claude", terms)
+        self.assertNotIn("Claude Claude", terms)
+
+    def test_a_surname_that_starts_like_the_first_name_is_still_a_name(self):
+        texts = [f"позвони Иван Иванов сегодня {i}" for i in range(3)]
+        self.assertIn("Иван Иванов", _terms(texts))
+
+    def test_the_built_in_name_comes_first_with_the_recordings_it_is_heard_in(self):
+        texts = [
+            "у Транскриптора новая версия",
+            "открыл Транскриптор вчера",
+            "сегодня Deepgram снова",
+            "вечером Deepgram опять",
+            "утром Deepgram работает",
+        ]
+        found = extract_candidates(texts, builtin=BUILTIN_TERMS)
+        self.assertEqual([t.term for t in found], [*BUILTIN_TERMS, "Deepgram"])
+        heard = {t.term: t.recordings for t in found}
+        self.assertEqual(heard["Транскриптор"], 2)
+        self.assertEqual(heard["Transcriptor"], 0)
+        self.assertEqual(BUILTIN_TERMS, ("Transcriptor", "Транскриптор"))
+
+    def test_a_mined_form_of_the_built_in_name_is_not_listed_twice(self):
+        texts = [f"снова Транскриптора нет, Транскриптором доволен {i}" for i in range(4)]
+        found = [t.term for t in extract_candidates(texts, builtin=BUILTIN_TERMS)]
+        self.assertEqual([t for t in found if t.lower().startswith("транскриптор")], ["Транскриптор"])
+
     def test_the_list_is_bounded_and_ranked_by_recordings(self):
         texts = []
         for i in range(10):
@@ -148,6 +210,16 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(len(found), 3)
         self.assertEqual(found[0].term, "Name0x")
         self.assertGreaterEqual(found[0].recordings, found[-1].recordings)
+
+
+class FrequentEnglishTests(unittest.TestCase):
+    def test_everyday_words_and_their_inflections(self):
+        for word in ("code", "Model", "models", "coding", "fixed", "studies", "pop-up", "follow-up"):
+            self.assertTrue(is_frequent_english(word), word)
+
+    def test_jargon_and_names_are_not_everyday(self):
+        for word in ("worktree", "handoff", "Telegram", "Opus", "Ultra", "M-Code", "pop-upz"):
+            self.assertFalse(is_frequent_english(word), word)
 
 
 class _Corpus:
@@ -182,7 +254,17 @@ class StoreTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def _store(self, **kwargs) -> AutoKeytermStore:
+        # The mining is what these pin; the built-in name has its own test.
+        kwargs.setdefault("builtin_terms", ())
         return AutoKeytermStore(corpus=self.corpus.entries, cache_path=self.cache, **kwargs)
+
+    def test_the_built_in_name_is_there_before_the_first_recompute_and_after(self):
+        store = AutoKeytermStore(corpus=self.corpus.entries, cache_path=self.cache)
+        self.assertEqual(store.terms(), BUILTIN_TERMS)
+        for i in range(3):
+            self.corpus.put(f"r{i}", NAMED, float(i))
+        store.recompute()
+        self.assertEqual(store.terms(), (*BUILTIN_TERMS, "Deepgram"))
 
     def test_a_recompute_reads_only_new_or_changed_transcripts(self):
         for i in range(3):
@@ -260,6 +342,7 @@ class SchedulingTests(unittest.IsolatedAsyncioTestCase):
         return AutoKeytermStore(
             corpus=self.corpus.entries,
             cache_path=None,
+            builtin_terms=(),
             is_enabled=lambda: self.enabled,
             recompute_debounce_sec=0.05,
             refresh_debounce_sec=0.01,
