@@ -184,6 +184,10 @@ const {
   toggleNotAfter,
   toggleDispatchScript,
 } = require("./renderer-toggle");
+const {
+  QUEUED_START_RETRY_MS,
+  createQueuedStart,
+} = require("./queued-start");
 // One lease per paste on the snapshot of the user's clipboard, released
 // exactly once (DM-02, DM-26).
 const {
@@ -1454,6 +1458,93 @@ function hasActivePostStopWork() {
   return pendingTranscriptionCount > 0 || postStopWorkerRunning || postStopQueue.length > 0;
 }
 
+// A start press that lands while the previous take is still being
+// finished waits here and runs as soon as it can (./queued-start says why
+// it cannot run in parallel). One slot; the capsule shows it.
+const queuedStart = createQueuedStart();
+let queuedStartRetryTimer = null;
+
+function showCapsuleQueued(queued) {
+  const next = !!queued;
+  if (recordingStatusCapsuleState.queued === next) return;
+  recordingStatusCapsuleState.queued = next;
+  if (!String(recordingStatusCapsuleState.status || "").trim()) return;
+  void updateRecordingStatusCapsule({}).catch((e) => {
+    appendMainLog(`[recording-capsule] queued publish failed: ${e?.message || e}`);
+  });
+}
+
+function clearQueuedStart(reason) {
+  if (queuedStartRetryTimer) {
+    clearTimeout(queuedStartRetryTimer);
+    queuedStartRetryTimer = null;
+  }
+  const entry = queuedStart.clear();
+  showCapsuleQueued(false);
+  if (entry) appendMainLog(`[shortcut] queued start cleared reason=${reason} waitedMs=${Math.max(0, Date.now() - entry.queuedAt)}`);
+  return entry;
+}
+
+function scheduleQueuedStart(delayMs) {
+  if (!queuedStart.pending) return;
+  if (queuedStartRetryTimer) clearTimeout(queuedStartRetryTimer);
+  queuedStartRetryTimer = setTimeout(() => {
+    queuedStartRetryTimer = null;
+    void runQueuedStart().catch((e) => {
+      appendMainLog(`[shortcut] queued start failed: ${e?.message || e}`);
+    });
+  }, Math.max(0, delayMs));
+}
+
+/**
+ * Run the queued start once nothing holds it back. The post-stop worker
+ * calls this when it finishes; a renderer that is still closing its take
+ * is tried again every QUEUED_START_RETRY_MS. A start that cannot be
+ * served in time ends with a visible failure, never silently.
+ */
+async function runQueuedStart() {
+  const entry = queuedStart.pending;
+  if (!entry) return;
+  if (queuedStart.expired()) {
+    clearQueuedStart("expired");
+    await setRecordingStatus("Start Missed", RECORDING_STATUS_KIND.FAIL).catch(() => { });
+    scheduleTerminalStatusReset(RECORDING_STATUS_TERMINAL_DWELL_MS);
+    return;
+  }
+  // The worker's own exit runs the queue again.
+  if (hasActivePostStopWork()) return;
+  if (shortcutToggleInFlight) {
+    scheduleQueuedStart(QUEUED_START_RETRY_MS);
+    return;
+  }
+  await toggleRecordingFromShortcut(entry.mode, { fromQueue: true });
+}
+
+// The terminal status ("Paste Sent", "Saved To App", …) stays on the
+// capsule for RECORDING_STATUS_TERMINAL_DWELL_MS. It used to be a sleep
+// inside the post-stop worker, so the worker — and with it the start
+// gate — stayed busy for those 900 ms after the paste had happened: five
+// of the seven presses the gate refused in the logs landed there. A timer
+// now: anything that takes the capsule over cancels it.
+let terminalStatusResetTimer = null;
+
+function cancelTerminalStatusReset() {
+  if (!terminalStatusResetTimer) return;
+  clearTimeout(terminalStatusResetTimer);
+  terminalStatusResetTimer = null;
+}
+
+function scheduleTerminalStatusReset(dwellMs) {
+  cancelTerminalStatusReset();
+  terminalStatusResetTimer = setTimeout(() => {
+    terminalStatusResetTimer = null;
+    // Something took the capsule over meanwhile: new post-stop work, a
+    // queued or in-flight press, or a take that has started.
+    if (hasActivePostStopWork() || queuedStart.pending || shortcutToggleInFlight || recordingStartedAt > 0) return;
+    resetRecordingStatusState();
+  }, Math.max(0, Number(dwellMs) || 0));
+}
+
 // Capsule geometry SSOT. The pill's width is the sum of its parts —
 // padLeft + statusControlSize + gap + waveWidth + gap + timerWidth +
 // padRight — and the page reports that back as the window size, so the
@@ -1526,6 +1617,9 @@ const recordingStatusCapsuleState = {
   // True while a screen-mode recording owns the screen: the capsule
   // shows the screenshot button. Set only by the screen-mode controller.
   screen: false,
+  // True while a start press waits for the previous take to finish
+  // (./queued-start): the capsule rings its icon in the recording red.
+  queued: false,
 };
 
 // The size the capsule window was last placed with; null while hidden.
@@ -1771,6 +1865,12 @@ function recordingStatusCapsuleHtml() {
     }
     #stateIcon.fail::before {
       background: rgba(184,184,184,.95);
+    }
+    /* A start is queued behind the take being finished: whatever that
+       take shows, the ring around it is the recording red. */
+    #pill.queued #stateIcon::after {
+      opacity: 1;
+      border-color: rgba(255,92,92,.85);
     }
     @keyframes coreBreathe {
       0%,100% { transform: translate(-50%,-50%) scale(1); }
@@ -2018,6 +2118,7 @@ function recordingStatusCapsuleHtml() {
         screenMode = nextScreen;
         pillEl.classList.toggle("screen", screenMode);
       }
+      pillEl.classList.toggle("queued", !!state.queued);
       render();
       if (pageIsActive()) {
         requestAnimationLoop();
@@ -2310,6 +2411,7 @@ async function updateRecordingStatusCapsule(patch = {}, { pressedAt = 0 } = {}) 
     timerRunning: !!recordingStatusCapsuleState.timerRunning,
     level: Math.max(0, Math.min(1, Number(recordingStatusCapsuleState.level || 0))),
     screen: !!recordingStatusCapsuleState.screen,
+    queued: !!recordingStatusCapsuleState.queued,
   };
   try {
     await capsuleWindow.webContents.executeJavaScript(
@@ -3031,11 +3133,11 @@ function macMicrophoneAccessGranted() {
  * a 3-second fragment went to the clipboard. The block is correct — one
  * capsule at a time — but there was no work worth blocking for.
  */
-async function dispatchRendererTogglePress(allowStart, startDetail = { mode: "voice" }) {
+async function dispatchRendererTogglePress(allowStart, startDetail = { mode: "voice" }, startOnly = false) {
   // The press expires with the budget main waits for it, so a renderer
   // that unblocks after main gave up cannot run it late (DM-05).
   return execRendererJsWithTimeout(
-    toggleDispatchScript({ allowStart, startDetail, notAfter: toggleNotAfter() }),
+    toggleDispatchScript({ allowStart, startDetail, notAfter: toggleNotAfter(), startOnly }),
     null,
     RENDERER_TOGGLE_BUDGET_MS,
   );
@@ -3047,8 +3149,10 @@ async function dispatchRendererTogglePress(allowStart, startDetail = { mode: "vo
  * @param {{pressedAt?: number}} [press]  when the key went down — the
  *   native hotkey tap stamps the key-down itself (./hotkey-router); the
  *   in-window button and globalShortcut press now.
+ * @param {{fromQueue?: boolean}} [press]  the queued start running
+ *   (./queued-start), not a new press: it never cancels the queue.
  */
-async function toggleRecordingFromShortcut(mode = "voice", { pressedAt: pressStamp = 0 } = {}) {
+async function toggleRecordingFromShortcut(mode = "voice", { pressedAt: pressStamp = 0, fromQueue = false } = {}) {
   if (shortcutToggleInFlight) return;
   const pressedAt = pressStamp > 0 ? pressStamp : Date.now();
   const trace = createTrace("toggle_hotkey", { mode, pressAgeMs: Date.now() - pressedAt }, { startedAt: pressedAt });
@@ -3078,14 +3182,14 @@ async function toggleRecordingFromShortcut(mode = "voice", { pressedAt: pressSta
     // ``dispatchRendererTogglePress`` asks them together and a press
     // reaches ``startLive`` in one hop.
     const postStopActive = activePostStopAtPress || hasActivePostStopWork();
-    let result = await dispatchRendererTogglePress(!postStopActive && macMicrophoneAccessGranted(), startDetail);
+    let result = await dispatchRendererTogglePress(!postStopActive && macMicrophoneAccessGranted(), startDetail, fromQueue);
     if (result && result.uiReady === false) {
       // Cold renderer: fall back to the wait loop and ask once more when
       // it has finished booting.
       const ready = await waitForRendererUiReady();
       traceStep(trace, "renderer_ready_wait", { ready: !!ready });
       if (ready) {
-        result = await dispatchRendererTogglePress(!postStopActive && macMicrophoneAccessGranted(), startDetail);
+        result = await dispatchRendererTogglePress(!postStopActive && macMicrophoneAccessGranted(), startDetail, fromQueue);
       }
     }
     if (result === null) {
@@ -3117,6 +3221,13 @@ async function toggleRecordingFromShortcut(mode = "voice", { pressedAt: pressSta
       dispatched: !!result.dispatched,
       wasRecording: !!result.wasRecording,
     });
+    if (fromQueue && result.wasRecording && !result.dispatched) {
+      // A take started some other way (the window's button) while this
+      // start waited; it is that take's capsule now.
+      clearQueuedStart("already-recording");
+      traceEnd(trace, "queue-superseded", {});
+      return;
+    }
     // A press that started a screen take starts its screen side at once:
     // the session and its surfaces come up while the microphone opens.
     // The session is opened under the id of the take the renderer is
@@ -3162,32 +3273,59 @@ async function toggleRecordingFromShortcut(mode = "voice", { pressedAt: pressSta
     // paint still costs a round trip and the microphone has no reason to wait behind it — the
     // renderer already has the press. A later status supersedes this one
     // through the capsule's update sequence, so a slow create can never
-    // repaint a state the app has left.
+    // repaint a state the app has left. A start the renderer cannot take
+    // yet publishes nothing here: it is queued below, and says so.
+    const startWithheld = !result.dispatched && (postStopActive || !!result.startBlocked);
     const transitionStatus = result.wasRecording || postStopActive ? "Transcribing" : "Starting";
-    void publishRecordingStatus(transitionStatus, "", { pressedAt }).catch((e) => {
-      appendMainLog(`[recording-status] transition publish failed: ${e?.message || e}`);
-    });
-    traceStep(trace, "recording_status_published", {
-      status: transitionStatus,
-      recording: !!result.wasRecording,
-      postStopActive: !!postStopActive,
-    });
+    if (!startWithheld) {
+      void publishRecordingStatus(transitionStatus, "", { pressedAt }).catch((e) => {
+        appendMainLog(`[recording-status] transition publish failed: ${e?.message || e}`);
+      });
+      traceStep(trace, "recording_status_published", {
+        status: transitionStatus,
+        recording: !!result.wasRecording,
+        postStopActive: !!postStopActive,
+      });
+    }
 
     if (!result.dispatched) {
       // The renderer was idle and the main process withheld the start.
       // Two possible reasons, answered in the order the sequential code
       // checked them.
-      if (postStopActive) {
-        appendMainLog(
-          `[shortcut] start blocked by single-capsule post-stop work ` +
-          `pending=${pendingTranscriptionCount} queue=${postStopQueue.length} worker=${postStopWorkerRunning ? 1 : 0}`,
-        );
-        traceStep(trace, "single_capsule_busy", {
-          pending: pendingTranscriptionCount,
-          queue: postStopQueue.length,
-          worker: !!postStopWorkerRunning,
-        });
-        traceEnd(trace, "blocked", { reason: "single-capsule-post-stop-active" });
+      if (startWithheld) {
+        // The previous take is still being finished — main is pasting it
+        // or the renderer is still closing it. The press is queued, not
+        // dropped (./queued-start); a second press cancels it.
+        const reason = result.startBlocked && !postStopActive ? "renderer-busy" : "post-stop-active";
+        const gate = `pending=${pendingTranscriptionCount} queue=${postStopQueue.length} worker=${postStopWorkerRunning ? 1 : 0}`;
+        if (!fromQueue) {
+          const { action, entry } = queuedStart.press(mode);
+          if (action === "cancelled") {
+            if (queuedStartRetryTimer) {
+              clearTimeout(queuedStartRetryTimer);
+              queuedStartRetryTimer = null;
+            }
+            showCapsuleQueued(false);
+            appendMainLog(`[shortcut] queued start cancelled by a second press waitedMs=${Math.max(0, Date.now() - entry.queuedAt)}`);
+            // The queue may have been all that kept the capsule up (a
+            // dwell that ended while it waited, or "Start Queued").
+            if (!hasActivePostStopWork()) scheduleTerminalStatusReset(RECORDING_STATUS_TERMINAL_DWELL_MS);
+            traceEnd(trace, "queue-cancelled", { reason });
+            return;
+          }
+          appendMainLog(`[shortcut] start queued behind ${reason} ${gate} mode=${entry.mode}`);
+          if (!String(recordingStatusCapsuleState.status || "").trim()) {
+            // Nothing on the capsule to ring (the renderer is busy with
+            // something that has no capsule of its own): say it outright.
+            void setRecordingStatus("Start Queued", RECORDING_STATUS_KIND.TRANSCRIBING).catch(() => { });
+          }
+          showCapsuleQueued(true);
+        }
+        traceStep(trace, "start_queued", { reason, waitedMs: queuedStart.waitedMs() });
+        // Behind the post-stop worker, its exit runs the queue; behind a
+        // busy renderer, nothing will announce the end, so ask again.
+        if (!hasActivePostStopWork()) scheduleQueuedStart(QUEUED_START_RETRY_MS);
+        traceEnd(trace, "queued", { reason });
         return;
       }
       const micGranted = await requestMacMicrophonePermissionOnce();
@@ -3198,7 +3336,7 @@ async function toggleRecordingFromShortcut(mode = "voice", { pressedAt: pressSta
         traceEnd(trace, "failed", { reason: "mic-permission-denied" });
         return;
       }
-      result = await dispatchRendererTogglePress(true, startDetail);
+      result = await dispatchRendererTogglePress(true, startDetail, fromQueue);
       if (!result?.dispatched) {
         traceStep(trace, "renderer_toggle_failed", { result: result || null });
         await setRecordingStatus("App Loading", RECORDING_STATUS_KIND.WARN);
@@ -3210,6 +3348,10 @@ async function toggleRecordingFromShortcut(mode = "voice", { pressedAt: pressSta
     }
 
     if (result.recording) {
+      // This press started a take (by either dispatch above): it owns the
+      // capsule from here, whatever the previous take queued or left up.
+      if (queuedStart.pending) clearQueuedStart(fromQueue ? "started" : "superseded");
+      cancelTerminalStatusReset();
       const confirmedStart = await waitForRendererRecordingStart();
       if (!confirmedStart.confirmed) {
         if (screenStart) {
@@ -3304,6 +3446,13 @@ async function toggleRecordingFromShortcut(mode = "voice", { pressedAt: pressSta
     shortcutToggleInFlight = false;
     if (!keepCapturedTarget) {
       clearCapturedPasteTarget();
+    }
+    // A queued start that neither started nor is waiting again (a retry
+    // timer, or the post-stop worker that will run it) failed on the way
+    // — its own path has shown why; it must not linger and start a take
+    // at some later, unrelated moment.
+    if (fromQueue && queuedStart.pending && !queuedStartRetryTimer && !hasActivePostStopWork()) {
+      clearQueuedStart("start-failed");
     }
   }
 }
@@ -6370,6 +6519,9 @@ function enqueuePostStopTask(options = {}) {
     return false;
   }
   _enqueuedRecordings.add(key);
+  // New work owns the capsule: the previous take's terminal status must
+  // not hide it when its dwell ends.
+  cancelTerminalStatusReset();
   postStopQueue.push(task);
   pendingTranscriptionCount += 1;
   appendMainLog(`[post-stop-queue] enqueue pending=${pendingTranscriptionCount} rec=${task.recordingId} ${pasteTargetSummary(task.target)}`);
@@ -6406,10 +6558,13 @@ async function runPostStopQueue() {
       }
       if (pendingTranscriptionCount > 0) {
         await setRecordingStatus("Transcribing", RECORDING_STATUS_KIND.TRANSCRIBING).catch(() => { });
+      } else if (queuedStart.pending || taskResult?.recording) {
+        // The capsule is about to belong to the next take (queued here),
+        // or already does (a take started from the window meanwhile).
       } else {
-        const dwellMs = Math.max(0, Number(taskResult?.dwellMs || 0));
-        if (dwellMs > 0) await sleep(dwellMs);
-        resetRecordingStatusState();
+        // The terminal status stays up for its dwell on a timer, so the
+        // gate opens now, not 900 ms from now.
+        scheduleTerminalStatusReset(Math.max(0, Number(taskResult?.dwellMs || 0)));
       }
     }
   } finally {
@@ -6423,6 +6578,8 @@ async function runPostStopQueue() {
       appendMainLog(`[post-stop-queue] drained dropped=${dropped}`);
     }
     postStopWorkerRunning = false;
+    // The previous take is finished: a start queued behind it runs now.
+    if (queuedStart.pending) scheduleQueuedStart(0);
   }
 }
 
@@ -6658,6 +6815,8 @@ async function processPostStopTask(task) {
   traceEnd(trace, "done", { transcriptFound: !!transcript });
   return {
     dwellMs: isRecNow ? 0 : RECORDING_STATUS_TERMINAL_DWELL_MS,
+    // A take running now owns the capsule; the worker must not reset it.
+    recording: !!isRecNow,
   };
 }
 
@@ -8472,6 +8631,10 @@ function resetStateOwnedByLostMainPage() {
     appendMainLog(`[render-process-gone] dropping pendingTranscriptionCount=${pendingTranscriptionCount}`);
     pendingTranscriptionCount = 0;
   }
+  // A start queued behind the dead renderer's take has no renderer to
+  // start in; the press is dropped with a log line, the capsule reset.
+  clearQueuedStart("renderer-gone");
+  cancelTerminalStatusReset();
   // The renderer that would have handed these transcripts over is gone,
   // so each would only wait out its deadline.
   if (postStopQueue.length > 0) {

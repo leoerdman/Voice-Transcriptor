@@ -28,7 +28,7 @@ function toggleNotAfter(now = Date.now()) {
   return now + RENDERER_TOGGLE_BUDGET_MS - RENDERER_TOGGLE_RETURN_MARGIN_MS;
 }
 
-function toggleDispatchScript({ allowStart, startDetail = { mode: "voice" }, notAfter }) {
+function toggleDispatchScript({ allowStart, startDetail = { mode: "voice" }, notAfter, startOnly = false }) {
   const deadline = Number.isFinite(notAfter) ? Math.trunc(notAfter) : 0;
   return `
     (() => {
@@ -53,6 +53,18 @@ function toggleDispatchScript({ allowStart, startDetail = { mode: "voice" }, not
       const state = { ok: true, uiReady, wasRecording: isRec, recording: isRec, dispatched: false, discarded: tooShort, auto, autoSendEnter, timerText, recordingId };
       if (!uiReady) return state;
       if (!isRec && !${allowStart ? "true" : "false"}) return state;
+      // A queued start (./queued-start) only ever starts: a take that is
+      // running by the time it gets here was not started by it, and a
+      // toggle would stop it.
+      if (isRec && ${startOnly ? "true" : "false"}) return state;
+      // A renderer still closing its previous take (or busy with a file)
+      // would refuse the start inside startLive, silently, and main would
+      // wait out its start confirmation for nothing. It says so instead,
+      // and main queues the press (./queued-start).
+      if (!isRec && typeof window.__transcriptorStartBlocked === 'function' && window.__transcriptorStartBlocked()) {
+        state.startBlocked = true;
+        return state;
+      }
       // The detail is read only when this press STARTS a recording: it says
       // which kind (voice or screen) and, for screen mode, the session id
       // the renderer hands back to main when the take stops.

@@ -15,9 +15,10 @@ const {
 } = require("./renderer-toggle");
 const { topLevelFunctionSource } = require("./main-source");
 
-function runInFakeRenderer(script, { now, recording = false, onToggle = () => {}, take = null }) {
+function runInFakeRenderer(script, { now, recording = false, onToggle = () => {}, take = null, startBlocked = undefined }) {
   const dispatched = [];
   const window = {
+    __transcriptorStartBlocked: startBlocked === undefined ? undefined : () => startBlocked,
     __transcriptorLiveTake: take ? () => take() : undefined,
     __transcriptorLiveStatusSnapshot: () => ({ timerText: "00:01", autoSendEnter: false }),
     __transcriptorIsRecording: recording,
@@ -62,7 +63,7 @@ test("the deadline leaves the answer time to travel back inside main's budget", 
 
 test("main.js dispatches the press through ./renderer-toggle with the same budget", () => {
   const fn = topLevelFunctionSource("dispatchRendererTogglePress");
-  assert.match(fn, /toggleDispatchScript\(\{ allowStart, startDetail, notAfter: toggleNotAfter\(\) \}\)/);
+  assert.match(fn, /toggleDispatchScript\(\{ allowStart, startDetail, notAfter: toggleNotAfter\(\), startOnly \}\)/);
   assert.match(fn, /RENDERER_TOGGLE_BUDGET_MS/);
 });
 
@@ -96,4 +97,31 @@ test("main opens the screen session under the take the renderer reports, and the
   assert.doesNotMatch(toggle, /retireScreenTake\(startDetail\.screenSessionId\)/);
   const { mainSource } = require("./main-source");
   assert.match(mainSource, /screenMode\.finish\(\{ id, discard: p\.discard === true, endsTake: true \}\)/);
+});
+
+test("a renderer still closing its take says so instead of swallowing the start", () => {
+  const script = toggleDispatchScript({ allowStart: true, notAfter: 10_000 });
+  const blocked = runInFakeRenderer(script, { now: 9_000, startBlocked: true });
+  assert.equal(blocked.result.startBlocked, true);
+  assert.equal(blocked.result.dispatched, false);
+  assert.equal(blocked.dispatched.length, 0);
+  // Free: the press starts as before.
+  const free = runInFakeRenderer(script, { now: 9_000, startBlocked: false });
+  assert.equal(free.result.dispatched, true);
+  assert.equal(free.result.startBlocked, undefined);
+  // A stop is never held back by it.
+  const stop = runInFakeRenderer(script, { now: 9_000, recording: true, startBlocked: true });
+  assert.equal(stop.result.dispatched, true);
+  assert.equal(stop.result.recording, false);
+});
+
+test("a queued start only ever starts: it never stops a take it did not start", () => {
+  const script = toggleDispatchScript({ allowStart: true, notAfter: 10_000, startOnly: true });
+  const running = runInFakeRenderer(script, { now: 9_000, recording: true });
+  assert.equal(running.result.dispatched, false);
+  assert.equal(running.result.wasRecording, true);
+  assert.equal(running.dispatched.length, 0);
+  const idle = runInFakeRenderer(script, { now: 9_000 });
+  assert.equal(idle.result.dispatched, true);
+  assert.equal(idle.result.recording, true);
 });
