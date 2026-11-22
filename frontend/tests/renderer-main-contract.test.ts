@@ -591,10 +591,12 @@ describe("boot, update check and History bootstrap (FQ-13/FQ-14/FQ-15/FQ-22)", (
     }
   });
 
-  it("Bluetooth → built-in mic: one setting, on by default, decided by chooseCaptureDevice on both start paths", () => {
-    expect(html).toMatch(/id="bluetoothBuiltinMicToggle" checked \/>/);
+  it("Bluetooth → built-in mic: one setting, off by default, decided by chooseCaptureDevice on both start paths", () => {
+    expect(html).toMatch(/id="bluetoothBuiltinMicToggle" \/>/);
     expect(mainTsxSlice("function collectUiPreferences(", "\n}\n")).toContain("bluetooth_builtin_mic: readBluetoothBuiltinMicEnabled(),");
-    expect(mainTsx).toContain('($("bluetoothBuiltinMicToggle") as HTMLInputElement).checked = ui.bluetooth_builtin_mic !== false;');
+    expect(mainTsx).toContain('($("bluetoothBuiltinMicToggle") as HTMLInputElement).checked = ui.bluetooth_builtin_mic === true;');
+    // A take the built-in mic barely heard says so, once per launch.
+    expect(mainTsxSlice("async function stopLive(", "\nasync function ")).toContain("warnBuiltInMicBarelyHeard(captureLevel, recordedMs)");
     const start = mainTsxSlice("async function startLive(", "\nasync function ");
     // The warm path reuses the hold only for the device the choice names;
     // the cold path chooses again on the freshly enumerated list.

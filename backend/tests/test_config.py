@@ -404,6 +404,31 @@ class SchemaStampTests(unittest.TestCase):
         )
 
 
+class BluetoothBuiltinMicMigrationTests(SchemaStampTests):
+    """v3: the 1.6.22-1.6.24 default ``bluetooth_builtin_mic: true`` is
+    dropped, so the setting reads as the new default, off."""
+
+    def _ui_after_load(self, ui: dict) -> dict:
+        self._write({"schema_version": 2, "preferences": {"ui": ui}})
+        self.config_mod.load_config()
+        on_disk = json.loads(self.config_mod.CONFIG_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(on_disk["schema_version"], 3)
+        return on_disk["preferences"]["ui"]
+
+    def test_a_stored_true_from_the_old_default_is_dropped(self):
+        ui = self._ui_after_load({"bluetooth_builtin_mic": True, "screen_clicks": True})
+        self.assertNotIn("bluetooth_builtin_mic", ui)
+        self.assertTrue(ui["screen_clicks"], "the other preferences are kept")
+
+    def test_a_stored_false_is_kept(self):
+        self.assertIs(self._ui_after_load({"bluetooth_builtin_mic": False})["bluetooth_builtin_mic"], False)
+
+    def test_a_true_saved_at_v3_is_the_users_and_survives(self):
+        self._write({"schema_version": 3, "preferences": {"ui": {"bluetooth_builtin_mic": True}}})
+        cfg = self.config_mod.load_config()
+        self.assertIs(cfg["preferences"]["ui"]["bluetooth_builtin_mic"], True)
+
+
 class OpenRouterPreferenceValidationTests(unittest.TestCase):
     """``preferences.openrouter`` is repaired like ``preferences.deepgram`` (B-019)."""
 

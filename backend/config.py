@@ -66,7 +66,7 @@ logger = logging.getLogger(__name__)
 # AND add a `_migrate_vN_to_vM` branch in `_migrate_schema` to upgrade
 # older configs. Never re-use a previously-shipped version number —
 # downgrade detection relies on this being monotonic.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 try:
     from cryptography.fernet import Fernet, InvalidToken
@@ -956,8 +956,9 @@ def _migrate_schema(cfg: Dict[str, Any]) -> Dict[str, Any]:
         try:
             if version == 1:
                 cfg = _migrate_v1_to_v2(cfg)
-            # Future: `elif version == 2: cfg = _migrate_v2_to_v3(cfg)`
-            # — keep branches in ascending order, one per version step.
+            elif version == 2:
+                cfg = _migrate_v2_to_v3(cfg)
+            # Keep branches in ascending order, one per version step.
             else:
                 logger.error(
                     "no migration registered from schema v%d to v%d; "
@@ -985,6 +986,32 @@ def _migrate_v1_to_v2(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """
     out = dict(cfg)
     out["schema_version"] = 2
+    return out
+
+
+def _migrate_v2_to_v3(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """v3 (1.6.25): ``preferences.ui.bluetooth_builtin_mic`` is off unless
+    the user turns it on.
+
+    1.6.22-1.6.24 shipped it ON, and the renderer writes the whole ``ui``
+    object on every preference save, so a stored ``true`` is in practice
+    that default rather than a choice (the user would have had to turn it
+    off and on again). Recording from the built-in mic while a headset is
+    the input made a user away from the Mac a tenth as loud and lost the
+    take's words (2026-11-22), so a stored ``true`` is dropped and reads
+    as the new default, off. A stored ``false`` is already the default
+    and is kept. A user who wants it turns it on again; from v3 on that
+    ``true`` is theirs.
+    """
+    out = dict(cfg)
+    prefs = out.get("preferences")
+    if isinstance(prefs, dict):
+        ui = prefs.get("ui")
+        if isinstance(ui, dict) and ui.get("bluetooth_builtin_mic") is True:
+            ui = dict(ui)
+            del ui["bluetooth_builtin_mic"]
+            out["preferences"] = {**prefs, "ui": ui}
+    out["schema_version"] = 3
     return out
 
 

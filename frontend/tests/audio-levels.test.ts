@@ -137,3 +137,53 @@ describe("capture level SSOT", () => {
     });
   });
 });
+
+describe("a take that starts cold", () => {
+  // 20 ms frames (RMS in thousandths) of the installed 1.6.24's take of
+  // 2026-11-22 19:10:59 on the built-in microphone: digital zero, the
+  // half-filled ramp-in frame, then the room at ~0.0055 RMS with two key
+  // thumps (70-100 Hz) after the stop press at ~0.45 s. Before the fix the
+  // floor was seeded by the zero frame and every frame was speech, so the
+  // stop tail ran to its 600 ms cap.
+  const RMS_MILLI = [
+    0.0, 0.6, 3.1, 4.6, 7.3, 5.1, 6.5, 4.4, 5.4, 4.6, 5.3, 5.5, 5.6, 5.2, 5.6, 5.0, 6.4, 5.2, 5.6, 5.5, 5.6, 4.7,
+    5.6, 5.2, 6.0, 41.5, 24.6, 22.2, 8.0, 6.3, 5.0, 5.7, 5.7, 5.6, 6.2, 17.1, 43.0, 21.2, 13.1, 6.6, 5.3, 5.8,
+    5.4, 6.1, 5.9, 5.6, 5.4, 5.5, 5.1, 5.5, 5.6, 6.7, 6.1, 4.5,
+  ];
+  const frames = RMS_MILLI.map((m) => ({ rms: m / 1000, peak: (m / 1000) * 3 }));
+
+  it("does not take the room for speech once the floor has found it", () => {
+    const level = createCaptureLevel();
+    const detected = frames.map((f) => observeCaptureFrame(level, f.rms, f.peak, 20));
+    // Room frames once the 500 ms window has the room in it and the floor
+    // has climbed to it (index 30+, 600 ms), thumps excluded.
+    const roomAfterWindow = detected.filter((_, i) => i >= 30 && RMS_MILLI[i] < 9);
+    expect(roomAfterWindow.some(Boolean)).toBe(false);
+    // The thumps still stand out.
+    expect(detected[25]).toBe(true);
+    expect(detected[36]).toBe(true);
+    expect(summarizeCaptureLevel(level).floorRms).toBeGreaterThan(0.002);
+  });
+
+  it("never seeds the floor from digital silence", () => {
+    const level = createCaptureLevel();
+    for (let i = 0; i < 3; i++) expect(observeCaptureFrame(level, 0, 0)).toBe(false);
+    // The first live frame seeds the floor and is not speech itself.
+    expect(observeCaptureFrame(level, 0.005, 0.015)).toBe(false);
+    expect(observeCaptureFrame(level, 0.0055, 0.016)).toBe(false);
+    expect(observeCaptureFrame(level, 0.05, 0.2)).toBe(true);
+  });
+
+  it("climbs from a seed below the room to the room within the recovery window", () => {
+    const level = createCaptureLevel();
+    observeCaptureFrame(level, 0.0006, 0.002, 20);
+    let roomSpeech = 0;
+    for (let i = 0; i < 10; i++) if (observeCaptureFrame(level, 0.0055, 0.016, 20)) roomSpeech += 1;
+    // Until the window holds 500 ms of the room the low seed stands
+    // (what a stuck floor did for the whole take)…
+    expect(roomSpeech).toBe(10);
+    // …and once the window has the room in it, the floor climbs to it.
+    for (let i = 0; i < 40; i++) observeCaptureFrame(level, 0.0055, 0.016, 20);
+    expect(observeCaptureFrame(level, 0.0055, 0.016, 20)).toBe(false);
+  });
+});

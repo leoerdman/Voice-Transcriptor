@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 
 import {
+  builtInMicBarelyHeard,
   captureElapsedMs,
   chooseCaptureDevice,
   isBuiltInInputLabel,
@@ -435,5 +436,45 @@ describe("isBuiltInInputLabel", () => {
     ["", false],
   ])("%s → %s", (label, expected) => {
     expect(isBuiltInInputLabel(label)).toBe(expected);
+  });
+});
+
+describe("builtInMicBarelyHeard", () => {
+  const base = { choiceReason: "bluetooth-default-built-in", recordedMs: 12_000, frames: 1000 };
+
+  it("flags a take the built-in mic barely heard (2026-11-22: 2-5 % speech frames)", () => {
+    expect(builtInMicBarelyHeard({ ...base, speechFrames: 30 })).toBe(true);
+    expect(builtInMicBarelyHeard({ ...base, speechFrames: 50 })).toBe(true);
+  });
+
+  it("leaves a take with ordinary speech alone (headset takes: 30-60 %)", () => {
+    expect(builtInMicBarelyHeard({ ...base, speechFrames: 300 })).toBe(false);
+    expect(builtInMicBarelyHeard({ ...base, speechFrames: 100 })).toBe(false);
+  });
+
+  it("judges only takes the Bluetooth setting moved to the built-in mic", () => {
+    for (const choiceReason of ["picked", "default", "bluetooth-default-no-built-in", ""]) {
+      expect(builtInMicBarelyHeard({ ...base, choiceReason, speechFrames: 0 })).toBe(false);
+    }
+  });
+
+  it("does not judge a take too short to say anything", () => {
+    expect(builtInMicBarelyHeard({ ...base, recordedMs: 2_999, speechFrames: 0 })).toBe(false);
+    expect(builtInMicBarelyHeard({ ...base, frames: 0, speechFrames: 0 })).toBe(false);
+  });
+});
+
+describe("chooseCaptureDevice with the setting off (the default since 1.6.25)", () => {
+  it("records from the Bluetooth default as it is", () => {
+    const choice = chooseCaptureDevice({
+      requestedDeviceId: "",
+      preferBuiltInOverBluetooth: false,
+      devices: [
+        { deviceId: "default", label: "Default - Leo Liberty 5 BT (Bluetooth)" },
+        { deviceId: "bi", label: "MacBook Pro Microphone (Built-in)" },
+      ],
+    });
+    expect(choice.reason).toBe("default");
+    expect(choice.deviceId).toBe("");
   });
 });

@@ -1539,8 +1539,18 @@ function scheduleTerminalStatusReset(dwellMs) {
   terminalStatusResetTimer = setTimeout(() => {
     terminalStatusResetTimer = null;
     // Something took the capsule over meanwhile: new post-stop work, a
-    // queued or in-flight press, or a take that has started.
-    if (hasActivePostStopWork() || queuedStart.pending || shortcutToggleInFlight || recordingStartedAt > 0) return;
+    // queued or in-flight press, or a take that has started (a live
+    // recording session — endRecordingStatusSession closes it at the stop).
+    // Each of those ends with its own status and reset; the skip is logged
+    // so a capsule left on screen is never silent in main.log.
+    const takenOverBy = hasActivePostStopWork() ? "post-stop"
+      : queuedStart.pending ? "queued-start"
+        : shortcutToggleInFlight ? "press"
+          : recordingStartedAt > 0 ? "take" : "";
+    if (takenOverBy) {
+      appendMainLog(`[recording-capsule] dwell reset skipped: taken over by ${takenOverBy}`);
+      return;
+    }
     resetRecordingStatusState();
   }, Math.max(0, Number(dwellMs) || 0));
 }
@@ -2288,9 +2298,12 @@ async function ensureRecordingStatusCapsuleWindow() {
     alwaysOnTop: true,
     skipTaskbar: true,
     show: false,
-    // Built hidden at startup and possibly never shown: do not paint it
-    // until it is. Painting an unshown window is Electron's default.
-    paintWhenInitiallyHidden: false,
+    // Painted while hidden (Electron's default, so not set here). With
+    // `paintWhenInitiallyHidden` turned off (1.6.24) this transparent,
+    // non-focusable window revealed by `showInactive()` never started
+    // painting: main logged the capsule visible and the user saw nothing.
+    // A hidden capsule costs nothing anyway — it is throttled
+    // (./capsule-power) and idle runs no animation and no frame loop.
     focusable: false,
     hasShadow: false,
     title: "Transcriptor Recording",
@@ -2828,6 +2841,7 @@ function hideRecordingStatusCapsule() {
   recordingStatusCapsuleLastLevelSent = -1;
   recordingStatusCapsuleLastLevelSentAt = 0;
   if (recordingStatusWindow && !recordingStatusWindow.isDestroyed()) {
+    if (recordingStatusWindow.isVisible()) appendMainLog("[recording-capsule] hidden");
     if (recordingStatusWindowReady) {
       recordingStatusWindow.webContents.executeJavaScript(
         `(() => {
@@ -3014,18 +3028,34 @@ async function publishRecordingStatus(status, kind = "", { pressedAt = 0 } = {})
   await setRecordingStatus(text, kind, { pressedAt });
 }
 
-function resetRecordingStatusState() {
-  recordingStopInFlight = false;
+/**
+ * The take's recording session is over: it was stopped and handed to the
+ * post-stop worker, or the whole status state is being reset. Its monitor
+ * stops and ``recordingStartedAt`` — what "a take is live" means to the
+ * terminal dwell's reset — goes back to 0. The capsule keeps the take's
+ * frozen timer (``recordingStatusCapsuleState``) until it hides.
+ *
+ * Before this existed only ``resetRecordingStatusState`` cleared
+ * ``recordingStartedAt``, and the dwell reset (1.6.23) refuses to run
+ * while it is set — so after every take stopped by the hotkey the reset
+ * never ran and the capsule stayed on screen on its last status.
+ */
+function endRecordingStatusSession() {
   recordingSilenceStartedAt = 0;
-  recordingAutoStopConfigRefreshAt = 0;
   recordingAutoStopConfigGen++;
   recordingStartedAt = 0;
   recordingSeenAudioFrames = false;
+  stopRecordingStateMonitor();
+}
+
+function resetRecordingStatusState() {
+  recordingStopInFlight = false;
+  recordingAutoStopConfigRefreshAt = 0;
+  endRecordingStatusSession();
   hideRecordingStatusCapsule();
   void setRendererMainStatus("Idle").catch((e) => {
     appendMainLog(`[recording-status] renderer idle publish failed: ${e?.message || e}`);
   });
-  stopRecordingStateMonitor();
   if (!postStopWorkerRunning && postStopQueue.length === 0 && pendingTranscriptionCount !== 0) {
     appendMainLog(`[recording-status] reset-stale-pending=${pendingTranscriptionCount}`);
     pendingTranscriptionCount = 0;
@@ -3436,6 +3466,7 @@ async function toggleRecordingFromShortcut(mode = "voice", { pressedAt: pressSta
 
     if (result.auto) {
       traceStep(trace, "recording_stopped", { autoTranscribe: true, timerText: result.timerText || "" });
+      endRecordingStatusSession();
       enqueuePostStopTask({
         autoTranscribe: true,
         autoSendEnter: !!result.autoSendEnter,
@@ -3443,7 +3474,6 @@ async function toggleRecordingFromShortcut(mode = "voice", { pressedAt: pressSta
         recordingId: Number(result.recordingId || 0),
         target: pasteTarget,
       });
-      stopRecordingStateMonitor();
     } else {
       traceStep(trace, "recording_stopped", { autoTranscribe: false, timerText: result.timerText || "" });
       // Kill recording monitor immediately — recording is done.
@@ -3573,6 +3603,7 @@ async function stopRecordingFromMainProcess() {
       startRecordingStateMonitor();
       await setRecordingStatus("Recording", RECORDING_STATUS_KIND.RECORDING);
     } else if (decision.action === STOP_ACTION.ENQUEUE) {
+      endRecordingStatusSession();
       enqueuePostStopTask({
         autoTranscribe: true,
         autoSendEnter: !!result.autoSendEnter,
@@ -3580,7 +3611,6 @@ async function stopRecordingFromMainProcess() {
         recordingId: Number(result.recordingId || 0),
         target: pasteTarget,
       });
-      stopRecordingStateMonitor();
     } else {
       await setRecordingStatus("Saved To App", RECORDING_STATUS_KIND.OK);
       resetRecordingStatusState();
@@ -9764,6 +9794,27 @@ app.whenReady().then(async () => {
     toggleRecordingFromShortcut().catch((e) => {
       appendMainLog(`[record-toggle] failed: ${e?.message || e}`);
     });
+  });
+  // The renderer judged a take recorded from the built-in mic (because of
+  // the Bluetooth setting) to have heard almost no speech. Main shows the
+  // notice - the main window is usually hidden while the user dictates -
+  // once per launch, in its own words.
+  let builtInMicNoticeShown = false;
+  mainWindowIpc.on(RENDERER_REQUEST_CHANNELS.BUILT_IN_MIC_NOTICE, () => {
+    if (builtInMicNoticeShown) return;
+    builtInMicNoticeShown = true;
+    appendMainLog("[mic] built-in mic barely heard the take; notice shown (once per launch)");
+    try {
+      const { Notification } = require("electron");
+      if (Notification.isSupported()) {
+        new Notification({
+          title: "The built-in mic barely hears you",
+          body: "Turn off \"With Bluetooth headphones, record from the Mac's built-in mic\" in Settings: it only works when you sit at the Mac.",
+        }).show();
+      }
+    } catch (e) {
+      appendMainLog(`[mic] built-in mic notice failed: ${e?.message || e}`);
+    }
   });
   mainWindowIpc.on(RENDERER_REQUEST_CHANNELS.REVEAL_RECORDING, (_event, payload) => {
     const appDataDir = dataDir();

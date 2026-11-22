@@ -56,6 +56,15 @@ class _MainCase(unittest.TestCase):
 
 
 class SaveRunsOffTheEventLoopTests(_MainCase):
+    def _save(self, title: str = "take", recorded_at_ms: int = 1_795_200_000_000) -> dict:
+        async def write_tmp(tmp: Path) -> None:
+            tmp.write_bytes(b"RIFF" + b"\x00" * 64)
+
+        return asyncio.run(self.main._save_recording_audio_source(
+            orig_name="take.wav", write_tmp_audio=write_tmp, title=title,
+            recorded_at_ms=recorded_at_ms,
+        ))
+
     def test_the_retention_scan_of_a_save_runs_on_a_worker_thread(self) -> None:
         threads: list[bool] = []
         real = self.main._prune_recording_audio
@@ -64,15 +73,88 @@ class SaveRunsOffTheEventLoopTests(_MainCase):
             threads.append(threading.current_thread() is threading.main_thread())
             return real(*args, **kwargs)
 
+        self.main._audio_retention_after_save._delay_sec = 0.0
+        with mock.patch.object(self.main, "_prune_recording_audio", spy):
+            self._save()
+            self.assertTrue(self.main._audio_retention_after_save.wait_idle(5.0))
+        self.assertEqual(threads, [False], "the save scanned the archive on the event loop thread")
+
+
+class SaveDoesNotWaitForRetentionTests(_MainCase):
+    """2026-11-22: ``recording save timing: total=2404ms … file=2347ms
+    pruned=1`` — the save waited on a scan of the whole collection to
+    delete one old audio file. The save now answers first."""
+
+    def _save(self, title: str, recorded_at_ms: int) -> dict:
         async def write_tmp(tmp: Path) -> None:
             tmp.write_bytes(b"RIFF" + b"\x00" * 64)
 
-        with mock.patch.object(self.main, "_prune_recording_audio", spy):
-            asyncio.run(self.main._save_recording_audio_source(
-                orig_name="take.wav", write_tmp_audio=write_tmp, title="take",
-                recorded_at_ms=1_795_200_000_000,
-            ))
-        self.assertEqual(threads, [False], "the save scanned the archive on the event loop thread")
+        return asyncio.run(self.main._save_recording_audio_source(
+            orig_name="take.wav", write_tmp_audio=write_tmp, title=title,
+            recorded_at_ms=recorded_at_ms,
+        ))
+
+    def test_a_save_answers_while_its_retention_pass_is_still_blocked(self) -> None:
+        self.main._audio_retention_after_save._delay_sec = 0.0
+        entered = threading.Event()
+        release = threading.Event()
+        calls: list[tuple] = []
+
+        def blocking_prune(target_dir, *, keep_stems=(), **_):
+            calls.append((Path(target_dir), tuple(keep_stems)))
+            entered.set()
+            release.wait(10.0)
+            return 1
+
+        with mock.patch.object(self.main, "_prune_recording_audio", blocking_prune):
+            out = self._save("take", 1_795_200_000_000)
+            self.assertTrue(out["ok"])
+            self.assertEqual(out["pruned_audio_count"], 0, "nothing was removed before the save answered")
+            self.assertTrue(entered.wait(5.0), "the retention pass runs after the save")
+            release.set()
+            self.assertTrue(self.main._audio_retention_after_save.wait_idle(5.0))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], (Path(out["name"]).stem,), "the saved stem is exempt")
+        # The removal is reported by the next save, never silently dropped.
+        with mock.patch.object(self.main, "_prune_recording_audio", lambda *a, **k: 0):
+            nxt = self._save("next", 1_795_200_060_000)
+            self.assertEqual(nxt["pruned_audio_count"], 1)
+            self.assertTrue(self.main._audio_retention_after_save.wait_idle(5.0))
+
+    def test_a_burst_of_saves_is_pruned_once(self) -> None:
+        retention = self.main._audio_retention_after_save
+        retention._delay_sec = 0.3
+        calls: list[tuple] = []
+
+        def prune(target_dir, *, keep_stems=(), **_):
+            calls.append((Path(target_dir), tuple(sorted(keep_stems))))
+            return 0
+
+        with mock.patch.object(self.main, "_prune_recording_audio", prune):
+            first = self._save("one", 1_795_200_000_000)
+            second = self._save("two", 1_795_200_001_000)
+            self.assertTrue(retention.wait_idle(5.0))
+        self.assertEqual(len(calls), 1, "one pass for the burst")
+        self.assertEqual(
+            calls[0][1],
+            tuple(sorted((Path(first["name"]).stem, Path(second["name"]).stem))),
+            "both saves' stems are exempt in that pass",
+        )
+
+    def test_the_retention_still_collects_beyond_the_count(self) -> None:
+        self.main._audio_retention_after_save._delay_sec = 0.0
+        policy = self.main.AudioRetentionPolicy(max_items=1)
+        with mock.patch.object(self.main, "_audio_retention_policy_for_dir", lambda _d: policy):
+            first = self._save("one", 1_795_200_000_000)
+            self.assertTrue(self.main._audio_retention_after_save.wait_idle(5.0))
+            target = Path(first["archive_dir"])
+            first_audio = target / first["audio_name"]
+            os.utime(first_audio, (time.time() - 600, time.time() - 600))
+            second = self._save("two", 1_795_200_060_000)
+            self.assertTrue(self.main._audio_retention_after_save.wait_idle(5.0))
+        self.assertFalse(first_audio.exists(), "the older take's audio is collected after the save")
+        self.assertTrue((target / second["audio_name"]).exists())
+        self.assertTrue((target / first["name"]).exists(), "transcripts are kept")
 
 
 class JobSnapshotTests(_MainCase):

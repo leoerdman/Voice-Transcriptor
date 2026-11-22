@@ -229,6 +229,15 @@ contextBridge.exposeInMainWorld("transcriptor", {
       return false;
     }
   },
+  // No payload: main owns the notice's wording.
+  noticeBuiltInMicBarelyHeard: () => {
+    try {
+      ipcRenderer.send("notice:built-in-mic");
+      return true;
+    } catch {
+      return false;
+    }
+  },
   revealRecording: (payload) => {
     try {
       const p = payload && typeof payload === "object" ? payload : {};
