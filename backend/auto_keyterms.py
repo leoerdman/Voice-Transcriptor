@@ -84,7 +84,8 @@ from backend.deepgram_keyterms import AUTO_KEYTERM_MAX_CHARS, keyterm_token_cost
 from backend.english_frequent_words import is_frequent_english
 from backend.storage import atomic_write_json
 
-logger = logging.getLogger("transcriptor.auto_keyterms")
+# A child of "backend": main.py routes that tree to stderr, i.e. main.log.
+logger = logging.getLogger(__name__)
 
 #: A term must recur in at least this many different recordings.
 MIN_RECORDINGS = 3

@@ -312,19 +312,28 @@ class StoreTests(unittest.TestCase):
     def test_a_corrupt_cache_is_ignored(self):
         self.cache.write_text("{not json", encoding="utf-8")
         store = self._store()
-        with self.assertLogs("transcriptor.auto_keyterms", level="WARNING"):
+        with self.assertLogs("backend.auto_keyterms", level="WARNING"):
             store.load_cached()
         self.assertEqual(store.terms(), ())
 
     def test_one_line_is_logged_per_recompute_without_the_list(self):
         for i in range(3):
             self.corpus.put(f"r{i}", NAMED, float(i))
-        with self.assertLogs("transcriptor.auto_keyterms", level="INFO") as logs:
+        with self.assertLogs("backend.auto_keyterms", level="INFO") as logs:
             self._store().recompute()
         self.assertEqual(len(logs.output), 1)
         self.assertIn("1 term(s)", logs.output[0])
         self.assertIn("token(s)", logs.output[0])
         self.assertNotIn("Deepgram", logs.output[0])
+
+    def test_the_recompute_line_reaches_main_log(self):
+        # backend.main hangs the stderr → main.log handler on "backend";
+        # a logger outside that tree is never written anywhere.
+        for i in range(3):
+            self.corpus.put(f"r{i}", NAMED, float(i))
+        with self.assertLogs("backend", level="INFO") as logs:
+            self._store().recompute()
+        self.assertTrue(any("auto-keyterms:" in line for line in logs.output), logs.output)
 
 
 class SchedulingTests(unittest.IsolatedAsyncioTestCase):
