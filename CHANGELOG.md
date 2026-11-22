@@ -3,6 +3,12 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.26] - 2026-11-23
+
+### Fixed
+
+- **The last word is no longer lost on a Bluetooth headset.** The recording tail was measured from the audio that had arrived when you pressed Stop, but a Bluetooth headset delivers its audio 150–300 ms late, so the microphone closed before your last word got through. The tail now starts from where the press falls in the audio: the input latency the device reports, and at least 300 ms for a Bluetooth microphone (macOS reports only ~30 ms for it). Stopping on a Bluetooth headset takes about 0.3 s longer; wired and built-in microphones are unchanged.
+
 ## [1.6.25] - 2026-11-23
 
 ### Fixed
