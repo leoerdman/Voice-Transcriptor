@@ -3,6 +3,12 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.29] - 2026-11-23
+
+### Fixed
+
+- **A Bluetooth headset that is still waking up is no longer shown as recording.** A cold start on a Bluetooth headset (after a pause of a few minutes) does not hear anything for 0.2 to 2.2 s: the headset is switching to its call mode, and the microphone delivers pure digital silence. The start tone and the capsule said "recording" the whole time, so the beginning of the phrase was lost. Now a take whose microphone has not woken shows "Microphone waking" in the capsule (the dimmed amber square, no red halo), and when the first real sound arrives the app plays a second, higher tone: that is the moment to speak. A microphone that is awake from its first frame (built-in, wired) behaves as before, with no second tone. The sound that was not captured cannot be recovered; the signal is what is now honest. The log has `microphone woke: <ms> of digital silence`.
+
 ## [1.6.28] - 2026-11-23
 
 ### Fixed
