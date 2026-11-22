@@ -753,13 +753,16 @@
                 from the Mac's built-in microphone: the headset stays in
                 high-quality playback (an open Bluetooth mic forces it into
                 headset mode) and the built-in mic can stay warm between
-                takes. On by default; a mic picked by name in the list is
-                always used as picked. preferences.ui.bluetooth_builtin_mic,
+                takes. Off by default (on in 1.6.22-1.6.24, cleared by config
+                schema v3): the built-in mic hears a user who is not sitting
+                at the Mac far worse than the headset. A mic picked by name in
+                the list is always used as picked. preferences.ui.bluetooth_builtin_mic,
                 decided by chooseCaptureDevice (./src/capture-warm.ts).
               -->
               <label class="toggle-inline settings-toggle"><span>With Bluetooth headphones, record from the Mac's
-                  built-in mic (keeps headphone sound clear, starts faster)</span><input type="checkbox"
-                  id="bluetoothBuiltinMicToggle" checked /></label>
+                  built-in mic. Only if you sit close to the Mac: it hears you worse than the
+                  headset</span><input type="checkbox"
+                  id="bluetoothBuiltinMicToggle" /></label>
               <label class="toggle-inline settings-toggle"><span>Auto stop on silence</span><input type="checkbox"
                   id="autoStopSilenceEnabled" /></label>
               <!--

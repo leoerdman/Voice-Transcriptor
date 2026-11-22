@@ -190,10 +190,17 @@ export function isBuiltInInputLabel(label: string): boolean {
  * Bluetooth input forces the headset into the Hands-Free Profile), so a
  * user whose system default input is their headset started every take
  * cold — 22 of 173 takes on 22.11 logged ``warm hold=0 reason=bluetooth``.
- * With the setting on (the default) and the system default being a
- * Bluetooth input, the take records from the Mac's built-in microphone
- * instead: the headset stays in high-quality A2DP playback, and the
- * built-in input can be warm-held and pre-rolled like any other.
+ * With the setting on and the system default being a Bluetooth input,
+ * the take records from the Mac's built-in microphone instead: the
+ * headset stays in high-quality A2DP playback, and the built-in input
+ * can be warm-held and pre-rolled like any other.
+ *
+ * Off by default (1.6.25). It was on in 1.6.22-1.6.24, and a user a
+ * metre from the Mac with a headset on was recorded at a tenth of the
+ * level (2026-11-22: built-in RMS ~0.005 / peak 0.02-0.05 against the
+ * same user's headset at 0.05-0.07 / 0.6-0.87) — live Deepgram returned
+ * no words at all. The built-in microphone only serves someone sitting
+ * at the Mac; ``builtInMicBarelyHeard`` says so when it does not.
  *
  * What it never overrides:
  *  - a device the user picked by name in the list — their choice;
@@ -472,4 +479,36 @@ export function handOverHeldCapture<P extends { hold: boolean }>(
   const held = deps.commit(deps.plan);
   if (!held) deps.stopTracks();
   return held;
+}
+
+/**
+ * Did a take recorded from the built-in microphone — because of the
+ * Bluetooth setting, not the user's pick — hear almost no speech?
+ *
+ * Judged on the take's own speech verdicts (``observeCaptureFrame``,
+ * ./audio-levels): the share of frames that rose above the room. "Not a
+ * single speech frame" never happens on a live microphone — a key thump
+ * or one loud syllable clears the floor — so the measure is a share.
+ * Measured on 2026-11-22: the built-in takes of a user wearing a headset
+ * scored 2-5 % (3.4 s and 12 s of dictation, 0-5 words recognised); the
+ * same user's headset takes 30-60 %. A take shorter than
+ * ``BUILT_IN_HEARING_MIN_TAKE_MS`` says too little to judge.
+ */
+export const BUILT_IN_HEARING_MIN_TAKE_MS = 3_000;
+export const BUILT_IN_HEARING_MIN_SPEECH_SHARE = 0.1;
+
+export interface BuiltInHearingInput {
+  /** ``CaptureDeviceChoice.reason`` of the take. */
+  choiceReason: string;
+  /** How long the take recorded. */
+  recordedMs: number;
+  /** ``CaptureLevel.frames`` / ``speechFrames`` of the take. */
+  frames: number;
+  speechFrames: number;
+}
+
+export function builtInMicBarelyHeard(input: BuiltInHearingInput): boolean {
+  if (input.choiceReason !== "bluetooth-default-built-in") return false;
+  if (!(input.recordedMs >= BUILT_IN_HEARING_MIN_TAKE_MS) || !(input.frames > 0)) return false;
+  return input.speechFrames / input.frames < BUILT_IN_HEARING_MIN_SPEECH_SHARE;
 }

@@ -9795,6 +9795,27 @@ app.whenReady().then(async () => {
       appendMainLog(`[record-toggle] failed: ${e?.message || e}`);
     });
   });
+  // The renderer judged a take recorded from the built-in mic (because of
+  // the Bluetooth setting) to have heard almost no speech. Main shows the
+  // notice - the main window is usually hidden while the user dictates -
+  // once per launch, in its own words.
+  let builtInMicNoticeShown = false;
+  mainWindowIpc.on(RENDERER_REQUEST_CHANNELS.BUILT_IN_MIC_NOTICE, () => {
+    if (builtInMicNoticeShown) return;
+    builtInMicNoticeShown = true;
+    appendMainLog("[mic] built-in mic barely heard the take; notice shown (once per launch)");
+    try {
+      const { Notification } = require("electron");
+      if (Notification.isSupported()) {
+        new Notification({
+          title: "The built-in mic barely hears you",
+          body: "Turn off \"With Bluetooth headphones, record from the Mac's built-in mic\" in Settings: it only works when you sit at the Mac.",
+        }).show();
+      }
+    } catch (e) {
+      appendMainLog(`[mic] built-in mic notice failed: ${e?.message || e}`);
+    }
+  });
   mainWindowIpc.on(RENDERER_REQUEST_CHANNELS.REVEAL_RECORDING, (_event, payload) => {
     const appDataDir = dataDir();
     const recordingsRoot = path.resolve(appDataDir, "recordings");

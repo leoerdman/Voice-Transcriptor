@@ -7,6 +7,8 @@
 //                        or a new accelerator set to register
 //   "record:toggle"      the in-window Record/Stop button
 //   "recording:reveal"   "Reveal in folder" for a saved transcript
+//   "notice:built-in-mic" the built-in mic (chosen by the Bluetooth setting)
+//                        barely heard the take: main shows its fixed notice
 //
 // They used to ride on `document.title`: the renderer wrote
 // "__app_<verb>__<url-encoded JSON>", main intercepted page-title-updated
@@ -28,6 +30,7 @@ const RENDERER_REQUEST_CHANNELS = Object.freeze({
   SHORTCUTS: "shortcuts:message",
   RECORD_TOGGLE: "record:toggle",
   REVEAL_RECORDING: "recording:reveal",
+  BUILT_IN_MIC_NOTICE: "notice:built-in-mic",
 });
 
 const SHORTCUT_ACTIONS = Object.freeze(["capture-start", "capture-cancel", "update"]);

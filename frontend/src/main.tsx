@@ -8,6 +8,7 @@ import {
   type MicHealthStatusLine,
 } from "./mic-health";
 import {
+  type CaptureLevel,
   createCaptureLevel,
   observeCaptureFrame,
   summarizeCaptureLevel,
@@ -68,6 +69,7 @@ import { classifyBootError, type BootFailure } from "./boot-error";
 import {
   captureElapsedMs,
   chooseCaptureDevice,
+  builtInMicBarelyHeard,
   decidePreRoll,
   decideWarmHold,
   decideWarmReuse,
@@ -919,6 +921,7 @@ declare global {
       }) => boolean;
       recordToggle?: () => boolean;
       revealRecording?: (payload: { name: string; archiveDir: string }) => boolean;
+      noticeBuiltInMicBarelyHeard?: () => boolean;
     };
   }
 }
@@ -6633,10 +6636,31 @@ function shouldUpscale(): boolean {
   return !!($("upscaleToggle") as HTMLInputElement).checked;
 }
 
+/**
+ * The take recorded from the built-in microphone because of the Bluetooth
+ * setting, and it heard almost no speech (``builtInMicBarelyHeard``): one
+ * log line and one notification naming the setting, once per launch.
+ */
+function warnBuiltInMicBarelyHeard(level: CaptureLevel, recordedMs: number): void {
+  if (builtInMicWarningShown) return;
+  builtInMicWarningShown = true;
+  const share = level.frames > 0 ? level.speechFrames / level.frames : 0;
+  console.warn(
+    `[trace stopLive] built-in mic barely heard speech: speechShare=${(share * 100).toFixed(1)}% ` +
+    `recordedMs=${recordedMs.toFixed(0)} (bluetooth_builtin_mic on); warning shown once this launch`,
+  );
+  const message =
+    "The Mac's built-in mic barely hears you. Turn off \"With Bluetooth headphones, record from the Mac's built-in mic\" in Settings.";
+  setStatus(message, "warning");
+  // The system notice comes from main (the window is usually hidden).
+  window.transcriptor?.noticeBuiltInMicBarelyHeard?.();
+}
+
 /** Settings' "record clicks in screen mode" — read by a screen take when it starts. */
-/** preferences.ui.bluetooth_builtin_mic — on unless explicitly off. */
+/** preferences.ui.bluetooth_builtin_mic — off unless the user turned it on
+ *  (on by default in 1.6.22-1.6.24; config schema v3 cleared that). */
 function readBluetoothBuiltinMicEnabled(): boolean {
-  return (document.getElementById("bluetoothBuiltinMicToggle") as HTMLInputElement | null)?.checked !== false;
+  return (document.getElementById("bluetoothBuiltinMicToggle") as HTMLInputElement | null)?.checked === true;
 }
 
 function readScreenClicksEnabled(): boolean {
@@ -7321,7 +7345,7 @@ async function loadCfg(): Promise<void> {
     const autoStopDbEl = $("autoStopSilenceDb") as HTMLInputElement;
     autoStopEnabledEl.checked = ui.auto_stop_silence_enabled === true;
     ($("screenClicksToggle") as HTMLInputElement).checked = ui.screen_clicks === true;
-    ($("bluetoothBuiltinMicToggle") as HTMLInputElement).checked = ui.bluetooth_builtin_mic !== false;
+    ($("bluetoothBuiltinMicToggle") as HTMLInputElement).checked = ui.bluetooth_builtin_mic === true;
     autoStopSecondsEl.value = String(clampAutoStopSeconds(Number(ui.auto_stop_silence_seconds)));
     autoStopDbEl.value = String(clampAutoStopThresholdDb(Number(ui.auto_stop_silence_db)));
     const upscaleToggle = $("upscaleToggle") as HTMLInputElement;
@@ -10332,6 +10356,10 @@ let warmCapture: WarmCapture | null = null;
  * the support log says whether the mechanism did anything on this host.
  */
 let sessionStartedWarm = false;
+/** ``CaptureDeviceChoice.reason`` of the take being recorded. */
+let sessionMicChoiceReason = "";
+/** The "built-in mic barely hears you" warning is shown once per launch. */
+let builtInMicWarningShown = false;
 let sessionPreRollMs = 0;
 
 function streamHasLiveAudio(s: MediaStream | null): boolean {
@@ -11939,6 +11967,7 @@ async function startLive(
     micHealth.reset();
     const initialTracks = stream.getAudioTracks();
     const initialDeviceId = initialTracks[0]?.getSettings?.()?.deviceId || "";
+    sessionMicChoiceReason = micChoice.reason;
     // The one line that says which microphone this take records from and why.
     console.log(
       `[trace startLive] mic="${initialTracks[0]?.label || micChoice.label}" ` +
@@ -12336,6 +12365,13 @@ async function stopLive(
     tailHoldMs = performance.now() - holdStarted;
   }
   const recordedMs = startAt > 0 ? Math.max(0, Date.now() - startAt) : 0;
+  // Read now: the level belongs to this take until the next one starts.
+  const builtInBarelyHeard = !discarding && builtInMicBarelyHeard({
+    choiceReason: sessionMicChoiceReason,
+    recordedMs,
+    frames: captureLevel.frames,
+    speechFrames: captureLevel.speechFrames,
+  });
   const recordedSec = recordedMs / 1000;
   // ── transcription-latency timer ───────────────────────────────────
   //
@@ -13611,6 +13647,7 @@ async function stopLive(
       `source=${transcriptSource} wsFramesNeverSent=${wsFramesNeverSent} ` +
       `${describeLiveFinalStats(finalEnvelopeStats)}`,
     );
+    if (builtInBarelyHeard) warnBuiltInMicBarelyHeard(captureLevel, recordedMs);
     // The final pass produced nothing, but the live preview held speech:
     // the take ends on what it kept (./stop-epilogue) — shown in the
     // TRANSCRIBE panel and saved to History, never pasted — instead of
