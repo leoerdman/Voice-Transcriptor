@@ -3,6 +3,15 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.25] - 2026-11-23
+
+### Fixed
+
+- **The capsule shows on the first take and goes away after every take.** Since 1.6.23 the capsule stayed on its last status after a take stopped with the hotkey (the session flag that blocks hiding was only cleared by hiding itself), and in 1.6.24 the first show could stay unpainted. The take now closes its status session when it is handed to post-stop, and the window paints on first show again.
+- **Saving a take no longer waits for the audio archive cleanup.** The cleanup ran inside the save and stat-ed every transcript in the archive twice (up to ~2.4 s per save). It now runs in the background after the save, with one directory scan.
+- **The recording tail no longer mistakes the room for speech.** A cold take seeded its noise floor from a digital-zero first frame, so keyboard taps and room noise kept the tail at its 600 ms cap. The floor now starts from a live frame and follows the recent minimum.
+- **"Record from the built-in mic with Bluetooth headphones" is off by default.** On a desk where the Mac is not close, the built-in microphone hears ~10× less than the headset and Deepgram returned nothing. Turned off for everyone who had it from the 1.6.22 default; when it is on and the built-in mic hears almost no speech, the app says so once per launch.
+
 ## [1.6.24] - 2026-11-23
 
 ### Fixed
