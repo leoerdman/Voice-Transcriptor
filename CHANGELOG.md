@@ -3,6 +3,12 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.24] - 2026-11-23
+
+### Fixed
+
+- **The hidden recording capsule no longer costs CPU.** In 1.6.22–1.6.23 the capsule window, now built once at startup, kept an animation running while it was never on screen (~13 % of a core plus ~27 % in the GPU process, measured on the installed build). The idle capsule now has a static icon and is not painted until it is first shown.
+
 ## [1.6.23] - 2026-11-23
 
 ### Changed
