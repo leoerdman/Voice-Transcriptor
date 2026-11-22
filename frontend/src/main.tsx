@@ -12648,8 +12648,8 @@ async function stopLive(
   recordedWebmChunks = [];
   // Release the PCM sink reference after capture teardown, but DO NOT
   // destroy (delete the OPFS spool file) yet — the File blob from
-  // finalize() may still reference it. Destruction is deferred to
-  // after saveRecordingText serializes the blob into the FormData upload.
+  // finalize() may still reference it. Destruction is deferred until the
+  // audio save has landed (./audio-persistence).
   const deferredSinkDestroy = pcmSink;
   pcmSink = null;
   activeLiveSessionId = "";
@@ -13008,8 +13008,9 @@ async function stopLive(
     // PREFERS the backend re-fetch over the in-memory ``transcribe
     // InputFile``. The in-memory file is the lazy ``Blob([header,
     // OPFS-spool])`` from ``OpfsPcmSink.finalize()``; once
-    // ``deferredSinkDestroy.destroy()`` runs (which already happened
-    // earlier in this function), the spool is gone
+    // ``deferredSinkDestroy.destroy()`` runs (the moment the audio save
+    // lands — ./audio-persistence; a failed save keeps the spool until
+    // the stop is over), the spool is gone
     // and the lazy blob reads as zero bytes — uploads succeed with a
     // 200 status but the backend gets an empty payload, ffmpeg
     // raises "invalid data", and BOTH provider paths fail
