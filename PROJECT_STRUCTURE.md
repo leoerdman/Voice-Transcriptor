@@ -158,6 +158,8 @@ desktop/
 ├── screen-mode.js                  # screen-mode rules SSOT: session record, stroke position, manifest, shared names (pure, node --test)
 ├── screen-mode-controller.js       # screen-mode I/O: drawing overlays (no frame), palette, native helper (its taps on our controls delivered in-process), display hot-plug, screencapture + compositing
 ├── native/screen-input/            # CGEventTap helper (main.swift) + PressClassifier.swift, the one click-vs-stroke rule (built by scripts/build-native.sh)
+├── native/dictation-helper/        # persistent helper: clipboard ledger (snapshot/restore by changeCount), native ⌘V paste, front app (built by scripts/build-native.sh)
+├── native/shared/                  # what both native helpers share: the JSON line protocol and the own-event marker
 ├── child-io.js                     # child-process text-output decoding SSOT (UTF-16LE on win32) (pure, node --test)
 ├── backend-runtime-check.js        # boot import check verdict: a timeout blames nobody, a real failure is attributed engine-site vs bundle (pure, node --test)
 ├── python-version.js               # interpreter version reader: the ONE file that declares it is .python-version (pure, node --test)
@@ -167,6 +169,7 @@ desktop/
 ├── window-lifecycle.js             # main-window lifecycle SSOT: activate/close/minimise/quit/second-instance/capsule decisions and where the window opens (pure, node --test)
 ├── transcript-signal.js            # what a renderer hand-off signal means for the post-stop task: paste, keep waiting, or terminal (pure, node --test)
 ├── clipboard-lease.js              # one owner of the user's real-clipboard snapshot during a paste; released exactly once (pure, node --test)
+├── dictation-helper.js            # the persistent native helper's client: spawn/restart, request/answer by id, native paste request and verdict (pure, node --test)
 ├── recording-stop.js               # what a main-process stop does once the renderer has or has not answered (pure, node --test)
 ├── windows-paste-fallback.js       # the Windows PowerShell paste fallback script; sends keys only after a confirmed foreground switch (pure, node --test)
 ├── renderer-toggle.js              # the record hotkey's one renderer round trip and its deadline (pure, node --test)
@@ -210,7 +213,7 @@ desktop/
 ├── icon.png / icon.ico             # package icons
 └── scripts/
     ├── prepare-runtime.sh          # macOS arm64 / Windows x64 / Linux x64 runtime builder
-    ├── build-native.sh             # screen mode's native helper (native/screen-input) → native/build/<target>; macOS arm64 only
+    ├── build-native.sh             # the native helpers (native/screen-input, native/dictation-helper) → native/build/<target>; macOS arm64 only
     ├── notarize-dmg.sh             # Developer ID DMG notarization + stapling
     ├── check-designated-requirement.js # refuses an install whose signature would strand the TCC grants (BUILD.command)
     ├── generate-dmg-background.py  # DMG background artwork generator

@@ -66,8 +66,8 @@ import Foundation
 // What counts as a stroke is decided here and only here
 // (PressClassifier.swift): a press that moves this far.
 let dragThreshold: Double = 5.0
-// Marks the events this helper re-posts so its own tap lets them through.
-let syntheticMarker: Int64 = 0x5652_5343  // "VRSC"
+// The events this helper re-posts carry `syntheticMarker` and the protocol
+// lines go out through `emit` — both from ../shared/LineProtocol.swift.
 
 final class State {
   let lock = NSLock()
@@ -77,15 +77,6 @@ final class State {
 }
 
 let state = State()
-let outputQueue = DispatchQueue(label: "screen-input.output")
-
-func emit(_ object: [String: Any]) {
-  guard let data = try? JSONSerialization.data(withJSONObject: object),
-        var line = String(data: data, encoding: .utf8) else { return }
-  line += "\n"
-  let bytes = Data(line.utf8)
-  outputQueue.async { FileHandle.standardOutput.write(bytes) }
-}
 
 func emitPoint(_ kind: String, _ p: CGPoint) {
   emit(["t": kind, "x": (p.x * 10).rounded() / 10, "y": (p.y * 10).rounded() / 10])

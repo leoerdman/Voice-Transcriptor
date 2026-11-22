@@ -607,19 +607,22 @@ test("every module the desktop bundle ships is named in PROJECT_STRUCTURE.md", (
   assert.deepEqual(missing, []);
 });
 
-test("the helper's place in the bundle is one fact across build-native.sh, package.json, main.js and afterPack", () => {
-  const { SCREEN_INPUT_HELPER_IN_BUNDLE } = require("./scripts/macos-signing-utils");
-  const [dirInBundle, name] = [path.dirname(SCREEN_INPUT_HELPER_IN_BUNDLE), path.basename(SCREEN_INPUT_HELPER_IN_BUNDLE)];
+test("each helper's place in the bundle is one fact across build-native.sh, package.json, main.js and afterPack", () => {
+  const { NATIVE_HELPERS_IN_BUNDLE } = require("./scripts/macos-signing-utils");
   const buildNative = fs.readFileSync(path.join(DESKTOP_DIR, "scripts", "build-native.sh"), "utf8");
-  assert.match(buildNative, new RegExp(`-o "\\$OUT_DIR/${name}"`));
+  const built = Array.from(buildNative.matchAll(/-o "\$OUT_DIR\/([\w-]+)"/g)).map((m) => m[1]);
+  assert.deepEqual(built, NATIVE_HELPERS_IN_BUNDLE.map((rel) => path.basename(rel)), "build-native.sh builds exactly the helpers afterPack checks");
   const entry = pkg.build.mac.extraResources.find((e) => e.from === "native/build/mac-${arch}");
   assert.ok(entry, "build.mac.extraResources copies the helper directory");
-  assert.equal(path.join("Contents", "Resources", entry.to), dirInBundle);
   const main = fs.readFileSync(path.join(DESKTOP_DIR, "main.js"), "utf8");
-  const segments = entry.to.split("/").concat(name).map((s) => `"${s}"`).join(", ");
-  assert.ok(main.includes(`path.join(process.resourcesPath, ${segments})`), "main.js runs the helper from where the bundle has it");
   // DX-25: a dev run reads the one macOS target build-native.sh builds.
   const macTargets = Array.from(buildNative.matchAll(/^\s*(mac-[a-z0-9]+)\)/gm)).map((m) => m[1]);
   assert.deepEqual(macTargets, ["mac-arm64"]);
-  assert.ok(main.includes(`path.join(__dirname, "native", "build", "${macTargets[0]}", "${name}")`), "dev helper path");
+  for (const rel of NATIVE_HELPERS_IN_BUNDLE) {
+    const [dirInBundle, name] = [path.dirname(rel), path.basename(rel)];
+    assert.equal(path.join("Contents", "Resources", entry.to), dirInBundle);
+    const segments = entry.to.split("/").concat(name).map((s) => `"${s}"`).join(", ");
+    assert.ok(main.includes(`path.join(process.resourcesPath, ${segments})`), `main.js runs ${name} from where the bundle has it`);
+    assert.ok(main.includes(`path.join(__dirname, "native", "build", "${macTargets[0]}", "${name}")`), `dev path of ${name}`);
+  }
 });

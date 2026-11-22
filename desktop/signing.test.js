@@ -20,8 +20,8 @@ const path = require("node:path");
 
 const {
   REQUIRED_USAGE_DESCRIPTION_KEYS,
-  SCREEN_INPUT_HELPER_IN_BUNDLE,
-  assertScreenInputHelper,
+  NATIVE_HELPERS_IN_BUNDLE,
+  assertNativeHelpers,
   designatedRequirementIsStable,
   isDeveloperIdIdentity,
   resolveSigningPlan,
@@ -258,21 +258,25 @@ test("no updater metadata is published: the app has no updater", () => {
   assert.equal(packageJson.build.publish, null);
 });
 
-test("afterPack's helper check: a mac build must carry screen-input, an App Store build must not", () => {
+test("afterPack's helper check: a mac build must carry both native helpers, an App Store build neither", () => {
   const os = require("node:os");
   const app = fs.mkdtempSync(path.join(os.tmpdir(), "helper-check-")) + "/Transcriptor.app";
-  const helper = path.join(app, SCREEN_INPUT_HELPER_IN_BUNDLE);
+  const helpers = NATIVE_HELPERS_IN_BUNDLE.map((rel) => path.join(app, rel));
+  assert.deepEqual(helpers.map((h) => path.basename(h)), ["screen-input", "dictation-helper"]);
   try {
-    assert.throws(() => assertScreenInputHelper(app, { expected: true }), /missing from the bundle/);
-    assert.equal(assertScreenInputHelper(app, { expected: false }), null);
+    assert.throws(() => assertNativeHelpers(app, { expected: true }), /screen-input is missing from the bundle/);
+    assert.deepEqual(assertNativeHelpers(app, { expected: false }), []);
     // A thin 64-bit Mach-O executable header (MH_MAGIC_64, MH_EXECUTE).
     const header = Buffer.alloc(32);
     header.writeUInt32LE(0xfeedfacf, 0);
     header.writeUInt32LE(2, 12);
-    fs.mkdirSync(path.dirname(helper), { recursive: true });
-    fs.writeFileSync(helper, header);
-    assert.equal(assertScreenInputHelper(app, { expected: true }), helper);
-    assert.throws(() => assertScreenInputHelper(app, { expected: false }), /must not ship/);
+    fs.mkdirSync(path.dirname(helpers[0]), { recursive: true });
+    fs.writeFileSync(helpers[0], header);
+    // One helper is not enough.
+    assert.throws(() => assertNativeHelpers(app, { expected: true }), /dictation-helper is missing from the bundle/);
+    fs.writeFileSync(helpers[1], header);
+    assert.deepEqual(assertNativeHelpers(app, { expected: true }), helpers);
+    assert.throws(() => assertNativeHelpers(app, { expected: false }), /must not ship/);
   } finally {
     fs.rmSync(path.dirname(app), { recursive: true, force: true });
   }
@@ -308,9 +312,9 @@ test("the install-time requirement check reads the signature without a shell", {
 
 test("afterPack runs the helper check for every mac flavour, before signing", () => {
   const afterPack = fs.readFileSync(path.join(__dirname, "afterPack.js"), "utf8");
-  const check = afterPack.indexOf("assertScreenInputHelper(appPath, { expected: !isMas })");
+  const check = afterPack.indexOf("assertNativeHelpers(appPath, { expected: !isMas })");
   assert.ok(check > 0, "afterPack checks the helper");
   assert.ok(check < afterPack.indexOf("if (isMas) {"), "before the MAS branch returns");
   assert.ok(check < afterPack.indexOf("preSignRuntimeBinaries({"), "before the runtime is signed");
-  assert.match(afterPack, /"--verify", "--strict", "--verbose=2", screenInputHelper/);
+  assert.match(afterPack, /for \(const helper of nativeHelpers\)[\s\S]*"--verify", "--strict", "--verbose=2", helper/);
 });
