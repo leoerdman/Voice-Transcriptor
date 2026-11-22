@@ -7,6 +7,7 @@ const { StringDecoder } = require("node:string_decoder");
 const {
   POWERSHELL_UTF8_PRELUDE,
   childStreamEncoding,
+  createLineSplitter,
   stripBom,
   withUtf8OutputPrelude,
 } = require("./child-io");
@@ -88,4 +89,31 @@ test("PowerShell is made to emit UTF-8, once, and only PowerShell", () => {
 test("pwsh gets the same treatment as powershell", () => {
   const out = withUtf8OutputPrelude("pwsh.exe", ["-NoProfile", "-Command", "echo hi"]);
   assert.equal(out[2], `${POWERSHELL_UTF8_PRELUDE}echo hi`);
+});
+
+test("line splitter: one record per line, however the pipe chunks them", () => {
+  const out = [];
+  const split = createLineSplitter((line) => out.push(line));
+  // Two records in one chunk — the [multi]/[ru] readings logging in the
+  // same millisecond used to land glued on a single main.log line.
+  split.push("backend.x: [multi] params=#1\nbackend.x: [ru] params=#2\nbackend.x: half");
+  assert.deepEqual(out, ["backend.x: [multi] params=#1", "backend.x: [ru] params=#2"]);
+  // ...and a record split across chunks comes out whole, not as two halves.
+  split.push(" of a record\r\n\n   \n  indented continuation\n");
+  assert.deepEqual(out.slice(2), ["backend.x: half of a record", "  indented continuation"]);
+  split.push("no trailing newline");
+  assert.equal(out.length, 4, "an unterminated record waits for its newline");
+  split.flush();
+  assert.equal(out[4], "no trailing newline");
+  split.flush();
+  assert.equal(out.length, 5, "flush on an empty buffer emits nothing");
+});
+
+test("line splitter: an endless line is emitted at the cap, not buffered without bound", () => {
+  const out = [];
+  const split = createLineSplitter((line) => out.push(line), { maxLineChars: 10 });
+  split.push("x".repeat(25));
+  assert.deepEqual(out, ["x".repeat(25)]);
+  split.push("tail\n");
+  assert.deepEqual(out, ["x".repeat(25), "tail"]);
 });
