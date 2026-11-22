@@ -1989,7 +1989,14 @@ function recordingStatusCapsuleHtml() {
                 ? "ok"
                 : next === "fail"
                   ? "fail"
-                  : "transcribing";
+                  // Idle is the hidden capsule. It has no rule of its own,
+                  // so nothing animates: the window now lives for the whole
+                  // session, and the old fallback ("transcribing", an
+                  // infinite box-shadow animation) kept its compositor and
+                  // the GPU process busy while it was never on screen.
+                  : next === "idle"
+                    ? "idle"
+                    : "transcribing";
       if (nextClass === stateIconModeClass) return;
       stateIconModeClass = nextClass;
       stateIcon.className = "";
@@ -2281,6 +2288,9 @@ async function ensureRecordingStatusCapsuleWindow() {
     alwaysOnTop: true,
     skipTaskbar: true,
     show: false,
+    // Built hidden at startup and possibly never shown: do not paint it
+    // until it is. Painting an unshown window is Electron's default.
+    paintWhenInitiallyHidden: false,
     focusable: false,
     hasShadow: false,
     title: "Transcriptor Recording",

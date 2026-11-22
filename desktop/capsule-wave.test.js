@@ -28,13 +28,23 @@ function capsuleHtml() {
 }
 
 function element() {
-  return {
+  const classes = new Set();
+  const el = {
     style: {},
     textContent: "",
-    className: "",
-    classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+    classList: {
+      add(c) { classes.add(c); },
+      remove(c) { classes.delete(c); },
+      toggle(c, on) { if (on === undefined ? !classes.has(c) : on) classes.add(c); else classes.delete(c); },
+      contains: (c) => classes.has(c),
+    },
     addEventListener() {},
   };
+  Object.defineProperty(el, "className", {
+    get: () => [...classes].join(" "),
+    set: (v) => { classes.clear(); String(v || "").split(/\s+/).filter(Boolean).forEach((c) => classes.add(c)); },
+  });
+  return el;
 }
 
 /** Run the capsule page's script; returns its hooks and the canvas log. */
@@ -80,6 +90,7 @@ function loadCapsule() {
   vm.runInNewContext(script, sandbox);
   return {
     draws,
+    element: (id) => sandbox.document.getElementById(id),
     setState: (next) => window.__setCapsuleState(next),
     step() {
       const fn = frame;
@@ -152,4 +163,20 @@ test("a new take brings the line in from the right again, even with no idle stat
   capsule.setState({ status: "Starting", mode: "recording", level: 0, startedAt: 99000 });
   capsule.step();
   assert.ok(lineOf().x > 0, "the second take starts at the right edge");
+});
+
+test("the hidden (idle) capsule runs no CSS animation", () => {
+  // The capsule window lives for the whole session (1.6.22). Idle used to
+  // fall back to the "transcribing" icon, whose infinite box-shadow
+  // animation kept the hidden window's compositor and the GPU process busy
+  // (measured on the installed 1.6.23: ~13 % + ~27 % of a core at idle).
+  const capsule = loadCapsule();
+  capsule.setState({ status: "Transcribing", mode: "transcribing", level: 0 });
+  assert.ok(capsule.element("stateIcon").classList.contains("transcribing"));
+  capsule.setState({ status: "", mode: "idle", level: 0 });
+  const icon = capsule.element("stateIcon");
+  assert.ok(icon.classList.contains("idle"), "idle has its own class");
+  assert.ok(!icon.classList.contains("transcribing"));
+  const css = /<style>([\s\S]*)<\/style>/.exec(capsuleHtml())[1];
+  assert.ok(!/#stateIcon\.idle[^{]*\{[^}]*animation/.test(css), "no animation is attached to the idle icon");
 });
