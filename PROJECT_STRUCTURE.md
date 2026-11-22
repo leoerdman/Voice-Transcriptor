@@ -188,6 +188,7 @@ desktop/
 ├── renderer-epoch.js               # which renderer a recording id belongs to, so a reloaded renderer's ids are never confused (pure, node --test)
 ├── shortcut-runtime.js             # the accelerators bound right now and how a Settings update changes them (pure, node --test)
 ├── capsule-geometry.js             # the recording capsule's window size and placement (pure, node --test)
+├── capsule-power.js                # the capsule window's idle cost (throttling on while hidden) and its press-to-visible metric line
 ├── screen-session-start.js         # what main does once screenMode.start() has answered: keep, already ended, or a voice take (pure, node --test)
 ├── screen-mode-warnings.js         # the one copy table for screen-mode warnings, keyed by the controller's kinds (pure, node --test)
 ├── screen-surfaces.js              # a screen take's capsule, palette and frames are shown together, once, never a subset (pure, node --test)
