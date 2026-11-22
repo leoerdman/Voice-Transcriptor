@@ -17,12 +17,8 @@ Voice Transcriptor/
 ├── requirements.runtime-lock.txt  # release-runtime transitive wheel constraints
 ├── .python-version                # Python version the shipped runtime is built with (SSOT)
 ├── contracts/                     # cross-domain wire fixtures: live-final-envelope.json, live-defaults.json, screen-session.json (fail the build on drift)
-├── BUGS_AUDIT.md                  # running audit ledger (2026-08-23 wave)
-├── BUGS_AUDIT_2026-08-24.md       # dated audit waves + fix statuses (root per audit charter)
-├── BUGS_AUDIT_2026-09-03.md       # dated audit waves + fix statuses (root per audit charter)
-├── BUGSAUDIT-2026-09-04.md        # Ultra-Audit 2026-09-04 summary: 270 findings, all P0 closed; consolidated journals
 ├── .env.example                   # user-facing environment-variable SSOT
-├── docs/                          # VERIFIED_AUDIT.md, AUDIT_2026-08.md, PRODUCT.md, VISION.md, install guides
+├── docs/                          # PRODUCT.md, VISION.md, ROADMAP.md, OPTIMIZATION.md, install guides, audit ledgers (BUGS_AUDIT*.md, BUGSAUDIT-*.md, VERIFIED_AUDIT.md), session handoffs
 ├── backend/                       # FastAPI backend and transcription pipeline
 ├── frontend/                      # Vite/TypeScript renderer
 └── desktop/                       # Electron shell and package config
@@ -33,7 +29,7 @@ Removed root clutter:
 - `INCONSISTENCIES.md` was an obsolete research snapshot and is no longer SSOT.
 - `desktop/README.md` duplicated stale desktop instructions and was removed.
 - `AUDIT_100_BUGS.md` was renamed to `VERIFIED_AUDIT.md` and moved to `docs/` because the audit intentionally lists only verified real bugs.
-- `INSTALL_OTHER_MAC.md` and the audit documents live under `docs/`, not the root.
+- `INSTALL_OTHER_MAC.md`, the audit ledgers (`BUGS_AUDIT*.md`, `BUGSAUDIT-*.md`) and `OPTIMIZATION.md` live under `docs/`, not the root.
 
 ## Backend
 
@@ -258,5 +254,5 @@ Desktop owns:
 
 - `docs/NEXT_SESSION_2026-09-04.md` — точка входа следующей сессии: ТЗ трёх хотфиксов и трёх worktree-веток.
 - `docs/NEXT_SESSION_2026-09-04b.md` — хендофф вечера 2026-09-04: единый владелец текста, Ultra-Audit, кто на чём остановился; §8 — релиз 1.6.1 и живые проверки.
-- `docs/audit-2026-09-04/` — разделы находок, журналы правок и отчёты агентов Ultra-Audit (включая «Швы (2026-09-05)»); сводка — `BUGSAUDIT-2026-09-04.md` в корне.
+- `docs/audit-2026-09-04/` — разделы находок, журналы правок и отчёты агентов Ultra-Audit (включая «Швы (2026-09-05)»); сводка — `docs/BUGSAUDIT-2026-09-04.md`.
 - `docs/COMPARISON_2026-09-04.md` — сравнение с лучшими open-source/коммерческими реализациями диктовки: ранжированная таблица по 11 пунктам дизайна, что уже не хуже, что сознательно не берём.
