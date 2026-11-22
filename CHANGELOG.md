@@ -3,6 +3,22 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.23] - 2026-11-23
+
+### Changed
+
+- **The recording tail follows your voice.** Instead of always holding the microphone 200 ms after Stop, the take keeps 120 ms and then waits only while you are still speaking (up to 600 ms, ended by 160 ms of silence); the stop sound itself is not taken for speech.
+- **A hotkey press during the previous paste is no longer lost.** It is queued (red ring on the capsule) and recording starts as soon as the paste is done; pressing again cancels it. Most such presses used to fall into a 900 ms "Paste Sent" wait, which no longer blocks a new start.
+- **⌘V follows the keyboard layout.** The native paste finds the key that types "v" in the current layout (Dvorak and others) and keeps QWERTY for layouts that use it with ⌘.
+- **One press, one action.** While hotkeys move between the native tap and Electron's global shortcuts, the same press arriving from both is acted on once.
+- **The learned vocabulary is cleaner.** Common English words and fragments of longer names ("Deep", "Seek" next to "DeepSeek") are no longer offered; "Transcriptor" / "Транскриптор" are built in.
+- **The deprecated audio fallback no longer starts on every take.** The ScriptProcessor path runs only when the AudioWorklet fails or delivers nothing within 400 ms.
+
+### Fixed
+
+- **`main.log` no longer carries speech or glued lines.** Per-segment Deepgram lines moved to debug; every log record of the backend is one line again (stderr was written in chunks, squeezed and cut at 1400 characters); permission checks are logged when they change, not on every take; the warm-socket pool and the learned vocabulary log under the backend logger again, so cold connects say why (`reason=`).
+- **Slow audio saves can be traced.** The save logs upload/parse, preparation and size, and the backend logs an event-loop stall over 250 ms with its CPU time.
+
 ## [1.6.22] - 2026-11-23
 
 ### Changed
