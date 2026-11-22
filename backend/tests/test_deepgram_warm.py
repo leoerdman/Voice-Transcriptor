@@ -1377,7 +1377,8 @@ class DualStreamWarmingTests(_WarmHandlerCase):
             for _ in range(4):
                 await asyncio.sleep(0)
             primary = self.main.live_config(
-                model="nova-3", language="auto", diarize=False, keyterms=(),
+                model="nova-3", language="auto", diarize=False,
+                keyterms=self.main.configured_keyterms(cfg, self.main.AUTO_KEYTERMS.terms()),
                 language_hints=self.main.configured_language_hints(cfg),
             )
             keys = [row["configKey"] for row in pool.status()["sockets"]]

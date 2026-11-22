@@ -274,6 +274,28 @@ test("HotkeyMatcher: our chords fire once and are swallowed whole, everything el
   assert.deepEqual(run.stdout.trim().split("\n").map((line) => line.replace(/^ok /, "")), HOTKEY_MATCHER_CASES);
 });
 
+test("KeyLayout: ⌘V is pressed on the key the layout's ⌘ table calls V", { skip }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "key-layout-test-"));
+  const bin = path.join(dir, "key-layout-tests");
+  const build = spawnSync(
+    "xcrun",
+    ["swiftc", "-o", bin, path.join(helperDir, "KeyLayout.swift"), path.join(__dirname, "native", "tests", "key-layout", "main.swift")],
+    { encoding: "utf8" },
+  );
+  assert.equal(build.status, 0, build.stderr);
+  const run = spawnSync(bin, [], { encoding: "utf8" });
+  fs.rmSync(dir, { recursive: true, force: true });
+  assert.equal(run.status, 0, run.stderr);
+  assert.deepEqual(run.stdout.trim().split("\n").map((line) => line.replace(/^ok /, "")), [
+    "QWERTY-family layouts keep V at code 9",
+    "Dvorak presses the key its layout calls V",
+    "Dvorak – QWERTY ⌘ reads its ⌘ table: V stays at code 9",
+    "no layout data gives no key",
+    "the paste key falls back to code 9 before the layout is read",
+    "reading the current layout gives a real key from it",
+  ]);
+});
+
 test("the dictation helper compiles from the sources build-native.sh names", { skip }, () => {
   const buildNative = fs.readFileSync(path.join(__dirname, "scripts", "build-native.sh"), "utf8");
   const block = buildNative.slice(buildNative.lastIndexOf("xcrun swiftc"), buildNative.indexOf('-o "$OUT_DIR/dictation-helper"'));

@@ -29,7 +29,23 @@ recording proves nothing — and looks like a name rather than a word:
 * **a two-word name**: two adjacent capitalised words of one script with
   no punctuation between them (``Ultra Gen``, ``Claude Code``). A word
   that almost only appears inside such a phrase (``Gen``) is not offered
-  on its own.
+  on its own. The same word twice (``Claude Claude``) or a CamelCase
+  name beside its own first or last part (``Deep DeepSeek``,
+  ``DeepSeek Seek``) is a recognition stutter, not a name.
+
+A plain single English word — neither CamelCase, nor all caps, nor with
+digits — is jargon only when it is not everyday English: ``worktree``
+is offered, ``code``, ``model``, ``main`` are not, and neither are
+``Deep`` or ``Seek`` split off ``DeepSeek`` (``backend.
+english_frequent_words``). Nova-3 knows everyday words already; as
+keyterms they would only spend budget and pull recognition toward
+themselves. The same words inside a recurring two-word name
+(``Liquid Glass``) still count.
+
+The app's own name (``BUILTIN_TERMS``) heads the list whatever the
+archive says: it is what the owner dictates about all day, and its
+misreadings (``транскиптер``) are exactly what the archive cannot learn
+it from.
 
 Russian inflects names (``Транскриптора``, ``Транскриптором``), so
 Cyrillic forms are grouped by a light ending strip and the most frequent
@@ -65,12 +81,19 @@ from pathlib import Path
 from typing import Awaitable, Callable, Iterable, Optional
 
 from backend.deepgram_keyterms import AUTO_KEYTERM_MAX_CHARS, keyterm_token_cost
+from backend.english_frequent_words import is_frequent_english
 from backend.storage import atomic_write_json
 
-logger = logging.getLogger("transcriptor.auto_keyterms")
+# A child of "backend": main.py routes that tree to stderr, i.e. main.log.
+logger = logging.getLogger(__name__)
 
 #: A term must recur in at least this many different recordings.
 MIN_RECORDINGS = 3
+
+#: The app's own name, in both scripts it is dictated in: always first
+#: in the vocabulary, because the archive holds it misheard and cannot
+#: teach it. The one place it is spelled for recognition.
+BUILTIN_TERMS: tuple[str, ...] = ("Transcriptor", "Транскриптор")
 
 #: How many automatic terms are kept. Every keyterm biases recognition
 #: toward itself, so the list stays a focused vocabulary rather than
@@ -108,6 +131,7 @@ _LATIN_RE = re.compile(r"[A-Za-z]")
 _CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
 _DIGIT_RE = re.compile(r"[0-9]")
 _CAMEL_RE = re.compile(r"[a-zа-яё][A-ZА-ЯЁ]")
+_CAMEL_PART_RE = re.compile(r"[A-ZА-ЯЁ]?[a-zа-яё]+|[A-ZА-ЯЁ]+(?![a-zа-яё])|[0-9]+")
 _BRACKETED_RE = re.compile(r"\[[^\]\n]*\]")
 _FILE_NAME_RE = re.compile(r"\.(?:[a-z]{2,4}[0-9]?)$")
 _PATH_CHARS = frozenset("/\\@")
@@ -236,6 +260,30 @@ def _transliterate(latin: str) -> str:
     for src, dst in _TRANSLIT_DIGRAPHS:
         out = out.replace(src, dst)
     return "".join(_TRANSLIT.get(ch, ch) for ch in out)
+
+
+def _term_key(term: str) -> str:
+    """One key per term however it is inflected or spaced: a word's
+    grouping key, a phrase's compact key."""
+    if " " in term.strip():
+        return _compact_key(term)
+    return _unigram_key(term.strip(), _script(term))
+
+
+def _is_stutter(phrase: str) -> bool:
+    """``Claude Claude``, ``Deep DeepSeek``, ``DeepSeek Seek``: the same
+    word twice, or a CamelCase name beside its own first or last part —
+    the recogniser hesitating over one name, not two words that make one.
+    A surname that merely starts like the first name (``Иван Иванов``)
+    is not a stutter."""
+    first, _space, second = phrase.partition(" ")
+    if first.lower() == second.lower():
+        return True
+    for whole, piece in ((first, second), (second, first)):
+        parts = _CAMEL_PART_RE.findall(whole)
+        if len(parts) >= 2 and piece.lower() in (parts[0].lower(), parts[-1].lower()):
+            return True
+    return False
 
 
 def _is_stop(token: str) -> bool:
@@ -381,13 +429,17 @@ def rank_terms(
     *,
     min_recordings: int = MIN_RECORDINGS,
     max_terms: int = MAX_AUTO_TERMS,
+    builtin: Iterable[str] = (),
 ) -> list[AutoTerm]:
     """Aggregate per-transcript evidence into the ranked vocabulary.
 
     Ranked by the number of recordings a term recurs in, weighted by how
     name-like its evidence is (``_KIND_WEIGHT``); spelling variants
     (``UltraGen`` / ``Ultra Gen``) are one term, counted once per
-    recording and spelled the way it is most often spelled.
+    recording and spelled the way it is most often spelled. *builtin*
+    terms (``BUILTIN_TERMS`` in the store) come first, in their own
+    spelling, with the recordings they are heard in, and replace any
+    mined form of themselves.
     """
     documents = list(documents)
     unigrams: dict[str, _UnigramStats] = {}
@@ -421,8 +473,11 @@ def rank_terms(
             continue
         if phrase.capitalised < PROPER_CAPITAL_SHARE * (phrase.capitalised + phrase.lower):
             continue
+        term = _representative(phrase.surfaces, prefer_capitalised=True)
+        if _is_stutter(term):
+            continue
         accepted_phrases[key] = _Candidate(
-            term=_representative(phrase.surfaces, prefer_capitalised=True),
+            term=term,
             occurrences=phrase.capitalised,
             weight=_KIND_WEIGHT["phrase"],
         )
@@ -467,6 +522,8 @@ def rank_terms(
             term = surface
         else:
             continue
+        if kind != "code" and script == "lat" and is_frequent_english(term):
+            continue
         accepted_unigrams[key] = _Candidate(
             term=term, occurrences=uni.occurrences, weight=_KIND_WEIGHT[kind]
         )
@@ -503,7 +560,22 @@ def rank_terms(
         )
         ranked.append((docs * max(c.weight for c in members), term))
     ranked.sort(key=lambda item: (-item[0], -item[1].occurrences, item[1].term.lower()))
-    return [term for _score, term in ranked[:max_terms]]
+
+    seeded: list[AutoTerm] = []
+    for text in builtin:
+        text = text.strip()
+        key = _term_key(text)
+        if not text or any(_term_key(t.term) == key for t in seeded):
+            continue
+        if " " in text:
+            heard = [d.phrases[text.lower()].capitalised for d in documents
+                     if text.lower() in d.phrases]
+        else:
+            heard = [d.unigrams[key].occurrences for d in documents if key in d.unigrams]
+        seeded.append(AutoTerm(term=text, recordings=len(heard), occurrences=sum(heard)))
+    seeded_keys = {_term_key(t.term) for t in seeded}
+    mined = [term for _score, term in ranked if _term_key(term.term) not in seeded_keys]
+    return (seeded + mined)[:max_terms]
 
 
 def extract_candidates(
@@ -511,12 +583,14 @@ def extract_candidates(
     *,
     min_recordings: int = MIN_RECORDINGS,
     max_terms: int = MAX_AUTO_TERMS,
+    builtin: Iterable[str] = (),
 ) -> list[AutoTerm]:
     """The ranked vocabulary of *texts*, one text per recording."""
     return rank_terms(
         (extract_document_stats(t) for t in texts),
         min_recordings=min_recordings,
         max_terms=max_terms,
+        builtin=builtin,
     )
 
 
@@ -574,6 +648,7 @@ class AutoKeytermStore:
         max_recordings: int = MAX_CORPUS_RECORDINGS,
         min_recordings: int = MIN_RECORDINGS,
         max_terms: int = MAX_AUTO_TERMS,
+        builtin_terms: Iterable[str] = BUILTIN_TERMS,
         recompute_debounce_sec: float = RECOMPUTE_DEBOUNCE_SEC,
         refresh_debounce_sec: float = REFRESH_DEBOUNCE_SEC,
         clock: Callable[[], float] = time.time,
@@ -584,10 +659,14 @@ class AutoKeytermStore:
         self._max_recordings = max(1, int(max_recordings))
         self._min_recordings = max(1, int(min_recordings))
         self._max_terms = max(1, int(max_terms))
+        self._builtin_terms = tuple(builtin_terms)
         self._recompute_debounce = float(recompute_debounce_sec)
         self._refresh_debounce = float(refresh_debounce_sec)
         self._clock = clock
-        self._snapshot = AutoKeytermSnapshot()
+        # The built-in terms are there before the first recompute or cache.
+        self._snapshot = AutoKeytermSnapshot(
+            terms=tuple(rank_terms((), max_terms=self._max_terms, builtin=self._builtin_terms))
+        )
         self._doc_cache: dict[str, tuple[tuple, Optional[DocumentStats]]] = {}
         self._compute_lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -691,7 +770,10 @@ class AutoKeytermStore:
                     docs.append(stats)
             self._doc_cache = live
             ranked = rank_terms(
-                docs, min_recordings=self._min_recordings, max_terms=self._max_terms
+                docs,
+                min_recordings=self._min_recordings,
+                max_terms=self._max_terms,
+                builtin=self._builtin_terms,
             )
             snap = AutoKeytermSnapshot(
                 terms=tuple(ranked), computed_at=self._clock(), recordings=len(docs)

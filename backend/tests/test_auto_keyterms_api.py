@@ -13,6 +13,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from backend.auto_keyterms import BUILTIN_TERMS
+
+#: The app's own name heads every list (``backend.auto_keyterms``).
+BUILTIN = tuple(BUILTIN_TERMS)
+
 
 def _fresh_main_module(data_dir: str):
     os.environ["TRANSCRIPTOR_DISABLE_PARENT_WATCHDOG"] = "1"
@@ -78,7 +83,7 @@ class CorpusTests(_MainCase):
             self._write("Uploaded Media", f"u{i}.txt", _transcript("эфир про Infinity тут"))
             self._write("", f"legacy{i}.txt", _transcript("эфир про Infinity тут", source_file="a.mp4"))
         self.main.AUTO_KEYTERMS.recompute()
-        self.assertEqual(self.main.AUTO_KEYTERMS.terms(), ("Deepgram",))
+        self.assertEqual(self.main.AUTO_KEYTERMS.terms(), BUILTIN + ("Deepgram",))
         self.assertEqual(self.main.AUTO_KEYTERMS.snapshot().recordings, 3)
 
     def test_the_corrected_transcript_is_read_not_the_raw_live_text(self):
@@ -87,10 +92,10 @@ class CorpusTests(_MainCase):
                 "Live Capsule",
                 f"d{i}.txt",
                 "Title: t\nSaved at: x\nLanguage: ru\nProvider: deepgram\nModel: nova-3\n\n"
-                "Original:\nоткрыл транскиптер вчера\n\nTranscription:\nоткрыл Транскриптор вчера\n",
+                "Original:\nоткрыл Дипграм вчера\n\nTranscription:\nоткрыл Deepgram вчера\n",
             )
         self.main.AUTO_KEYTERMS.recompute()
-        self.assertEqual(self.main.AUTO_KEYTERMS.terms(), ("Транскриптор",))
+        self.assertEqual(self.main.AUTO_KEYTERMS.terms(), BUILTIN + ("Deepgram",))
 
     def test_any_change_to_the_archive_schedules_a_recompute(self):
         with mock.patch.object(self.main.AUTO_KEYTERMS, "schedule_recompute") as spy:
@@ -111,12 +116,12 @@ class EndpointTests(_MainCase):
         self.assertEqual(r.status_code, 200, r.text)
         state = r.json()
         self.assertTrue(state["enabled"])
-        self.assertEqual({t["term"] for t in state["terms"]}, {"Deepgram", "MacBook"})
+        self.assertEqual([t["term"] for t in state["terms"]], [*BUILTIN, "Deepgram", "MacBook"])
         self.assertTrue(all(t["included"] for t in state["terms"]))
         self.assertEqual(state["manualCount"], 1)
-        self.assertEqual(state["autoCount"], 2)
+        self.assertEqual(state["autoCount"], 4)
         self.assertEqual(state["tokenBudget"], 500)
-        self.assertEqual(state["tokensUsed"], 6)
+        self.assertEqual(state["tokensUsed"], 10)
         self.assertEqual(state["recordings"], 3)
 
     def test_the_endpoints_need_the_api_token(self):
@@ -127,21 +132,29 @@ class EndpointTests(_MainCase):
         client = self._client()
         r = client.post("/api/deepgram/auto-keyterms", json={"block": "deepgram"}, headers=self._headers())
         self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual([t["term"] for t in r.json()["terms"]], ["MacBook"])
+        self.assertEqual([t["term"] for t in r.json()["terms"]], [*BUILTIN, "MacBook"])
         self.assertEqual(r.json()["blocked"], ["deepgram"])
         cfg = self.main.load_config()
         self.assertEqual(
             self.main.configured_keyterms(cfg, self.main.AUTO_KEYTERMS.terms()),
-            ("Sonnet", "MacBook"),
+            ("Sonnet", *BUILTIN, "MacBook"),
         )
         r = client.post("/api/deepgram/auto-keyterms", json={"unblock": "Deepgram"}, headers=self._headers())
         self.assertEqual(r.json()["blocked"], [])
-        self.assertEqual(len(r.json()["terms"]), 2)
+        self.assertEqual(len(r.json()["terms"]), 4)
+
+    def test_the_built_in_name_can_be_removed_like_any_automatic_term(self):
+        client = self._client()
+        r = client.post("/api/deepgram/auto-keyterms", json={"block": BUILTIN[0]}, headers=self._headers())
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertNotIn(BUILTIN[0], [t["term"] for t in r.json()["terms"]])
+        cfg = self.main.load_config()
+        self.assertNotIn(BUILTIN[0], self.main.configured_keyterms(cfg, self.main.AUTO_KEYTERMS.terms()))
 
     def test_a_pinned_term_is_shown_once_in_the_manual_list(self):
         self.main.save_config({"preferences": {"deepgram": {"keyterms": "Sonnet, Deepgram"}}})
         state = self._client().get("/api/deepgram/auto-keyterms", headers=self._headers()).json()
-        self.assertEqual([t["term"] for t in state["terms"]], ["MacBook"])
+        self.assertEqual([t["term"] for t in state["terms"]], [*BUILTIN, "MacBook"])
 
     def test_switching_off_keeps_the_list_visible_but_sends_only_the_manual_list(self):
         r = self._client().post(
@@ -150,7 +163,7 @@ class EndpointTests(_MainCase):
         state = r.json()
         self.assertFalse(state["enabled"])
         self.assertEqual(state["autoCount"], 0)
-        self.assertEqual(len(state["terms"]), 2)
+        self.assertEqual(len(state["terms"]), 4)
         cfg = self.main.load_config()
         self.assertEqual(
             self.main.configured_keyterms(cfg, self.main.AUTO_KEYTERMS.terms()), ("Sonnet",)
@@ -179,7 +192,7 @@ class WarmPoolWiringTests(_MainCase):
 
         with mock.patch.object(self.main.DEEPGRAM_WARM_POOL, "retarget_keyterms", fake_retarget):
             asyncio.run(self.main._retarget_warm_keyterms())
-        self.assertEqual(calls, [("dg-test", ("Sonnet", "Deepgram"))])
+        self.assertEqual(calls, [("dg-test", ("Sonnet", *BUILTIN, "Deepgram"))])
 
 
 if __name__ == "__main__":

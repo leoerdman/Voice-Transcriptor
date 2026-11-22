@@ -69,6 +69,18 @@ function canonicalAcceleratorForPlatform(acc, platform = process.platform) {
 // hotkey tap (desktop/native/dictation-helper/HotkeyTap.swift) receives
 // its chords already translated through it. A key missing here (media
 // keys, shifted punctuation, "Plus") simply stays on globalShortcut.
+//
+// Positions, not letters, on purpose — unlike the paste's ⌘V, which
+// follows the layout (native/dictation-helper/KeyLayout.swift) because
+// the target app reads it by letter. A hotkey binding is a key position:
+// Settings records letters and digits from KeyboardEvent.code, the
+// physical key (frontend/src/shortcut-capture.ts: "KeyV" → "V" on any
+// layout), and globalShortcut registers a Carbon hot key on the fixed
+// kVK_ANSI_* position Chromium's table gives each accelerator key name,
+// whatever the layout. This table is that same mapping, so the tap fires
+// on exactly the key globalShortcut would, and handing a hotkey between
+// the two (Secure Input, a helper restart) never moves it to another key
+// on Dvorak or with Russian selected.
 const MAC_KEY_CODES = Object.freeze({
   a: 0x00, s: 0x01, d: 0x02, f: 0x03, h: 0x04, g: 0x05, z: 0x06, x: 0x07,
   c: 0x08, v: 0x09, b: 0x0b, q: 0x0c, w: 0x0d, e: 0x0e, r: 0x0f, y: 0x10,

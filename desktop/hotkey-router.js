@@ -21,6 +21,17 @@
 // helper confirms, so no key is ever dead while the helper is asked; once
 // the tap is trusted, a new table goes straight to it.
 //
+// One press, one action, whichever path reports it. Handing a chord from
+// one path to the other is not instant — the tap is armed in the helper a
+// pipe round trip before main lets globalShortcut go, and Secure Input
+// ending is seen by a 250 ms poll — and a press inside that overlap can
+// reach main twice: from the tap and from globalShortcut. Every press goes
+// through dispatch(), which drops the second report of the same action
+// from the other path when main receives it within SAME_PRESS_WINDOW_MS of
+// the first. Reports from the same path are never merged: the tap fires
+// once per key-down (HotkeyMatcher) and so does globalShortcut, so two of
+// them are two presses.
+//
 // Pure of Electron: the helper client, the globalShortcut calls and the
 // accelerator → chord translation are injected (hotkey-router.test.js).
 
@@ -29,6 +40,14 @@ const HOTKEYS_REQUEST_TIMEOUT_MS = 1500;
 /** A native press stamp further from main's clock than this is not used. */
 const PRESS_STAMP_MAX_AGE_MS = 10000;
 const PRESS_STAMP_MAX_AHEAD_MS = 1000;
+/**
+ * Two paths reporting one action this close together (main's receive
+ * clock) are one press. Far above the gap between the two reports of one
+ * key-down (a pipe hop vs. an Electron callback, a few ms — both queue
+ * together while main is busy), far below a deliberate second press of a
+ * toggle.
+ */
+const SAME_PRESS_WINDOW_MS = 100;
 
 /**
  * The press instant a `hotkey` event carries, or `now` when it is missing
@@ -72,11 +91,26 @@ function createHotkeyRouter(deps) {
   let helperArmed = false;
   // The last transition logged — one line per change, not per apply.
   let announced = "";
+  // action → the last press dispatched {via, receivedAt, merged}; kept
+  // across apply() so a table swap inside the overlap still merges.
+  const lastPress = new Map();
 
   function announce(state, detail) {
     if (state === announced) return;
     announced = state;
     log(`[hotkeys] ${detail}`);
+  }
+
+  /** Run the action for one report of a press, unless it is a second report. */
+  function dispatch(binding, via, pressedAt, receivedAt) {
+    const last = lastPress.get(binding.action);
+    if (last && last.via !== via && !last.merged && Math.abs(receivedAt - last.receivedAt) <= SAME_PRESS_WINDOW_MS) {
+      last.merged = true;
+      log(`[hotkeys] ${binding.action}: ${via} report of the press ${last.via} already ran, dropped (${receivedAt - last.receivedAt} ms apart)`);
+      return;
+    }
+    lastPress.set(binding.action, { via, receivedAt, merged: false });
+    binding.handler(pressedAt);
   }
 
   function nativeOwns(binding) {
@@ -85,7 +119,10 @@ function createHotkeyRouter(deps) {
 
   function holdGlobal(binding) {
     if (binding.held) return;
-    const result = deps.registerGlobal(binding.accelerator, () => binding.handler(now()));
+    const result = deps.registerGlobal(binding.accelerator, () => {
+      const at = now();
+      dispatch(binding, "global", at, at);
+    });
     binding.canonical = result.accelerator || binding.canonical;
     binding.held = result.ok ? result.accelerator : "";
     binding.error = result.ok ? "" : String(result.error || "registration failed");
@@ -220,10 +257,13 @@ function createHotkeyRouter(deps) {
     onHelperEvent(event) {
       if (!event || typeof event !== "object") return;
       if (event.t === "hotkey") {
-        // The tap swallowed this press, so globalShortcut never saw it:
-        // it is dispatched whoever owns the chord right now.
+        // Dispatched whoever owns the chord right now: the tap caught it.
+        // A globalShortcut report of the same press is merged in dispatch.
         const binding = bindings.find((b) => b.chord && b.action === event.chord);
-        if (binding) binding.handler(pressedAtFromEvent(event, now()));
+        if (binding) {
+          const at = now();
+          dispatch(binding, "native", pressedAtFromEvent(event, at), at);
+        }
         return;
       }
       if (event.t === "tap-disabled") {
@@ -263,6 +303,7 @@ function createHotkeyRouter(deps) {
 
 module.exports = {
   HOTKEYS_REQUEST_TIMEOUT_MS,
+  SAME_PRESS_WINDOW_MS,
   createHotkeyRouter,
   pressedAtFromEvent,
 };

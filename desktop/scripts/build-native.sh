@@ -65,6 +65,7 @@ xcrun swiftc -O \
   "$SHARED" \
   "$DESKTOP_DIR/native/dictation-helper/ClipboardLedger.swift" \
   "$DESKTOP_DIR/native/dictation-helper/Paste.swift" \
+  "$DESKTOP_DIR/native/dictation-helper/KeyLayout.swift" \
   "$DESKTOP_DIR/native/dictation-helper/HotkeyMatcher.swift" \
   "$DESKTOP_DIR/native/dictation-helper/HotkeyTap.swift" \
   "$DESKTOP_DIR/native/dictation-helper/main.swift" \
