@@ -3,6 +3,19 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.22] - 2026-11-23
+
+### Changed
+
+- **The text is pasted as soon as it is recognised.** The paste no longer waits for the take's audio file to be uploaded and saved (about a second on every dictation); History and screen takes still wait for the save they need. The two Deepgram sockets of a dual-stream take close at once instead of one after the other.
+- **Recording starts without waiting on the archive draft and the capture file.** The previous draft is read in parallel and the capture file opens behind the microphone; frames that arrive before it is ready are kept in memory and written in order.
+- **With Bluetooth headphones, the take records from the Mac's built-in microphone.** When the system's default input is a Bluetooth headset, the microphone stays warm (instant start, pre-roll) and the headphones keep their full audio quality instead of dropping to headset mode. On by default in Settings → Defaults; a Bluetooth microphone picked by name in the list is still used.
+- **Pasting goes through a native helper.** A helper that lives for the whole session snapshots the clipboard when recording starts, waits for the modifier keys to be released and sends ⌘V itself — no AppleScript process per paste. AppleScript remains the fallback.
+- **Your clipboard comes back after every paste on macOS,** not only after a verified one — as long as nothing else changed it in the meantime. An app whose paste could not be verified is tried again every 20th paste instead of never again until restart.
+- **Hotkeys are caught by the native helper's event tap.** The press is timestamped where it happens and no longer goes through the window first; Electron's global shortcuts remain the fallback (no Accessibility permission, helper restarting, Secure Input).
+- **The recording capsule is built once and sleeps while hidden** instead of being destroyed after 8 s idle and rebuilt (110–380 ms) on the next press. `main.log` records `press_to_capsule_visible_ms` for every voice take.
+- **Deepgram key terms learn your names and jargon.** Terms that recur across your transcripts are added after your own list, within the 500-token limit; Settings show them with remove, "add to my list" and the budget used. On by default.
+
 ## [1.6.21] - 2026-11-21
 
 ### Fixed
