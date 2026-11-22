@@ -4,7 +4,8 @@
 // (Ultra-Audit 2026-11-20 DM-02, DM-26).
 //
 // A paste overwrites the clipboard with the transcript and, once the
-// target has verifiably received it, puts back what the user had. Two
+// paste is out and nobody has copied anything since, puts back what the
+// user had (clipboardRestoreDecision below). Two
 // rules make that possible, and both were broken:
 //
 //  1. The snapshot is taken BEFORE anything writes the transcript. Both
@@ -87,4 +88,62 @@ function createClipboardLeases(takeSnapshot) {
   };
 }
 
-module.exports = { createClipboardLeases };
+// ── When the user's clipboard is put back (OPTIMIZATION.md 1.5) ─────────
+//
+// The restore used to wait for a VERIFIED paste. Verification needs an
+// accessibility read of the target's text, and the apps people dictate
+// into most (Claude desktop, Chromium-based editors) expose none: in the
+// 2026-11 logs 14 of 308 pastes were verified, so in ~95% of dictations
+// the user's clipboard was replaced by the transcript for good.
+//
+// The rule now is Hex's (src/paste.rs): once the paste chord is out, wait
+// CLIPBOARD_RESTORE_DELAY_MS for the target to read the pasteboard, then
+// put the original back — but only if the clipboard still holds exactly
+// what we wrote. A clipboard somebody changed in that window (the user's
+// own ⌘C, a later paste of ours) is left alone. "Still ours" is the
+// pasteboard change count where the native helper reports it, and the
+// text we wrote where only Electron's clipboard is available.
+//
+// A paste that FAILED keeps the transcript (main.js
+// keepTranscriptOnClipboardAfterFailure): the text the user just
+// dictated must not vanish together with the paste.
+//
+// Windows and Linux keep the verified gate. Their paste chord is sent by
+// SendKeys / xdotool, which report success for a keystroke that went
+// nowhere (BUGS_AUDIT §6.1) — "sent" there is no evidence the text
+// landed, and a restore would take the only copy of the transcript away.
+// macOS's chord is a CGEventPost or an AppleScript with a SENT receipt.
+
+/** How long the target gets to read the pasteboard before the restore. */
+const CLIPBOARD_RESTORE_DELAY_MS = 500;
+
+/**
+ * Should a SUCCESSFUL paste (the chord was sent) put the user's
+ * clipboard back?
+ *
+ * @param {{platform: string, verified?: boolean|null}} paste
+ * @returns {{restore: boolean, reason: string}}
+ */
+function clipboardRestoreDecision({ platform, verified } = {}) {
+  if (verified === true) return { restore: true, reason: "verified" };
+  if (platform === "darwin") return { restore: true, reason: "sent" };
+  return { restore: false, reason: "unverified-send" };
+}
+
+/**
+ * Does the clipboard still hold what the paste wrote? By change count
+ * when both are known (a count says "nobody wrote since", even a write
+ * of the same text), by the text otherwise.
+ */
+function clipboardStillOurs({ writtenChangeCount, currentChangeCount, writtenText, currentText } = {}) {
+  const counted = Number.isInteger(writtenChangeCount) && Number.isInteger(currentChangeCount);
+  if (counted) return writtenChangeCount === currentChangeCount;
+  return String(currentText == null ? "" : currentText) === String(writtenText == null ? "" : writtenText);
+}
+
+module.exports = {
+  CLIPBOARD_RESTORE_DELAY_MS,
+  clipboardRestoreDecision,
+  clipboardStillOurs,
+  createClipboardLeases,
+};

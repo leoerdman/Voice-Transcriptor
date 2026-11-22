@@ -7,7 +7,12 @@
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 
-const { createClipboardLeases } = require("./clipboard-lease");
+const {
+  CLIPBOARD_RESTORE_DELAY_MS,
+  clipboardRestoreDecision,
+  clipboardStillOurs,
+  createClipboardLeases,
+} = require("./clipboard-lease");
 const { topLevelFunctionSource } = require("./main-source");
 
 function fakeClipboard(initial) {
@@ -77,4 +82,31 @@ test("main.js: only the paste ladder writes the transcript, after snapshotting, 
   assert.ok(acquireAt > 0, "runPasteLadder takes the lease");
   assert.ok(writeAt > acquireAt, "the snapshot is taken before the transcript is written");
   assert.match(ladder, /finally \{[\s\S]*clipboardLease\.settle\(\)/);
+});
+
+// OPTIMIZATION.md 1.5: the restore no longer waits for a verified paste.
+test("macOS puts the clipboard back after any sent paste; Windows/Linux only after a verified one", () => {
+  assert.deepEqual(clipboardRestoreDecision({ platform: "darwin", verified: false }), { restore: true, reason: "sent" });
+  assert.deepEqual(clipboardRestoreDecision({ platform: "darwin", verified: null }), { restore: true, reason: "sent" });
+  assert.deepEqual(clipboardRestoreDecision({ platform: "darwin", verified: true }), { restore: true, reason: "verified" });
+  for (const platform of ["win32", "linux"]) {
+    assert.equal(clipboardRestoreDecision({ platform, verified: false }).restore, false);
+    assert.equal(clipboardRestoreDecision({ platform, verified: true }).restore, true);
+  }
+  assert.equal(CLIPBOARD_RESTORE_DELAY_MS, 500);
+});
+
+test("the clipboard is still ours by change count when known, by text otherwise", () => {
+  assert.equal(clipboardStillOurs({ writtenChangeCount: 41, currentChangeCount: 41 }), true);
+  // The same text copied again by the user is still a change.
+  assert.equal(clipboardStillOurs({ writtenChangeCount: 41, currentChangeCount: 42, writtenText: "a", currentText: "a" }), false);
+  assert.equal(clipboardStillOurs({ writtenText: "hello", currentText: "hello" }), true);
+  assert.equal(clipboardStillOurs({ writtenText: "hello", currentText: "" }), false);
+});
+
+test("main.js restores on the decision, never on verified alone", () => {
+  const body = topLevelFunctionSource("scheduleSmartClipboardRestore");
+  assert.match(body, /clipboardRestoreDecision\(/);
+  assert.match(body, /CLIPBOARD_RESTORE_DELAY_MS/);
+  assert.doesNotMatch(body, /verified !== true/);
 });

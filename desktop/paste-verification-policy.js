@@ -16,11 +16,19 @@
 // verification, they are an IMPOSSIBLE one, and repeating them on every
 // paste for the rest of the process buys nothing.
 //
-// So: remember per target. Two consecutive UNREADABLE outcomes for one
-// app — reads that returned nothing at all — and verification for that
-// app is off for the lifetime of the process. A verified outcome resets
-// the memory: an app that CAN be verified keeps being verified, which is
-// the case worth paying for.
+// So: remember per target — per app, keyed by its bundle id (never one
+// verdict for the whole process). Two consecutive UNREADABLE outcomes for
+// one app — reads that returned nothing at all — and verification for
+// that app is off. Off is not forever: every REPROBE_AFTER_SKIPS-th paste
+// into it carries the reads once more, so an app that started exposing
+// its value (an update, a different field) is noticed within one
+// session, and a still-unreadable one costs one slow paste in twenty. A
+// verified outcome resets the memory: an app that CAN be verified keeps
+// being verified, which is the case worth paying for.
+//
+// Verification no longer decides whether the user's clipboard comes back
+// (./clipboard-lease clipboardRestoreDecision); it is evidence for the
+// paste status and the trace, nothing more.
 //
 // An inconclusive outcome (the reads worked, the length simply did not
 // grow by what we predicted) is deliberately NOT evidence of anything.
@@ -43,6 +51,9 @@
 
 /** Consecutive UNREADABLE outcomes before verification is switched off. */
 const UNVERIFIED_STREAK_LIMIT = 2;
+
+/** Pastes skipped without the reads before a switched-off app is probed again. */
+const REPROBE_AFTER_SKIPS = 20;
 
 /** What a verification attempt can tell us about a target. */
 const PASTE_VERIFICATION_OUTCOME = Object.freeze({
@@ -87,15 +98,20 @@ function pasteVerificationKey(target = {}) {
  * @param {number}   [options.limit]     consecutive unverified outcomes to tolerate
  * @param {Function} [options.onDisable] called ONCE per key, when it is switched off
  */
-function createPasteVerificationPolicy({ limit = UNVERIFIED_STREAK_LIMIT, onDisable = null } = {}) {
+function createPasteVerificationPolicy({
+  limit = UNVERIFIED_STREAK_LIMIT,
+  reprobeAfter = REPROBE_AFTER_SKIPS,
+  onDisable = null,
+} = {}) {
   const effectiveLimit = Math.max(1, Number(limit) || UNVERIFIED_STREAK_LIMIT);
-  /** @type {Map<string, {unverifiedStreak: number, disabled: boolean}>} */
+  const effectiveReprobe = Math.max(1, Number(reprobeAfter) || REPROBE_AFTER_SKIPS);
+  /** @type {Map<string, {unverifiedStreak: number, disabled: boolean, skipped: number}>} */
   const memory = new Map();
 
   function entryFor(key) {
     let entry = memory.get(key);
     if (!entry) {
-      entry = { unverifiedStreak: 0, disabled: false };
+      entry = { unverifiedStreak: 0, disabled: false, skipped: 0 };
       memory.set(key, entry);
     }
     return entry;
@@ -107,6 +123,7 @@ function createPasteVerificationPolicy({ limit = UNVERIFIED_STREAK_LIMIT, onDisa
       unverifiedStreak: entry.unverifiedStreak,
       disabled: entry.disabled,
       limit: effectiveLimit,
+      skipped: entry.skipped,
     };
   }
 
@@ -114,12 +131,18 @@ function createPasteVerificationPolicy({ limit = UNVERIFIED_STREAK_LIMIT, onDisa
     /**
      * Should the next paste into `key` carry the verification reads?
      * An unknown target always may: the cost is only worth avoiding
-     * where we have evidence it is wasted.
+     * where we have evidence it is wasted. A switched-off target is
+     * asked again on every REPROBE_AFTER_SKIPS-th paste — so this is
+     * called exactly once per paste.
      */
     shouldAttemptVerification(key) {
       if (!key) return true;
       const entry = memory.get(key);
-      return !entry || !entry.disabled;
+      if (!entry || !entry.disabled) return true;
+      entry.skipped += 1;
+      if (entry.skipped < effectiveReprobe) return false;
+      entry.skipped = 0;
+      return true;
     },
 
     /**
@@ -139,6 +162,7 @@ function createPasteVerificationPolicy({ limit = UNVERIFIED_STREAK_LIMIT, onDisa
         // policy believed before it.
         entry.unverifiedStreak = 0;
         entry.disabled = false;
+        entry.skipped = 0;
         return snapshot(key, entry);
       }
       if (outcome === PASTE_VERIFICATION_OUTCOME.UNREADABLE) {
@@ -166,7 +190,7 @@ function createPasteVerificationPolicy({ limit = UNVERIFIED_STREAK_LIMIT, onDisa
     /** Current memory for a key — diagnostics and tests. */
     stateFor(key) {
       const entry = memory.get(key);
-      return entry ? snapshot(key, entry) : { key, unverifiedStreak: 0, disabled: false, limit: effectiveLimit };
+      return entry ? snapshot(key, entry) : { key, unverifiedStreak: 0, disabled: false, limit: effectiveLimit, skipped: 0 };
     },
   };
 }
@@ -229,6 +253,7 @@ function summarizeAxReadTrace(events = []) {
 
 module.exports = {
   UNVERIFIED_STREAK_LIMIT,
+  REPROBE_AFTER_SKIPS,
   PASTE_VERIFICATION_OUTCOME,
   pasteVerificationKey,
   createPasteVerificationPolicy,

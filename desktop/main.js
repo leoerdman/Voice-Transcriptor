@@ -180,7 +180,12 @@ const {
 } = require("./renderer-toggle");
 // One lease per paste on the snapshot of the user's clipboard, released
 // exactly once (DM-02, DM-26).
-const { createClipboardLeases } = require("./clipboard-lease");
+const {
+  CLIPBOARD_RESTORE_DELAY_MS,
+  clipboardRestoreDecision,
+  clipboardStillOurs,
+  createClipboardLeases,
+} = require("./clipboard-lease");
 // The one rule for where this shell keeps its data (DM-07, DM-11, S-12).
 const { MAIN_LOG_FILE, resolveDataDir, oneDriveMigrationEntries } = require("./data-dir");
 // main.log is created 0600 and an older world-readable one tightened (BL-02).
@@ -5151,44 +5156,6 @@ function snapshotClipboard() {
 const clipboardLeases = createClipboardLeases(snapshotClipboard);
 
 /**
- * Smart clipboard restore.
- *
- * Waits for the paste to settle, then restores the user's original
- * clipboard — but ABORTS the restore if the clipboard contents
- * changed before we got there, which means the user intentionally
- * copied something new (Cmd+C on a different selection) during the
- * window. Without this guard the prior fixed-1200 ms setTimeout
- * could clobber the user's new copy, or could steal a second paste
- * (Cmd+V → gets transcript again) if the target app handled the
- * synthesised paste faster than 1200 ms.
- *
- * Algorithm:
- *   1. Wait INITIAL_DELAY_MS (400) so the target process reads the
- *      clipboard via the synthesised Cmd+V / Ctrl+V.
- *   2. Poll ``clipboard.readText()`` every POLL_INTERVAL_MS (200)
- *      up to MAX_WAIT_MS (1500) total.
- *      - If text still equals what WE wrote → keep waiting.
- *      - If text differs → user copied something else; ABORT restore
- *        (don't clobber).
- *   3. At MAX_WAIT_MS → restore snapshot.
- *
- * Note on rich clipboards: ``readText`` returns "" for image-only
- * clipboards, so Cmd+C on an image during the window → "" !==
- * writtenText → correctly aborts restore (user's image survives).
- *
- * ``verified`` (BUGS_AUDIT 2026-09-03 §6.1/§6.4/§6.6) is the single gate
- * that decides whether restoring is even attempted: every paste method
- * used to call this unconditionally on any ok:true result, but "ok:true"
- * only ever meant "the OS-level paste command was sent", never "the
- * target actually received the text". A silently-failed Windows paste
- * (§6.1) or a macOS target that reads the pasteboard slower than the
- * fixed 1.5 s window (§6.4) both then had their clipboard overwritten
- * back to the OLD content — destroying the only remaining copy of the
- * transcript. When ``verified`` is not literally ``true`` the transcript
- * is left on the clipboard on purpose: the user can still paste it by
- * hand, whereas a silent restore gives them nothing.
- */
-/**
  * The failure half of the clipboard contract (BUGS_AUDIT §6.5, debt
  * registry item 3, and the Wispr Flow rule the registry records: the
  * clipboard is never restored on failure).
@@ -5206,8 +5173,17 @@ function keepTranscriptOnClipboardAfterFailure(lease, logCtx) {
   lease.release();
 }
 
+/**
+ * The success half of the clipboard contract (./clipboard-lease
+ * clipboardRestoreDecision): the paste chord is out, so after
+ * CLIPBOARD_RESTORE_DELAY_MS the user's clipboard is put back — unless
+ * somebody changed it in the meantime (their own ⌘C, a later paste of
+ * ours), which is left alone. This is the Electron-clipboard path, where
+ * "unchanged" can only be judged by the text.
+ */
 function scheduleSmartClipboardRestore(lease, writtenText, logCtx = "paste:clipboardRestore", verified = false) {
-  if (verified !== true) {
+  const decision = clipboardRestoreDecision({ platform: process.platform, verified });
+  if (!decision.restore) {
     appendMainLog(`[${logCtx}] paste not verified; leaving transcript on the clipboard instead of restoring`);
     lease.release();
     return;
@@ -5216,35 +5192,20 @@ function scheduleSmartClipboardRestore(lease, writtenText, logCtx = "paste:clipb
   // the lease over from the ladder's ``finally``.
   const releaseLease = lease.handOff();
   const snap = lease.snapshot;
-  const INITIAL_DELAY_MS = 400;
-  const POLL_INTERVAL_MS = 200;
-  const MAX_WAIT_MS = 1500;
-  const expected = String(writtenText == null ? "" : writtenText);
-  const startedAt = Date.now();
-
-  const tryPollOrRestore = () => {
-    const elapsed = Date.now() - startedAt;
+  setTimeout(() => {
     let current = "";
     try { current = String(clipboard.readText() || ""); } catch { current = ""; }
-    if (current !== expected) {
-      // User copied something new during the window. Abort the restore
-      // so we don't clobber their new clipboard content. The original
-      // snapshot is forever sacrificed here — acceptable trade-off,
-      // otherwise we silently overwrite user intent.
-      appendMainLog(`[${logCtx}] user copied new content during paste window; skipping restore`);
+    if (!clipboardStillOurs({ writtenText, currentText: current })) {
+      // Somebody wrote the clipboard during the window. Their content
+      // wins; the original snapshot is given up rather than clobbering it.
+      appendMainLog(`[${logCtx}] clipboard changed during paste window; skipping restore`);
       releaseLease();
       return;
     }
-    if (elapsed >= MAX_WAIT_MS) {
-      // Paste is settled, clipboard still has our text, no new user
-      // copy arrived — safe to restore the original snapshot.
-      safeExecSync(logCtx, () => restoreClipboard(snap));
-      releaseLease();
-      return;
-    }
-    setTimeout(tryPollOrRestore, POLL_INTERVAL_MS);
-  };
-  setTimeout(tryPollOrRestore, INITIAL_DELAY_MS);
+    safeExecSync(logCtx, () => restoreClipboard(snap));
+    appendMainLog(`[${logCtx}] restored previous clipboard reason=${decision.reason}`);
+    releaseLease();
+  }, CLIPBOARD_RESTORE_DELAY_MS);
 }
 
 /** Restore a clipboard snapshot produced by snapshotClipboard(). */
@@ -5949,8 +5910,8 @@ async function pasteFromClipboard(text, target, options, trace, clipboardLease) 
     if (macOutcome.success) {
       logPasteTrace("success", { method: "robust_paste", attempt: attempt + 1, reason: out, verified: macOutcome.verified, sent: !!macOutcome.sent });
       traceEnd(trace, "success", { method: "robust_paste", attempt: attempt + 1, reason: out, verified: macOutcome.verified, sent: !!macOutcome.sent });
-      // Restore previous clipboard only when the paste was verified —
-      // see scheduleSmartClipboardRestore's doc comment (§6.4/§6.6).
+      // The chord is out: the previous clipboard comes back unless it
+      // changed meanwhile (./clipboard-lease clipboardRestoreDecision).
       scheduleSmartClipboardRestore(clipboardLease, text, "paste:clipboardRestore:robust_paste", macOutcome.verified);
       return { ok: true, reason: out, method: "robust_paste", verified: macOutcome.verified };
     }
@@ -6018,10 +5979,9 @@ async function pasteFromClipboard(text, target, options, trace, clipboardLease) 
     const out = String(menuRes.stdout || "").trim();
     const menuOutcome = evaluatePasteOutcome({ method: "menu-paste", ok: menuRes.ok, stdout: menuRes.stdout });
     if (menuOutcome.success) {
-      // This fallback script has no AX-verification suffix (unlike
-      // robust_paste's menu-paste-primary/robust-paste branches), so
-      // verified is always false here — the restore gate correctly
-      // leaves the transcript on the clipboard rather than restoring.
+      // This fallback script has no AX-verification suffix, so verified
+      // is false here; on macOS a sent paste restores all the same
+      // (./clipboard-lease clipboardRestoreDecision).
       scheduleSmartClipboardRestore(clipboardLease, text, "paste:clipboardRestore:menu", menuOutcome.verified);
       traceEnd(trace, "success", { method: "menu-paste", reason: out, verified: menuOutcome.verified });
       return { ok: true, reason: out, method: "menu-paste", verified: menuOutcome.verified };
