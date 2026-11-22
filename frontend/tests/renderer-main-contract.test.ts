@@ -608,6 +608,25 @@ describe("boot, update check and History bootstrap (FQ-13/FQ-14/FQ-15/FQ-22)", (
     expect(mainTsx).toMatch(/"devicechange", \(\) => \{\s*releaseWarmCaptureOnLifecycle\("devicechange"\);[\s\S]{0,200}void loadMics\(false\);/);
   });
 
+  it("the picked microphone is a stored intent (./mic-preference) that only a pick in the Mic list changes", () => {
+    // Settings persist the stored pick, never what the list happens to show.
+    const collect = mainTsxSlice("function collectUiPreferences(", "\n}\n");
+    expect(collect).toContain("...micPreferenceToStored(micPreference),");
+    expect(collect).not.toContain("micSelect");
+    expect(mainTsx).toContain("micPreference = micPreferenceFromStored(ui);");
+    // Exactly two writers: the config load above and the user's pick.
+    expect(mainTsx.match(/\bmicPreference = /g) || []).toHaveLength(2);
+    expect(mainTsx).toContain("const next = micPreferenceFromPick(sel.value, knownAudioInputs, micPreference);");
+    // Both start paths resolve the pick on the list they choose against.
+    const start = mainTsxSlice("async function startLive(", "\nasync function ");
+    expect(start.match(/micResolution = resolveRequestedMic\(\);/g) || []).toHaveLength(2);
+    expect(start.match(/requestedDeviceId: micResolution\.deviceId,/g) || []).toHaveLength(2);
+    expect(start).not.toContain("micSelect");
+    expect(start).toContain("pick=${micResolution.kind}");
+    // The list is rendered from the pick, not from its previous value.
+    expect(mainTsxSlice("async function loadMics(", "\n}\n")).toContain("renderMicPicker();");
+  });
+
   it("a crashed take's draft is joined with the entry its audio was promoted into (./take-recovery)", () => {
     const boot = mainTsxSlice("async function initRecordingsBootstrap(): Promise<void> {", "\n}\n");
     const promote = boot.indexOf("promoted = await recoverBackendAudioSessions();");

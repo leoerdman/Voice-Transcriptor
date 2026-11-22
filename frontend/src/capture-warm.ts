@@ -149,7 +149,8 @@ export interface InputDeviceInfo {
 }
 
 export interface CaptureDeviceInput {
-  /** The picker's value: "" means "system default". */
+  /** The device asked for — the picked one as ./mic-preference resolved it;
+   *  "" means "system default". */
   requestedDeviceId: string;
   /** The setting "record from the built-in microphone while Bluetooth
    *  headphones are the default" (preferences.ui.bluetooth_builtin_mic). */
@@ -285,7 +286,7 @@ export interface WarmReuseInput {
   warmHoldMs: number;
   /** `deviceId` the held track reports. */
   heldDeviceId: string;
-  /** `deviceId` the picker is currently on; "" means "system default". */
+  /** `deviceId` this start asks for; "" means "system default". */
   requestedDeviceId: string;
   trackLive: boolean;
   contextState: string;

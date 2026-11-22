@@ -76,9 +76,18 @@ import {
   decideWarmReuse,
   freezeCaptureForStop,
   handOverHeldCapture,
-  type InputDeviceInfo,
   type WarmHoldLifecycleRelease,
 } from "./capture-warm";
+import {
+  SYSTEM_DEFAULT_MIC,
+  micPickerModel,
+  micPreferenceFromPick,
+  micPreferenceFromStored,
+  micPreferenceToStored,
+  resolveMicPreference,
+  type AudioInputDevice,
+  type MicPreference,
+} from "./mic-preference";
 import {
   dualStreamTradeOffText,
   resolveDualStreamPreference,
@@ -357,7 +366,11 @@ interface AppConfig {
       provider?: string;
       language?: string;
       local_model?: string;
+      // The picked microphone (./mic-preference): id, name and group at
+      // the moment of picking. All empty = the system default.
       mic_id?: string;
+      mic_label?: string;
+      mic_group_id?: string;
       auto_transcribe?: boolean;
       live_preview?: boolean;
       upscale_enabled?: boolean;
@@ -2563,7 +2576,12 @@ let suppressUiPrefAutosave = false;
  * is exactly the branch a failed load takes.
  */
 let uiPreferencesLoaded = false;
-let preferredMicId = "";
+/**
+ * The microphone the user picked (./mic-preference) — the one source of
+ * truth for which device records and for what Settings persists. The Mic
+ * list displays it; only an explicit pick there replaces it.
+ */
+let micPreference: MicPreference = SYSTEM_DEFAULT_MIC;
 let upscalePresets: UpscalePresetItem[] = [];
 let pendingUpscalePresetId = "";
 let defaultUpscalePresetId = "";
@@ -5777,7 +5795,25 @@ document.querySelectorAll(".sb-item").forEach((e) => {
  * A device change releases any warm hold, so a stale list never decides
  * a warm start; the cold path re-enumerates first.
  */
-let knownAudioInputs: InputDeviceInfo[] = [];
+let knownAudioInputs: AudioInputDevice[] = [];
+
+/** Show the picked microphone in the Mic list, as resolved against ``knownAudioInputs``. */
+function renderMicPicker(): void {
+  const sel = $("micSelect") as HTMLSelectElement;
+  const model = micPickerModel(micPreference, knownAudioInputs);
+  sel.replaceChildren(...model.options.map((o) => new Option(o.text, o.value)));
+  sel.value = model.selected;
+  sel.title = "";
+}
+
+/**
+ * Which device this take asks for: the picked one (under whatever id it
+ * has now), or — while it is not connected — the system default, for this
+ * take only.
+ */
+function resolveRequestedMic() {
+  return resolveMicPreference(micPreference, knownAudioInputs);
+}
 
 async function loadMics(forceReload = false): Promise<void> {
   if (!navigator.mediaDevices?.getUserMedia || !navigator.mediaDevices?.enumerateDevices) {
@@ -5792,23 +5828,17 @@ async function loadMics(forceReload = false): Promise<void> {
       stream.getTracks().forEach((t) => t.stop());
     }
     const devs = await navigator.mediaDevices.enumerateDevices();
-    const curVal = sel.value;
-    sel.replaceChildren(new Option("Default", ""));
-    const mics = devs.filter((d) => d.kind === "audioinput");
-    knownAudioInputs = mics.map((d) => ({ deviceId: d.deviceId, label: d.label }));
-    if (mics.length === 0) {
+    knownAudioInputs = devs
+      .filter((d) => d.kind === "audioinput")
+      .map((d) => ({ deviceId: d.deviceId, label: d.label, groupId: d.groupId }));
+    // Rendered from the stored pick, never from what the list showed
+    // before: a device that vanished for a moment is shown as "not
+    // connected" and comes back selected, and the list never reads
+    // "Default" for a choice the user did not make.
+    if (knownAudioInputs.length === 0) {
       sel.replaceChildren(new Option("No microphones", ""));
     } else {
-      mics.forEach((d, i) => {
-        const o = document.createElement("option");
-        o.value = d.deviceId;
-        o.textContent = d.label || "Microphone " + (i + 1);
-        sel.appendChild(o);
-      });
-    }
-    const nextVal = curVal || preferredMicId || "";
-    if (nextVal && Array.from(sel.options).some((o) => o.value === nextVal)) {
-      sel.value = nextVal;
+      renderMicPicker();
     }
   } catch (e) {
     console.error("Error loading microphones:", e);
@@ -6381,7 +6411,10 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
     provider_group: readProviderGroup(),
     language: (($("language") as HTMLSelectElement).value || "auto").trim(),
     local_model: selectedLocalModel(),
-    mic_id: (($("micSelect") as HTMLSelectElement).value || "").trim(),
+    // From the stored pick, not the list: the list may be showing an
+    // error or a stand-in while the picked device is away, and saving
+    // any other setting must not overwrite the pick with that.
+    ...micPreferenceToStored(micPreference),
     auto_transcribe: !!($("autoTranscribeToggle") as HTMLInputElement).checked,
     live_preview: !!($("livePreviewToggle") as HTMLInputElement).checked,
     upscale_enabled: !!($("upscaleToggle") as HTMLInputElement).checked,
@@ -7383,7 +7416,8 @@ async function loadCfg(): Promise<void> {
       upscaleModelSelectEl.value = storedUpscaleModel || DEFAULT_UPSCALE_MODEL;
     }
     populateUpscaleModelOptions();
-    preferredMicId = String(ui.mic_id || "").trim();
+    micPreference = micPreferenceFromStored(ui);
+    if (knownAudioInputs.length) renderMicPicker();
     renderTranscriptionSelectors();
     await loadUpscalePresets(pendingUpscalePresetId);
 
@@ -9802,6 +9836,12 @@ dualSecondaryLanguageSelect()?.addEventListener("change", () => {
   queueUiPreferencesSave();
 });
 ($("micSelect") as HTMLSelectElement).addEventListener("change", () => {
+  // The one place the pick changes: the user chose a row in the list.
+  const sel = $("micSelect") as HTMLSelectElement;
+  const next = micPreferenceFromPick(sel.value, knownAudioInputs, micPreference);
+  if (!next) return;
+  micPreference = next;
+  console.log(`[trace mic] picked "${next.label || (next.deviceId ? next.deviceId : "system default")}"`);
   queueUiPreferencesSave();
 });
 
@@ -10668,8 +10708,8 @@ function releaseWarmCaptureOnLifecycle(reason: WarmHoldLifecycleRelease): void {
 try {
   navigator.mediaDevices?.addEventListener?.("devicechange", () => {
     releaseWarmCaptureOnLifecycle("devicechange");
-    // Headphones connected or gone: refresh the list the next start's
-    // microphone choice is made against (``knownAudioInputs``).
+    // A device came or went: refresh the list the next start resolves
+    // the pick against, and the Mic list that shows it.
     void loadMics(false);
   });
 } catch (e) {
@@ -11945,14 +11985,16 @@ async function startLive(
       throw new Error("This browser does not support microphone capture.");
     }
     const preferBuiltInOverBluetooth = readBluetoothBuiltinMicEnabled();
-    // Which microphone this take records from (./capture-warm
-    // ``chooseCaptureDevice``): the picker's device, or — while the system
-    // default is a Bluetooth headset and the setting is on — the Mac's
-    // built-in one, which keeps the headset in A2DP and can be warm-held.
+    // Which microphone this take records from: the picked one under the
+    // id it has now (./mic-preference — the system default only while it
+    // is not connected), then ./capture-warm ``chooseCaptureDevice``,
+    // which — while the system default is a Bluetooth headset and the
+    // setting is on — swaps the default for the Mac's built-in mic.
     // Resolved against the last known device list, so the warm path below
     // touches no device API.
+    let micResolution = resolveRequestedMic();
     let micChoice = chooseCaptureDevice({
-      requestedDeviceId: (($("micSelect") as HTMLSelectElement).value || "").trim(),
+      requestedDeviceId: micResolution.deviceId,
       preferBuiltInOverBluetooth,
       devices: knownAudioInputs,
     });
@@ -11978,15 +12020,12 @@ async function startLive(
       await loadMics(false);
       markStartPhase("loadMics");
       throwIfStartCancelled();
-      // Re-read rather than reuse ``selectedDeviceId``: ``loadMics``
-      // repopulates the picker and can change its value (a device that
-      // disappeared, a default that resolved), and the request has to
-      // carry what the picker says NOW. The warm check above necessarily
-      // runs before that, on what the picker said before.
-      // Chosen again on the list ``loadMics`` just enumerated: headphones
-      // connected or disconnected since the last start change the answer.
+      // Resolved again on the list ``loadMics`` just enumerated: a device
+      // that came back, left, or reappeared under a new id since the warm
+      // check above changes the answer.
+      micResolution = resolveRequestedMic();
       micChoice = chooseCaptureDevice({
-        requestedDeviceId: (($("micSelect") as HTMLSelectElement).value || "").trim(),
+        requestedDeviceId: micResolution.deviceId,
         preferBuiltInOverBluetooth,
         devices: knownAudioInputs,
       });
@@ -12013,7 +12052,7 @@ async function startLive(
     // The one line that says which microphone this take records from and why.
     console.log(
       `[trace startLive] mic="${initialTracks[0]?.label || micChoice.label}" ` +
-      `choice=${micChoice.reason} warm=${warm ? 1 : 0}`,
+      `pick=${micResolution.kind} choice=${micChoice.reason} warm=${warm ? 1 : 0}`,
     );
     micHealth.observe({ kind: "session-start", deviceId: initialDeviceId });
     if (initialTracks.some((t) => t.muted)) {
