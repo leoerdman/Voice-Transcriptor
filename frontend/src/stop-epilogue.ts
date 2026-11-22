@@ -169,8 +169,10 @@ export interface SessionMetadataInput {
 }
 
 export interface SessionMetadataSaverDeps {
-  /** The History entry the provisional save created (empty: none yet). */
-  target(): { name: string; archiveDir: string };
+  /** The History entry the provisional save created (empty: none yet).
+   *  May be a promise: the audio save that creates the entry runs beside
+   *  the transcript wait, and the metadata write waits for it here. */
+  target(): { name: string; archiveDir: string } | Promise<{ name: string; archiveDir: string }>;
   /** The live source text at the moment of the save — read late, since
    *  final events can still land while the socket drains. */
   liveSourceText(): string;
@@ -193,8 +195,8 @@ export function resolveSessionTitle(
 export function createSessionMetadataSaver(
   deps: SessionMetadataSaverDeps,
 ): (input: SessionMetadataInput) => Promise<FinalSaveOutcome> {
-  return (input) => attemptFinalSave(() => {
-    const { name, archiveDir } = deps.target();
+  return (input) => attemptFinalSave(async () => {
+    const { name, archiveDir } = await deps.target();
     const sourceText = deps.liveSourceText();
     return deps.save({
       name,

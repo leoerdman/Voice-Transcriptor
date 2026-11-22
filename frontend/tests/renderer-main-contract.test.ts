@@ -221,6 +221,30 @@ describe("stopLive has exactly one transcript delivery site (F/7 / U-022)", () =
     expect(String(finalSave)).toMatch(/transcriptText:\s*transcriptRaw,/);
   });
 
+  it("the audio save runs beside the transcript wait: the FINAL delivery never waits for it (OPTIMIZATION.md §3.1)", () => {
+    expect(stopLiveBody).toContain("startAudioPersistence({");
+    // No inline two-attempt upload left on the stop path.
+    expect(stopLiveBody).not.toMatch(/await saveRecordingText\(\{[^}]*audioFile/);
+    expect(stopLiveBody).not.toMatch(/await audioPersistence\.settled/);
+    // Only the steps that consume the saved recording wait for the save:
+    // the metadata write's target, the recovery decode of the saved file,
+    // and a screen take's marks (archived screenshot paths).
+    const allowed = [
+      "if (stagedScreenManifest) {",
+      "const fetchRecoveryAudioFile = async",
+      "const recoverFromEmptyTranscriptInner = async",
+      "target: async () => {",
+    ];
+    const waits = [...stopLiveBody.matchAll(/await audioSaveApplied;/g)];
+    expect(waits.length).toBe(allowed.length);
+    for (const wait of waits) {
+      const before = stopLiveBody.slice(Math.max(0, (wait.index ?? 0) - 400), wait.index);
+      expect(allowed.some((ctx) => before.includes(ctx)), `unexpected wait for the audio save: …${before.slice(-160)}`).toBe(true);
+    }
+    // The spool outlives a failed save until the stop is completely over.
+    expect(mainTsx).toContain("audioPersistence.releaseSpoolWhenDone();");
+  });
+
   it("FL-04: every exit ends the mic-health session through the one session-ending step", () => {
     const endBlock = /const endStopSession = \(\): void => \{([\s\S]*?)\n {2}\};/.exec(stopLiveBody)?.[1];
     expect(endBlock, "endStopSession not found in stopLive").toBeTruthy();

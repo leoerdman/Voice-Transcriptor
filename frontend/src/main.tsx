@@ -165,6 +165,7 @@ import {
   takeStartedAtMs,
   transcriptScreenManifest,
 } from "./recording-save";
+import { skippedAudioPersistence, startAudioPersistence, type AudioPersistence } from "./audio-persistence";
 import {
   RECORDING_COLLECTIONS,
   liveRecordingCollection,
@@ -11938,6 +11939,12 @@ async function stopLive(
   // backend's post-CloseStream is_final emission and truncate the
   // tail.
   let _wsToCloseAtEnd: WebSocket | null = null;
+  // The take's audio save (./audio-persistence) and the application of
+  // its outcome. Hoisted for the same reason: the outer ``finally``
+  // releases the capture spool once the save has settled, and the steps
+  // that need the saved recording await ``audioSaveApplied``.
+  let audioPersistence: AudioPersistence<SavedRecordingRef> = skippedAudioPersistence(() => {});
+  let audioSaveApplied: Promise<void> = Promise.resolve();
   let tailHoldMs = 0;
   let stopTransitionReleased = false;
   let stoppedRecordingId = 0;
@@ -12510,6 +12517,9 @@ async function stopLive(
   // than firing close() and nulling the slot in the same tick) means the
   // slot is provably empty before the next start can claim it.
   await closeAudioContextSlot();
+  // A cold stop closes the device here (Bluetooth: HFP → A2DP); the mark
+  // keeps that wait visible in the stop's phase line.
+  mark("closeAudioContext");
   workletNode = null;
   teardownScriptProcessorCapture();
   src = null;
@@ -12587,7 +12597,12 @@ async function stopLive(
   // SAID), the live text only when there is none (./stop-epilogue).
   const defaultTitle = title;
   const saveSessionMetadata = createSessionMetadataSaver({
-    target: () => ({ name: persistedRecordingName, archiveDir: persistedRecordingArchiveDir }),
+    // The entry the audio save created — so the metadata write waits for
+    // that save, which runs beside the transcript wait.
+    target: async () => {
+      await audioSaveApplied;
+      return { name: persistedRecordingName, archiveDir: persistedRecordingArchiveDir };
+    },
     liveSourceText: latestSourceForSave,
     fallbackTitle: defaultTitle,
     save: async (request) => saveRecordingText({
@@ -12676,41 +12691,62 @@ async function stopLive(
   const stagedScreenManifest = await screenSessionPromise;
   const recordingCollection = await recordingCollectionPromise;
   let screenManifest = stagedScreenManifest;
-  if (savedAudioFile) {
-    // Two-attempt save: first with the configured archive dir, then
-    // with the DEFAULT dir. The most common cause of "initial save
-    // failed" is a stale custom recordings_dir that became unwritable
-    // (rename, permissions, external drive ejected). Retrying into the
-    // default dir salvages the audio instead of silently losing it.
-    let saveDone = false;
-    // Build unique attempt list — if sessionArchiveDir is already ""
-    // the fallback would be identical, so skip the duplicate.
-    const saveDirs = sessionArchiveDir ? [sessionArchiveDir, ""] : [""];
-    for (const tryArchiveDir of saveDirs) {
-      if (saveDone) break;
-      try {
-        const persisted = await saveRecordingText({
-          archiveDir: tryArchiveDir,
-          title: provisionalTitle,
-          sourceText: latestSourceForSave(),
-          transcriptText: "",
-          provider: metadataProvider,
-          model: modelValue,
-          language: languageValue,
-          recordingCollection,
-          audioFile: savedAudioFile,
-          liveSessionId: liveSessionId,
-          screenSessionId: stagedScreenManifest?.id || undefined,
-          recordedAtMs: takeStartedAt,
-          refreshList: false,
-        });
+  // The audio save runs BESIDE the transcript wait, not before it
+  // (./audio-persistence, OPTIMIZATION.md §3.1): the FINAL signal and the
+  // paste no longer wait ~1 s for an upload they do not need. What does
+  // need the save waits for ``audioPersistence.settled`` itself: the
+  // History metadata write (the entry's archive name, through
+  // ``saveSessionMetadata``'s target), the recovery decode of the saved
+  // file (``fetchRecoveryAudioFile``) and a screen take's marks (below).
+  const releaseCaptureSpool = (): void => {
+    if (deferredSinkDestroy) void deferredSinkDestroy.destroy();
+  };
+  audioPersistence = savedAudioFile
+    ? startAudioPersistence({
+      archiveDir: sessionArchiveDir,
+      save: (tryArchiveDir) => saveRecordingText({
+        archiveDir: tryArchiveDir,
+        title: provisionalTitle,
+        sourceText: latestSourceForSave(),
+        transcriptText: "",
+        provider: metadataProvider,
+        model: modelValue,
+        language: languageValue,
+        recordingCollection,
+        audioFile: savedAudioFile,
+        liveSessionId: liveSessionId,
+        screenSessionId: stagedScreenManifest?.id || undefined,
+        recordedAtMs: takeStartedAt,
+        refreshList: false,
+      }),
+      onAttemptFailed: (tryArchiveDir, e) => {
+        console.warn(`Audio persistence attempt failed (archiveDirSet=${String(tryArchiveDir || "").trim() ? "1" : "0"}, fileSize=${savedAudioFile?.size || 0}, fileNameLen=${String(savedAudioFile?.name || "").length})`, e);
+      },
+      releaseSpool: releaseCaptureSpool,
+    })
+    : skippedAudioPersistence(releaseCaptureSpool);
+  const audioSaveStartedAt = performance.now();
+  // What the save's outcome changes, applied the moment it settles — which
+  // may be after the transcript was pasted. Nothing here may throw into
+  // the stop: a failure is a warning, never an unhandled rejection.
+  audioSaveApplied = audioPersistence.settled.then((outcome) => {
+    try {
+      if (outcome.kind === "skipped") return;
+      console.log(
+        `[trace stopLive] audio save ${outcome.kind} durMs=${(performance.now() - audioSaveStartedAt).toFixed(0)}` +
+        (outcome.kind === "saved" ? ` fallbackDir=${outcome.usedFallbackDir ? 1 : 0}` : ""),
+      );
+      if (outcome.kind === "saved" && savedAudioFile) {
+        const persisted = outcome.persisted;
         persistedRecordingName = persisted.name;
         persistedRecordingArchiveDir = persisted.archiveDir;
-        screenManifest = transcriptScreenManifest(
-          parseScreenManifest(persisted.screensManifest),
-          stagedScreenManifest,
-          persisted.screensError || "",
-        );
+        if (stagedScreenManifest) {
+          screenManifest = transcriptScreenManifest(
+            parseScreenManifest(persisted.screensManifest),
+            stagedScreenManifest,
+            persisted.screensError || "",
+          );
+        }
         setCurrentRecordingAudio(savedAudioFile, persistedRecordingName, persistedRecordingArchiveDir, sessionUiToken);
         // No separate recovery discard (BL-16): the save carried
         // ``liveSessionId``, and the backend discards that session's
@@ -12718,62 +12754,55 @@ async function stopLive(
         // WebSocket handler still owns the spool (BL-01,
         // ``_safe_delete_live_recovery``). The extra POST answered
         // ``deleted:false`` on 1 583 of 1 591 sessions.
-        const fallbackNote = tryArchiveDir !== sessionArchiveDir && sessionArchiveDir
-          ? " (saved to default folder — configured archive was unavailable)"
+        //
+        // Only the entry's name is patched: the save may land after the
+        // transcript's own status, which it must not overwrite.
+        patchCurrentRecordingSummary({ savedName: persistedRecordingName }, sessionUiToken);
+        const fallbackNote = outcome.usedFallbackDir
+          ? " It was saved to the default folder — the configured archive was unavailable."
           : "";
-        patchCurrentRecordingSummary({
-          title: provisionalTitle,
-          status: (enhance && transcribeInputFile ? "Audio saved locally. Starting final transcription." : "Audio saved locally.") + fallbackNote,
-          tone: "success",
-          savedName: persistedRecordingName,
-        }, sessionUiToken);
         if (persisted.screensError) {
           // M3: saved, but not whole — said, not swallowed, and the
           // transcript gets no marks pointing at the swept staging folder.
           console.warn(`[trace screen] screenshots not attached: ${persisted.screensError}`);
           showRecordSessionNotice(
-            `Recording audio is saved, but its screenshots could not be attached (${persisted.screensError}). The transcript has no screen marks.`,
+            `Recording audio is saved, but its screenshots could not be attached (${persisted.screensError}). The transcript has no screen marks.${fallbackNote}`,
             "warning",
             UI_TOKENS.notice.longMs,
             sessionUiToken,
           );
         } else {
           showRecordSessionNotice(
-            "Recording audio is saved and available immediately.",
-            "success",
-            UI_TOKENS.notice.briefMs,
+            `Recording audio is saved and available immediately.${fallbackNote}`,
+            fallbackNote ? "warning" : "success",
+            fallbackNote ? UI_TOKENS.notice.longMs : UI_TOKENS.notice.briefMs,
             sessionUiToken,
           );
         }
-        saveDone = true;
-      } catch (e) {
-        const errMsg = e instanceof Error ? e.message : String(e || "");
-        console.warn(`Audio persistence attempt failed (archiveDirSet=${String(tryArchiveDir || "").trim() ? "1" : "0"}, fileSize=${savedAudioFile?.size || 0}, fileNameLen=${String(savedAudioFile?.name || "").length})`, e);
-        if (tryArchiveDir === "" || saveDirs.length === 1) {
-          // Both attempts failed — truly broken. Surface the ACTUAL
-          // backend error message instead of a generic "check folder
-          // permissions" hint that masks the real cause. The previous
-          // text said the same thing for a Windows path-too-long, an
-          // antivirus block, a 413 oversize, a 5xx backend crash, or a
-          // genuine permission denial — all five looked identical to
-          // the user. Now we name the underlying error verbatim and
-          // append the permission hint as a fallback when the message
-          // is empty (rare; only fires on `String(e)` of a bare object).
-          const detail = errMsg.trim()
-            || "unknown error — check the Recordings folder permissions";
-          patchCurrentRecordingSummary({
-            title: provisionalTitle,
-            status: `Audio capture finished, but save failed: ${detail}`,
-            tone: "error",
-          }, sessionUiToken);
-        }
+        return;
       }
+      if (outcome.kind === "failed") {
+        // Both attempts failed — truly broken. Name the ACTUAL backend
+        // error (a path-too-long, an antivirus block, a 413, a 5xx and a
+        // permission denial used to read the same), with the permission
+        // hint only when the error carries no message at all. Said as a
+        // notice as well as in the summary: the save can settle after the
+        // transcript's status, and the summary alone would be overwritten
+        // by the stop's last word.
+        const detail = outcome.message || "unknown error — check the Recordings folder permissions";
+        const status = `Audio capture finished, but save failed: ${detail}`;
+        patchCurrentRecordingSummary({ title: provisionalTitle, status, tone: "error" }, sessionUiToken);
+        showRecordSessionNotice(status, "error", UI_TOKENS.notice.longMs, sessionUiToken);
+      }
+    } catch (e) {
+      console.warn("[trace stopLive] applying the audio save outcome failed", e);
     }
-  }
-  // NOW safe to destroy the OPFS spool file — saveRecordingText above
-  // has already serialized the File blob into the FormData upload.
-  if (deferredSinkDestroy) {
-    void deferredSinkDestroy.destroy();
+  });
+  // Screen mode: the marks are written from the ARCHIVED manifest, so the
+  // paths in the transcript are the screenshots' permanent ones — a
+  // screen take's transcript waits for the save that moves them.
+  if (stagedScreenManifest) {
+    await audioSaveApplied;
   }
 
   // Screen mode: the strokes and screenshots of this take, from the
@@ -12915,6 +12944,9 @@ async function stopLive(
     // was never persisted (extremely rare — stopLive's two-attempt
     // save with default-dir fallback covers nearly every failure).
     const fetchRecoveryAudioFile = async (): Promise<File | null> => {
+      // The save runs beside the transcript wait: the saved file exists
+      // (or is known not to) only once it has settled.
+      await audioSaveApplied;
       if (persistedRecordingName) {
         try {
           return await fetchSavedAudioFromBackend(
@@ -12960,6 +12992,7 @@ async function stopLive(
         ? LIVE_SHORT_EMPTY_RECOVERY_TIMEOUT_MS
         : LIVE_DEFAULT_EMPTY_RECOVERY_TIMEOUT_MS;
     const recoverFromEmptyTranscriptInner = async (reason: string, signal?: AbortSignal): Promise<string> => {
+      await audioSaveApplied;
       console.log(`[trace recover] enter reason="${reason}" persistedRecordingName="${persistedRecordingName}" hasInMemoryFile=${!!transcribeInputFile}`);
       const decoded = await decodeSavedRecording({
         name: persistedRecordingName,
@@ -13448,6 +13481,11 @@ async function stopLive(
     // Keep this final assignment as the crash-proof fallback for exceptions
     // before that release point; `isBusy` is released only after the full
     // stop/transcribe pipeline completes.
+    //
+    // The capture spool outlives a FAILED audio save until here: the
+    // recovery paths above may still read the in-memory file it backs.
+    // A saved take released it the moment the save landed.
+    audioPersistence.releaseSpoolWhenDone();
     if (stopTransitionOwnerToken === stopTransitionToken) {
       stopTransitionInFlight = false;
       stopTransitionOwnerToken = "";
