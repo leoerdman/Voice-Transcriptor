@@ -3,6 +3,12 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.30] - 2026-11-23
+
+### Fixed
+
+- **The recording tail now counts the built-in microphone's real input delay.** The tail after Stop starts from where the press falls in the audio, which needs the microphone's input latency. The app took it from Chromium, which reports 2.9 ms for the MacBook microphone, while macOS itself says 62.8 ms (device latency, safety offset, buffer and stream latency). The tail therefore began about 60 ms before the press. The native helper now reads those figures from Core Audio for every input device, and the app uses the larger of the two numbers (never their sum); Bluetooth headsets keep their 300 ms floor, which macOS cannot see. The stop trace shows it as `native=…ms`.
+
 ## [1.6.29] - 2026-11-23
 
 ### Fixed
