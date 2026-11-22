@@ -90,7 +90,7 @@ import logging
 import sys
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
 from backend.async_tasks import cancel_and_collect
@@ -189,6 +189,10 @@ class _WarmSlot:
     session: DeepgramLiveSession
     key: str
     api_key: str
+    # The configuration the socket was opened with — kept so a keyterm
+    # change can re-open the SAME reading with the new list
+    # (``retarget_keyterms``) instead of guessing model and language.
+    cfg: DeepgramLiveConfig
     warmed_at: float
     reaper: Optional[asyncio.Task] = None
 
@@ -241,7 +245,8 @@ class DeepgramWarmPool:
         # Insertion-ordered, and kept that way: the oldest slot is the
         # first one out when the bound is reached.
         self._slots: "OrderedDict[str, _WarmSlot]" = OrderedDict()
-        self._pending: dict[str, tuple[asyncio.Task, str]] = {}
+        # key -> (connect task, api key, configuration being connected).
+        self._pending: dict[str, tuple[asyncio.Task, str, DeepgramLiveConfig]] = {}
 
     # ----- Lifecycle --------------------------------------------------
 
@@ -412,7 +417,49 @@ class DeepgramWarmPool:
         task = asyncio.get_running_loop().create_task(
             self._warm_connect(api_key, cfg, key), name="deepgram-warm-connect"
         )
-        self._pending[key] = (task, api_key)
+        self._pending[key] = (task, api_key, cfg)
+
+    async def retarget_keyterms(
+        self, api_key: str, keyterms: tuple[str, ...]
+    ) -> None:
+        """Re-open every warm socket whose keyterms are no longer current.
+
+        The keyterm list is part of the query string and therefore of
+        the slot key, so a socket opened before the list changed can
+        never be ADOPTED by a recording that uses the new list — that
+        much holds by construction. What construction alone does not do
+        is release it: the stale socket would sit out its idle TTL
+        holding a concurrency slot, and the next recording would pay the
+        cold connect this pool exists to remove. The keyterm list
+        changes behind the renderer's back (the self-filling vocabulary,
+        ``backend.auto_keyterms``, recomputes after a recording is
+        saved), so the pool is told, and swaps each affected socket —
+        and each affected connect still in flight — for one opened with
+        the same configuration and the new list.
+
+        A configuration on which keyterms are not on the wire (a
+        non-Nova-3 model) keeps its key and is left alone. Without an
+        API key the stale sockets are only released. Never raises.
+        """
+        if not self._armed:
+            return
+        keyterms = tuple(keyterms)
+        reopen: list[DeepgramLiveConfig] = []
+        async with self._lock:
+            for key, slot in list(self._slots.items()):
+                fresh = replace(slot.cfg, keyterms=keyterms)
+                if fresh.to_query_string() == key:
+                    continue
+                await self._drop_slot(key, "keyterms changed")
+                reopen.append(fresh)
+            for key, (_task, _pending_key, cfg) in list(self._pending.items()):
+                fresh = replace(cfg, keyterms=keyterms)
+                if fresh.to_query_string() == key:
+                    continue
+                await self._cancel_pending(key)
+                reopen.append(fresh)
+        for cfg in reopen:
+            self.rewarm(api_key, cfg)
 
     async def _warm_connect(
         self, api_key: str, cfg: DeepgramLiveConfig, key: str
@@ -433,11 +480,15 @@ class DeepgramWarmPool:
         # belongs to that caller and must not be stored.
         if key in self._pending:
             self._pending.pop(key, None)
-            await self._store_warm(session, key, api_key)
+            await self._store_warm(session, key, api_key, cfg)
         return session
 
     async def _store_warm(
-        self, session: DeepgramLiveSession, key: str, api_key: str
+        self,
+        session: DeepgramLiveSession,
+        key: str,
+        api_key: str,
+        cfg: DeepgramLiveConfig,
     ) -> None:
         # Every mutation happens before the first await, so a concurrent
         # ``acquire()`` can never observe a half-swapped slot. This runs
@@ -452,7 +503,11 @@ class DeepgramWarmPool:
             self._cancel_reaper(oldest)
             evicted.append(oldest)
         slot = _WarmSlot(
-            session=session, key=key, api_key=api_key, warmed_at=self._clock(),
+            session=session,
+            key=key,
+            api_key=api_key,
+            cfg=cfg,
+            warmed_at=self._clock(),
         )
         self._slots[key] = slot
         connect_ms = session.stats.connect_ms

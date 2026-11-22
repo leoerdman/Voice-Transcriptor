@@ -14,9 +14,16 @@ from urllib.parse import parse_qs, parse_qsl
 
 from backend.config import DEFAULT_CONFIG, _validate_config_shape
 from backend.deepgram_keyterms import (
+    MAX_KEYTERM_TOKENS,
+    auto_keyterms_blocked,
+    auto_keyterms_enabled,
     configured_keyterms,
+    configured_merge,
     keyterm_query_pairs,
+    keyterm_token_cost,
     keyterms_supported,
+    merge_keyterms,
+    normalize_auto_keyterms_blocked,
     normalize_keyterms,
 )
 from backend.remote_deepgram_live import DeepgramLiveConfig
@@ -184,6 +191,87 @@ class ConfigDefaultAndValidationTests(unittest.TestCase):
             DEFAULT_CONFIG["preferences"]["deepgram"],
         )
         self.assertEqual(fixed["preferences"]["deepgram"]["keyterms"], "")
+
+
+
+def _cfg(**deepgram) -> dict:
+    return {"preferences": {"deepgram": deepgram}}
+
+
+class MergeWithTheSelfFillingVocabularyTests(unittest.TestCase):
+    """The owner's list first and whole; automatic terms only in what
+    the shared budget has left."""
+
+    def test_the_manual_list_goes_first_then_automatic_terms(self):
+        merged = merge_keyterms(("Sonnet", "Opus"), ("Deepgram", "MacBook"))
+        self.assertEqual(merged.terms, ("Sonnet", "Opus", "Deepgram", "MacBook"))
+        self.assertEqual(merged.manual, ("Sonnet", "Opus"))
+        self.assertEqual(merged.auto, ("Deepgram", "MacBook"))
+        self.assertEqual(
+            merged.tokens_used,
+            sum(keyterm_token_cost(t) for t in merged.terms),
+        )
+
+    def test_automatic_terms_stop_at_the_budget_and_never_displace_manual_ones(self):
+        manual = tuple(f"manual{i}" for i in range(200))  # 2 tokens each
+        auto = tuple(f"auto{i}" for i in range(100))
+        merged = merge_keyterms(manual, auto)
+        self.assertEqual(merged.manual, manual)
+        self.assertLessEqual(merged.tokens_used, MAX_KEYTERM_TOKENS)
+        self.assertEqual(len(merged.auto), (MAX_KEYTERM_TOKENS - 400) // 2)
+        self.assertEqual(merged.auto_over_budget, auto[len(merged.auto):])
+
+    def test_a_removed_term_is_not_sent_whatever_its_casing(self):
+        merged = merge_keyterms((), ("Deepgram", "MacBook"), blocked=("deepgram",))
+        self.assertEqual(merged.terms, ("MacBook",))
+
+    def test_a_term_already_in_the_manual_list_is_not_sent_twice(self):
+        merged = merge_keyterms(("claude",), ("Claude", "Opus"))
+        self.assertEqual(merged.terms, ("claude", "Opus"))
+        self.assertEqual(merged.auto, ("Opus",))
+
+    def test_configured_keyterms_adds_automatic_terms_by_default(self):
+        self.assertEqual(
+            configured_keyterms(_cfg(keyterms="Sonnet"), ("Deepgram",)),
+            ("Sonnet", "Deepgram"),
+        )
+
+    def test_switched_off_only_the_manual_list_is_sent(self):
+        cfg = _cfg(keyterms="Sonnet", auto_keyterms=False)
+        self.assertFalse(auto_keyterms_enabled(cfg))
+        self.assertEqual(configured_keyterms(cfg, ("Deepgram",)), ("Sonnet",))
+        # ...while the Settings panel can still show what it WOULD send.
+        self.assertEqual(
+            configured_merge(cfg, ("Deepgram",), assume_enabled=True).auto,
+            ("Deepgram",),
+        )
+
+    def test_the_stored_removal_list_is_applied(self):
+        cfg = _cfg(keyterms="", auto_keyterms_blocked=["Deepgram"])
+        self.assertEqual(configured_keyterms(cfg, ("Deepgram", "Opus")), ("Opus",))
+
+    def test_the_removal_list_is_normalised(self):
+        self.assertEqual(
+            normalize_auto_keyterms_blocked([" Deepgram ", "deepgram", 3, "", "Opus"]),
+            ["Deepgram", "Opus"],
+        )
+        self.assertEqual(auto_keyterms_blocked(_cfg(auto_keyterms_blocked="oops")), ())
+
+    def test_the_config_repairs_malformed_automatic_settings(self):
+        fixed = _validate_config_shape(
+            {"preferences": {"deepgram": {
+                "auto_keyterms": "yes",
+                "auto_keyterms_blocked": ["Opus", 7, "opus", "Claude"],
+            }}}
+        )
+        dg = fixed["preferences"]["deepgram"]
+        self.assertIs(dg["auto_keyterms"], DEFAULT_CONFIG["preferences"]["deepgram"]["auto_keyterms"])
+        self.assertEqual(dg["auto_keyterms_blocked"], ["Opus", "Claude"])
+
+    def test_the_feature_defaults_on_with_nothing_removed(self):
+        dg = DEFAULT_CONFIG["preferences"]["deepgram"]
+        self.assertIs(dg["auto_keyterms"], True)
+        self.assertEqual(dg["auto_keyterms_blocked"], [])
 
 
 if __name__ == "__main__":
