@@ -2720,6 +2720,87 @@ textarea:focus-visible,
   color: var(--text-3);
 }
 
+/* ── Learned key terms (Settings → Deepgram) ───────────────────────── */
+.auto-keyterms-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.auto-keyterms-list:empty {
+  display: none;
+}
+
+/* Switched off: still listed (so it can be pruned first), visibly unused. */
+.auto-keyterms-list.is-off {
+  opacity: 0.55;
+}
+
+.auto-keyterm {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 4px 2px 8px;
+  border-radius: var(--control-radius);
+  background: var(--surface-2);
+  font-size: 12px;
+  color: var(--text);
+}
+
+/* Mined but not sent: the shared token budget ran out before it. */
+.auto-keyterm.is-over-budget .auto-keyterm-term {
+  color: var(--text-3);
+  text-decoration: line-through;
+}
+
+.auto-keyterm-term {
+  user-select: text;
+}
+
+.auto-keyterm-action {
+  min-width: 20px;
+  height: 20px;
+  padding: 0 4px;
+  border: 0;
+  border-radius: var(--control-radius);
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.auto-keyterm-action:hover:not(:disabled) {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+.auto-keyterm-action:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.auto-keyterms-blocked {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+.auto-keyterms-blocked[hidden] {
+  display: none;
+}
+
+.auto-keyterms-blocked .auto-keyterm-action {
+  background: var(--surface-2);
+  color: var(--text-3);
+}
+
 /* ── Shortcut picker button ─────────────────────────────────────────── */
 .shortcut-btn {
   display: inline-flex;
