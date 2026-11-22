@@ -29,6 +29,8 @@
 //           {"cmd":"clipboard-keep","id":n}          a failed paste: keep the transcript
 //           {"cmd":"hotkeys","id":n,"chords":[{"chord":"record","keyCode":n,"mods":["cmd","alt","ctrl","shift"]}]}
 //                                                    arm the tap with this table; [] disarms it
+//           {"cmd":"input-latency","id":n}           what Core Audio says each input device
+//                                                    lags the room by (InputLatency.swift)
 //           {"cmd":"quit"}
 //   stdout: {"t":"ready","pid":n,"accessibility":b,"postEvents":b,"listenEvents":b}
 //           {"t":"permissions","id":n,"accessibility":b,"postEvents":b,"listenEvents":b}
@@ -41,6 +43,8 @@
 //           {"t":"clipboard-restore","id":n,"result":"restored|user-changed|superseded|nothing"}
 //           {"t":"clipboard-keep","id":n}
 //           {"t":"hotkeys","id":n,"active":b,"secureInput":b,"reason":".."}
+//           {"t":"input-latency","id":n,"devices":[{"name":"..","transport":"built-in|bluetooth|usb|virtual|aggregate|other",
+//            "latencyMs":x,"sampleRate":x,"deviceFrames":n,"safetyFrames":n,"bufferFrames":n,"streamFrames":n}]}
 //   events (no id):
 //           {"t":"hotkey","chord":"..","pressedAt":epochMs,"ageMs":x,"clock":"event|callback"}
 //           {"t":"tap-disabled","reason":"timeout|user-input","reenabled":b}
@@ -210,6 +214,8 @@ func handle(_ obj: [String: Any], cmd: String) {
   case "clipboard-keep":
     ledger.keep()
     emit(["t": "clipboard-keep", "id": id])
+  case "input-latency":
+    emit(["t": "input-latency", "id": id, "devices": InputLatency.inputDevices().map { $0.json }])
   case "hotkeys":
     guard let chords = HotkeyChord.parseList(obj["chords"]) else {
       emit(["t": "hotkeys", "id": id, "active": false, "reason": "bad-chords"])

@@ -9,7 +9,8 @@
 #     the rule; FrontWindow.swift: the window a screenshot captures).
 #   * `dictation-helper` — lives for the whole app session: clipboard
 #     snapshot/restore by change count, the native ⌘V paste and the
-#     hotkey tap (record, paste-last, screen mode). Source:
+#     hotkey tap (record, paste-last, screen mode) and the input devices'
+#     Core Audio latencies the stop tail is placed by. Source:
 #     desktop/native/dictation-helper/.
 #
 # Output: desktop/native/build/<target>/ — copied by electron-builder to
@@ -66,6 +67,7 @@ xcrun swiftc -O \
   "$DESKTOP_DIR/native/dictation-helper/ClipboardLedger.swift" \
   "$DESKTOP_DIR/native/dictation-helper/Paste.swift" \
   "$DESKTOP_DIR/native/dictation-helper/KeyLayout.swift" \
+  "$DESKTOP_DIR/native/dictation-helper/InputLatency.swift" \
   "$DESKTOP_DIR/native/dictation-helper/HotkeyMatcher.swift" \
   "$DESKTOP_DIR/native/dictation-helper/HotkeyTap.swift" \
   "$DESKTOP_DIR/native/dictation-helper/main.swift" \

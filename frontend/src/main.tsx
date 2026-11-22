@@ -17,7 +17,7 @@ import { decideLiveTranscriptAdoption } from "./live-coverage";
 import { playRecordingCue, recordingCueLengthMs } from "./recording-cues";
 import { createMicWakeTracker } from "./mic-wake";
 import { StopTailWait, VoiceTimeline, type StopTailOutcome } from "./stop-tail";
-import { captureInputLatency, type CaptureLatency } from "./capture-latency";
+import { captureInputLatency, type CaptureLatency, type NativeInputDevice } from "./capture-latency";
 import { WorkletDeliveryWatchdog } from "./worklet-watchdog";
 import {
   languageHintLabel,
@@ -853,6 +853,15 @@ declare global {
        * while ``repairable`` is true.
        */
       repair: () => Promise<{ ok?: boolean; status?: string; state?: string; title?: string; fix?: string }>;
+    };
+    /**
+     * Input-device latency bridge (Electron preload → main → the native
+     * dictation helper). What Core Audio says each input device lags the
+     * room by; empty without the helper. Absent in browser dev preview —
+     * feature-check (./capture-latency).
+     */
+    __transcriptorInputLatency?: {
+      getDevices: () => Promise<{ devices?: NativeInputDevice[] }>;
     };
     /**
      * Recording-output bridge (Electron preload → main). Absent in
@@ -10154,6 +10163,25 @@ let scriptFallbackPending: Float32Array[] = [];
  */
 let captureBufferPeriodMs = 0;
 /**
+ * Core Audio's view of the input devices (./capture-latency), read from the
+ * desktop shell's native helper once the capture stream is live — after
+ * Chromium has opened the device and set its buffer — and held for the
+ * press that ends the take, which must not wait on an IPC round trip.
+ */
+let nativeInputDevices: NativeInputDevice[] = [];
+
+async function refreshNativeInputDevices(): Promise<void> {
+  const bridge = window.__transcriptorInputLatency;
+  if (!bridge) return;
+  try {
+    const answer = await bridge.getDevices();
+    if (Array.isArray(answer?.devices)) nativeInputDevices = answer.devices;
+  } catch (e) {
+    // No answer keeps the last list; the track's own report still counts.
+    console.warn(`[trace startLive] input latency read failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+/**
  * ScriptProcessor buffer size. 4096 samples is ~85 ms at 48 kHz: long
  * enough that main-thread jitter cannot drop audio, short enough that
  * the arbitration between it and the worklet happens within a tenth of
@@ -10468,6 +10496,7 @@ function currentCaptureInputLatency(): CaptureLatency {
   }
   return captureInputLatency({
     reportedLatencySec,
+    nativeDevices: nativeInputDevices,
     deviceLabel: micTrackLabel(stream),
     bufferPeriodMs: captureBufferPeriodMs,
     bluetoothFloorMs: UI_TOKENS.capture.inputLatency.bluetoothFloorMs,
@@ -12073,6 +12102,7 @@ async function startLive(
     // Skipped on the warm path: the device list is already loaded, and
     // the point of that path is to touch no device APIs at all.
     if (!warm) void loadMics(false);
+    void refreshNativeInputDevices();
     // Reset the mic-health tracker for this session so the previous
     // session's terminal state does not leak into the new run.
     micHealth.reset();
@@ -13953,7 +13983,7 @@ async function stopLive(
       `tailHold: ${tailHoldMs.toFixed(0)}ms` +
       (tailOutcome
         ? ` (tail=${(tailOutcome.latencyMs + tailOutcome.tailMs).toFixed(0)}ms = latency ` +
-          `${tailOutcome.latencyMs.toFixed(0)}ms ${pressLatency.source} reported=${pressLatency.reportedMs.toFixed(0)}ms + ` +
+          `${tailOutcome.latencyMs.toFixed(0)}ms ${pressLatency.source} reported=${pressLatency.reportedMs.toFixed(0)}ms native=${pressLatency.nativeMs.toFixed(0)}ms + ` +
           `${tailOutcome.tailMs.toFixed(0)}ms ${tailOutcome.reason})`
         : "") +
       ` → ${labels}`,

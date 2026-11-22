@@ -296,6 +296,28 @@ test("KeyLayout: ⌘V is pressed on the key the layout's ⌘ table calls V", { s
   ]);
 });
 
+test("InputLatency: Core Audio's four terms give the input lag the renderer places the stop tail by", { skip }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "input-latency-test-"));
+  const bin = path.join(dir, "input-latency-tests");
+  const build = spawnSync(
+    "xcrun",
+    ["swiftc", "-o", bin, path.join(helperDir, "InputLatency.swift"), path.join(__dirname, "native", "tests", "input-latency", "main.swift")],
+    { encoding: "utf8" },
+  );
+  assert.equal(build.status, 0, build.stderr);
+  const run = spawnSync(bin, [], { encoding: "utf8" });
+  fs.rmSync(dir, { recursive: true, force: true });
+  assert.equal(run.status, 0, run.stderr);
+  assert.deepEqual(run.stdout.trim().split("\n").map((line) => line.replace(/^ok /, "")), [
+    "the built-in microphone's four terms add up to 62.8 ms at 44.1 kHz",
+    "the Bluetooth headset's terms add up to 30 ms at 16 kHz",
+    "a rate that is not a rate gives no latency",
+    "the protocol line carries the name, the transport and the rounded total",
+    "transport codes become the words the log shows",
+    "reading this machine's input devices gives whole, positive figures",
+  ]);
+});
+
 test("the dictation helper compiles from the sources build-native.sh names", { skip }, () => {
   const buildNative = fs.readFileSync(path.join(__dirname, "scripts", "build-native.sh"), "utf8");
   const block = buildNative.slice(buildNative.lastIndexOf("xcrun swiftc"), buildNative.indexOf('-o "$OUT_DIR/dictation-helper"'));

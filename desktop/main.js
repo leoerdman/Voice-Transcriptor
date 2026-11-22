@@ -9716,6 +9716,21 @@ app.whenReady().then(async () => {
   // asks right after `probePasteCapability("boot")` already ran gets the
   // cached answer for free; the very first ask of a session pays for one
   // probe so the badge is never a beat behind the first recording.
+  // What Core Audio says each input device lags the room by — the part of
+  // the capture latency Chromium's track report leaves out (the built-in
+  // microphone: 62.8 ms against its 2.9; frontend/src/capture-latency.ts).
+  // No helper (an App Store build, a dev run without build-native.sh, a
+  // helper restarting) answers an empty list: the renderer then goes by
+  // what the track reports, as it did before.
+  mainWindowIpc.handle("input-latency:get-devices", async () => {
+    const answer = await dictationHelper.request("input-latency", {}, { timeoutMs: 800 });
+    if (!answer || answer.t !== "input-latency" || !Array.isArray(answer.devices)) return { devices: [] };
+    const devices = answer.devices
+      .filter((d) => d && typeof d.name === "string" && Number.isFinite(d.latencyMs) && d.latencyMs > 0)
+      .map((d) => ({ name: d.name, transport: String(d.transport || "other"), latencyMs: d.latencyMs }));
+    return { devices };
+  });
+
   mainWindowIpc.handle("paste-capability:get-status", async () => {
     const cap = await ensurePasteCapabilityFresh("renderer-query");
     const context = pasteCapabilityMessageContext();

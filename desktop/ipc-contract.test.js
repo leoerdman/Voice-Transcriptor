@@ -67,6 +67,14 @@ test("paste-capability:get-status is invoked by the renderer bridge and handled 
   );
 });
 
+test("input-latency:get-devices is invoked by the renderer bridge and handled by main", () => {
+  assert.match(preloadSource, /getDevices: \(\) => ipcRenderer\.invoke\("input-latency:get-devices"\)/);
+  assert.match(mainSource, /mainWindowIpc\.handle\("input-latency:get-devices"/);
+  assert.match(preloadSource, /exposeInMainWorld\("__transcriptorInputLatency"/);
+  // It asks the helper for the one command the helper documents.
+  assert.match(mainSource, /dictationHelper\.request\("input-latency"/);
+});
+
 test("permissions:repair is invoked by the renderer bridge and handled by main", () => {
   // The stale-grant repair the app performs on its own behalf, exposed
   // as an explicit action: `tccutil reset <service> <bundle id>` drops a

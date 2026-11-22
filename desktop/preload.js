@@ -55,6 +55,17 @@ contextBridge.exposeInMainWorld("__transcriptorPasteCapability", {
   repair: () => ipcRenderer.invoke("permissions:repair"),
 });
 
+// Input-device latency bridge. Invoke-only: `getDevices()` resolves
+// `{ devices: [{ name, transport, latencyMs }] }` — what Core Audio says
+// each input device lags the room by, read by the native dictation helper
+// (desktop/native/dictation-helper/InputLatency.swift). Empty when there
+// is no helper; the renderer (frontend/src/capture-latency.ts) matches a
+// capture track to its device by name and goes by what the track itself
+// reports otherwise.
+contextBridge.exposeInMainWorld("__transcriptorInputLatency", {
+  getDevices: () => ipcRenderer.invoke("input-latency:get-devices"),
+});
+
 // Transcript hand-off bridge (BUGS_AUDIT_2026-09-03 §6.7/§6.8).
 //
 // The renderer knows the instant a recording's text exists; the main

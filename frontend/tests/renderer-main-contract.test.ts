@@ -318,6 +318,24 @@ describe("paste-capability note is wired to the bridge (D-009)", () => {
 });
 
 /**
+ * The stop tail's input latency (./capture-latency) includes what Core Audio
+ * says of the capture device, read by the native helper. The channel is typed
+ * in preload, main and here; desktop/ipc-contract.test.js holds the first two.
+ */
+describe("the capture's input latency reads Core Audio through the input-latency bridge", () => {
+  it("asks the bridge once the capture stream is live and hands the list to captureInputLatency", () => {
+    expect(mainTsx).toContain("window.__transcriptorInputLatency");
+    expect(mainTsx).toMatch(/bridge\.getDevices\(\)/);
+    expect(mainTsx).toMatch(/\n\s+void refreshNativeInputDevices\(\);/);
+    expect(mainTsx).toMatch(/nativeDevices: nativeInputDevices,/);
+  });
+
+  it("puts Core Audio's figure in the stop trace next to what the track reported", () => {
+    expect(mainTsx).toContain("native=${pressLatency.nativeMs.toFixed(0)}ms");
+  });
+});
+
+/**
  * D-015 (desktop-fix-journal.md, commit 14 "Not done, the renderer
  * half"): the renderer used to re-derive migrations 1 and 2
  * (unpressablePaste, macFunctionPair) by hand and never implemented
