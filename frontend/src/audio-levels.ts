@@ -65,6 +65,33 @@ const FLOOR_FALL = 0.25;
 const FLOOR_RISE = 0.0008;
 const FLOOR_MIN_RMS = DEAD_PEAK_FLOOR;
 
+/**
+ * The floor is never left below the quietest frame of the last
+ * `FLOOR_RECOVERY_WINDOW_MS` of audio: while that minimum sits above it,
+ * the floor climbs towards it with a time constant of
+ * `FLOOR_RECOVERY_TAU_MS` of audio (whatever the frame length).
+ *
+ * Without this the floor could get stuck under the room for the whole
+ * take. It rises only from frames that are not speech, and every frame
+ * is speech against a floor that is too low — so one bad seed was never
+ * corrected. A cold start seeds it exactly that way: the capture's first
+ * frame is digital zero or the half-filled ramp-in frame, the floor
+ * starts near 0, and every frame after it — the room, a key thump —
+ * counts as speech. On the installed 1.6.24 that held the stop tail to
+ * its 600 ms cap on every cold take (2026-11-22 19:09:30 and 19:10:59,
+ * "tail=600ms capped" over a room at ~0.005 RMS) and would have made
+ * "the take carried speech" true for any take that started cold.
+ *
+ * The minimum over a window is how a noise floor is measured
+ * (minimum statistics). The window is longer than a stretch of speech
+ * without a pause, so the minimum of a stretch of speech is still the
+ * room it is spoken in, and a held word does not lift the floor.
+ */
+const FLOOR_RECOVERY_WINDOW_MS = 500;
+const FLOOR_RECOVERY_TAU_MS = 100;
+/** Frame length assumed when the caller does not say (one worklet batch). */
+const DEFAULT_FRAME_MS = 10.7;
+
 /** Running measurement of one capture session's own level. */
 export interface CaptureLevel {
   /** Frames observed so far. */
@@ -77,6 +104,11 @@ export interface CaptureLevel {
   peakMax: number;
   /** Frames that carried speech relative to the floor at the time. */
   speechFrames: number;
+  /** The floor has been seeded from a live (non-dead) frame. */
+  floorSeeded: boolean;
+  /** The last frames' RMS and length, newest last, covering about
+   *  `FLOOR_RECOVERY_WINDOW_MS` of audio. */
+  recent: Array<{ rms: number; ms: number }>;
 }
 
 export interface CaptureLevelSummary {
@@ -106,6 +138,8 @@ export function createCaptureLevel(): CaptureLevel {
     sumSquaredRms: 0,
     peakMax: 0,
     speechFrames: 0,
+    floorSeeded: false,
+    recent: [],
   };
 }
 
@@ -120,26 +154,53 @@ function speechRmsThreshold(level: CaptureLevel): number {
  *
  * The verdict is taken against the floor as it stood BEFORE this frame,
  * so a loud frame cannot lift the floor it is being judged against.
+ *
+ * The floor is seeded by the first LIVE frame: frames of digital
+ * silence at the start (a capture that has not delivered signal yet)
+ * say nothing about the room and are never speech. `frameMs` is the
+ * frame's audio length (defaults to one worklet batch).
  */
-export function observeCaptureFrame(level: CaptureLevel, rms: number, peak: number): boolean {
+export function observeCaptureFrame(level: CaptureLevel, rms: number, peak: number, frameMs = DEFAULT_FRAME_MS): boolean {
   const frameRms = Number.isFinite(rms) && rms > 0 ? rms : 0;
   const framePeak = Number.isFinite(peak) && peak > 0 ? peak : 0;
   const threshold = speechRmsThreshold(level);
-  const isSpeech = level.frames > 0
+  const isSpeech = level.floorSeeded
     && (frameRms >= threshold || framePeak >= threshold * SPEECH_PEAK_CREST_RATIO);
 
-  if (level.frames === 0) {
-    level.floorRms = frameRms;
+  if (!level.floorSeeded) {
+    if (frameRms >= FLOOR_MIN_RMS) {
+      level.floorRms = frameRms;
+      level.floorSeeded = true;
+    }
   } else if (frameRms < level.floorRms) {
     level.floorRms += (frameRms - level.floorRms) * FLOOR_FALL;
   } else if (!isSpeech) {
     level.floorRms += (frameRms - level.floorRms) * FLOOR_RISE;
   }
+  if (level.floorSeeded) recoverFloorFromRecentMinimum(level, frameRms, frameMs);
   level.frames += 1;
   level.sumSquaredRms += frameRms * frameRms;
   if (framePeak > level.peakMax) level.peakMax = framePeak;
   if (isSpeech) level.speechFrames += 1;
   return isSpeech;
+}
+
+function recoverFloorFromRecentMinimum(level: CaptureLevel, frameRms: number, frameMs: number): void {
+  const ms = Number.isFinite(frameMs) && frameMs > 0 ? frameMs : DEFAULT_FRAME_MS;
+  level.recent.push({ rms: frameRms, ms });
+  let covered = 0;
+  for (const f of level.recent) covered += f.ms;
+  // Drop the oldest frames the window no longer needs.
+  while (level.recent.length > 1 && covered - level.recent[0].ms >= FLOOR_RECOVERY_WINDOW_MS) {
+    covered -= level.recent[0].ms;
+    level.recent.shift();
+  }
+  if (covered < FLOOR_RECOVERY_WINDOW_MS) return;
+  let recentMin = Infinity;
+  for (const f of level.recent) if (f.rms < recentMin) recentMin = f.rms;
+  if (recentMin > level.floorRms) {
+    level.floorRms += (recentMin - level.floorRms) * (1 - Math.exp(-ms / FLOOR_RECOVERY_TAU_MS));
+  }
 }
 
 export function summarizeCaptureLevel(level: CaptureLevel): CaptureLevelSummary {

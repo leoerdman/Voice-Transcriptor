@@ -11376,8 +11376,8 @@ function pushCapturedFrame(input: Float32Array, preRollMs = 0): void {
   // Updates the session's measured level in place — every "speech or
   // silence?" question the capture path asks is answered against it
   // (./audio-levels). The per-frame verdict feeds the stop tail.
-  const frameIsSpeech = observeCaptureFrame(captureLevel, rms, peak);
   const frameMs = preRollMs > 0 ? preRollMs : ac && ac.sampleRate > 0 ? (input.length / ac.sampleRate) * 1000 : 0;
+  const frameIsSpeech = observeCaptureFrame(captureLevel, rms, peak, frameMs);
   voiceTimeline.push(frameMs, frameIsSpeech);
   stopTailFrameCheck?.();
   // Smooth RMS via EMA so the main-process silence detector sees the

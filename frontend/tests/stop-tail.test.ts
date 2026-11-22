@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { createCaptureLevel, observeCaptureFrame } from "../src/audio-levels";
 import { recordingCueLengthMs } from "../src/recording-cues";
 import { StopTailWait, VoiceTimeline, decideStopTail, type StopTailConfig } from "../src/stop-tail";
 
@@ -165,5 +166,29 @@ describe("StopTailWait", () => {
     const wait = new StopTailWait(new VoiceTimeline(), 0, TONE_MS, 1_000, CONFIG);
     expect(wait.deadlines()).toEqual([1_220, 1_700]);
     expect(wait.poll(1_700)).not.toBeNull();
+  });
+});
+
+describe("a cold take's stop on a quiet room (2026-11-22 19:10:59)", () => {
+  // The take's 20 ms frames (RMS, thousandths): digital zero, the ramp-in
+  // frame, the room at ~0.0055 and two key thumps after the press at
+  // 0.46 s. The installed 1.6.24 seeded the floor from the zero frame,
+  // took every frame for speech and held the microphone to the 600 ms cap.
+  const RMS_MILLI = [
+    0.0, 0.6, 3.1, 4.6, 7.3, 5.1, 6.5, 4.4, 5.4, 4.6, 5.3, 5.5, 5.6, 5.2, 5.6, 5.0, 6.4, 5.2, 5.6, 5.5, 5.6, 4.7,
+    5.6, 5.2, 6.0, 41.5, 24.6, 22.2, 8.0, 6.3, 5.0, 5.7, 5.7, 5.6, 6.2, 17.1, 43.0, 21.2, 13.1, 6.6, 5.3, 5.8,
+    5.4, 6.1, 5.9, 5.6, 5.4, 5.5, 5.1, 5.5, 5.6, 6.7, 6.1, 4.5,
+  ];
+
+  it("ends at the minimum tail: the thumps are not sustained speech", () => {
+    const level = createCaptureLevel();
+    const timeline = new VoiceTimeline();
+    for (const m of RMS_MILLI) timeline.push(20, observeCaptureFrame(level, m / 1000, (m / 1000) * 3, 20));
+    const state = decideStopTail(timeline, 460, TONE_MS, CONFIG);
+    expect(state.kind).toBe("through");
+    if (state.kind === "through") {
+      expect(state.reason).not.toBe("capped");
+      expect(state.tailMs).toBe(CONFIG.minMs);
+    }
   });
 });
