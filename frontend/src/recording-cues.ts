@@ -53,6 +53,14 @@ export const RECORDING_CUES: Readonly<Record<RecordingCueKind, Readonly<Recordin
 export const CUE_ATTACK_SEC = 0.012;
 /** The oscillator runs this much past the envelope's end. */
 const CUE_RELEASE_TAIL_SEC = 0.01;
+/**
+ * How long a cue sounds from the moment it is scheduled, in ms — the
+ * oscillator's whole run. The stop tail (./stop-tail) does not take what
+ * the microphone hears in this window for speech.
+ */
+export function recordingCueLengthMs(kind: RecordingCueKind): number {
+  return (RECORDING_CUES[kind].durationSec + CUE_RELEASE_TAIL_SEC) * 1000;
+}
 /** Exponential ramps cannot reach zero; this is "silent". */
 const CUE_SILENT_GAIN = 0.0001;
 

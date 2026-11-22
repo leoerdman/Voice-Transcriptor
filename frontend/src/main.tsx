@@ -13,7 +13,8 @@ import {
   summarizeCaptureLevel,
 } from "./audio-levels";
 import { decideLiveTranscriptAdoption } from "./live-coverage";
-import { playRecordingCue } from "./recording-cues";
+import { playRecordingCue, recordingCueLengthMs } from "./recording-cues";
+import { StopTailWait, VoiceTimeline, type StopTailOutcome } from "./stop-tail";
 import {
   languageHintLabel,
   parseLanguageHintDefaults,
@@ -1283,21 +1284,42 @@ const UI_TOKENS = {
      */
     minRecordingMs: 500,
     /**
-     * How much longer the microphone stays open after Stop.
+     * How long the microphone stays open after Stop — by the voice in the
+     * audio, not a fixed pause (./stop-tail has the rule, a port of Hex's
+     * release tail).
      *
      * Stop lands while the user is still finishing the last word far more
      * often than it looks: across 112 measured stops, 39 % left NO
-     * trailing silence at all and 45 % left 100 ms or less. Two saved
-     * recordings analysed directly end with speech at full level in the
-     * final 50 ms frame — the word is not "lost in transcription", it is
-     * not in the audio, and no amount of re-decoding can recover it.
-     * A word also needs its release and a moment of silence before a
-     * recogniser will seal it.
+     * trailing silence at all and 45 % left 100 ms or less; two saved
+     * recordings end with speech at full level in the final 50 ms frame.
+     * The fixed 200 ms this replaces was too long for every stop pressed
+     * after the user went quiet and too short for a long last word.
      *
-     * Fixed, deliberately: no speech detection, no variable window. Stop
-     * means stop, 200 ms later, every time.
+     *  - minMs 120: always kept. Speech still running at this point is
+     *    what extends the tail, so it has to reach past the press by more
+     *    than a syllable gap (speechGapMs) plus one worklet batch (~11 ms)
+     *    for a word that is still sounding to be seen at all; and a word
+     *    that ended right at the press still leaves 100+ ms of release and
+     *    silence for the recogniser to seal it. Hex keeps 200 ms but trims
+     *    its clip to the decided tail; the decision here only ends the
+     *    wait, so a shorter floor costs no audio when speech goes on.
+     *  - maxMs 600, quietEndMs 160, speechRunMs 100, speechGapMs 40,
+     *    toneMarginMs 60: Hex's MAX_RELEASE_TAIL, TAIL_QUIET_FRAMES,
+     *    TAIL_SPEECH_FRAMES, TAIL_SPEECH_GAP_FRAMES (20 ms frames) and
+     *    STOP_TONE_MARGIN. The stop tone (recording-cues) plus the margin
+     *    is never taken for speech.
+     *  - graceMs 100: how long past a bound the wall clock waits for audio
+     *    that has not been delivered (Hex's ReleaseWait::GRACE).
      */
-    stopTailHoldMs: 200,
+    stopTail: {
+      minMs: 120,
+      maxMs: 600,
+      quietEndMs: 160,
+      speechRunMs: 100,
+      speechGapMs: 40,
+      toneMarginMs: 60,
+      graceMs: 100,
+    },
     /**
      * Below this length, "the session was silent" is not a conclusion
      * worth drawing.
@@ -10031,6 +10053,11 @@ const SCRIPT_PROCESSOR_BUFFER_SAMPLES = 4096;
 // against a constant amplitude (./audio-levels, BUGS_AUDIT_2026-09-03
 // §4.3).
 let captureLevel = createCaptureLevel();
+// This take's per-frame speech verdicts in audio time, for the stop tail
+// (./stop-tail). Reset with ``captureLevel``.
+let voiceTimeline = new VoiceTimeline();
+// The stop waiting for its tail re-checks on every delivered frame.
+let stopTailFrameCheck: (() => void) | null = null;
 let liveDraftText = "";
 let liveDraftDisplayText = "";
 let liveInterimText = "";
@@ -11327,10 +11354,11 @@ function pushCapturedFrame(input: Float32Array, preRollMs = 0): void {
   const rms = Math.sqrt(sum / input.length);
   // Updates the session's measured level in place — every "speech or
   // silence?" question the capture path asks is answered against it
-  // (./audio-levels). The per-frame verdict itself has no reader: the
-  // stop path used to keep the last speech-carrying sample offset for
-  // its tail-gap arithmetic, and that arithmetic is the backend's now.
-  observeCaptureFrame(captureLevel, rms, peak);
+  // (./audio-levels). The per-frame verdict feeds the stop tail.
+  const frameIsSpeech = observeCaptureFrame(captureLevel, rms, peak);
+  const frameMs = preRollMs > 0 ? preRollMs : ac && ac.sampleRate > 0 ? (input.length / ac.sampleRate) * 1000 : 0;
+  voiceTimeline.push(frameMs, frameIsSpeech);
+  stopTailFrameCheck?.();
   // Smooth RMS via EMA so the main-process silence detector sees the
   // energy trend over ~120 ms, not a single 2.67 ms micro-window
   // that might happen to land on an inter-syllable gap.
@@ -11578,6 +11606,7 @@ async function startLive(
   );
   workletLastFrameAt = 0;
   captureLevel = createCaptureLevel();
+  voiceTimeline = new VoiceTimeline();
   captureRmsEma = 0;
   // The resampler carries <1 output-sample of the PREVIOUS session's
   // audio; clear it so a new recording never starts with a stale frame.
@@ -12111,6 +12140,33 @@ async function startLive(
   }
 }
 
+/**
+ * Hold the capture open until the stop tail is decided: re-checked on
+ * every delivered frame (``pushCapturedFrame``) and at the wall-clock
+ * deadlines that end the wait for a capture that stopped delivering.
+ */
+function waitForStopTail(stopAtAudioMs: number, toneMs: number, startedAt: number): Promise<StopTailOutcome> {
+  const wait = new StopTailWait(voiceTimeline, stopAtAudioMs, toneMs, startedAt, UI_TOKENS.capture.stopTail);
+  return new Promise((resolve) => {
+    const timers: number[] = [];
+    let check: () => void = () => {};
+    const finish = (outcome: StopTailOutcome): void => {
+      for (const id of timers) window.clearTimeout(id);
+      if (stopTailFrameCheck === check) stopTailFrameCheck = null;
+      resolve(outcome);
+    };
+    check = (): void => {
+      const outcome = wait.poll(performance.now());
+      if (outcome) finish(outcome);
+    };
+    for (const at of wait.deadlines()) {
+      timers.push(window.setTimeout(check, Math.max(0, at - performance.now())));
+    }
+    stopTailFrameCheck = check;
+    check();
+  });
+}
+
 async function waitForCaptureDrain(
   framesAtStop: number,
   maxWaitMs = UI_TOKENS.drain.maxWaitMs,
@@ -12154,9 +12210,13 @@ async function stopLive(
   const stopTransitionToken = createClientSessionId();
   stopTransitionInFlight = true;
   // At the press: the stop tone answers the user's action. It overlaps
-  // the short tail hold below — the price of not making the user wait
-  // for it (measured 500–550 ms when it waited for the capture to detach).
-  console.log(`[cue] stop ${playRecordingCue("stop")}`);
+  // the tail below — the price of not making the user wait for it
+  // (measured 500–550 ms when it waited for the capture to detach) — and
+  // the tail does not take what the microphone hears of it for speech.
+  const stopCue = playRecordingCue("stop");
+  console.log(`[cue] stop ${stopCue}`);
+  const stopAtAudioMs = voiceTimeline.heardMs;
+  const stopToneMs = stopCue === "played" || stopCue === "resuming" ? recordingCueLengthMs("stop") : 0;
   stopTransitionOwnerToken = stopTransitionToken;
   // ``_wsToCloseAtEnd`` is hoisted to function scope so the outer
   // ``finally`` block can close the WS AFTER the entire transcribe
@@ -12173,6 +12233,7 @@ async function stopLive(
   let audioPersistence: AudioPersistence<SavedRecordingRef> = skippedAudioPersistence(() => {});
   let audioSaveApplied: Promise<void> = Promise.resolve();
   let tailHoldMs = 0;
+  let tailOutcome: StopTailOutcome | null = null;
   let stopTransitionReleased = false;
   let stoppedRecordingId = 0;
   let stoppedSessionToken = "";
@@ -12238,13 +12299,14 @@ async function stopLive(
     setBusy(false, sessionUiToken);
   };
   // ── Trailing capture ────────────────────────────────────────────────
-  // The microphone stays open a moment past the press so the last word
-  // is complete in the audio. Everything below — the drain, the sink,
-  // the finalize — then works on a recording that actually contains it.
-  // Skipped for a discarded take: there is nothing to preserve.
+  // The microphone stays open past the press until the last word is
+  // complete in the audio (./stop-tail decides from the voice in it).
+  // Everything below — the drain, the sink, the finalize — then works on
+  // a recording that actually contains it. Skipped for a discarded take:
+  // there is nothing to preserve.
   if (!discarding && stream) {
     const holdStarted = performance.now();
-    await new Promise((resolve) => window.setTimeout(resolve, UI_TOKENS.capture.stopTailHoldMs));
+    tailOutcome = await waitForStopTail(stopAtAudioMs, stopToneMs, holdStarted);
     tailHoldMs = performance.now() - holdStarted;
   }
   const recordedMs = startAt > 0 ? Math.max(0, Date.now() - startAt) : 0;
@@ -13697,7 +13759,9 @@ async function stopLive(
       .join(" → ");
     console.log(
       `[trace stopLive] total=${totalMs.toFixed(0)}ms | ` +
-      `tailHold: ${tailHoldMs.toFixed(0)}ms → ${labels}`,
+      `tailHold: ${tailHoldMs.toFixed(0)}ms` +
+      (tailOutcome ? ` (tail=${tailOutcome.tailMs.toFixed(0)}ms ${tailOutcome.reason})` : "") +
+      ` → ${labels}`,
     );
     (window as unknown as { __transcriptorStopTimings?: unknown }).__transcriptorStopTimings = {
       totalMs,
