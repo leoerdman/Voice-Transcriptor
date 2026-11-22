@@ -7,7 +7,8 @@
 // on. This helper is started once with the app and does that work
 // in-process: the clipboard (snapshot, write, restore by change count —
 // ClipboardLedger.swift), the frontmost app, the modifier wait and ⌘V
-// through CGEventPost (Paste.swift). It also catches the shell's hotkeys
+// through CGEventPost (Paste.swift) on the key the keyboard layout reads
+// as ⌘V (KeyLayout.swift). It also catches the shell's hotkeys
 // with an event tap of its own (HotkeyTap.swift), so a press reaches the
 // shell straight from the key-down, stamped with its real instant.
 //
@@ -35,6 +36,7 @@
 //           {"t":"clipboard-prepare","id":n,"changeCount":n,"ms":x}
 //           {"t":"paste","id":n,"ok":b,"sent":b,"reason":"..","reverted":b,"changeCount":n,
 //            "source":"prepared|carried|fresh","front":{..},"modifiers":{"cleared":b,"flags":n,"waitedMs":n},
+//            "key":{"code":n,"layout":".."},                 the key pressed as ⌘V (KeyLayout.swift)
 //            "verification":"verified|unverified|unreadable|skipped","ms":{..}}
 //           {"t":"clipboard-restore","id":n,"result":"restored|user-changed|superseded|nothing"}
 //           {"t":"clipboard-keep","id":n}
@@ -153,7 +155,9 @@ func handlePaste(_ obj: [String: Any], id: Int) {
   if verify { ms["verifyBefore"] = elapsedMs(step) }
 
   step = DispatchTime.now().uptimeNanoseconds
-  guard postCommandV(gapMs: max(0, intField(obj, "gapMs", 15))) else {
+  let pasteKey = PasteKey.current
+  answer["key"] = ["code": Int(pasteKey.code), "layout": pasteKey.layout]
+  guard postCommandV(vKey: pasteKey.code, gapMs: max(0, intField(obj, "gapMs", 15))) else {
     answer["reverted"] = revertWrite(written)
     return finish("post-failed")
   }
@@ -220,6 +224,10 @@ func handle(_ obj: [String: Any], cmd: String) {
   }
 }
 
+// The paste key is read before the first request can arrive; the main
+// run loop below then delivers each input-source change.
+PasteKey.watch()
+
 var ready = Permissions.refresh()
 ready["t"] = "ready"
 ready["pid"] = Int(getpid())
@@ -246,5 +254,6 @@ Thread.detachNewThread {
   exit(0)
 }
 
-// The main run loop keeps NSWorkspace's frontmost app current.
+// The main run loop keeps NSWorkspace's frontmost app current and
+// delivers the input-source changes the paste key follows.
 withExtendedLifetime(activity) { CFRunLoopRun() }

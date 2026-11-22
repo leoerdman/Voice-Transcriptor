@@ -129,18 +129,19 @@ func awaitModifierRelease(deadlineMs: Int, pollMs: Int) -> (cleared: Bool, flags
 // MARK: - ⌘V
 
 let commandKeyCode: CGKeyCode = 55
-// The "V" position. The AppleScript fallback presses the same `key code 9`.
-let vKeyCode: CGKeyCode = 9
 
 /// ⌘V as four events — ⌘ down, V down, V up, ⌘ up — from a private event
 /// source, so the user's physical keys never leak into their flags, each
 /// marked as ours so the helper's own keyboard tap lets it through.
-func postCommandV(gapMs: Int) -> Bool {
+/// `vKey` is the key the current layout reads as ⌘V (KeyLayout.swift
+/// PasteKey); the AppleScript fallback, with no layout to read, presses
+/// the QWERTY position `key code 9`.
+func postCommandV(vKey: CGKeyCode, gapMs: Int) -> Bool {
   let source = CGEventSource(stateID: .privateState)
   let specs: [(CGKeyCode, Bool, CGEventFlags)] = [
     (commandKeyCode, true, .maskCommand),
-    (vKeyCode, true, .maskCommand),
-    (vKeyCode, false, .maskCommand),
+    (vKey, true, .maskCommand),
+    (vKey, false, .maskCommand),
     (commandKeyCode, false, []),
   ]
   var events: [CGEvent] = []
