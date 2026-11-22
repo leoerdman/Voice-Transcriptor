@@ -3,6 +3,12 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.27] - 2026-11-23
+
+### Fixed
+
+- **The microphone you pick stays picked.** It is kept until you pick another one — after a restart, after the Mac wakes, and when a Bluetooth headset, USB microphone or iPhone connects or disconnects. Before, the choice could be lost: after a restart the app could see the microphone under a new id, and a microphone that was briefly missing switched the list to "Default", which the next settings save stored for good — from then on every take used the system default, which macOS moves to a Bluetooth headset as soon as it connects. Now the app remembers the microphone by name as well, finds it again under a new id, and uses the system default only while the picked microphone is not connected (the list says "— not connected"), going back to it as soon as it returns. The list no longer has the "Default - <name>" row, which looked like that microphone but followed the system default; "System default (<name>)" shows which device that is right now.
+
 ## [1.6.26] - 2026-11-23
 
 ### Fixed
