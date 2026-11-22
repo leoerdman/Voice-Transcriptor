@@ -94,13 +94,19 @@ from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
 from backend.async_tasks import cancel_and_collect
+from backend.deepgram_language import resolve_live_language
 from backend.remote_deepgram_live import (
     DeepgramLiveConfig,
     DeepgramLiveError,
     DeepgramLiveSession,
 )
 
-logger = logging.getLogger("transcriptor.deepgram_warm")
+# Under ``backend``: that logger owns the stderr handler main.log is fed
+# from, and a hand-typed name outside it ("transcriptor.deepgram_warm")
+# had every pool decision — ready, adopted, discarded and why — dropped
+# at INFO, so a recording that did not adopt a warm socket could not say
+# why (audit BL-04).
+logger = logging.getLogger(__name__)
 
 
 # Cadence for a socket that sends no audio. Inside Deepgram's documented
@@ -121,6 +127,11 @@ WARM_IDLE_TTL_SEC = 300.0
 # is a billed, concurrency-limited connection, so a third is evicted
 # rather than opened.
 WARM_MAX_SOCKETS = 2
+
+# How many configurations' "where did the last warm socket go" the pool
+# remembers, for the reason on a cold connect. A configuration's key
+# changes with its keyterm list, so the memory is bounded.
+WARM_GONE_MEMORY = 8
 
 # A warm socket proves it is alive by getting its KeepAlive frames onto
 # the wire. Two missed cadences (plus slack) means the send path is no
@@ -170,6 +181,12 @@ class WarmAcquisition:
     adopted: bool
     warm_age_sec: float
     connect_ms: Optional[float]
+    # Why this socket was connected cold, empty when ``adopted``. The
+    # common answer is by design: a recording more than
+    # ``WARM_IDLE_TTL_SEC`` after the previous one finds its warm socket
+    # retired by the idle bound (measured 20-22.11: 43 of the 49 cold
+    # second readings; the other 6 were the first recording after start).
+    cold_reason: str = ""
 
 
 def _default_factory(
@@ -247,6 +264,8 @@ class DeepgramWarmPool:
         self._slots: "OrderedDict[str, _WarmSlot]" = OrderedDict()
         # key -> (connect task, api key, configuration being connected).
         self._pending: dict[str, tuple[asyncio.Task, str, DeepgramLiveConfig]] = {}
+        # key -> (what happened to the last warm socket for it, when).
+        self._gone: "OrderedDict[str, tuple[str, float]]" = OrderedDict()
 
     # ----- Lifecycle --------------------------------------------------
 
@@ -314,12 +333,14 @@ class DeepgramWarmPool:
                     reason = self._unfit_reason(slot, api_key)
                     if reason is None:
                         self._release_slot(key)
+                        self._note_gone(key, "adopted by the previous recording")
                         return self._adopt(
                             slot.session,
                             age=max(0.0, self._clock() - slot.warmed_at),
                         )
                     await self._drop_slot(key, reason)
 
+                cold_reason = self._cold_reason(key)
                 task = asyncio.get_running_loop().create_task(
                     self._connect_only(self._factory(api_key, cfg)),
                     name="deepgram-acquire-connect",
@@ -336,11 +357,19 @@ class DeepgramWarmPool:
         # ``_connect_only`` re-raises what ``connect()`` raised, so this
         # caller's failure path is exactly what it was before the pool
         # existed; ``session is None`` cannot happen on this branch.
+        connect_ms = session.stats.connect_ms
+        logger.info(
+            "deepgram-live: [%s] cold connect in %sms reason=%s",
+            resolve_live_language(cfg.language),
+            f"{connect_ms:.0f}" if connect_ms is not None else "?",
+            cold_reason,
+        )
         return WarmAcquisition(
             session=session,
             adopted=False,
             warm_age_sec=0.0,
-            connect_ms=session.stats.connect_ms,
+            connect_ms=connect_ms,
+            cold_reason=cold_reason,
         )
 
     @staticmethod
@@ -473,7 +502,8 @@ class DeepgramWarmPool:
         except Exception as e:
             logger.info("deepgram-live: pre-warm connect failed: %s", e)
             await _quiet_close(session)
-            self._pending.pop(key, None)
+            if self._pending.pop(key, None) is not None:
+                self._note_gone(key, f"pre-warm connect failed: {e}")
             return None
         # ``acquire()`` may already have taken this task over (it pops
         # the pending entry before awaiting), in which case the session
@@ -499,9 +529,13 @@ class DeepgramWarmPool:
             self._cancel_reaper(previous)
         evicted: list[_WarmSlot] = []
         while len(self._slots) >= self._max_sockets:
-            _oldest_key, oldest = self._slots.popitem(last=False)
+            oldest_key, oldest = self._slots.popitem(last=False)
             self._cancel_reaper(oldest)
             evicted.append(oldest)
+            self._note_gone(
+                oldest_key, f"oldest of more than {self._max_sockets} warm sockets"
+            )
+        self._gone.pop(key, None)
         slot = _WarmSlot(
             session=session,
             key=key,
@@ -584,10 +618,28 @@ class DeepgramWarmPool:
             self._cancel_reaper(slot)
         return slot
 
+    def _note_gone(self, key: str, what: str) -> None:
+        """Remember what became of the last warm socket for ``key``."""
+        self._gone.pop(key, None)
+        self._gone[key] = (what, self._clock())
+        while len(self._gone) > WARM_GONE_MEMORY:
+            self._gone.popitem(last=False)
+
+    def _cold_reason(self, key: str) -> str:
+        """Why a recording for ``key`` finds no warm socket to adopt."""
+        if not self._armed:
+            return "warm pool not armed"
+        gone = self._gone.get(key)
+        if gone is not None:
+            what, at = gone
+            return f"last warm socket {max(0.0, self._clock() - at):.0f}s ago: {what}"
+        return "no warm socket was opened for this configuration"
+
     async def _drop_slot(self, key: str, reason: str) -> None:
         slot = self._release_slot(key)
         if slot is None:
             return
+        self._note_gone(key, f"discarded: {reason}")
         logger.info(
             "deepgram-live: discarded warm socket age=%.1fs reason=%s",
             max(0.0, self._clock() - slot.warmed_at),
@@ -605,6 +657,7 @@ class DeepgramWarmPool:
         entry = self._pending.pop(key, None)
         if entry is None:
             return
+        self._note_gone(key, "warm connect cancelled")
         task = entry[0]
         if task.done():
             session = None

@@ -6342,12 +6342,18 @@ async def _run_deepgram_live_session(
                     primary_language=primary_language,
                     expected_languages=language_hints,
                 )
+                # ``adopted=False`` is a cold connect, not a refused
+                # reading: the second reading is used either way. The
+                # reason names what became of its warm socket — usually
+                # the idle bound after a pause of more than
+                # ``WARM_IDLE_TTL_SEC`` between recordings.
                 logger.info(
                     "dual-stream: second reading opened primary=%s secondary=%s "
-                    "(adopted=%s)",
+                    "(adopted=%s%s)",
                     primary_language,
                     dual_language,
                     secondary.adopted,
+                    "" if secondary.adopted else f" reason={secondary.cold_reason}",
                 )
             except Exception as e:
                 logger.warning(

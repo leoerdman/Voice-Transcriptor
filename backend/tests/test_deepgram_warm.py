@@ -138,7 +138,7 @@ class AdoptionTests(_PoolCase):
     async def test_adoption_is_logged_with_the_age_and_the_saving(self):
         await self._warm()
         self.clock.advance(12.0)
-        with self.assertLogs("transcriptor.deepgram_warm", level="INFO") as logs:
+        with self.assertLogs("backend.deepgram_warm", level="INFO") as logs:
             acquisition = await self.pool.acquire("k", _cfg())
         line = next(m for m in logs.output if "adopted warm socket" in m)
         self.assertIn("age=12.0s", line)
@@ -213,7 +213,7 @@ class AdoptionTests(_PoolCase):
         # warm socket that carried any would shift the entire transcript.
         warm = await self._warm()
         warm.stats.bytes_sent = 3200
-        with self.assertLogs("transcriptor.deepgram_warm", level="INFO") as logs:
+        with self.assertLogs("backend.deepgram_warm", level="INFO") as logs:
             acquisition = await self.pool.acquire("k", _cfg())
         self.assertFalse(acquisition.adopted)
         self.assertIn("timestamps would be shifted", "\n".join(logs.output))
@@ -416,6 +416,54 @@ class LifecycleTests(_PoolCase):
         self.assertTrue(warm.discarded)
         self.assertEqual(pool.status()["sockets"], [])
         await pool.close_all()
+
+    async def test_a_recording_after_the_idle_bound_says_why_it_connected_cold(self):
+        # 43 of the 49 cold second readings of 20-22.11 came more than
+        # WARM_IDLE_TTL_SEC after the previous recording: by design, and
+        # now said so on the line instead of a bare ``adopted=False``.
+        pool = DeepgramWarmPool(
+            session_factory=self._factory, clock=self.clock, idle_ttl_sec=0.01,
+        )
+        pool.start()
+        pool.rewarm("k", _cfg())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0.05)
+        self.clock.advance(400.0)
+        with self.assertLogs("backend.deepgram_warm", level="INFO") as logs:
+            acquisition = await pool.acquire("k", _cfg())
+        self.assertFalse(acquisition.adopted)
+        self.assertIn("400s ago: discarded: idle for 0s", acquisition.cold_reason)
+        line = next(m for m in logs.output if "cold connect" in m)
+        self.assertIn("[ru] cold connect in 100ms reason=last warm socket 400s ago", line)
+        await pool.close_all()
+
+    async def test_cold_reasons_name_what_became_of_the_warm_socket(self):
+        cold = await self.pool.acquire("k", _cfg())
+        self.assertEqual(cold.cold_reason, "warm pool not armed")
+
+        await self._warm()
+        adopted = await self.pool.acquire("k", _cfg())
+        self.assertTrue(adopted.adopted)
+        self.assertEqual(adopted.cold_reason, "")
+        again = await self.pool.acquire("k", _cfg())
+        self.assertIn("adopted by the previous recording", again.cold_reason)
+
+        never = await self.pool.acquire("k", _cfg(language="en"))
+        self.assertEqual(never.cold_reason, "no warm socket was opened for this configuration")
+
+        warm = await self._warm(cfg=_cfg(language="ru"))
+        warm.last_fatal = True
+        warm.last_error = "upstream said no"
+        unfit = await self.pool.acquire("k", _cfg(language="ru"))
+        self.assertIn("discarded: socket reported a fatal error", unfit.cold_reason)
+
+        self.next_connect_error = RuntimeError("dns down")
+        self.pool.rewarm("k", _cfg(language="de"))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        failed = await self.pool.acquire("k", _cfg(language="de"))
+        self.assertIn("pre-warm connect failed: dns down", failed.cold_reason)
 
     async def test_a_second_rewarm_for_the_same_config_is_a_no_op(self):
         await self._warm()
