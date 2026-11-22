@@ -193,6 +193,34 @@ class OneNormalisationTests(_MainCase):
         self.assertEqual(fields.title, "a/b: c")
 
 
+class SaveTimingPhasesTests(_MainCase):
+    """OPTIMIZATION.md §3.1: a ~1 s save-with-audio on loopback could not be
+    attributed. The timing line now covers the phase before the handler
+    (upload + multipart parse) as well as the handler's own."""
+
+    def test_the_save_line_reports_the_receive_phase_and_the_size(self) -> None:
+        from fastapi.testclient import TestClient
+
+        client = TestClient(self.main.app, base_url="http://127.0.0.1:8321")
+        payload = b"RIFF" + b"\0" * 4096
+        with self.assertLogs("backend.main", level="INFO") as logs:
+            r = client.post(
+                "/api/recordings/save-with-audio",
+                files={"file": ("take.wav", payload, "audio/wav")},
+                data={"title": "t", "transcript_text": "x", "recorded_at_ms": "1795361725000"},
+                headers={"x-api-token": self.main.API_TOKEN},
+            )
+            self.assertEqual(r.status_code, 200, r.text)
+        line = next(m for m in logs.output if "recording save timing" in m)
+        recv = int(line.split("recv=")[1].split("ms")[0])
+        self.assertGreaterEqual(recv, 0, "the middleware's arrival stamp reached the handler")
+        self.assertIn(f"bytes={len(payload)}", line)
+        self.assertIn("prep=", line)
+
+    def test_a_direct_call_outside_a_request_has_no_receive_phase(self) -> None:
+        self.assertIsNone(self.main.REQUEST_ARRIVED_AT.get())
+
+
 class UploadCeilingBeforeTheBodyTests(_MainCase):
     """BM-26: a declared body past the upload ceiling is refused before the
     multipart parser spools it to the temp volume."""
