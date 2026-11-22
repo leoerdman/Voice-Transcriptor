@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # Builds the native helpers the desktop shell ships beside the Python
-# runtime. Today that is one: `screen-input`, the CGEventTap that lets
-# screen mode tell a click (passed through to the app underneath) from a
-# press-and-drag (a stroke drawn on the overlay). Source:
-# desktop/native/screen-input/ (main.swift: the tap; PressClassifier.swift: the rule;
-# FrontWindow.swift: the window a screenshot captures).
+# runtime — one Swift package, two targets sharing desktop/native/shared/
+# (the line protocol and the own-event marker):
+#   * `screen-input` — screen mode's CGEventTap that tells a click (passed
+#     through to the app underneath) from a press-and-drag (a stroke drawn
+#     on the overlay); lives only while screen mode is on. Source:
+#     desktop/native/screen-input/ (main.swift: the tap; PressClassifier.swift:
+#     the rule; FrontWindow.swift: the window a screenshot captures).
+#   * `dictation-helper` — lives for the whole app session: clipboard
+#     snapshot/restore by change count, the native ⌘V paste and the
+#     record-hotkey tap. Source: desktop/native/dictation-helper/.
 #
 # Output: desktop/native/build/<target>/ — copied by electron-builder to
 # Contents/Resources/runtime/bin, inside the runtime root, so afterPack's
@@ -30,7 +35,7 @@ case "$TARGET" in
     exit 1
     ;;
   *)
-    # Screen mode is macOS-only; other targets ship an empty directory so
+    # Both helpers are macOS-only; other targets ship an empty directory so
     # the packaging layout is the same everywhere.
     echo "[build-native] $TARGET: no native helpers"
     exit 0
@@ -42,11 +47,24 @@ if ! xcrun --find swiftc >/dev/null 2>&1; then
   exit 1
 fi
 
+SHARED="$DESKTOP_DIR/native/shared/LineProtocol.swift"
+
 xcrun swiftc -O \
   -target "${ARCH}-apple-macos12" \
+  "$SHARED" \
   "$DESKTOP_DIR/native/screen-input/PressClassifier.swift" \
   "$DESKTOP_DIR/native/screen-input/FrontWindow.swift" \
   "$DESKTOP_DIR/native/screen-input/main.swift" \
   -o "$OUT_DIR/screen-input"
 chmod 755 "$OUT_DIR/screen-input"
 echo "[build-native] built $OUT_DIR/screen-input"
+
+xcrun swiftc -O \
+  -target "${ARCH}-apple-macos12" \
+  "$SHARED" \
+  "$DESKTOP_DIR/native/dictation-helper/ClipboardLedger.swift" \
+  "$DESKTOP_DIR/native/dictation-helper/Paste.swift" \
+  "$DESKTOP_DIR/native/dictation-helper/main.swift" \
+  -o "$OUT_DIR/dictation-helper"
+chmod 755 "$OUT_DIR/dictation-helper"
+echo "[build-native] built $OUT_DIR/dictation-helper"

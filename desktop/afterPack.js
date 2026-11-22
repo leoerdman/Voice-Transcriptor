@@ -62,7 +62,7 @@ const { existsSync } = require("node:fs");
 const path = require("node:path");
 const {
   assertNoBundledBytecode,
-  assertScreenInputHelper,
+  assertNativeHelpers,
   hardenAppTransportSecurity,
   hasSigningIdentity,
   makeBundledPythonImportsReadOnly,
@@ -115,10 +115,11 @@ exports.default = async function afterPack(context) {
     log: (message) => console.log(message.replace("[macos-signing]", "[afterPack]")),
   });
 
-  // Screen mode's helper ships in every mac build except the App Store
-  // one; a build that disagrees fails here instead of shipping a screen
-  // hotkey that is silently never offered (or a helper the sandbox kills).
-  const screenInputHelper = assertScreenInputHelper(appPath, { expected: !isMas });
+  // The native helpers ship in every mac build except the App Store one;
+  // a build that disagrees fails here instead of shipping a screen hotkey
+  // that is silently never offered, pastes that always take the slow
+  // AppleScript path, or helpers the sandbox kills.
+  const nativeHelpers = assertNativeHelpers(appPath, { expected: !isMas });
 
   if (isMas) {
     assertNoBundledBytecode(appPath);
@@ -349,14 +350,16 @@ exports.default = async function afterPack(context) {
     ["--verify", "--deep", "--strict", "--verbose=2", appPath],
     { stdio: "inherit" },
   );
-  // The helper lives under Resources, which `--deep` covers only by the
-  // envelope hash: verify its own signature too (macOS refuses to give an
-  // event tap to an unsigned or broken binary under hardened runtime).
-  execFileSync(
-    "/usr/bin/codesign",
-    ["--verify", "--strict", "--verbose=2", screenInputHelper],
-    { stdio: "inherit" },
-  );
+  // The helpers live under Resources, which `--deep` covers only by the
+  // envelope hash: verify their own signatures too (macOS refuses to give
+  // an event tap to an unsigned or broken binary under hardened runtime).
+  for (const helper of nativeHelpers) {
+    execFileSync(
+      "/usr/bin/codesign",
+      ["--verify", "--strict", "--verbose=2", helper],
+      { stdio: "inherit" },
+    );
+  }
 
   // Dump the top-level signature identity + authority + runtime flags
   // so the build log shows exactly how the app was signed.

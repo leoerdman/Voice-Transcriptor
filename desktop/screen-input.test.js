@@ -31,6 +31,7 @@ const native = path.join(__dirname, "native");
 const classifierSource = path.join(native, "screen-input", "PressClassifier.swift");
 const helperSource = path.join(native, "screen-input", "main.swift");
 const frontWindowSource = path.join(native, "screen-input", "FrontWindow.swift");
+const sharedSource = path.join(native, "shared", "LineProtocol.swift");
 
 // Every case the Swift suite must run, by name. A case that disappears or
 // stops printing fails here; a new case is added to this list on purpose.
@@ -112,6 +113,6 @@ test("FrontWindow: the shot's window is the frontmost ordinary window that is no
 });
 
 test("the helper (event tap + protocol) compiles with the rule it ships", { skip }, () => {
-  const check = spawnSync("xcrun", ["swiftc", "-typecheck", classifierSource, frontWindowSource, helperSource], { encoding: "utf8" });
+  const check = spawnSync("xcrun", ["swiftc", "-typecheck", sharedSource, classifierSource, frontWindowSource, helperSource], { encoding: "utf8" });
   assert.equal(check.status, 0, check.stderr);
 });

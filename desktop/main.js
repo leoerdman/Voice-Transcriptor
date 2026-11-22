@@ -182,7 +182,12 @@ const {
 } = require("./renderer-toggle");
 // One lease per paste on the snapshot of the user's clipboard, released
 // exactly once (DM-02, DM-26).
-const { createClipboardLeases } = require("./clipboard-lease");
+const {
+  CLIPBOARD_RESTORE_DELAY_MS,
+  clipboardRestoreDecision,
+  clipboardStillOurs,
+  createClipboardLeases,
+} = require("./clipboard-lease");
 // The one rule for where this shell keeps its data (DM-07, DM-11, S-12).
 const { MAIN_LOG_FILE, resolveDataDir, oneDriveMigrationEntries } = require("./data-dir");
 // main.log is created 0600 and an older world-readable one tightened (BL-02).
@@ -212,6 +217,14 @@ const {
 // ./screen-mode-controller; the instance is `screenMode` below.
 const { SCREEN_MODE, isScreenSessionId, screenSessionId } = require("./screen-mode");
 const { createScreenModeController, SCREEN_MODE_LAYERS } = require("./screen-mode-controller");
+// The persistent native helper: clipboard, frontmost app, native ⌘V
+// (desktop/native/dictation-helper/, OPTIMIZATION.md wave 2).
+const {
+  LOST: DICTATION_HELPER_LOST,
+  createDictationHelper,
+  interpretNativePaste,
+  nativePasteRequest,
+} = require("./dictation-helper");
 // What the user is told for each screen-mode warning (D1).
 const { SCREEN_SHOT_HOTKEY_WARNING, screenModeWarningCopy } = require("./screen-mode-warnings");
 const { AUTO_STOP_OFF, parseAutoStopConfig } = require("./auto-stop-config");
@@ -2484,6 +2497,23 @@ function screenModeHelperPath() {
   return path.join(__dirname, "native", "build", "mac-arm64", "screen-input");
 }
 
+function dictationHelperPath() {
+  if (app.isPackaged) return path.join(process.resourcesPath, "runtime", "bin", "dictation-helper");
+  return path.join(__dirname, "native", "build", "mac-arm64", "dictation-helper");
+}
+
+// One process for the whole session (./dictation-helper). Every caller
+// treats "not available" as "take the old path", so an App Store build
+// (which does not ship it) and a dev run without build-native.sh work as
+// they always did.
+const dictationHelper = createDictationHelper({
+  spawn: (...args) => require("child_process").spawn(...args),
+  helperPath: dictationHelperPath,
+  exists: (p) => fs.existsSync(p),
+  platform: process.platform,
+  log: (line) => appendMainLog(line),
+});
+
 // Where a take's screenshots are staged until its recording is saved; the
 // backend then moves them beside the recording (backend/screen_sessions.py).
 function screenModeStagingRoot() {
@@ -3159,6 +3189,9 @@ async function toggleRecordingFromShortcut(mode = "voice") {
       });
       setCapturedPasteTarget(capturePasteTargetFromFrontInfo(front));
       keepCapturedTarget = true;
+      // The user's clipboard, snapshotted now so the paste at stop does
+      // not have to read it (used only if nothing changes it meanwhile).
+      void dictationHelper.request("clipboard-prepare");
       traceStep(trace, "target_captured", {
         target: pasteTargetSummary(pasteTarget),
       });
@@ -3955,6 +3988,19 @@ async function getLinuxFrontmostAppInfo() {
  */
 async function getFrontmostAppIdentityFast() {
   if (process.platform !== "darwin") return null;
+  // The dictation helper answers from NSWorkspace in-process — no spawn
+  // at all, and it knows the bundle id the verification policy keys on.
+  // Bounded short: it serves requests in order, and lsappinfo below is
+  // the answer whenever it is busy or absent.
+  const native = await dictationHelper.request("front-app", {}, { timeoutMs: 300 });
+  if (native && native.t === "front-app" && Number(native.pid) > 0) {
+    return {
+      name: String(native.name || ""),
+      pid: Number(native.pid),
+      windowTitle: "",
+      bundleId: String(native.bundleId || ""),
+    };
+  }
   try {
     const front = await runCommand("/usr/bin/lsappinfo", ["front"], { timeoutMs: 1500 });
     const asn = String(front?.stdout || "").trim();
@@ -4856,6 +4902,9 @@ async function maybeRepairPastePermissions({ cause = "auto", reason = "" } = {})
  * repair can never recurse into itself.
  */
 async function probeAndRepairPasteCapability(cause = "manual") {
+  // The helper reads its Accessibility bits once; the capability probe is
+  // the moment to read them again (a grant revoked or re-made).
+  void dictationHelper.request("permissions").then((answer) => dictationHelper.notePermissions(answer));
   const capability = await probePasteCapability(cause);
   if (process.platform !== "darwin") return capability;
   if (shouldAttemptPaste(capability)) return capability;
@@ -5132,44 +5181,6 @@ function snapshotClipboard() {
 const clipboardLeases = createClipboardLeases(snapshotClipboard);
 
 /**
- * Smart clipboard restore.
- *
- * Waits for the paste to settle, then restores the user's original
- * clipboard — but ABORTS the restore if the clipboard contents
- * changed before we got there, which means the user intentionally
- * copied something new (Cmd+C on a different selection) during the
- * window. Without this guard the prior fixed-1200 ms setTimeout
- * could clobber the user's new copy, or could steal a second paste
- * (Cmd+V → gets transcript again) if the target app handled the
- * synthesised paste faster than 1200 ms.
- *
- * Algorithm:
- *   1. Wait INITIAL_DELAY_MS (400) so the target process reads the
- *      clipboard via the synthesised Cmd+V / Ctrl+V.
- *   2. Poll ``clipboard.readText()`` every POLL_INTERVAL_MS (200)
- *      up to MAX_WAIT_MS (1500) total.
- *      - If text still equals what WE wrote → keep waiting.
- *      - If text differs → user copied something else; ABORT restore
- *        (don't clobber).
- *   3. At MAX_WAIT_MS → restore snapshot.
- *
- * Note on rich clipboards: ``readText`` returns "" for image-only
- * clipboards, so Cmd+C on an image during the window → "" !==
- * writtenText → correctly aborts restore (user's image survives).
- *
- * ``verified`` (BUGS_AUDIT 2026-09-03 §6.1/§6.4/§6.6) is the single gate
- * that decides whether restoring is even attempted: every paste method
- * used to call this unconditionally on any ok:true result, but "ok:true"
- * only ever meant "the OS-level paste command was sent", never "the
- * target actually received the text". A silently-failed Windows paste
- * (§6.1) or a macOS target that reads the pasteboard slower than the
- * fixed 1.5 s window (§6.4) both then had their clipboard overwritten
- * back to the OLD content — destroying the only remaining copy of the
- * transcript. When ``verified`` is not literally ``true`` the transcript
- * is left on the clipboard on purpose: the user can still paste it by
- * hand, whereas a silent restore gives them nothing.
- */
-/**
  * The failure half of the clipboard contract (BUGS_AUDIT §6.5, debt
  * registry item 3, and the Wispr Flow rule the registry records: the
  * clipboard is never restored on failure).
@@ -5187,8 +5198,17 @@ function keepTranscriptOnClipboardAfterFailure(lease, logCtx) {
   lease.release();
 }
 
+/**
+ * The success half of the clipboard contract (./clipboard-lease
+ * clipboardRestoreDecision): the paste chord is out, so after
+ * CLIPBOARD_RESTORE_DELAY_MS the user's clipboard is put back — unless
+ * somebody changed it in the meantime (their own ⌘C, a later paste of
+ * ours), which is left alone. This is the Electron-clipboard path, where
+ * "unchanged" can only be judged by the text.
+ */
 function scheduleSmartClipboardRestore(lease, writtenText, logCtx = "paste:clipboardRestore", verified = false) {
-  if (verified !== true) {
+  const decision = clipboardRestoreDecision({ platform: process.platform, verified });
+  if (!decision.restore) {
     appendMainLog(`[${logCtx}] paste not verified; leaving transcript on the clipboard instead of restoring`);
     lease.release();
     return;
@@ -5197,35 +5217,20 @@ function scheduleSmartClipboardRestore(lease, writtenText, logCtx = "paste:clipb
   // the lease over from the ladder's ``finally``.
   const releaseLease = lease.handOff();
   const snap = lease.snapshot;
-  const INITIAL_DELAY_MS = 400;
-  const POLL_INTERVAL_MS = 200;
-  const MAX_WAIT_MS = 1500;
-  const expected = String(writtenText == null ? "" : writtenText);
-  const startedAt = Date.now();
-
-  const tryPollOrRestore = () => {
-    const elapsed = Date.now() - startedAt;
+  setTimeout(() => {
     let current = "";
     try { current = String(clipboard.readText() || ""); } catch { current = ""; }
-    if (current !== expected) {
-      // User copied something new during the window. Abort the restore
-      // so we don't clobber their new clipboard content. The original
-      // snapshot is forever sacrificed here — acceptable trade-off,
-      // otherwise we silently overwrite user intent.
-      appendMainLog(`[${logCtx}] user copied new content during paste window; skipping restore`);
+    if (!clipboardStillOurs({ writtenText, currentText: current })) {
+      // Somebody wrote the clipboard during the window. Their content
+      // wins; the original snapshot is given up rather than clobbering it.
+      appendMainLog(`[${logCtx}] clipboard changed during paste window; skipping restore`);
       releaseLease();
       return;
     }
-    if (elapsed >= MAX_WAIT_MS) {
-      // Paste is settled, clipboard still has our text, no new user
-      // copy arrived — safe to restore the original snapshot.
-      safeExecSync(logCtx, () => restoreClipboard(snap));
-      releaseLease();
-      return;
-    }
-    setTimeout(tryPollOrRestore, POLL_INTERVAL_MS);
-  };
-  setTimeout(tryPollOrRestore, INITIAL_DELAY_MS);
+    safeExecSync(logCtx, () => restoreClipboard(snap));
+    appendMainLog(`[${logCtx}] restored previous clipboard reason=${decision.reason}`);
+    releaseLease();
+  }, CLIPBOARD_RESTORE_DELAY_MS);
 }
 
 /** Restore a clipboard snapshot produced by snapshotClipboard(). */
@@ -5373,6 +5378,13 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
     traceEnd(trace, "failed", { reason: "empty-text" });
     return { ok: false, reason: "empty-text", method: "none", verified: false };
   }
+  // macOS: the native helper first. It owns the clipboard for its paste
+  // (snapshot, write, restore by change count); when it does not post it
+  // hands over with the user's clipboard in place and the ladder below
+  // runs exactly as it would without it.
+  const native = await tryNativePaste(text, target, options, trace);
+  if (native.result) return native.result;
+  options = { ...options, verification: native.verification };
   // The clipboard contract, in this order and in this one place (DM-02):
   // snapshot the user's clipboard, THEN put the transcript on it. Every
   // outcome below leaves the transcript there unless a verified paste
@@ -5400,6 +5412,99 @@ async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options
     // makes this a no-op.
     clipboardLease.settle();
   }
+}
+
+/**
+ * The native paste (./dictation-helper, desktop/native/dictation-helper):
+ * front-app check, modifier wait, clipboard write and ⌘V through
+ * CGEventPost in one in-process round trip, instead of a JXA spawn and an
+ * osascript per paste. Returns `{result}` when it decided the paste
+ * (sent, or lost — never retried another way, it may be out), or
+ * `{result: null}` to hand over to the AppleScript ladder.
+ */
+async function tryNativePaste(text, target, options, trace) {
+  if (process.platform !== "darwin" || !dictationHelper.isAvailable()) return { result: null };
+  const effectiveTarget = normalizeCapturedPasteTarget(target);
+  // No target: the ladder owns that refusal (and its status).
+  if (!hasCapturedPasteTarget(effectiveTarget)) return { result: null };
+  const verificationKey = pasteVerificationKey({
+    bundleId: effectiveTarget.bundleId || "",
+    appName: effectiveTarget.appName || "",
+  });
+  const verify = pasteVerificationPolicy.shouldAttemptVerification(verificationKey);
+  const verification = { key: verificationKey, verify };
+  traceStep(trace, "paste_verification_policy", { ...pasteVerificationPolicy.stateFor(verificationKey), verify });
+  const request = nativePasteRequest({
+    text,
+    // The helper refuses to post unless this app is in front; when it is
+    // not (focus moved, activation needed), the ladder activates it.
+    pid: Number(effectiveTarget.pid) || 0,
+    verify,
+    modifierPlan: planModifierRelease({
+      platform: process.platform,
+      accelerator: options.accelerator || "",
+      trigger: options.trigger || "",
+    }),
+  });
+  traceStep(trace, "method_begin", { method: "native_paste", attempt: 1, verify });
+  const startedAt = Date.now();
+  const answer = await dictationHelper.request("paste", request.fields, { timeoutMs: request.timeoutMs });
+  const outcome = interpretNativePaste(answer);
+  const detail = {
+    method: "native_paste",
+    ms: Date.now() - startedAt,
+    kind: outcome.kind,
+    reason: outcome.reason,
+    verification: outcome.verification || "",
+    source: answer?.source || "",
+    reverted: !!answer?.reverted,
+    helperMs: answer?.ms || null,
+    modifiers: answer?.modifiers || null,
+    frontPid: Number(answer?.front?.pid) || 0,
+    frontBundleId: String(answer?.front?.bundleId || ""),
+  };
+  traceStep(trace, "method_result", detail);
+  logPasteTrace("native_paste_result", detail);
+  if (verify && outcome.policyOutcome) pasteVerificationPolicy.recordOutcome(verificationKey, outcome.policyOutcome);
+  if (outcome.kind === "success") {
+    scheduleNativeClipboardRestore(outcome.changeCount, outcome.verified, "paste:clipboardRestore:native_paste");
+    logPasteTrace("success", { method: "native_paste", reason: outcome.reason, verified: outcome.verified });
+    traceEnd(trace, "success", { method: "native_paste", reason: outcome.reason, verified: outcome.verified });
+    return { result: { ok: true, reason: outcome.reason, method: "native_paste", verified: outcome.verified }, verification };
+  }
+  if (outcome.kind === "lost") {
+    // ⌘V may be out: the transcript stays on the clipboard (the failure
+    // half of the contract) rather than risking a second paste.
+    appendMainLog(`[paste:clipboardKeep:native_paste] ${outcome.reason}; transcript left on the clipboard`);
+    void dictationHelper.request("clipboard-keep");
+    logPasteTrace("failed", { reason: outcome.reason, method: "native_paste" });
+    traceEnd(trace, "failed", { reason: outcome.reason, method: "native_paste" });
+    return { result: { ok: false, reason: outcome.reason, method: "native_paste", verified: false }, verification };
+  }
+  traceStep(trace, "native_fallback", { reason: outcome.reason, reverted: !!outcome.reverted });
+  return { result: null, verification };
+}
+
+/**
+ * The native path's restore (./clipboard-lease clipboardRestoreDecision):
+ * the helper puts the user's clipboard back only while the pasteboard's
+ * change count is still the one our write produced.
+ */
+function scheduleNativeClipboardRestore(changeCount, verified, logCtx) {
+  const decision = clipboardRestoreDecision({ platform: process.platform, verified });
+  if (!decision.restore || !Number.isInteger(changeCount)) {
+    void dictationHelper.request("clipboard-keep");
+    appendMainLog(`[${logCtx}] transcript left on the clipboard reason=${decision.reason}`);
+    return;
+  }
+  setTimeout(() => {
+    dictationHelper.request("clipboard-restore", { changeCount }).then((answer) => {
+      const result = answer && answer.t === "clipboard-restore"
+        ? answer.result
+        : answer && answer.t === DICTATION_HELPER_LOST ? "lost" : "no-helper";
+      appendMainLog(`[${logCtx}] result=${result} reason=${decision.reason}`);
+    });
+  }, CLIPBOARD_RESTORE_DELAY_MS);
 }
 
 async function pasteFromClipboard(text, target, options, trace, clipboardLease) {
@@ -5832,7 +5937,11 @@ async function pasteFromClipboard(text, target, options, trace, clipboardLease) 
       bundleId: effectiveTarget.bundleId || frontBefore.bundleId || "",
       appName: effectiveTarget.appName || frontBefore.name || "",
     });
-    const verifyPaste = pasteVerificationPolicy.shouldAttemptVerification(verificationKey);
+    // Asked once per paste: the native attempt that handed over already
+    // took this paste's turn of the policy's re-probe count.
+    const verifyPaste = options.verification && options.verification.key === verificationKey
+      ? options.verification.verify
+      : pasteVerificationPolicy.shouldAttemptVerification(verificationKey);
     traceStep(trace, "paste_verification_policy", {
       ...pasteVerificationPolicy.stateFor(verificationKey),
       verify: verifyPaste,
@@ -5930,8 +6039,8 @@ async function pasteFromClipboard(text, target, options, trace, clipboardLease) 
     if (macOutcome.success) {
       logPasteTrace("success", { method: "robust_paste", attempt: attempt + 1, reason: out, verified: macOutcome.verified, sent: !!macOutcome.sent });
       traceEnd(trace, "success", { method: "robust_paste", attempt: attempt + 1, reason: out, verified: macOutcome.verified, sent: !!macOutcome.sent });
-      // Restore previous clipboard only when the paste was verified —
-      // see scheduleSmartClipboardRestore's doc comment (§6.4/§6.6).
+      // The chord is out: the previous clipboard comes back unless it
+      // changed meanwhile (./clipboard-lease clipboardRestoreDecision).
       scheduleSmartClipboardRestore(clipboardLease, text, "paste:clipboardRestore:robust_paste", macOutcome.verified);
       return { ok: true, reason: out, method: "robust_paste", verified: macOutcome.verified };
     }
@@ -5999,10 +6108,9 @@ async function pasteFromClipboard(text, target, options, trace, clipboardLease) 
     const out = String(menuRes.stdout || "").trim();
     const menuOutcome = evaluatePasteOutcome({ method: "menu-paste", ok: menuRes.ok, stdout: menuRes.stdout });
     if (menuOutcome.success) {
-      // This fallback script has no AX-verification suffix (unlike
-      // robust_paste's menu-paste-primary/robust-paste branches), so
-      // verified is always false here — the restore gate correctly
-      // leaves the transcript on the clipboard rather than restoring.
+      // This fallback script has no AX-verification suffix, so verified
+      // is false here; on macOS a sent paste restores all the same
+      // (./clipboard-lease clipboardRestoreDecision).
       scheduleSmartClipboardRestore(clipboardLease, text, "paste:clipboardRestore:menu", menuOutcome.verified);
       traceEnd(trace, "success", { method: "menu-paste", reason: out, verified: menuOutcome.verified });
       return { ok: true, reason: out, method: "menu-paste", verified: menuOutcome.verified };
@@ -9140,6 +9248,8 @@ app.on("before-quit", () => {
   // The screen-mode mouse helper holds a CGEventTap: it must never
   // outlive the app (it also exits on its own when its stdin closes).
   try { screenMode.teardown(); } catch { }
+  // So does the dictation helper (its stdin closing is its quit).
+  try { dictationHelper.stop(); } catch { }
   // Long-running runCommand children (the multi-GB engine pip install)
   // must die with the app, not orphan for their full timeout (BUG-61).
   killAllTrackedChildren();
@@ -9204,6 +9314,7 @@ installSignalQuitHandlers({
 });
 
 app.whenReady().then(async () => {
+  dictationHelper.start();
   // Process-level uncaughtException / unhandledRejection handlers are
   // already registered at module top-level so pre-whenReady crashes are
   // captured. No duplicate registration needed here.

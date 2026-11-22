@@ -8,6 +8,7 @@ const assert = require("node:assert/strict");
 
 const {
   UNVERIFIED_STREAK_LIMIT,
+  REPROBE_AFTER_SKIPS,
   PASTE_VERIFICATION_OUTCOME: OUTCOME,
   pasteVerificationKey,
   createPasteVerificationPolicy,
@@ -127,7 +128,31 @@ test("stateFor reports a target nothing is known about", () => {
     unverifiedStreak: 0,
     disabled: false,
     limit: 2,
+    skipped: 0,
   });
+});
+
+test("a switched-off app is probed again every REPROBE_AFTER_SKIPS-th paste, and only that app", () => {
+  const policy = createPasteVerificationPolicy({ reprobeAfter: 3 });
+  policy.recordOutcome("com.anthropic.claudefordesktop", OUTCOME.UNREADABLE);
+  policy.recordOutcome("com.anthropic.claudefordesktop", OUTCOME.UNREADABLE);
+  const asked = [1, 2, 3, 4, 5, 6].map(() => policy.shouldAttemptVerification("com.anthropic.claudefordesktop"));
+  assert.deepEqual(asked, [false, false, true, false, false, true]);
+  // Another app is untouched by the first one's verdict.
+  assert.equal(policy.shouldAttemptVerification("com.apple.textedit"), true);
+  // The probe found it readable now: back on for good.
+  policy.recordOutcome("com.anthropic.claudefordesktop", OUTCOME.VERIFIED);
+  assert.equal(policy.shouldAttemptVerification("com.anthropic.claudefordesktop"), true);
+  assert.equal(policy.stateFor("com.anthropic.claudefordesktop").disabled, false);
+});
+
+test("the default re-probe interval is the exported constant", () => {
+  const policy = createPasteVerificationPolicy();
+  policy.recordOutcome("claude", OUTCOME.UNREADABLE);
+  policy.recordOutcome("claude", OUTCOME.UNREADABLE);
+  let probes = 0;
+  for (let i = 0; i < REPROBE_AFTER_SKIPS * 2; i++) if (policy.shouldAttemptVerification("claude")) probes++;
+  assert.equal(probes, 2);
 });
 
 // ── AX read timings ───────────────────────────────────────────────────

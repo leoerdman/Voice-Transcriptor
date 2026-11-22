@@ -55,6 +55,7 @@
       "recording-final-slot.js",
       "transcript-signal.js",
       "clipboard-lease.js",
+      "dictation-helper.js",
       "recording-stop.js",
       "windows-paste-fallback.js",
       "renderer-toggle.js",
