@@ -8,7 +8,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const { macHotkeyChord, canonicalAcceleratorForPlatform } = require("./accelerator");
-const { createHotkeyRouter, pressedAtFromEvent } = require("./hotkey-router");
+const { createHotkeyRouter, pressedAtFromEvent, SAME_PRESS_WINDOW_MS } = require("./hotkey-router");
 
 const NOW = 1_000_000;
 
@@ -48,7 +48,7 @@ function fakeGlobal({ refuse = [] } = {}) {
   };
 }
 
-function setup({ helper = fakeHelper(), global = fakeGlobal(), platform = "darwin" } = {}) {
+function setup({ helper = fakeHelper(), global = fakeGlobal(), platform = "darwin", now = () => NOW } = {}) {
   const log = [];
   const statuses = [];
   const presses = [];
@@ -60,7 +60,7 @@ function setup({ helper = fakeHelper(), global = fakeGlobal(), platform = "darwi
     canonicalize: (a) => canonicalAcceleratorForPlatform(a, "darwin"),
     platform,
     log: (line) => log.push(line),
-    now: () => NOW,
+    now,
     onStatusChange: (s) => statuses.push(s),
   });
   const bindings = [
@@ -121,6 +121,77 @@ test("a globalShortcut press is stamped now", () => {
   router.apply(bindings);
   global.held.get("Option+Left")();
   assert.deepEqual(presses, [["record", NOW]]);
+});
+
+// The overlap: the helper has armed the tap (it reports presses) while
+// main still holds globalShortcut (its answer is on the way).
+function overlapping() {
+  let clock = NOW;
+  const ctx = setup({ now: () => clock });
+  ctx.router.apply(ctx.bindings);
+  assert.equal(ctx.global.held.size, 3, "globalShortcut held until the helper answers");
+  const accelerators = { record: "Option+Left", paste: "Option+Shift+V", screen: "Option+Right" };
+  return {
+    ...ctx,
+    at(ms) { clock = NOW + ms; },
+    viaTap(action, pressedAt = clock) { ctx.router.onHelperEvent({ t: "hotkey", chord: action, pressedAt }); },
+    viaGlobal(action) { ctx.global.held.get(accelerators[action])(); },
+  };
+}
+
+for (const action of ["record", "paste", "screen"]) {
+  test(`${action}: one press reported by the tap and by globalShortcut runs once, either order`, () => {
+    const o = overlapping();
+    o.viaTap(action, NOW - 4);
+    o.at(3);
+    o.viaGlobal(action);
+    assert.deepEqual(o.presses, [[action, NOW - 4]]);
+    assert.equal(o.log.filter((l) => l.includes(`${action}: global report of the press native already ran`)).length, 1);
+
+    const r = overlapping();
+    r.viaGlobal(action);
+    r.at(2);
+    r.viaTap(action, NOW - 5);
+    assert.deepEqual(r.presses, [[action, NOW]]);
+  });
+
+  test(`${action}: two presses each reported twice run twice; the same path twice is two presses`, () => {
+    const o = overlapping();
+    o.viaTap(action);
+    o.at(5);
+    o.viaGlobal(action);
+    o.at(60);
+    o.viaTap(action);
+    o.at(64);
+    o.viaGlobal(action);
+    assert.equal(o.presses.length, 2, "a merged report never swallows the next press");
+
+    const same = overlapping();
+    same.viaTap(action);
+    same.at(30);
+    same.viaTap(action);
+    same.viaGlobal(action);
+    same.at(40);
+    same.viaGlobal(action);
+    assert.equal(same.presses.length, 3, "tap, tap (two key-downs), global merged with the 2nd tap, global again");
+  });
+}
+
+test("a report from the other path after the window is a new press", () => {
+  const o = overlapping();
+  o.viaTap("record");
+  o.at(SAME_PRESS_WINDOW_MS + 1);
+  o.viaGlobal("record");
+  assert.equal(o.presses.length, 2);
+});
+
+test("a table swap inside the overlap still merges the two reports", async () => {
+  const o = overlapping();
+  o.viaGlobal("record");
+  o.router.apply(o.bindings);
+  o.at(4);
+  o.viaTap("record");
+  assert.equal(o.presses.length, 1);
 });
 
 test("the press stamp is used only when plausible", () => {
