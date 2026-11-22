@@ -148,7 +148,10 @@ const { createBackendServing, loadWhenServing } = require("./backend-serving");
 const { createWindowLiveness } = require("./window-liveness");
 const { createSingleFlight } = require("./single-flight");
 // A session that grants no permission request or check (the capsule, DM-35).
-const { denyAllSessionPermissions } = require("./session-permissions");
+const { createPermissionChangeLog, denyAllSessionPermissions } = require("./session-permissions");
+// One per process: `[perm-check]` is logged at startup and on change, not
+// on every recording's getUserMedia.
+const permissionCheckChanged = createPermissionChangeLog();
 const { pruneLogArchives } = require("./log-retention");
 // Recording ids are unique only per renderer page: key them with the
 // page's epoch (DM-32).
@@ -8748,12 +8751,14 @@ async function createWindow(options = {}) {
     const allow = allowedCapability && fromBackend;
     const logUrl = permissionOriginsLog(wc, details, requestingOrigin);
     const kinds = mediaTypes.length ? ` types=${mediaTypes.join("+")}` : "";
-    if (known && !fromBackend) {
-      appendMainLog(`[perm-check] DENY non-backend origin: perm=${perm}${kinds} origins=${logUrl}`);
-    } else {
-      appendMainLog(
-        `[perm-check] perm=${perm}${kinds} allow=${allow} reason=${allow ? reason : (fromBackend ? reason : "non-backend-origin")} origins=${logUrl}`,
-      );
+    const shownReason = allow ? reason : (fromBackend ? reason : "non-backend-origin");
+    // Logged on first sight and on change only (./session-permissions).
+    if (permissionCheckChanged(`${perm}${kinds} origins=${logUrl}`, `${allow} ${shownReason}`)) {
+      if (known && !fromBackend) {
+        appendMainLog(`[perm-check] DENY non-backend origin: perm=${perm}${kinds} origins=${logUrl}`);
+      } else {
+        appendMainLog(`[perm-check] perm=${perm}${kinds} allow=${allow} reason=${shownReason} origins=${logUrl}`);
+      }
     }
     return allow;
   });
