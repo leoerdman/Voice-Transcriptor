@@ -46,7 +46,7 @@ test("main starts the session before the awaits that used to delay it, and reads
   assert.ok(startAt < fn.indexOf("await waitForRendererRecordingStart()"), "start() waits behind the microphone confirmation");
   assert.ok(startAt < fn.indexOf("await frontAtHotkeyPromise"), "start() waits behind the frontmost-app lookup");
   assert.ok(startAt < fn.indexOf("await beginRecordingStatusSession()"), "start() waits behind the capsule session");
-  assert.ok(startAt < fn.indexOf("void publishRecordingStatus(transitionStatus)"), "the capsule is held (screen shape, hidden) before its first paint");
+  assert.ok(startAt < fn.indexOf("void publishRecordingStatus(transitionStatus,"), "the capsule is held (screen shape, hidden) before its first paint");
   assert.match(topLevelFunctionSource("startScreenTake"), /holdCapsuleForScreenTake\(\);\n  return screenMode\.start\(id, \{ pressedAt, recordClicks \}\);/);
   assert.match(fn, /decideAfterScreenStart\(started\)/);
   assert.match(fn, /AFTER_SCREEN_START\.VOICE_TAKE\) notifyRendererVoiceTake\(/);

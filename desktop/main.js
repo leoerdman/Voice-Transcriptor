@@ -169,6 +169,8 @@ const { createOwnProcessRules } = require("./own-process");
 const { createQuitApp, installSignalQuitHandlers } = require("./quit-path");
 // The capsule window's size (one flag) and when it is placed (DM-13, DM-25).
 const { capsuleWindowSize, capsuleBoundsIn, capsuleNeedsPlacement } = require("./capsule-geometry");
+// What a hidden capsule costs (throttling) and the press-to-visible metric.
+const { createCapsulePower, capsulePressMetricLine } = require("./capsule-power");
 // What to do once screenMode.start() answered for a take (DM-31).
 const { AFTER_SCREEN_START, decideAfterScreenStart } = require("./screen-session-start");
 // The record hotkey's renderer round trip, with a press that expires
@@ -503,17 +505,14 @@ let win = null;
 let recordingStatusWindow = null;
 let recordingStatusWindowLoadPromise = null;
 let recordingStatusWindowReady = false;
-// Grace period between the capsule going idle and its renderer process
-// being torn down. Root cause it fixes: the capsule window was created
-// on the first recording and then lived until app quit — a second,
-// permanently resident renderer process (~64 MB plus its own V8 isolate)
-// that, being created with backgroundThrottling disabled, kept its
-// compositor ticking while hidden and burned ~13% of a CPU core at idle,
-// dragging the shared GPU process along with it. The window now exists
-// only while there is something to show. The delay keeps a rapid
-// stop→start cycle from paying a window re-create.
-const RECORDING_STATUS_CAPSULE_TEARDOWN_MS = 8000;
-let recordingStatusTeardownTimer = null;
+// The capsule window is built once after startup (prewarmRecordingStatusCapsule)
+// and only shown/hidden; its idle cost is handled by ./capsule-power
+// (throttling on while hidden). It is rebuilt only when the window or its
+// page process is gone (window-liveness below).
+const capsulePower = createCapsulePower({ log: (line) => appendMainLog(line) });
+// Hotkey press time of the recording whose capsule is not on screen yet;
+// consumed by the first reveal (press_to_capsule_visible_ms).
+let recordingStatusCapsulePressedAt = 0;
 let mainWindowInitialLoadPromise = null;
 let recordingStateMonitor = null;
 let tray = null;
@@ -594,6 +593,8 @@ const RECORDING_STATUS_TERMINAL_DWELL_MS = 900;
  *  whose clicks are taken by the in-process mouse helper and never reach
  *  the window server, avoids that (Ultra-Audit 2026-11-20 H-03). */
 const RECORDING_STATUS_CAPSULE_ACTIVATE_SUPPRESS_MS = 700;
+// How long after app ready the capsule is built in the background.
+const RECORDING_STATUS_CAPSULE_PREWARM_DELAY_MS = 1500;
 
 /** How often the monitor re-reads the renderer's auto-stop settings. The
  *  user can change them mid-recording from Settings. */
@@ -2118,10 +2119,6 @@ function installRecordingStatusCapsuleIpc() {
 
 async function ensureRecordingStatusCapsuleWindow() {
   if (!app.isReady()) return null;
-  // A pending teardown means the capsule is idle but still alive.
-  // Reclaim it rather than letting the timer destroy a window we are
-  // about to show again.
-  cancelRecordingStatusCapsuleTeardown();
   if (recordingStatusWindow && !recordingStatusWindow.isDestroyed()) {
     // The window OBJECT exists the moment `new BrowserWindow` returns —
     // its document does not. A caller handed the object mid-load used to
@@ -2170,7 +2167,9 @@ async function ensureRecordingStatusCapsuleWindow() {
       contextIsolation: true,
       sandbox: true,
       devTools: false,
-      backgroundThrottling: false,
+      // Born asleep: hidden windows are throttled; capsulePower.awake
+      // lifts it right before the capsule is shown.
+      backgroundThrottling: true,
     },
   });
 
@@ -2190,7 +2189,6 @@ async function ensureRecordingStatusCapsuleWindow() {
     recordingStatusWindow = null;
     recordingStatusWindowReady = false;
     recordingStatusWindowLoadPromise = null;
-    cancelRecordingStatusCapsuleTeardown();
   });
   // A capsule whose page died is rebuilt, not reloaded: its readiness and
   // pending paints belong to the dead page, and `updateRecordingStatusCapsule`
@@ -2231,8 +2229,9 @@ function rebuildRecordingStatusCapsule() {
   return updateRecordingStatusCapsule({});
 }
 
-async function updateRecordingStatusCapsule(patch = {}) {
+async function updateRecordingStatusCapsule(patch = {}, { pressedAt = 0 } = {}) {
   Object.assign(recordingStatusCapsuleState, patch);
+  if (pressedAt > 0 && !recordingStatusCapsuleState.screen) recordingStatusCapsulePressedAt = pressedAt;
   const seq = ++recordingStatusCapsuleUpdateSeq;
   const requestedAt = Date.now();
   const status = String(recordingStatusCapsuleState.status || "").trim();
@@ -2310,12 +2309,18 @@ function revealRecordingStatusCapsule(capsuleWindow, status, requestedAt) {
   // anyway, so "the capsule appeared" is a transition on the record
   // and its answer — do nothing to the main window — is stated in
   // one place rather than assumed here.
+  capsulePower.awake(capsuleWindow);
   capsuleWindow.showInactive();
   applyWindowLifecycleEvent(WINDOW_LIFECYCLE_EVENTS.capsuleShown);
   appendMainLog(
     `[recording-capsule] visible status="${status}" ms=${Date.now() - requestedAt} ` +
     `create=${recordingStatusCapsuleLastCreateMs}ms`,
   );
+  const pressLine = capsulePressMetricLine({
+    pressedAt: recordingStatusCapsulePressedAt, now: Date.now(), status,
+  });
+  if (pressLine) appendMainLog(pressLine);
+  recordingStatusCapsulePressedAt = 0;
   recordingStatusCapsuleLastCreateMs = 0;
 }
 
@@ -2592,42 +2597,19 @@ function notifyRendererVoiceTake(screenSessionId) {
   }
 }
 
-function cancelRecordingStatusCapsuleTeardown() {
-  if (recordingStatusTeardownTimer) {
-    clearTimeout(recordingStatusTeardownTimer);
-    recordingStatusTeardownTimer = null;
-  }
-}
-
-function destroyRecordingStatusCapsuleWindow(reason) {
-  cancelRecordingStatusCapsuleTeardown();
-  const target = recordingStatusWindow;
-  if (!target || target.isDestroyed()) return;
-  // `closable: false` blocks `close()`, so `destroy()` is the only way
-  // out for this window — it is also what the load-failure path already
-  // uses. The "closed" handler nulls the module state.
-  try {
-    target.destroy();
-    appendMainLog(`[recording-capsule] window destroyed (${reason})`);
-  } catch (e) {
-    appendMainLog(`[recording-capsule] destroy failed: ${e?.message || e}`);
-  }
-}
-
-function scheduleRecordingStatusCapsuleTeardown() {
-  cancelRecordingStatusCapsuleTeardown();
-  if (!recordingStatusWindow || recordingStatusWindow.isDestroyed()) return;
-  recordingStatusTeardownTimer = setTimeout(() => {
-    recordingStatusTeardownTimer = null;
-    // Re-check under the timer: an update that arrived after the hide
-    // cancels the teardown via ensureRecordingStatusCapsuleWindow, but
-    // a status set through some other path must not lose its window.
-    if (String(recordingStatusCapsuleState.status || "").trim()) return;
-    destroyRecordingStatusCapsuleWindow("idle");
-  }, RECORDING_STATUS_CAPSULE_TEARDOWN_MS);
-  // Never hold the event loop open for a teardown that quit would do
-  // anyway.
-  try { recordingStatusTeardownTimer.unref?.(); } catch { }
+/**
+ * Build the capsule window once the app has settled, so the first press
+ * finds it ready. Deferred off the startup path; a failure only means the
+ * first press builds it the usual way.
+ */
+function prewarmRecordingStatusCapsule() {
+  const timer = setTimeout(() => {
+    if (isQuitting) return;
+    void ensureRecordingStatusCapsuleWindow().catch((e) => {
+      appendMainLog(`[recording-capsule] prewarm failed: ${e?.message || e}`);
+    });
+  }, RECORDING_STATUS_CAPSULE_PREWARM_DELAY_MS);
+  try { timer.unref?.(); } catch { }
 }
 
 function hideRecordingStatusCapsule() {
@@ -2642,6 +2624,7 @@ function hideRecordingStatusCapsule() {
   recordingStatusCapsuleState.elapsedMs = 0;
   recordingStatusCapsuleState.timerRunning = false;
   recordingStatusCapsulePlacedSize = null;
+  recordingStatusCapsulePressedAt = 0;
   recordingStatusCapsuleLastLevelSent = -1;
   recordingStatusCapsuleLastLevelSentAt = 0;
   if (recordingStatusWindow && !recordingStatusWindow.isDestroyed()) {
@@ -2654,8 +2637,7 @@ function hideRecordingStatusCapsule() {
         true,
       ).catch(() => { });
     }
-    try { recordingStatusWindow.hide(); } catch { }
-    scheduleRecordingStatusCapsuleTeardown();
+    capsulePower.sleep(recordingStatusWindow);
   }
 }
 
@@ -2826,10 +2808,10 @@ async function beginRecordingStatusSession() {
   if (gen === recordingAutoStopConfigGen) recordingAutoStopConfig = cfg;
 }
 
-async function publishRecordingStatus(status, kind = "") {
+async function publishRecordingStatus(status, kind = "", { pressedAt = 0 } = {}) {
   const text = String(status || "").trim();
   if (!text) return;
-  await setRecordingStatus(text, kind);
+  await setRecordingStatus(text, kind, { pressedAt });
 }
 
 function resetRecordingStatusState() {
@@ -2874,10 +2856,10 @@ async function setRendererMainStatus(text) {
  * ladders. Omitting it falls back to classifying the text, which is what
  * renderer-authored statuses need.
  */
-async function setRecordingStatus(text, kind = "") {
+async function setRecordingStatus(text, kind = "", { pressedAt = 0 } = {}) {
   const status = String(text || "").trim();
   if (!status) return;
-  await updateRecordingStatusCapsule({ status, kind: String(kind || "") });
+  await updateRecordingStatusCapsule({ status, kind: String(kind || "") }, { pressedAt });
   await setRendererMainStatus(status);
 }
 
@@ -3083,14 +3065,13 @@ async function toggleRecordingFromShortcut(mode = "voice") {
       return;
     }
 
-    // Published, not awaited. Creating the capsule window costs 110-380 ms
-    // (it is destroyed 8 s after going idle, so most presses pay a fresh
-    // create) and the microphone has no reason to wait behind it — the
+    // Published, not awaited. The capsule window is prebuilt, but a first
+    // paint still costs a round trip and the microphone has no reason to wait behind it — the
     // renderer already has the press. A later status supersedes this one
     // through the capsule's update sequence, so a slow create can never
     // repaint a state the app has left.
     const transitionStatus = result.wasRecording || postStopActive ? "Transcribing" : "Starting";
-    void publishRecordingStatus(transitionStatus).catch((e) => {
+    void publishRecordingStatus(transitionStatus, "", { pressedAt }).catch((e) => {
       appendMainLog(`[recording-status] transition publish failed: ${e?.message || e}`);
     });
     traceStep(trace, "recording_status_published", {
@@ -9173,9 +9154,6 @@ app.on("before-quit", () => {
     clearTimeout(backendRestartTimer);
     backendRestartTimer = null;
   }
-  // Same reasoning: a capsule teardown scheduled seconds before quit
-  // must not fire against a window Electron is already tearing down.
-  cancelRecordingStatusCapsuleTeardown();
   globalShortcut.unregisterAll();
   shortcutBridgeHandler = null;
   shortcutCaptureAbortHandler = null;
@@ -9963,6 +9941,9 @@ app.whenReady().then(async () => {
   // skipped the startup event entirely and ended in a bare modal with
   // no window.
   await applyWindowLifecycleEvent(WINDOW_LIFECYCLE_EVENTS.startup);
+  // After the startup event: the capsule is built in the background and
+  // never delays the main window.
+  prewarmRecordingStatusCapsule();
 }).catch((err) => {
   // The whenReady chain has many awaits — IPC and tray setup, permission
   // probes, accessibility checks, and any one of

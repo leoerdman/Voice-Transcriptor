@@ -76,6 +76,7 @@
       "renderer-epoch.js",
       "shortcut-runtime.js",
       "capsule-geometry.js",
+      "capsule-power.js",
       "screen-session-start.js",
       "power-events.js",
       "child-io.js",
