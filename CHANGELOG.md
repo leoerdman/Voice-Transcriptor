@@ -3,6 +3,12 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.28] - 2026-11-23
+
+### Fixed
+
+- **The capsule's waveform runs steadily from right to left.** It used to jump left and right when you started or stopped speaking. Each bar's place was counted from the last time a bar was added, and that count was reset whenever the capsule switched between "recording" and the silence countdown — which is exactly what speech and pauses cause — so every bar jumped by up to a whole step; a late frame also froze the bars and lost the time it took. Now a bar is born at the right wall at a fixed moment and runs left at one constant speed, so its place depends on the clock alone, not on frames, mode or loudness, and it comes out of the wall the way the red line does. Nothing new runs while the capsule is hidden.
+
 ## [1.6.27] - 2026-11-23
 
 ### Fixed
