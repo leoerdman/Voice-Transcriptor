@@ -14,6 +14,7 @@ const assert = require("node:assert/strict");
 const vm = require("node:vm");
 
 const { mainSource, topLevelFunctionSource } = require("./main-source");
+const { createWaveScroller } = require("./capsule-wave-scroll");
 
 function capsuleTokensSource() {
   const start = mainSource.indexOf("const RECORDING_STATUS_CAPSULE = ");
@@ -24,7 +25,7 @@ function capsuleTokensSource() {
 
 function capsuleHtml() {
   const src = `${capsuleTokensSource()}\n${topLevelFunctionSource("recordingStatusCapsuleHtml")}\nrecordingStatusCapsuleHtml();`;
-  return vm.runInNewContext(src, {});
+  return vm.runInNewContext(src, { createWaveScroller });
 }
 
 function element() {
@@ -92,10 +93,10 @@ function loadCapsule() {
     draws,
     element: (id) => sandbox.document.getElementById(id),
     setState: (next) => window.__setCapsuleState(next),
-    step() {
+    step(ms = 100) {
       const fn = frame;
       frame = null;
-      clock += 100;
+      clock += ms;
       if (fn) fn(clock);
     },
   };
@@ -179,4 +180,35 @@ test("the hidden (idle) capsule runs no CSS animation", () => {
   assert.ok(!icon.classList.contains("transcribing"));
   const css = /<style>([\s\S]*)<\/style>/.exec(capsuleHtml())[1];
   assert.ok(!/#stateIcon\.idle[^{]*\{[^}]*animation/.test(css), "no animation is attached to the idle icon");
+});
+
+test("the bars keep running through a change of mode, a level jump and a stalled frame", () => {
+  // User, 2026-11-23: "the waveform jumps left and right when I start
+  // speaking and when I stop". Speech and silence flip the capsule between
+  // "recording" and the auto-stop countdown, and the level jumps; the old
+  // scroller zeroed its push clock on the mode switch and moved every bar.
+  const capsule = loadCapsule();
+  capsule.setState({ status: "Recording", mode: "recording", level: 0.8, startedAt: 1000 });
+  for (let i = 0; i < 40; i += 1) capsule.step(16);
+  const barsOf = () => capsule.draws.filter((d) => d.h > tokens.waveBaselineHeight).map((d) => d.x);
+  const before = barsOf();
+  assert.ok(before.length >= 3, "bars are on the strip");
+  const speed = (tokens.waveBarWidth + tokens.waveBarGap) / tokens.waveLevelTickMs;
+
+  capsule.setState({ status: "Auto stop in 5s", mode: "autostop", level: 0 });
+  capsule.step(16);
+  capsule.setState({ status: "Recording", mode: "recording", level: 0.9 });
+  capsule.step(16);
+  const after = barsOf();
+  // The same bars, 32 ms further left (a new bar may have been born).
+  for (let i = 0; i < before.length; i += 1) {
+    const moved = before[i] - after[after.length - before.length + i];
+    assert.ok(Math.abs(moved - speed * 32) < 0.35, `bar ${i} moved ${moved}px, expected ${(speed * 32).toFixed(2)}`);
+  }
+
+  // A 600 ms stall: the bars are where time puts them, evenly spaced.
+  capsule.step(600);
+  const gaps = barsOf().sort((a, b) => a - b).map((x, i, all) => (i ? x - all[i - 1] : null)).slice(1);
+  const step = tokens.waveBarWidth + tokens.waveBarGap;
+  for (const gap of gaps) assert.ok(Math.abs(gap - step) < 1e-6, `gap ${gap} is one step after a stall`);
 });

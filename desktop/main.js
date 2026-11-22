@@ -173,6 +173,7 @@ const { createOwnProcessRules } = require("./own-process");
 const { createQuitApp, installSignalQuitHandlers } = require("./quit-path");
 // The capsule window's size (one flag) and when it is placed (DM-13, DM-25).
 const { capsuleWindowSize, capsuleBoundsIn, capsuleNeedsPlacement } = require("./capsule-geometry");
+const { createWaveScroller } = require("./capsule-wave-scroll");
 // What a hidden capsule costs (throttling) and the press-to-visible metric.
 const { createCapsulePower, capsulePressMetricLine } = require("./capsule-power");
 // What to do once screenMode.start() answered for a take (DM-31).
@@ -1598,8 +1599,10 @@ const RECORDING_STATUS_CAPSULE = Object.freeze((() => {
   // right edge and go left").
   waveBaselineHeight: 1,
   waveFrameMs: 16,
+  // One tick, one speed, for every mode: the bars' place is a function of
+  // time alone (./capsule-wave-scroll), so a mode that scrolled at its own
+  // pace would move the bars already on the strip.
   waveLevelTickMs: 220,
-  waveIdleTickMs: 360,
   waveActiveStaleMs: 900,
   // A pointer-down is reported at most once per this window.
   pointerLockMs: 80,
@@ -1943,7 +1946,13 @@ function recordingStatusCapsuleHtml() {
     cv.style.width = waveW + "px";
     cv.style.height = waveH + "px";
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    const bars = [];
+    const createWaveScroller = ${createWaveScroller.toString()};
+    const scroller = createWaveScroller({
+      stepPx: bw + gap,
+      tickMs: ${t.waveLevelTickMs},
+      maxBars,
+      widthPx: waveW
+    });
     let state = {
       status: "",
       mode: "idle",
@@ -1953,7 +1962,6 @@ function recordingStatusCapsuleHtml() {
       level: 0
     };
     let lastLevelAt = 0;
-    let lastWavePushAt = 0;
     let lastRenderFrameAt = 0;
     let animationFrameHandle = 0;
     let lastTimerText = "";
@@ -1985,7 +1993,6 @@ function recordingStatusCapsuleHtml() {
       if (nextWaveMode !== waveMode) {
         waveMode = nextWaveMode;
         activeWave = waveMode === "recording" || waveMode === "autostop";
-        lastWavePushAt = 0;
       }
       const nextClass = next === "recording"
         ? "rec"
@@ -2032,36 +2039,35 @@ function recordingStatusCapsuleHtml() {
       const grown = ((now - baselineSince) / ${t.waveLevelTickMs}) * (bw + gap);
       const lineX = Math.max(0, waveW - Math.max(1, grown));
       ctx.fillRect(lineX, (waveH - lineH) / 2, waveW - lineX, lineH);
-      const tickMs = (waveMode === "recording" || waveMode === "autostop")
-        ? ${t.waveLevelTickMs}
-        : ${t.waveIdleTickMs};
-      const step = bw + gap;
-      const progress = lastWavePushAt > 0
-        ? Math.max(0, Math.min(1, (now - lastWavePushAt) / tickMs))
-        : 0;
-      const smoothOffset = progress * step;
-      for (let i = 0; i < bars.length; i += 1) {
-        const v = bars[bars.length - 1 - i];
-        const x = waveW - (i + 1) * step - smoothOffset;
-        if (x < 0) break;
-        const h = Math.min(waveH - 2, v * (waveH - 2));
+      for (const bar of scroller.layout(now, bw)) {
+        const h = Math.min(waveH - 2, bar.v * (waveH - 2));
         if (h <= 0) continue;
         const y = (waveH - h) / 2;
         if (typeof ctx.roundRect === "function") {
           ctx.beginPath();
-          ctx.roundRect(x, y, bw, h, Math.min(bw / 2, h / 2));
+          ctx.roundRect(bar.x, y, bar.w, h, Math.min(bar.w / 2, h / 2));
           ctx.fill();
         } else {
-          ctx.fillRect(x, y, bw, h);
+          ctx.fillRect(bar.x, y, bar.w, h);
         }
       }
     }
-    function pushLevel(value) {
+    /** The height a bar of this input level is drawn at. */
+    function barLevel(value) {
       const raw = Math.max(0, Math.min(1, Number(value) || 0));
       const level = Math.max(0, Math.min(1, Math.pow(raw, .72) * 1.45));
       if (level > 0.015) lastLevelAt = Date.now();
-      bars.push(level);
-      while (bars.length > maxBars) bars.shift();
+      return level;
+    }
+    /** The level of the bar whose tick has just come due. */
+    function nextBarLevel() {
+      if (waveMode === "recording" || waveMode === "autostop") {
+        return barLevel(state.level);
+      }
+      const idle = activeWave
+        ? (0.08 + Math.random() * 0.12)
+        : ((waveMode === "transcribing" || waveMode === "upscaling") ? 0.055 : (0.03 + Math.random() * 0.03));
+      return barLevel(idle);
     }
     function timerElapsedMs(now) {
       const startedAt = Number(state.startedAt || 0);
@@ -2073,25 +2079,13 @@ function recordingStatusCapsuleHtml() {
     }
     function tickWave(now) {
       if (!pageIsActive()) {
-        if (bars.length || baselineDrawn) {
-          bars.length = 0;
+        if (scroller.size || baselineDrawn) {
+          scroller.reset();
           renderWave(now);
         }
         return;
       }
-      const level = Math.max(0, Math.min(1, Number(state.level || 0)));
-      if (waveMode === "recording" || waveMode === "autostop") {
-        if (now - lastWavePushAt >= ${t.waveLevelTickMs}) {
-          lastWavePushAt = now;
-          pushLevel(level);
-        }
-      } else if (now - lastWavePushAt >= ${t.waveIdleTickMs}) {
-        lastWavePushAt = now;
-        const idle = activeWave
-          ? (0.08 + Math.random() * 0.12)
-          : ((waveMode === "transcribing" || waveMode === "upscaling") ? 0.055 : (0.03 + Math.random() * 0.03));
-        pushLevel(idle);
-      }
+      scroller.advance(now, nextBarLevel);
       if (now - lastLevelAt > ${t.waveActiveStaleMs} && activeWave) {
         activeWave = false;
       }
@@ -2120,8 +2114,8 @@ function recordingStatusCapsuleHtml() {
       animationFrameHandle = requestAnimationFrame(animationLoop);
     }
     function clearInactiveWave(now = Date.now()) {
-      if (!bars.length && !baselineDrawn) return;
-      bars.length = 0;
+      if (!scroller.size && !baselineDrawn) return;
+      scroller.reset();
       renderWave(now);
     }
     window.__setCapsuleState = (next) => {
