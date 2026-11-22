@@ -728,6 +728,18 @@
             <div class="field-stack">
               <label class="toggle-inline settings-toggle"><span>Auto-send Cmd+Ctrl Enter</span><input type="checkbox"
                   id="settingsAutoSendEnterToggle" /></label>
+              <!--
+                While the system default input is a Bluetooth headset, record
+                from the Mac's built-in microphone: the headset stays in
+                high-quality playback (an open Bluetooth mic forces it into
+                headset mode) and the built-in mic can stay warm between
+                takes. On by default; a mic picked by name in the list is
+                always used as picked. preferences.ui.bluetooth_builtin_mic,
+                decided by chooseCaptureDevice (./src/capture-warm.ts).
+              -->
+              <label class="toggle-inline settings-toggle"><span>With Bluetooth headphones, record from the Mac's
+                  built-in mic (keeps headphone sound clear, starts faster)</span><input type="checkbox"
+                  id="bluetoothBuiltinMicToggle" checked /></label>
               <label class="toggle-inline settings-toggle"><span>Auto stop on silence</span><input type="checkbox"
                   id="autoStopSilenceEnabled" /></label>
               <!--

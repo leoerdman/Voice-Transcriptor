@@ -65,11 +65,13 @@ import { UPLOAD_QUEUE_SAVE_FAILED_STATUS, nextQueueSaveRetry } from "./upload-qu
 import { classifyBootError, type BootFailure } from "./boot-error";
 import {
   captureElapsedMs,
+  chooseCaptureDevice,
   decidePreRoll,
   decideWarmHold,
   decideWarmReuse,
   freezeCaptureForStop,
   handOverHeldCapture,
+  type InputDeviceInfo,
   type WarmHoldLifecycleRelease,
 } from "./capture-warm";
 import {
@@ -365,6 +367,13 @@ interface AppConfig {
        * default, user 2026-11-21); only an explicit `false` turns it off.
        */
       screen_clicks?: boolean;
+      /**
+       * While the system default input is a Bluetooth headset, record from
+       * the Mac's built-in microphone (./capture-warm ``chooseCaptureDevice``).
+       * Absent means on (the shipped default); only an explicit `false`
+       * turns it off.
+       */
+      bluetooth_builtin_mic?: boolean;
       /**
        * Live-tab speaker diarization. Its two neighbours in the same
        * popover (``auto_transcribe``, ``live_preview``) have always been
@@ -5709,6 +5718,14 @@ document.querySelectorAll(".sb-item").forEach((e) => {
   });
 });
 
+/**
+ * The `audioinput` list as of the last ``loadMics`` — what a start that
+ * touches no device API (the warm path) resolves its microphone against.
+ * A device change releases any warm hold, so a stale list never decides
+ * a warm start; the cold path re-enumerates first.
+ */
+let knownAudioInputs: InputDeviceInfo[] = [];
+
 async function loadMics(forceReload = false): Promise<void> {
   if (!navigator.mediaDevices?.getUserMedia || !navigator.mediaDevices?.enumerateDevices) {
     ($("micSelect") as HTMLSelectElement).replaceChildren(new Option("Microphone API unavailable", ""));
@@ -5725,6 +5742,7 @@ async function loadMics(forceReload = false): Promise<void> {
     const curVal = sel.value;
     sel.replaceChildren(new Option("Default", ""));
     const mics = devs.filter((d) => d.kind === "audioinput");
+    knownAudioInputs = mics.map((d) => ({ deviceId: d.deviceId, label: d.label }));
     if (mics.length === 0) {
       sel.replaceChildren(new Option("No microphones", ""));
     } else {
@@ -6327,6 +6345,7 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
     shortcut_screen: currentShortcuts.screen,
     shortcut_screen_shot: currentShortcuts.screenShot,
     screen_clicks: readScreenClicksEnabled(),
+    bluetooth_builtin_mic: readBluetoothBuiltinMicEnabled(),
     // Upload tab — mirrors current DOM values. Optional-chained because
     // setupUploadView may not have run yet on a page that loaded
     // without the Upload section (defensive against future view splits).
@@ -6587,6 +6606,11 @@ function shouldUpscale(): boolean {
 }
 
 /** Settings' "record clicks in screen mode" — read by a screen take when it starts. */
+/** preferences.ui.bluetooth_builtin_mic — on unless explicitly off. */
+function readBluetoothBuiltinMicEnabled(): boolean {
+  return (document.getElementById("bluetoothBuiltinMicToggle") as HTMLInputElement | null)?.checked !== false;
+}
+
 function readScreenClicksEnabled(): boolean {
   return !!(document.getElementById("screenClicksToggle") as HTMLInputElement | null)?.checked;
 }
@@ -7269,6 +7293,7 @@ async function loadCfg(): Promise<void> {
     const autoStopDbEl = $("autoStopSilenceDb") as HTMLInputElement;
     autoStopEnabledEl.checked = ui.auto_stop_silence_enabled === true;
     ($("screenClicksToggle") as HTMLInputElement).checked = ui.screen_clicks === true;
+    ($("bluetoothBuiltinMicToggle") as HTMLInputElement).checked = ui.bluetooth_builtin_mic !== false;
     autoStopSecondsEl.value = String(clampAutoStopSeconds(Number(ui.auto_stop_silence_seconds)));
     autoStopDbEl.value = String(clampAutoStopThresholdDb(Number(ui.auto_stop_silence_db)));
     const upscaleToggle = $("upscaleToggle") as HTMLInputElement;
@@ -7577,6 +7602,12 @@ async function handleKeyAction(provider: RemoteProvider): Promise<void> {
   });
 });
 ($("screenClicksToggle") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
+($("bluetoothBuiltinMicToggle") as HTMLInputElement).addEventListener("change", () => {
+  // A held microphone was chosen under the old setting: let the next
+  // start choose again instead of reusing it.
+  releaseWarmCapture("mic-setting-changed");
+  queueUiPreferencesSave();
+});
 ($("settingsAutoSendEnterToggle") as HTMLInputElement).addEventListener("change", () => {
   setAutoSendEnterEnabled(($("settingsAutoSendEnterToggle") as HTMLInputElement).checked);
   queueUiPreferencesSave();
@@ -10375,6 +10406,9 @@ function releaseWarmCaptureOnLifecycle(reason: WarmHoldLifecycleRelease): void {
 try {
   navigator.mediaDevices?.addEventListener?.("devicechange", () => {
     releaseWarmCaptureOnLifecycle("devicechange");
+    // Headphones connected or gone: refresh the list the next start's
+    // microphone choice is made against (``knownAudioInputs``).
+    void loadMics(false);
   });
 } catch (e) {
   // Older shells expose mediaDevices without EventTarget semantics; the
@@ -11646,12 +11680,23 @@ async function startLive(
     if (!navigator.mediaDevices?.getUserMedia) {
       throw new Error("This browser does not support microphone capture.");
     }
-    const selectedDeviceId = (($("micSelect") as HTMLSelectElement).value || "").trim();
+    const preferBuiltInOverBluetooth = readBluetoothBuiltinMicEnabled();
+    // Which microphone this take records from (./capture-warm
+    // ``chooseCaptureDevice``): the picker's device, or — while the system
+    // default is a Bluetooth headset and the setting is on — the Mac's
+    // built-in one, which keeps the headset in A2DP and can be warm-held.
+    // Resolved against the last known device list, so the warm path below
+    // touches no device API.
+    let micChoice = chooseCaptureDevice({
+      requestedDeviceId: (($("micSelect") as HTMLSelectElement).value || "").trim(),
+      preferBuiltInOverBluetooth,
+      devices: knownAudioInputs,
+    });
     // The graph the previous recording left running, if it is still the
     // right one (§4.7). Adopting it skips getUserMedia, the AudioContext
     // and the worklet module — the whole ~310 ms — and its ring has been
     // holding the last half-second of audio the entire time.
-    const warm = takeWarmCapture(selectedDeviceId);
+    const warm = takeWarmCapture(micChoice.deviceId);
     sessionStartedWarm = !!warm;
     sessionPreRollMs = 0;
     if (warm) {
@@ -11674,10 +11719,16 @@ async function startLive(
       // disappeared, a default that resolved), and the request has to
       // carry what the picker says NOW. The warm check above necessarily
       // runs before that, on what the picker said before.
-      const devId = (($("micSelect") as HTMLSelectElement).value || "").trim();
+      // Chosen again on the list ``loadMics`` just enumerated: headphones
+      // connected or disconnected since the last start change the answer.
+      micChoice = chooseCaptureDevice({
+        requestedDeviceId: (($("micSelect") as HTMLSelectElement).value || "").trim(),
+        preferBuiltInOverBluetooth,
+        devices: knownAudioInputs,
+      });
       // Bounded and retried — see acquireMicStream. The old code awaited a
       // bare getUserMedia, so a busy input device hung the start outright.
-      stream = await acquireMicStream(devId);
+      stream = await acquireMicStream(micChoice.deviceId);
       markStartPhase("getUserMedia");
       throwIfStartCancelled();
     }
@@ -11694,6 +11745,11 @@ async function startLive(
     micHealth.reset();
     const initialTracks = stream.getAudioTracks();
     const initialDeviceId = initialTracks[0]?.getSettings?.()?.deviceId || "";
+    // The one line that says which microphone this take records from and why.
+    console.log(
+      `[trace startLive] mic="${initialTracks[0]?.label || micChoice.label}" ` +
+      `choice=${micChoice.reason} warm=${warm ? 1 : 0}`,
+    );
     micHealth.observe({ kind: "session-start", deviceId: initialDeviceId });
     if (initialTracks.some((t) => t.muted)) {
       micHealth.observe({ kind: "track-muted", muted: true });

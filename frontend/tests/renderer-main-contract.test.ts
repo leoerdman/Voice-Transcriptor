@@ -591,6 +591,21 @@ describe("boot, update check and History bootstrap (FQ-13/FQ-14/FQ-15/FQ-22)", (
     }
   });
 
+  it("Bluetooth → built-in mic: one setting, on by default, decided by chooseCaptureDevice on both start paths", () => {
+    expect(html).toMatch(/id="bluetoothBuiltinMicToggle" checked \/>/);
+    expect(mainTsxSlice("function collectUiPreferences(", "\n}\n")).toContain("bluetooth_builtin_mic: readBluetoothBuiltinMicEnabled(),");
+    expect(mainTsx).toContain('($("bluetoothBuiltinMicToggle") as HTMLInputElement).checked = ui.bluetooth_builtin_mic !== false;');
+    const start = mainTsxSlice("async function startLive(", "\nasync function ");
+    // The warm path reuses the hold only for the device the choice names;
+    // the cold path chooses again on the freshly enumerated list.
+    expect(start).toContain("const warm = takeWarmCapture(micChoice.deviceId);");
+    expect(start).toContain("stream = await acquireMicStream(micChoice.deviceId);");
+    expect(start.match(/chooseCaptureDevice\(\{/g) || []).toHaveLength(2);
+    expect(start).toContain("choice=${micChoice.reason}");
+    // A hot-plugged headset refreshes the list the next choice uses.
+    expect(mainTsx).toMatch(/"devicechange", \(\) => \{\s*releaseWarmCaptureOnLifecycle\("devicechange"\);[\s\S]{0,200}void loadMics\(false\);/);
+  });
+
   it("a crashed take's draft is joined with the entry its audio was promoted into (./take-recovery)", () => {
     const boot = mainTsxSlice("async function initRecordingsBootstrap(): Promise<void> {", "\n}\n");
     const promote = boot.indexOf("promoted = await recoverBackendAudioSessions();");

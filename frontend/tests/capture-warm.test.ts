@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 
 import {
   captureElapsedMs,
+  chooseCaptureDevice,
+  isBuiltInInputLabel,
   WARM_HOLD_LIFECYCLE_RELEASES,
   type WarmHoldLifecycleRelease,
   decidePreRoll,
@@ -352,5 +354,86 @@ describe("the stop-sequence ordering (F-001)", () => {
     expect(freezeCaptureForStop({ planHold: () => ended, stopTracks: () => { stopped += 1; } }))
       .toEqual({ hold: false, reason: "track-ended" });
     expect(stopped).toBe(1);
+  });
+});
+
+describe("chooseCaptureDevice — Bluetooth default → the Mac's built-in microphone", () => {
+  const macWithHeadset = [
+    { deviceId: "default", label: "Default - Leo Liberty 5 BT (Bluetooth)" },
+    { deviceId: "bt-1", label: "Leo Liberty 5 BT (Bluetooth)" },
+    { deviceId: "builtin-1", label: "MacBook Pro Microphone (Built-in)" },
+    { deviceId: "usb-1", label: "Yeti Stereo Microphone (USB)" },
+  ];
+
+  it("records from the built-in mic while the system default is a Bluetooth headset", () => {
+    expect(chooseCaptureDevice({ requestedDeviceId: "", preferBuiltInOverBluetooth: true, devices: macWithHeadset }))
+      .toEqual({ deviceId: "builtin-1", label: "MacBook Pro Microphone (Built-in)", reason: "bluetooth-default-built-in" });
+  });
+
+  it("the built-in mic it picks is then warm-holdable (the point of the setting)", () => {
+    const choice = chooseCaptureDevice({ requestedDeviceId: "", preferBuiltInOverBluetooth: true, devices: macWithHeadset });
+    expect(decideWarmHold({ ...holdInput, deviceLabel: choice.label })).toEqual({ hold: true, reason: "held" });
+  });
+
+  it("the list's \"Default - …\" entry is the system default too, not a pinned device", () => {
+    expect(chooseCaptureDevice({ requestedDeviceId: "default", preferBuiltInOverBluetooth: true, devices: macWithHeadset }).deviceId)
+      .toBe("builtin-1");
+  });
+
+  it("a Bluetooth mic the user picked by name is used as picked", () => {
+    expect(chooseCaptureDevice({ requestedDeviceId: "bt-1", preferBuiltInOverBluetooth: true, devices: macWithHeadset }))
+      .toEqual({ deviceId: "bt-1", label: "Leo Liberty 5 BT (Bluetooth)", reason: "picked" });
+  });
+
+  it("with the setting off, the default stands", () => {
+    expect(chooseCaptureDevice({ requestedDeviceId: "", preferBuiltInOverBluetooth: false, devices: macWithHeadset }))
+      .toMatchObject({ deviceId: "", reason: "default" });
+  });
+
+  it("a non-Bluetooth default is never moved", () => {
+    const devices = [
+      { deviceId: "default", label: "Default - Yeti Stereo Microphone (USB)" },
+      { deviceId: "builtin-1", label: "MacBook Pro Microphone (Built-in)" },
+      { deviceId: "usb-1", label: "Yeti Stereo Microphone (USB)" },
+    ];
+    expect(chooseCaptureDevice({ requestedDeviceId: "", preferBuiltInOverBluetooth: true, devices }))
+      .toMatchObject({ deviceId: "", reason: "default" });
+  });
+
+  it("a Mac with no built-in mic (mini / Studio) keeps recording from the headset", () => {
+    const devices = macWithHeadset.filter((d) => d.deviceId !== "builtin-1");
+    expect(chooseCaptureDevice({ requestedDeviceId: "", preferBuiltInOverBluetooth: true, devices }))
+      .toMatchObject({ deviceId: "", reason: "bluetooth-default-no-built-in" });
+  });
+
+  it("without labels (no permission yet) nothing is guessed", () => {
+    const devices = [{ deviceId: "default", label: "" }, { deviceId: "x", label: "" }];
+    expect(chooseCaptureDevice({ requestedDeviceId: "", preferBuiltInOverBluetooth: true, devices }))
+      .toMatchObject({ deviceId: "", reason: "default" });
+  });
+
+  it("follows the headset coming and going (the list it is given is the current one)", () => {
+    const unplugged = [
+      { deviceId: "default", label: "Default - MacBook Pro Microphone (Built-in)" },
+      { deviceId: "builtin-1", label: "MacBook Pro Microphone (Built-in)" },
+    ];
+    expect(chooseCaptureDevice({ requestedDeviceId: "", preferBuiltInOverBluetooth: true, devices: unplugged }).reason).toBe("default");
+    expect(chooseCaptureDevice({ requestedDeviceId: "", preferBuiltInOverBluetooth: true, devices: macWithHeadset }).reason)
+      .toBe("bluetooth-default-built-in");
+  });
+});
+
+describe("isBuiltInInputLabel", () => {
+  it.each([
+    ["MacBook Pro Microphone (Built-in)", true],
+    ["MacBook Air Microphone", true],
+    ["Built-in Microphone", true],
+    ["iMac Microphone", true],
+    ["Leo Liberty 5 BT (Bluetooth)", false],
+    ["AirPods Pro", false],
+    ["Yeti Stereo Microphone (USB)", false],
+    ["", false],
+  ])("%s → %s", (label, expected) => {
+    expect(isBuiltInInputLabel(label)).toBe(expected);
   });
 });
