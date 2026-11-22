@@ -196,6 +196,21 @@ test("every command main.js sends is documented and handled by main.swift", () =
   }
 });
 
+test("the hotkey request and events the router speaks are the ones main.swift documents", () => {
+  const router = fs.readFileSync(path.join(__dirname, "hotkey-router.js"), "utf8");
+  assert.match(router, /helper\.request\("hotkeys", \{ chords: /);
+  const header = helperMain.slice(0, helperMain.indexOf("import "));
+  assert.ok(header.includes('{"cmd":"hotkeys","id":n,"chords":[{"chord":'), "hotkeys documented");
+  assert.ok(helperMain.includes('case "hotkeys":'), "hotkeys handled");
+  for (const event of ["hotkey", "tap-disabled", "secure-input"]) {
+    assert.ok(header.includes(`{"t":"${event}"`), `${event} documented`);
+    assert.ok(router.includes(`event.t === "${event}"`), `${event} read by the router`);
+  }
+  for (const field of ['"pressedAt"', '"reenabled"', '"secureInput"']) {
+    assert.ok(header.includes(field), `${field} documented`);
+  }
+});
+
 // ── Swift ─────────────────────────────────────────────────────────────
 const swiftc = process.platform === "darwin"
   ? spawnSync("xcrun", ["--find", "swiftc"], { encoding: "utf8" })
