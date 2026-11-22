@@ -210,9 +210,14 @@ def deepgram_transcribe(
     }
 
     timeout, upload_attempts = _deepgram_http_policy(len(audio_bytes))
+    # ``language=`` is what tells two concurrent calls apart: the recovery
+    # pass of a dual-stream recording decodes the same span in both
+    # readings at once (``deepgram_recovery``), and without it the two
+    # start lines were byte-identical and read as a duplicated log line.
     logger.info(
-        "deepgram_transcribe: model=%s, audio=%d bytes timeout=%s attempts=%d keyterms=%d",
+        "deepgram_transcribe: model=%s language=%s audio=%d bytes timeout=%s attempts=%d keyterms=%d",
         model,
+        params.get("language") or ("detect" if params.get("detect_language") else "-"),
         len(audio_bytes),
         timeout,
         upload_attempts,
@@ -327,7 +332,11 @@ def deepgram_transcribe(
     # would make the pre-recorded adapter depend on the streaming one.
     raw_words = alternative.get("words")
 
-    logger.info("deepgram_transcribe: success, %d chars", len(text))
+    logger.info(
+        "deepgram_transcribe: success language=%s, %d chars",
+        params.get("language") or ("detect" if params.get("detect_language") else "-"),
+        len(text),
+    )
     return {
         "text": str(text).strip(),
         "duration": duration,

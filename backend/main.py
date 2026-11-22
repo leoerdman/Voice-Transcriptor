@@ -210,8 +210,10 @@ logger = logging.getLogger(__name__)
 # config entirely — every ``backend.*`` INFO+ record goes straight
 # to stderr → ``backend.stderr.on("data")`` in desktop/main.js →
 # ``[backend-stderr] …`` in main.log. The diagnostic ladder we
-# need (Finalize sent / is_final emissions / finalize EXIT delta)
-# is now visible by construction.
+# need (Finalize sent / finalize ENTER-EXIT delta / coverage holes /
+# session complete) is now visible by construction. Per-segment
+# ``is_final`` / ``interim`` traces are DEBUG: at INFO they were ~24%
+# of the journal and the ladder already carries their counts.
 _backend_logger = logging.getLogger("backend")
 _backend_logger.setLevel(logging.INFO)
 if not any(

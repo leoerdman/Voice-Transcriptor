@@ -481,6 +481,18 @@ class RecoverSpansTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SpliceRecoveredWordsTests(unittest.TestCase):
+    def test_a_dropped_owned_word_is_logged_by_its_span_not_its_text(self):
+        # main.log never carries what the user dictated (BL-02).
+        segments = [_segment(0.0, 3.0, [("секретное", 0.0, 3.0)])]
+        with self.assertLogs("backend.deepgram_recovery", level="INFO") as logs:
+            splice_recovered_words(
+                segments,
+                [{"word": "секретное", "start": 0.5, "end": 2.5, "source": RECOVERY_SOURCE}],
+            )
+        line = next(m for m in logs.output if "already owned" in m)
+        self.assertNotIn("секретное", line)
+        self.assertIn("0.50-2.50", line)
+
     def test_a_word_inside_a_final_is_put_back_at_its_time_position(self):
         segments = [
             _segment(4.91, 9.70, [("три", 4.91, 5.3), ("на", 6.4, 6.8)]),

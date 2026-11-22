@@ -3860,7 +3860,14 @@ class DeepgramLiveSession:
                     w for w in self._orphan_interim_words
                     if not (start < (w["start"] + w["end"]) / 2.0 < end)
                 ]
-            self._log.info(
+            # Per-segment trace: DEBUG. At INFO these lines (with the
+            # sampled interims below) were ~24% of main.log — one per
+            # Deepgram final per reading — while the session already
+            # reports its outcome in counted form: ``finalize ENTER/EXIT``
+            # (segments_final), ``post-Finalize finals=``, ``coverage
+            # holes`` (which prints the interim spans touching each hole
+            # from ``_interim_ring``) and ``ws deepgram session complete``.
+            self._log.debug(
                 "deepgram-live: is_final start=%.2f end=%.2f speech_final=%s "
                 "textLen=%d words=%d",
                 start, end, speech_final, len(text), len(message_words),
@@ -3957,9 +3964,10 @@ class DeepgramLiveSession:
             ]
             self._interim_words.extend(new_words)
         if self.stats.segments_interim % 5 == 1:
-            # Sample 1-in-5 interim emissions to keep log volume bounded
-            # while still proving Deepgram is producing output.
-            self._log.info(
+            # Sample 1-in-5 interim emissions. DEBUG for the same reason as
+            # ``is_final`` above: that Deepgram produced output is already
+            # proven at INFO by the session summary's ``interim_segs=``.
+            self._log.debug(
                 "deepgram-live: interim #%d start=%.2f end=%.2f textLen=%d",
                 self.stats.segments_interim, start, end, len(text),
             )
