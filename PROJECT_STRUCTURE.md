@@ -144,7 +144,7 @@ Frontend owns:
 ```text
 desktop/
 ├── main.js                         # Electron main process, backend lifecycle, recording monitor, hotkeys
-├── accelerator.js                  # accelerator canonicalisation SSOT (pure, node --test)
+├── accelerator.js                  # accelerator canonicalisation SSOT + the macOS key-code table the native hotkey tap matches (pure, node --test)
 ├── engine-deps.js                  # GigaAM engine dependency-policy SSOT (pure, node --test)
 ├── renderer-console.js             # renderer console → support-log policy SSOT (pure, node --test)
 ├── paste-result.js                 # auto-paste success/verification decision SSOT (pure, node --test)
@@ -158,7 +158,7 @@ desktop/
 ├── screen-mode.js                  # screen-mode rules SSOT: session record, stroke position, manifest, shared names (pure, node --test)
 ├── screen-mode-controller.js       # screen-mode I/O: drawing overlays (no frame), palette, native helper (its taps on our controls delivered in-process), display hot-plug, screencapture + compositing
 ├── native/screen-input/            # CGEventTap helper (main.swift) + PressClassifier.swift, the one click-vs-stroke rule (built by scripts/build-native.sh)
-├── native/dictation-helper/        # persistent helper: clipboard ledger (snapshot/restore by changeCount), native ⌘V paste, front app (built by scripts/build-native.sh)
+├── native/dictation-helper/        # persistent helper: clipboard ledger (snapshot/restore by changeCount), native ⌘V paste, front app, hotkey tap (HotkeyTap.swift; the rule in HotkeyMatcher.swift) (built by scripts/build-native.sh)
 ├── native/shared/                  # what both native helpers share: the JSON line protocol and the own-event marker
 ├── child-io.js                     # child-process text-output decoding SSOT (UTF-16LE on win32) (pure, node --test)
 ├── backend-runtime-check.js        # boot import check verdict: a timeout blames nobody, a real failure is attributed engine-site vs bundle (pure, node --test)
@@ -170,6 +170,7 @@ desktop/
 ├── transcript-signal.js            # what a renderer hand-off signal means for the post-stop task: paste, keep waiting, or terminal (pure, node --test)
 ├── clipboard-lease.js              # one owner of the user's real-clipboard snapshot during a paste; released exactly once (pure, node --test)
 ├── dictation-helper.js            # the persistent native helper's client: spawn/restart, request/answer by id, native paste request and verdict (pure, node --test)
+├── hotkey-router.js                # who holds record/paste-last/screen hotkeys: the helper's native tap or globalShortcut, never both, with fallback (pure, node --test)
 ├── recording-stop.js               # what a main-process stop does once the renderer has or has not answered (pure, node --test)
 ├── windows-paste-fallback.js       # the Windows PowerShell paste fallback script; sends keys only after a confirmed foreground switch (pure, node --test)
 ├── renderer-toggle.js              # the record hotkey's one renderer round trip and its deadline (pure, node --test)

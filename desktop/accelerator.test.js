@@ -6,7 +6,7 @@
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 
-const { canonicalAcceleratorForPlatform } = require("./accelerator");
+const { MAC_KEY_CODES, canonicalAcceleratorForPlatform, macHotkeyChord } = require("./accelerator");
 
 test("darwin: Command/Cmd stay Command", () => {
   assert.equal(canonicalAcceleratorForPlatform("Command+S", "darwin"), "Command+S");
@@ -103,4 +103,41 @@ test("a malformed accelerator is handed back, not repaired into a bare modifier"
 
 test("surrounding whitespace inside a well-formed chord is still normalised", () => {
   assert.equal(canonicalAcceleratorForPlatform(" Cmd + Shift + V ", "darwin"), "Command+Shift+V");
+});
+
+// ── macHotkeyChord: what the native hotkey tap matches ───────────────
+test("macHotkeyChord: the shipped macOS defaults all have a native chord", () => {
+  const defaults = require("./shortcut-defaults.json").platformDefaults.darwin;
+  assert.deepEqual(macHotkeyChord(defaults.record), { keyCode: 0x7b, mods: ["alt"] });
+  assert.deepEqual(macHotkeyChord(defaults.paste), { keyCode: 0x09, mods: ["alt", "shift"] });
+  assert.deepEqual(macHotkeyChord(defaults.screen), { keyCode: 0x7c, mods: ["alt"] });
+  assert.deepEqual(macHotkeyChord(defaults.screenShot), { keyCode: 0x32, mods: [] });
+});
+
+test("macHotkeyChord: every spelling the shell accepts means what it means to globalShortcut", () => {
+  const cmdV = { keyCode: 0x09, mods: ["cmd"] };
+  for (const acc of ["Command+V", "Cmd+V", "CommandOrControl+V", "CmdOrCtrl+v", "Meta+V", "Super+V"]) {
+    assert.deepEqual(macHotkeyChord(acc), cmdV, acc);
+  }
+  assert.deepEqual(macHotkeyChord("Option+Left"), macHotkeyChord("Alt+Left"));
+  assert.deepEqual(macHotkeyChord("Ctrl+Shift+Alt+Cmd+F9"), { keyCode: 0x65, mods: ["cmd", "alt", "ctrl", "shift"] });
+  assert.deepEqual(macHotkeyChord(" Alt + Shift + V "), { keyCode: 0x09, mods: ["alt", "shift"] });
+});
+
+test("macHotkeyChord: what the tap cannot match stays on globalShortcut (null)", () => {
+  for (const acc of ["", "Alt", "Alt+Shift", "Alt+A+B", "Control++", "Cmd+Plus", "MediaNextTrack", "AltGr+A", "Alt+Nope", null, 42]) {
+    assert.equal(macHotkeyChord(acc), null, String(acc));
+  }
+});
+
+test("macHotkeyChord: the key-code table gives one code per key position", () => {
+  const SYNONYMS = new Set(["enter,return", "esc,escape"]);
+  const byCode = new Map();
+  for (const [name, code] of Object.entries(MAC_KEY_CODES)) {
+    assert.ok(Number.isInteger(code) && code >= 0 && code <= 0x7f, `${name}: ${code}`);
+    byCode.set(code, [...(byCode.get(code) || []), name]);
+  }
+  for (const names of byCode.values()) {
+    if (names.length > 1) assert.ok(SYNONYMS.has(names.sort().join(",")), names.join(","));
+  }
 });

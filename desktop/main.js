@@ -8,7 +8,8 @@ const crypto = require("crypto");
 const shortcutDefaultsManifest = require("./shortcut-defaults.json");
 // SSOT for cross-platform accelerator canonicalisation — required by
 // main.js and unit-tested directly (desktop/accelerator.test.js).
-const { canonicalAcceleratorForPlatform } = require("./accelerator");
+const { canonicalAcceleratorForPlatform, macHotkeyChord } = require("./accelerator");
+const { createHotkeyRouter } = require("./hotkey-router");
 // One declaration of "this stored hotkey pair is retired" — see
 // desktop/shortcut-migration.js.
 const { migrateShortcutPair } = require("./shortcut-migration");
@@ -944,9 +945,14 @@ function textDigest(input) {
   return (h >>> 0).toString(16).padStart(8, "0");
 }
 
-function createTrace(scope, seed = {}) {
+/**
+ * @param {{startedAt?: number}} [opts]  when the traced action began, if
+ *   before this call (a hotkey press stamped at its key-down): every
+ *   step's ``ms`` and the ``totalMs`` count from it.
+ */
+function createTrace(scope, seed = {}, { startedAt = 0 } = {}) {
   const id = `${scope}-${Date.now()}-${(++traceCounter % 100000).toString().padStart(5, "0")}`;
-  const ctx = { id, scope, startedAt: Date.now(), step: 0 };
+  const ctx = { id, scope, startedAt: startedAt > 0 ? startedAt : Date.now(), step: 0 };
   appendMainLog(`[trace-start] ${JSON.stringify({ id, scope, ...seed })}`);
   return ctx;
 }
@@ -2512,7 +2518,53 @@ const dictationHelper = createDictationHelper({
   exists: (p) => fs.existsSync(p),
   platform: process.platform,
   log: (line) => appendMainLog(line),
+  onEvent: (event) => hotkeyRouter.onHelperEvent(event),
+  onReady: () => hotkeyRouter.onHelperReady(),
+  onExit: () => hotkeyRouter.onHelperExit(),
 });
+
+// Attempt to register an accelerator and return a normalized result.
+// ``globalShortcut.register`` can return ``false`` (accelerator in
+// use by another app) OR throw (malformed accelerator string from
+// an edited config). Both paths become a non-fatal ``ok=false`` so
+// the caller can log + surface the failure without crashing the
+// Electron main process.
+function safeRegisterShortcut(accelerator, handler) {
+  const canonical = canonicalAcceleratorForPlatform(accelerator, process.platform);
+  try {
+    const ok = globalShortcut.register(canonical, handler);
+    return { ok: !!ok, accelerator: canonical, error: ok ? "" : "already in use" };
+  } catch (e) {
+    return { ok: false, accelerator: canonical, error: String(e?.message || e) };
+  }
+}
+
+// The record / paste-last / screen-mode hotkeys: the dictation helper's
+// native tap when it is armed and trusted, globalShortcut otherwise —
+// never both (./hotkey-router). The screenshot key stays on
+// globalShortcut: it is bound only during a screen take, never pressed
+// to start one.
+const hotkeyRouter = createHotkeyRouter({
+  helper: dictationHelper,
+  registerGlobal: safeRegisterShortcut,
+  unregisterGlobal: (accelerator) => globalShortcut.unregister(accelerator),
+  chordFor: macHotkeyChord,
+  canonicalize: (accelerator) => canonicalAcceleratorForPlatform(accelerator, process.platform),
+  platform: process.platform,
+  log: (line) => appendMainLog(line),
+  onStatusChange: (routes) => publishHotkeyRoutes(routes),
+});
+
+/** A switch between the tap and globalShortcut, into the Settings status. */
+function publishHotkeyRoutes(routes) {
+  if (!lastShortcutStatus) return;
+  const next = { ...lastShortcutStatus };
+  for (const action of ["record", "paste", "screen"]) {
+    if (routes[action]) next[action] = routes[action];
+  }
+  lastShortcutStatus = next;
+  publishShortcutStatusToRenderer();
+}
 
 // Where a take's screenshots are staged until its recording is saved; the
 // backend then moves them beside the recording (backend/screen_sessions.py).
@@ -2986,11 +3038,14 @@ async function dispatchRendererTogglePress(allowStart, startDetail = { mode: "vo
 /**
  * @param {"voice"|"screen"} mode  what a press that STARTS a recording
  *   starts. A press during a recording stops it whatever its mode.
+ * @param {{pressedAt?: number}} [press]  when the key went down — the
+ *   native hotkey tap stamps the key-down itself (./hotkey-router); the
+ *   in-window button and globalShortcut press now.
  */
-async function toggleRecordingFromShortcut(mode = "voice") {
+async function toggleRecordingFromShortcut(mode = "voice", { pressedAt: pressStamp = 0 } = {}) {
   if (shortcutToggleInFlight) return;
-  const pressedAt = Date.now();
-  const trace = createTrace("toggle_hotkey", { mode });
+  const pressedAt = pressStamp > 0 ? pressStamp : Date.now();
+  const trace = createTrace("toggle_hotkey", { mode, pressAgeMs: Date.now() - pressedAt }, { startedAt: pressedAt });
   const startDetail = mode === "screen" && screenMode.isSupported()
     ? { mode: "screen", screenSessionId: screenSessionId() }
     : { mode: "voice" };
@@ -2999,7 +3054,9 @@ async function toggleRecordingFromShortcut(mode = "voice") {
   const frontAtHotkeyPromise = getFrontmostAppInfoWithTimeout(1200);
   try {
     const activePostStopAtPress = hasActivePostStopWork();
-    await ensureBackgroundWindow();
+    // Built only when it is gone; a live window costs the press no turn
+    // of the event loop.
+    if (!win || win.isDestroyed() || !win.webContents) await ensureBackgroundWindow();
     if (!win || win.isDestroyed() || !win.webContents) {
       traceStep(trace, "app_not_ready", {});
       await setRecordingStatus("App Not Ready", RECORDING_STATUS_KIND.WARN);
@@ -9680,9 +9737,8 @@ app.whenReady().then(async () => {
   }
 
   // ── Global Shortcuts (config-driven with live reload) ─────────────────────
-  let registeredRecordHotkey = "";
-  let registeredPasteHotkey = "";
-  let registeredScreenHotkey = "";
+  // Record, paste-last and screen mode are bound through hotkeyRouter
+  // (native tap or globalShortcut); the screenshot key directly.
   let shortcutsSuspendedForCapture = false;
   // The accelerators bound at runtime — the ONE source every
   // registration reads (S-11). config.json seeds it once, at the first
@@ -9731,38 +9787,14 @@ app.whenReady().then(async () => {
     return defaults;
   }
 
-  // Attempt to register an accelerator and return a normalized result.
-  // ``globalShortcut.register`` can return ``false`` (accelerator in
-  // use by another app) OR throw (malformed accelerator string from
-  // an edited config). Both paths become a non-fatal ``ok=false`` so
-  // the caller can log + surface the failure without crashing the
-  // Electron main process.
-  function safeRegisterShortcut(accelerator, handler) {
-    const canonical = canonicalAcceleratorForPlatform(accelerator, process.platform);
-    try {
-      const ok = globalShortcut.register(canonical, handler);
-      return { ok: !!ok, accelerator: canonical, error: ok ? "" : "already in use" };
-    } catch (e) {
-      return { ok: false, accelerator: canonical, error: String(e?.message || e) };
-    }
-  }
-
+  // Lets every hotkey go — the native tap is disarmed too, so a Settings
+  // capture sees the very keys the app holds.
   function unregisterRegisteredShortcuts(reason = "") {
-    const previousRecord = registeredRecordHotkey;
-    const previousPaste = registeredPasteHotkey;
-    if (registeredScreenHotkey) {
-      try { globalShortcut.unregister(registeredScreenHotkey); } catch { }
-    }
-    registeredScreenHotkey = "";
+    const previous = hotkeyRouter.status();
+    const previousRecord = previous.record?.active || "";
+    const previousPaste = previous.paste?.active || "";
+    hotkeyRouter.clear();
     unbindScreenShotHotkey();
-    if (registeredRecordHotkey) {
-      try { globalShortcut.unregister(registeredRecordHotkey); } catch { }
-    }
-    if (registeredPasteHotkey) {
-      try { globalShortcut.unregister(registeredPasteHotkey); } catch { }
-    }
-    registeredRecordHotkey = "";
-    registeredPasteHotkey = "";
     if (reason && (previousRecord || previousPaste)) {
       appendMainLog(
         `[shortcuts] unregistered (${reason}): record=${previousRecord || "-"} paste=${previousPaste || "-"}`,
@@ -9821,66 +9853,64 @@ app.whenReady().then(async () => {
     // failed, while Settings kept showing the new keys.
     if (!activeShortcuts) activeShortcuts = normalizeShortcutSet(readShortcutsFromConfig());
     const shortcuts = activeShortcuts;
-    // Unregister old shortcuts (keep devtools). Clear stored values
-    // up-front — only set them back after a
-    // successful registration, so a failed accelerator is never
-    // tracked as "active" (which would cause the next reload to
-    // unregister something that was never registered).
-    unregisterRegisteredShortcuts();
+    // The router replaces the whole set at once (a failed accelerator is
+    // never tracked as bound); the screenshot key is re-bound below.
+    unbindScreenShotHotkey();
 
-    const recordResult = safeRegisterShortcut(shortcuts.record, () => {
-      toggleRecordingFromShortcut().catch((e) => {
-        appendMainLog(`[shortcut] toggle failed: ${e?.message || e}`);
-        resetRecordingStatusState();
+    // Screen mode: its toggle is bound whenever the platform supports it;
+    // the screenshot key is bound only while a screen-mode take runs.
+    const screenSupported = screenMode.isSupported();
+    const bindings = [
+      {
+        action: "record",
+        accelerator: shortcuts.record,
+        handler: (pressedAt) => {
+          toggleRecordingFromShortcut("voice", { pressedAt }).catch((e) => {
+            appendMainLog(`[shortcut] toggle failed: ${e?.message || e}`);
+            resetRecordingStatusState();
+          });
+        },
+      },
+      {
+        action: "paste",
+        accelerator: shortcuts.paste,
+        handler: () => {
+          pasteLatestTranscriptFromShortcut().catch((e) => {
+            appendMainLog(`[shortcut] paste-last failed: ${e?.message || e}`);
+            resetRecordingStatusState();
+          });
+        },
+      },
+    ];
+    if (screenSupported && shortcuts.screen) {
+      bindings.push({
+        action: "screen",
+        accelerator: shortcuts.screen,
+        handler: (pressedAt) => {
+          toggleRecordingFromShortcut("screen", { pressedAt }).catch((e) => {
+            appendMainLog(`[shortcut] screen toggle failed: ${e?.message || e}`);
+            resetRecordingStatusState();
+          });
+        },
       });
-    });
-    if (recordResult.ok) {
-      registeredRecordHotkey = shortcuts.record;
-    } else {
+    }
+    const routes = hotkeyRouter.apply(bindings);
+    const SLOT_NAMES = { record: "recording", paste: "paste-last", screen: "screen-mode" };
+    for (const [action, route] of Object.entries(routes)) {
       // WARN: a failed registration is silent otherwise — the app
       // looks like it started fine and the hotkey simply never fires.
       // The status object built below (and replayed via did-finish-load,
       // see the comment at its declaration) is what actually surfaces
       // this to the renderer/Settings UI.
-      appendMainLog(
-        `[shortcuts] WARN: failed to register recording shortcut: ${shortcuts.record} (${recordResult.error})`,
-      );
-    }
-
-    const pasteResult = safeRegisterShortcut(shortcuts.paste, () => {
-      pasteLatestTranscriptFromShortcut().catch((e) => {
-        appendMainLog(`[shortcut] paste-last failed: ${e?.message || e}`);
-        resetRecordingStatusState();
-      });
-    });
-    if (pasteResult.ok) {
-      registeredPasteHotkey = shortcuts.paste;
-    } else {
-      appendMainLog(
-        `[shortcuts] WARN: failed to register paste-last shortcut: ${shortcuts.paste} (${pasteResult.error})`,
-      );
-    }
-
-    // Screen mode: its toggle is bound whenever the platform supports it;
-    // the screenshot key is bound only while a screen-mode take runs.
-    const screenSupported = screenMode.isSupported();
-    let screenResult = { ok: false, accelerator: shortcuts.screen || "", error: "" };
-    if (screenSupported && shortcuts.screen) {
-      screenResult = safeRegisterShortcut(shortcuts.screen, () => {
-        toggleRecordingFromShortcut("screen").catch((e) => {
-          appendMainLog(`[shortcut] screen toggle failed: ${e?.message || e}`);
-          resetRecordingStatusState();
-        });
-      });
-      if (screenResult.ok) {
-        registeredScreenHotkey = screenResult.accelerator;
-      } else {
-        appendMainLog(
-          `[shortcuts] WARN: failed to register screen-mode shortcut: ${shortcuts.screen} (${screenResult.error})`,
-        );
+      if (!route.active) {
+        appendMainLog(`[shortcuts] WARN: failed to register ${SLOT_NAMES[action]} shortcut: ${route.desired} (${route.error})`);
       }
-    } else if (!screenSupported) {
-      screenResult.error = "unsupported";
+    }
+    let screenRoute = routes.screen;
+    if (!screenRoute) {
+      // Not bound: screen mode is unsupported here, or no key is set.
+      screenRoute = { desired: shortcuts.screen || "", active: "", error: "" };
+      if (!screenSupported) screenRoute.error = "unsupported";
     }
     desiredScreenShotHotkey = screenSupported ? shortcuts.screenShot || "" : "";
     screenShotHotkeyError = "";
@@ -9923,21 +9953,9 @@ app.whenReady().then(async () => {
       }
     }
     const status = {
-      record: {
-        desired: recordResult.accelerator || shortcuts.record,
-        active: recordResult.ok ? recordResult.accelerator : "",
-        error: recordResult.ok ? "" : recordResult.error,
-      },
-      paste: {
-        desired: pasteResult.accelerator || shortcuts.paste,
-        active: pasteResult.ok ? pasteResult.accelerator : "",
-        error: pasteResult.ok ? "" : pasteResult.error,
-      },
-      screen: {
-        desired: screenResult.accelerator || shortcuts.screen || "",
-        active: screenResult.ok ? screenResult.accelerator : "",
-        error: screenResult.ok ? "" : screenResult.error,
-      },
+      record: routes.record,
+      paste: routes.paste,
+      screen: screenRoute,
       // Bound only during a screen take; outside one, ``error`` is what
       // a registration probe answered, so a key another app owns is
       // reported before the take where it would be dead (DM-24, S-09).
@@ -9959,10 +9977,11 @@ app.whenReady().then(async () => {
     // During a take the key is (re)bound now; the bind updates the slot.
     if (screenMode.isActive()) bindScreenShotHotkey();
 
+    const bound = (route) => (route.active ? `${route.active}(${route.via})` : "FAILED");
     appendMainLog(
-      `[shortcuts] registered: record=${registeredRecordHotkey || "FAILED"} ` +
-      `paste=${registeredPasteHotkey || "FAILED"} ` +
-      `screen=${registeredScreenHotkey || (screenSupported ? "FAILED" : "unsupported")} ` +
+      `[shortcuts] registered: record=${bound(routes.record)} ` +
+      `paste=${bound(routes.paste)} ` +
+      `screen=${routes.screen ? bound(routes.screen) : (screenSupported ? "FAILED" : "unsupported")} ` +
       `screenShot=${desiredScreenShotHotkey || "-"}`,
     );
   }

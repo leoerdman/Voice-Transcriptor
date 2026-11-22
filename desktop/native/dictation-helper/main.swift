@@ -7,7 +7,9 @@
 // on. This helper is started once with the app and does that work
 // in-process: the clipboard (snapshot, write, restore by change count —
 // ClipboardLedger.swift), the frontmost app, the modifier wait and ⌘V
-// through CGEventPost (Paste.swift).
+// through CGEventPost (Paste.swift). It also catches the shell's hotkeys
+// with an event tap of its own (HotkeyTap.swift), so a press reaches the
+// shell straight from the key-down, stamped with its real instant.
 //
 // It is a second target of the native package beside screen-input, not a
 // mode of it: screen mode's mouse tap swallows clicks and must die with
@@ -24,6 +26,8 @@
 //            "releaseDeadlineMs":n,"pollMs":n,"settleMs":n,"gapMs":n}
 //           {"cmd":"clipboard-restore","id":n,"changeCount":n}
 //           {"cmd":"clipboard-keep","id":n}          a failed paste: keep the transcript
+//           {"cmd":"hotkeys","id":n,"chords":[{"chord":"record","keyCode":n,"mods":["cmd","alt","ctrl","shift"]}]}
+//                                                    arm the tap with this table; [] disarms it
 //           {"cmd":"quit"}
 //   stdout: {"t":"ready","pid":n,"accessibility":b,"postEvents":b,"listenEvents":b}
 //           {"t":"permissions","id":n,"accessibility":b,"postEvents":b,"listenEvents":b}
@@ -34,6 +38,18 @@
 //            "verification":"verified|unverified|unreadable|skipped","ms":{..}}
 //           {"t":"clipboard-restore","id":n,"result":"restored|user-changed|superseded|nothing"}
 //           {"t":"clipboard-keep","id":n}
+//           {"t":"hotkeys","id":n,"active":b,"secureInput":b,"reason":".."}
+//   events (no id):
+//           {"t":"hotkey","chord":"..","pressedAt":epochMs,"ageMs":x,"clock":"event|callback"}
+//           {"t":"tap-disabled","reason":"timeout|user-input","reenabled":b}
+//           {"t":"secure-input","on":b}
+//
+// Commands run one at a time, in order, on one queue — except `hotkeys`,
+// which is answered at once even while a paste is waiting out its
+// modifier deadline.
+//
+// Hotkey refusals ("active": false): no-chords, not-trusted,
+// tap-create-failed, tap-not-enabled, bad-chords.
 //
 // Paste failure reasons: empty-text, not-trusted, front-mismatch,
 // clipboard-write-failed, post-failed. A paste that does not post leaves
@@ -52,7 +68,7 @@ let activity = ProcessInfo.processInfo.beginActivity(
   reason: "Transcriptor paste and hotkey helper"
 )
 
-// Touched only from the command thread, one request at a time.
+// Touched only from the command queue, one request at a time.
 var ledger = ClipboardLedger()
 
 func elapsedMs(_ since: UInt64) -> Int {
@@ -190,6 +206,15 @@ func handle(_ obj: [String: Any], cmd: String) {
   case "clipboard-keep":
     ledger.keep()
     emit(["t": "clipboard-keep", "id": id])
+  case "hotkeys":
+    guard let chords = HotkeyChord.parseList(obj["chords"]) else {
+      emit(["t": "hotkeys", "id": id, "active": false, "reason": "bad-chords"])
+      return
+    }
+    var answer = HotkeyTap.shared.configure(chords)
+    answer["t"] = "hotkeys"
+    answer["id"] = id
+    emit(answer)
   default:
     break
   }
@@ -199,16 +224,24 @@ var ready = Permissions.refresh()
 ready["t"] = "ready"
 ready["pid"] = Int(getpid())
 emit(ready)
-// stdin: requests, one at a time, in order. EOF (the app died or closed
-// the pipe) is a quit — the keyboard tap must never outlive its owner.
+// stdin: requests, run one at a time, in order, on the command queue;
+// `hotkeys` is answered from the reader itself, never behind a paste. EOF
+// (the app died or closed the pipe) is a quit — the keyboard tap must
+// never outlive its owner.
+let commandQueue = DispatchQueue(label: "dictation-helper.commands", qos: .userInitiated)
 Thread.detachNewThread {
   while let line = readLine(strippingNewline: true) {
     guard let data = line.data(using: .utf8),
           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           let cmd = obj["cmd"] as? String else { continue }
     if cmd == "quit" { break }
-    handle(obj, cmd: cmd)
+    if cmd == "hotkeys" {
+      handle(obj, cmd: cmd)
+      continue
+    }
+    commandQueue.async { handle(obj, cmd: cmd) }
   }
+  commandQueue.sync {}
   outputQueue.sync {}
   exit(0)
 }

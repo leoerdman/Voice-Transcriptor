@@ -15,10 +15,23 @@ let syntheticMarker: Int64 = 0x5652_5343
 
 let outputQueue = DispatchQueue(label: "native-helper.output")
 
-func emit(_ object: [String: Any]) {
+private func encodeLine(_ object: [String: Any]) -> Data? {
   guard let data = try? JSONSerialization.data(withJSONObject: object),
-        var line = String(data: data, encoding: .utf8) else { return }
+        var line = String(data: data, encoding: .utf8) else { return nil }
   line += "\n"
-  let bytes = Data(line.utf8)
+  return Data(line.utf8)
+}
+
+func emit(_ object: [String: Any]) {
+  guard let bytes = encodeLine(object) else { return }
   outputQueue.async { FileHandle.standardOutput.write(bytes) }
+}
+
+/// For an event-tap callback: even the JSON is built on the output queue,
+/// so the callback itself only hands over a closure.
+func emitDeferred(_ build: @escaping () -> [String: Any]) {
+  outputQueue.async {
+    guard let bytes = encodeLine(build()) else { return }
+    FileHandle.standardOutput.write(bytes)
+  }
 }

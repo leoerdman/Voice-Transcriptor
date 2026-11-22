@@ -9,7 +9,8 @@
 #     the rule; FrontWindow.swift: the window a screenshot captures).
 #   * `dictation-helper` — lives for the whole app session: clipboard
 #     snapshot/restore by change count, the native ⌘V paste and the
-#     record-hotkey tap. Source: desktop/native/dictation-helper/.
+#     hotkey tap (record, paste-last, screen mode). Source:
+#     desktop/native/dictation-helper/.
 #
 # Output: desktop/native/build/<target>/ — copied by electron-builder to
 # Contents/Resources/runtime/bin, inside the runtime root, so afterPack's
@@ -64,6 +65,8 @@ xcrun swiftc -O \
   "$SHARED" \
   "$DESKTOP_DIR/native/dictation-helper/ClipboardLedger.swift" \
   "$DESKTOP_DIR/native/dictation-helper/Paste.swift" \
+  "$DESKTOP_DIR/native/dictation-helper/HotkeyMatcher.swift" \
+  "$DESKTOP_DIR/native/dictation-helper/HotkeyTap.swift" \
   "$DESKTOP_DIR/native/dictation-helper/main.swift" \
   -o "$OUT_DIR/dictation-helper"
 chmod 755 "$OUT_DIR/dictation-helper"
