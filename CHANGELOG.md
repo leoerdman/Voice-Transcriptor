@@ -3,6 +3,12 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.31] - 2026-11-23
+
+### Fixed
+
+- **The red line at the start of a take no longer jumps back.** When you pressed the hotkey the line came in from the right edge, went a little way left, then jumped back to the right edge and started again. The press shows the capsule at once, and a moment later the microphone's real start stamps the take with its start time; the capsule took that stamp for a new take and restarted the line. Now the line restarts only when one running take is replaced by another, so it runs once, right to left, without a jump.
+
 ## [1.6.30] - 2026-11-23
 
 ### Fixed

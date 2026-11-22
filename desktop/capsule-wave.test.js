@@ -235,3 +235,21 @@ test("a waking microphone is drawn as its own state: its icon, a dimmed wave tha
   capsule.setState({ status: "Recording", mode: "recording", level: 0.2, startedAt: 1000 });
   assert.ok(capsule.element("stateIcon").classList.contains("rec"));
 });
+
+test("the line does not jump back when the take's start time arrives after the press", () => {
+  // User, 2026-11-23: "the red line starts from the right, goes a little way
+  // left, jumps back to the start and runs again". The press shows "Starting"
+  // with no start time; the microphone's real start stamps one a moment later.
+  const capsule = loadCapsule();
+  capsule.setState({ status: "Starting", mode: "recording", level: 0, startedAt: 0 });
+  const lineAt = () => capsule.draws.find((d) => d.h === tokens.waveBaselineHeight);
+  capsule.step(16);
+  let previous = lineAt().w;
+  for (let i = 0; i < 12; i += 1) {
+    if (i === 6) capsule.setState({ status: "Recording", mode: "recording", level: 0, startedAt: 1000 + 16 * 7 });
+    capsule.step(16);
+    const width = lineAt().w;
+    assert.ok(width >= previous, `the line shrank at frame ${i}: ${previous} -> ${width}`);
+    previous = width;
+  }
+});

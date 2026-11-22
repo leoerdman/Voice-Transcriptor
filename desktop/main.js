@@ -2141,9 +2141,15 @@ function recordingStatusCapsuleHtml() {
     window.__setCapsuleState = (next) => {
       const previousStart = Number(state.startedAt || 0);
       state = { ...state, ...(next || {}) };
-      // A new take (a new start time) brings its line in from the right
-      // edge again, even when no empty status came between the takes.
-      if (Number(state.startedAt || 0) !== previousStart && Number(state.startedAt || 0) > 0) baselineSince = 0;
+      // A take that REPLACES a running one (one start time becomes another)
+      // brings its line in from the right edge again, even when no empty
+      // status came between the takes. The first start time of a take
+      // (0 -> T: the press shows "Starting" with none, the microphone's
+      // real start stamps it a moment later) is the SAME take: resetting
+      // there made the line run a little way left and jump back to the
+      // right edge (user, 2026-11-23).
+      const nextStart = Number(state.startedAt || 0);
+      if (previousStart > 0 && nextStart > 0 && nextStart !== previousStart) baselineSince = 0;
       const nextScreen = !!state.screen;
       if (nextScreen !== screenMode) {
         screenMode = nextScreen;
