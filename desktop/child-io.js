@@ -67,9 +67,58 @@ function withUtf8OutputPrelude(cmd, args = []) {
   return next;
 }
 
+/**
+ * A child's stdout/stderr arrives in pipe-sized chunks, not lines. A
+ * chunk can hold several records, or end in the middle of one.
+ *
+ * The backend's stderr used to be logged one chunk per main.log line,
+ * whitespace collapsed: two records written in the same millisecond
+ * (the `[multi]` and `[ru]` readings, say) came out glued into one
+ * line, a record split across two chunks came out as two half-lines,
+ * and a burst over the length cap lost its tail. Splitting on the
+ * record separator, here, gives every record its own timestamped line.
+ *
+ * `push` takes decoded text (`stream.setEncoding` keeps multi-byte
+ * characters whole across chunks); `flush` emits a final record that
+ * had no trailing newline — call it on the stream's `end`. A line
+ * longer than `maxLineChars` without a newline is emitted rather than
+ * buffered without bound.
+ *
+ * @param {(line: string) => void} onLine  receives each non-blank line,
+ *   trailing whitespace (`\r` included) removed, indentation kept
+ * @param {{maxLineChars?: number}} [options]
+ */
+function createLineSplitter(onLine, { maxLineChars = 64 * 1024 } = {}) {
+  let buffer = "";
+  const emit = (line) => {
+    const text = line.replace(/\s+$/, "");
+    if (text.trim()) onLine(text);
+  };
+  return {
+    push(chunk) {
+      buffer += String(chunk == null ? "" : chunk);
+      let idx;
+      while ((idx = buffer.indexOf("\n")) >= 0) {
+        emit(buffer.slice(0, idx));
+        buffer = buffer.slice(idx + 1);
+      }
+      if (buffer.length > maxLineChars) {
+        emit(buffer);
+        buffer = "";
+      }
+    },
+    flush() {
+      const rest = buffer;
+      buffer = "";
+      emit(rest);
+    },
+  };
+}
+
 module.exports = {
   POWERSHELL_UTF8_PRELUDE,
   childStreamEncoding,
+  createLineSplitter,
   stripBom,
   withUtf8OutputPrelude,
 };

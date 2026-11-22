@@ -1,6 +1,7 @@
 import json
 import math
 import logging
+from contextvars import ContextVar
 import os
 import sys
 import asyncio
@@ -55,6 +56,7 @@ from backend.audio_constants import (
     LIVE_RECOVERY_MIN_BYTES,
     LIVE_SAMPLE_RATE_HZ,
 )
+from backend.loop_stall import watch_loop_stalls
 from backend.models_manager import (
     ModelDeleteError,
     delete_model,
@@ -210,8 +212,10 @@ logger = logging.getLogger(__name__)
 # config entirely — every ``backend.*`` INFO+ record goes straight
 # to stderr → ``backend.stderr.on("data")`` in desktop/main.js →
 # ``[backend-stderr] …`` in main.log. The diagnostic ladder we
-# need (Finalize sent / is_final emissions / finalize EXIT delta)
-# is now visible by construction.
+# need (Finalize sent / finalize ENTER-EXIT delta / coverage holes /
+# session complete) is now visible by construction. Per-segment
+# ``is_final`` / ``interim`` traces are DEBUG: at INFO they were ~24%
+# of the journal and the ladder already carries their counts.
 _backend_logger = logging.getLogger("backend")
 _backend_logger.setLevel(logging.INFO)
 if not any(
@@ -500,9 +504,15 @@ async def _app_lifespan(_app: "FastAPI") -> AsyncIterator[None]:
     warm_boot = asyncio.get_running_loop().create_task(
         _prewarm_deepgram_at_boot(), name="deepgram-warm-boot"
     )
+    # A synchronous step on the loop delays every live frame and request
+    # at once; this is what makes such a stall visible (backend.loop_stall).
+    stall_watch = asyncio.get_running_loop().create_task(
+        watch_loop_stalls(), name="loop-stall-watch"
+    )
 
     yield
 
+    await cancel_and_await(stall_watch, what="loop stall watch", log=logger)
     await AUTO_KEYTERMS.stop()
     await cancel_and_await(warm_boot, what="deepgram boot pre-warm", log=logger)
     # Shutdown: drain in-flight transcription jobs before the process
@@ -1906,8 +1916,21 @@ _ASSETS_CACHE_HEADERS = {
 }
 
 
+# When the current HTTP request reached the app (``perf_counter``), before
+# its body was read: a route that reports its own phases (``recording save
+# timing``) can then say how long the upload and the multipart parse took
+# before its handler ran — the one phase its own clock cannot see. A
+# context variable rather than a handler parameter: the route runs in a
+# task ``call_next`` creates, which inherits the value, and handlers keep
+# their signatures. ``None`` outside a request (a direct call).
+REQUEST_ARRIVED_AT: ContextVar[Optional[float]] = ContextVar(
+    "request_arrived_at", default=None
+)
+
+
 @app.middleware("http")
 async def guard_host_and_set_cache_control(request: Request, call_next):
+    REQUEST_ARRIVED_AT.set(time.perf_counter())
     # Host allowlist runs BEFORE the route so the unauthenticated
     # ``GET /`` is covered too. See _host_header_allowed for the
     # DNS-rebinding rationale.
@@ -6340,12 +6363,18 @@ async def _run_deepgram_live_session(
                     primary_language=primary_language,
                     expected_languages=language_hints,
                 )
+                # ``adopted=False`` is a cold connect, not a refused
+                # reading: the second reading is used either way. The
+                # reason names what became of its warm socket — usually
+                # the idle bound after a pause of more than
+                # ``WARM_IDLE_TTL_SEC`` between recordings.
                 logger.info(
                     "dual-stream: second reading opened primary=%s secondary=%s "
-                    "(adopted=%s)",
+                    "(adopted=%s%s)",
                     primary_language,
                     dual_language,
                     secondary.adopted,
+                    "" if secondary.adopted else f" reason={secondary.cold_reason}",
                 )
             except Exception as e:
                 logger.warning(
@@ -9280,10 +9309,16 @@ async def _save_recording_audio_source(
     also the clock its screen marks are placed by (``audioStartedAt``).
     """
     # Phase timings for the one line logged at the end: a slow save is
-    # told apart as transfer/parse (before this handler runs — the line's
-    # ``total`` stays small), the copy, the fsync'd promote, or the
-    # filing step (screenshots, registry, retention scan).
+    # told apart as transfer/parse (``recv``: from the request reaching
+    # the app, ``REQUEST_ARRIVED_AT``, to this handler running), the handler's
+    # own preparation (``prep``: target folder, name claim, backup of a
+    # replaced file — on the loop), the copy, the fsync'd promote, or the
+    # filing step (screenshots, registry, retention scan). A stall of the
+    # loop itself shows up beside it as ``event loop stalled`` and the
+    # renderer's ``audio save saved durMs`` is the whole round trip.
     started = time.perf_counter()
+    arrived_at = REQUEST_ARRIVED_AT.get()
+    recv_ms = (started - arrived_at) * 1000.0 if arrived_at is not None else -1.0
     raw_existing_name = str(name or "").strip()
     existing_name = _recording_text_name_leaf(raw_existing_name) if raw_existing_name else ""
     fields = _normalize_save_fields(
@@ -9356,14 +9391,16 @@ async def _save_recording_audio_source(
             ) from backup_err
     new_audio_placed = False
     save_completed = False
+    audio_bytes = 0
 
     def _place_audio_and_text() -> None:
         # Blocking file work (an fsync of up to 2 GB, the transcript's
         # fsync) runs on a worker thread, never on the event loop that
         # carries live WebSocket frames (BM-12).
-        nonlocal new_audio_placed
+        nonlocal new_audio_placed, audio_bytes
         atomic_promote_file(tmp_audio, out_audio)
         new_audio_placed = True
+        audio_bytes = out_audio.stat().st_size
         _write_recording_text_file(
             out=out_text,
             title=safe_title,
@@ -9377,6 +9414,7 @@ async def _save_recording_audio_source(
         )
 
     write_ms = place_ms = 0.0
+    prep_ms = (time.perf_counter() - started) * 1000.0
     try:
         phase = time.perf_counter()
         await write_tmp_audio(tmp_audio)
@@ -9448,11 +9486,15 @@ async def _save_recording_audio_source(
     file_ms = (time.perf_counter() - phase) * 1000.0
     _invalidate_recordings_cache()
     logger.info(
-        "recording save timing: total=%.0fms write=%.0fms place=%.0fms file=%.0fms pruned=%d",
+        "recording save timing: total=%.0fms recv=%.0fms prep=%.0fms write=%.0fms "
+        "place=%.0fms file=%.0fms bytes=%d pruned=%d",
         (time.perf_counter() - started) * 1000.0,
+        recv_ms,
+        prep_ms,
         write_ms,
         place_ms,
         file_ms,
+        audio_bytes,
         pruned,
     )
     # Atomically discard the live recovery spool now that the audio is

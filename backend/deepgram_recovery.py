@@ -629,10 +629,17 @@ def splice_recovered_words(
     # difference is invisible unless the two reasons are counted apart.
     if len(fresh) != len(words):
         kept = {id(w) for w in fresh}
+        # Spans, not the words: main.log is a support artefact and never
+        # carries what the user dictated (BL-02). The span is what a
+        # reader matches against ``coverage holes`` anyway.
         logger.info(
             "recovery: %d decoded word(s) already owned by the transcript: %s",
             len(words) - len(fresh),
-            [str(w.get("word")) for w in words if id(w) not in kept][:12],
+            [
+                f"{as_float(w.get('start')):.2f}-{as_float(w.get('end')):.2f}"
+                for w in words
+                if id(w) not in kept
+            ][:12],
         )
     if not fresh:
         return list(segments), 0

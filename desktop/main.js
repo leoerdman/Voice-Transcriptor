@@ -148,7 +148,10 @@ const { createBackendServing, loadWhenServing } = require("./backend-serving");
 const { createWindowLiveness } = require("./window-liveness");
 const { createSingleFlight } = require("./single-flight");
 // A session that grants no permission request or check (the capsule, DM-35).
-const { denyAllSessionPermissions } = require("./session-permissions");
+const { createPermissionChangeLog, denyAllSessionPermissions } = require("./session-permissions");
+// One per process: `[perm-check]` is logged at startup and on change, not
+// on every recording's getUserMedia.
+const permissionCheckChanged = createPermissionChangeLog();
 const { pruneLogArchives } = require("./log-retention");
 // Recording ids are unique only per renderer page: key them with the
 // page's epoch (DM-32).
@@ -236,7 +239,7 @@ const { readPythonVersion } = require("./python-version");
 
 // SSOT for how a child process's text output is produced and decoded —
 // the PowerShell UTF-8 prelude and the `cscript //U` UTF-16LE receipt.
-const { childStreamEncoding, stripBom, withUtf8OutputPrelude } = require("./child-io");
+const { childStreamEncoding, createLineSplitter, stripBom, withUtf8OutputPrelude } = require("./child-io");
 
 // SSOT for the backend's API token and who may read it (BM-01): minted
 // here once per launch, given to the backend in its environment and to the
@@ -566,6 +569,9 @@ let lastAccessibilityTrusted = null;
 // error page is actionable only by a developer with log-file access.
 let backendStderrTail = "";
 const BACKEND_STDERR_TAIL_MAX = 4096;
+// Per-record cap for a backend line mirrored into main.log; a record is
+// one line now, so the cap no longer cuts off the records behind it.
+const BACKEND_LOG_LINE_MAX = 1400;
 let isQuitting = false;
 let shortcutToggleInFlight = false;
 let recordingStopInFlight = false;
@@ -8208,18 +8214,29 @@ async function startBackend() {
     child.stdin.on("error", () => { /* intentional no-op */ });
   }
 
-  child.stdout.on("data", (d) => {
-    const msg = d.toString();
-    appendMainLog(`[backend-stdout] ${compactLogText(msg, 1400)}`);
-  });
-  child.stderr.on("data", (d) => {
-    const msg = d.toString();
-    appendMainLog(`[backend-stderr] ${compactLogText(msg, 1400)}`);
+  // One main.log line per backend log record (./child-io
+  // createLineSplitter): a pipe chunk is not a record, and logging it as
+  // one glued same-millisecond records together and split long ones.
+  // A multi-line record (a traceback, the coverage-holes report) keeps
+  // its indented continuation lines, each under its own timestamp.
+  const backendLogLine = (stream) => (line) => {
+    const text = line.length > BACKEND_LOG_LINE_MAX ? `${line.slice(0, BACKEND_LOG_LINE_MAX)}...` : line;
+    appendMainLog(`[backend-${stream}] ${text}`);
+  };
+  const stdoutLines = createLineSplitter(backendLogLine("stdout"));
+  const stderrLines = createLineSplitter(backendLogLine("stderr"));
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (msg) => stdoutLines.push(msg));
+  child.stdout.on("end", () => stdoutLines.flush());
+  child.stderr.on("data", (msg) => {
+    stderrLines.push(msg);
     // Keep the last ~4 KB of stderr so the fallback error page can
     // show the actual failure reason instead of a generic "did not
     // start in time" message.
     backendStderrTail = (backendStderrTail + msg).slice(-BACKEND_STDERR_TAIL_MAX);
   });
+  child.stderr.on("end", () => stderrLines.flush());
 
   child.on("exit", (code, signal) => {
     // ./backend-exit decides (DM-09, DM-27): while the app is not
@@ -8734,12 +8751,14 @@ async function createWindow(options = {}) {
     const allow = allowedCapability && fromBackend;
     const logUrl = permissionOriginsLog(wc, details, requestingOrigin);
     const kinds = mediaTypes.length ? ` types=${mediaTypes.join("+")}` : "";
-    if (known && !fromBackend) {
-      appendMainLog(`[perm-check] DENY non-backend origin: perm=${perm}${kinds} origins=${logUrl}`);
-    } else {
-      appendMainLog(
-        `[perm-check] perm=${perm}${kinds} allow=${allow} reason=${allow ? reason : (fromBackend ? reason : "non-backend-origin")} origins=${logUrl}`,
-      );
+    const shownReason = allow ? reason : (fromBackend ? reason : "non-backend-origin");
+    // Logged on first sight and on change only (./session-permissions).
+    if (permissionCheckChanged(`${perm}${kinds} origins=${logUrl}`, `${allow} ${shownReason}`)) {
+      if (known && !fromBackend) {
+        appendMainLog(`[perm-check] DENY non-backend origin: perm=${perm}${kinds} origins=${logUrl}`);
+      } else {
+        appendMainLog(`[perm-check] perm=${perm}${kinds} allow=${allow} reason=${shownReason} origins=${logUrl}`);
+      }
     }
     return allow;
   });

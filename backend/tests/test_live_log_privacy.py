@@ -47,7 +47,7 @@ def _final(start: float, end: float, text: str) -> dict:
 class DictatedTextNeverReachesTheLogTests(unittest.TestCase):
     def test_a_final_is_logged_by_its_size_and_tagged_with_its_reading(self):
         session = DeepgramLiveSession(api_key="k", config=DeepgramLiveConfig(language="ru"))
-        with self.assertLogs("backend.remote_deepgram_live", level="INFO") as logs:
+        with self.assertLogs("backend.remote_deepgram_live", level="DEBUG") as logs:
             session._process_deepgram_message(_final(0.0, 1.5, SECRET_WORDS))
         line = next(m for m in logs.output if "is_final" in m)
         for word in SECRET_WORDS.split():
@@ -58,9 +58,20 @@ class DictatedTextNeverReachesTheLogTests(unittest.TestCase):
 
     def test_the_multilingual_reading_is_tagged_multi(self):
         session = DeepgramLiveSession(api_key="k", config=DeepgramLiveConfig(language="auto"))
-        with self.assertLogs("backend.remote_deepgram_live", level="INFO") as logs:
+        with self.assertLogs("backend.remote_deepgram_live", level="DEBUG") as logs:
             session._process_deepgram_message(_final(0.0, 1.0, "hello there"))
         self.assertTrue(all("[multi] " in m for m in logs.output), logs.output)
+
+    def test_per_segment_traces_stay_out_of_the_info_journal(self):
+        # One line per Deepgram final and per sampled interim, per reading,
+        # was ~24% of main.log; the session summary carries their counts.
+        session = DeepgramLiveSession(api_key="k", config=DeepgramLiveConfig(language="ru"))
+        interim = _final(0.0, 1.0, "hello there")
+        interim["is_final"] = False
+        interim["speech_final"] = False
+        with self.assertNoLogs("backend.remote_deepgram_live", level="INFO"):
+            session._process_deepgram_message(interim)
+            session._process_deepgram_message(_final(0.0, 1.5, SECRET_WORDS))
 
 
 class ParamsLineTests(unittest.TestCase):
