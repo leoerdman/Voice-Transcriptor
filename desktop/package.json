@@ -60,6 +60,7 @@
       "recording-stop.js",
       "windows-paste-fallback.js",
       "renderer-toggle.js",
+      "queued-start.js",
       "renderer-requests.js",
       "auto-stop-config.js",
       "data-dir.js",

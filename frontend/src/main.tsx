@@ -791,6 +791,7 @@ declare global {
     __transcriptorLastUiFinalKind?: RecordingFinalSignalKind;
     __transcriptorLiveStatusSnapshot?: () => LiveStatusSnapshot;
     __transcriptorRecordingTooShort?: () => boolean;
+    __transcriptorStartBlocked?: () => boolean;
     __transcriptorLiveTake?: () => { mode: LiveRecordingMode; screenSessionId: string; screenClicks: boolean };
     __transcriptorSetMainStatus?: (status: string, kind?: StatusKind) => boolean;
     __setBackendBootStatus?: (msg: string) => void;
@@ -10001,6 +10002,22 @@ function recordingIsTooShortToKeep(): boolean {
   return elapsedMs < UI_TOKENS.capture.minRecordingMs;
 }
 window.__transcriptorRecordingTooShort = recordingIsTooShortToKeep;
+/**
+ * Is earlier work holding a new start back? ``startLive`` returns
+ * silently while the previous take is still closing (or a file is being
+ * transcribed), so the hotkey asks first and main queues the press
+ * instead of waiting out a start that never comes
+ * (desktop/renderer-toggle.js, desktop/queued-start.js).
+ *
+ * A start already in flight is not "held back": a press that lands then
+ * joins the take that is starting, and the toggle reports that take to
+ * main (2026-11-21). Queuing it instead would make the queued press stop
+ * the take once it ran.
+ */
+function earlierWorkBlocksStart(): boolean {
+  return (isBusy || stopTransitionInFlight) && !startLiveInFlight;
+}
+window.__transcriptorStartBlocked = earlierWorkBlocksStart;
 /**
  * PCM capture sink for the current recording session. Lazily created
  * inside ``startLive`` once the mic has yielded its first frames,

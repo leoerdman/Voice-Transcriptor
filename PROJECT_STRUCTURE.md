@@ -109,6 +109,8 @@ frontend/
     ├── deepgram-dual.ts              # dual-stream Auto preference-resolution SSOT (pure)
     ├── language-hints.ts             # "Expected languages" (Nova-3 language hints) preference resolution (pure)
     ├── recording-cues.ts             # recording start/stop tones (pure, fake-AudioContext tested)
+    ├── stop-tail.ts                  # how long the mic stays open after Stop: by the voice in the audio, stop tone excluded (Hex release tail, pure)
+    ├── worklet-watchdog.ts           # arms the ScriptProcessor fallback only for an AudioWorklet that stayed silent (pure, timer-injected)
     ├── live-source.ts                # live-source composition SSOT: committed + interim → preview text and draft autosave (pure)
     ├── live-pane.ts                  # Live Preview pane display contract: preview on/off, status line (pure)
     ├── live-envelope.ts              # the `final` stop-envelope wire type: one reader, matches backend/live_envelope.py
@@ -174,6 +176,7 @@ desktop/
 ├── recording-stop.js               # what a main-process stop does once the renderer has or has not answered (pure, node --test)
 ├── windows-paste-fallback.js       # the Windows PowerShell paste fallback script; sends keys only after a confirmed foreground switch (pure, node --test)
 ├── renderer-toggle.js              # the record hotkey's one renderer round trip and its deadline (pure, node --test)
+├── queued-start.js                 # a start press during the previous take's finish: queued (one slot, second press cancels, expiry), never dropped (pure, node --test)
 ├── renderer-requests.js            # the main window's requests (shortcuts, record toggle, reveal) — what main accepts from each (pure, node --test); replaces the document.title channel
 ├── auto-stop-config.js             # the silence auto-stop setting main applies: the renderer's, or off — no copy of its defaults (pure, node --test)
 ├── data-dir.js                     # the one rule for where the desktop shell keeps its data (pure, node --test)
