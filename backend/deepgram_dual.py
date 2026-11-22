@@ -1560,8 +1560,25 @@ class DualLiveSession:
         await self._both("discard")
 
     async def _both(self, method: str, **kwargs) -> None:
+        """Run a teardown step on both sockets AT ONCE.
+
+        The two sockets are independent upstream connections: closing one
+        neither needs nor affects the other. Run back to back, each waits
+        out its own ``CloseStream`` round trip to Deepgram (~250–300 ms),
+        so the session ended — and the next recording's warm sockets
+        started connecting — a whole round trip later than needed
+        (OPTIMIZATION.md §5 1.2: the second socket's close landed 235 ms
+        after the first). The envelope is already on the wire before this
+        runs (C4); what the overlap buys is the next take's warm sockets.
+
+        The secondary's failure stays ignored (the primary carries the
+        recording); the primary's is raised, after both have finished.
+        """
         secondary = self.secondary
-        if secondary is not None:
+
+        async def _secondary_step() -> None:
+            if secondary is None:
+                return
             try:
                 await getattr(secondary, method)(**kwargs)
             except Exception as e:
@@ -1575,7 +1592,17 @@ class DualLiveSession:
             await cancel_and_await(
                 self._secondary_closing, what="dual-stream secondary close", log=logger
             )
-        await getattr(self.primary, method)(**kwargs)
+
+        secondary_result, primary_result = await asyncio.gather(
+            _secondary_step(),
+            getattr(self.primary, method)(**kwargs),
+            return_exceptions=True,
+        )
+        if isinstance(secondary_result, BaseException):
+            # Only a cancellation of the feeder/closing joins can land here.
+            raise secondary_result
+        if isinstance(primary_result, BaseException):
+            raise primary_result
 
 
 __all__ = [

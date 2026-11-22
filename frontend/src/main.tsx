@@ -65,11 +65,13 @@ import { UPLOAD_QUEUE_SAVE_FAILED_STATUS, nextQueueSaveRetry } from "./upload-qu
 import { classifyBootError, type BootFailure } from "./boot-error";
 import {
   captureElapsedMs,
+  chooseCaptureDevice,
   decidePreRoll,
   decideWarmHold,
   decideWarmReuse,
   freezeCaptureForStop,
   handOverHeldCapture,
+  type InputDeviceInfo,
   type WarmHoldLifecycleRelease,
 } from "./capture-warm";
 import {
@@ -165,6 +167,8 @@ import {
   takeStartedAtMs,
   transcriptScreenManifest,
 } from "./recording-save";
+import { skippedAudioPersistence, startAudioPersistence, type AudioPersistence } from "./audio-persistence";
+import { DeferredPcmSink } from "./deferred-pcm-sink";
 import {
   RECORDING_COLLECTIONS,
   liveRecordingCollection,
@@ -363,6 +367,13 @@ interface AppConfig {
        * default, user 2026-11-21); only an explicit `false` turns it off.
        */
       screen_clicks?: boolean;
+      /**
+       * While the system default input is a Bluetooth headset, record from
+       * the Mac's built-in microphone (./capture-warm ``chooseCaptureDevice``).
+       * Absent means on (the shipped default); only an explicit `false`
+       * turns it off.
+       */
+      bluetooth_builtin_mic?: boolean;
       /**
        * Live-tab speaker diarization. Its two neighbours in the same
        * popover (``auto_transcribe``, ``live_preview``) have always been
@@ -5707,6 +5718,14 @@ document.querySelectorAll(".sb-item").forEach((e) => {
   });
 });
 
+/**
+ * The `audioinput` list as of the last ``loadMics`` — what a start that
+ * touches no device API (the warm path) resolves its microphone against.
+ * A device change releases any warm hold, so a stale list never decides
+ * a warm start; the cold path re-enumerates first.
+ */
+let knownAudioInputs: InputDeviceInfo[] = [];
+
 async function loadMics(forceReload = false): Promise<void> {
   if (!navigator.mediaDevices?.getUserMedia || !navigator.mediaDevices?.enumerateDevices) {
     ($("micSelect") as HTMLSelectElement).replaceChildren(new Option("Microphone API unavailable", ""));
@@ -5723,6 +5742,7 @@ async function loadMics(forceReload = false): Promise<void> {
     const curVal = sel.value;
     sel.replaceChildren(new Option("Default", ""));
     const mics = devs.filter((d) => d.kind === "audioinput");
+    knownAudioInputs = mics.map((d) => ({ deviceId: d.deviceId, label: d.label }));
     if (mics.length === 0) {
       sel.replaceChildren(new Option("No microphones", ""));
     } else {
@@ -6325,6 +6345,7 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
     shortcut_screen: currentShortcuts.screen,
     shortcut_screen_shot: currentShortcuts.screenShot,
     screen_clicks: readScreenClicksEnabled(),
+    bluetooth_builtin_mic: readBluetoothBuiltinMicEnabled(),
     // Upload tab — mirrors current DOM values. Optional-chained because
     // setupUploadView may not have run yet on a page that loaded
     // without the Upload section (defensive against future view splits).
@@ -6585,6 +6606,11 @@ function shouldUpscale(): boolean {
 }
 
 /** Settings' "record clicks in screen mode" — read by a screen take when it starts. */
+/** preferences.ui.bluetooth_builtin_mic — on unless explicitly off. */
+function readBluetoothBuiltinMicEnabled(): boolean {
+  return (document.getElementById("bluetoothBuiltinMicToggle") as HTMLInputElement | null)?.checked !== false;
+}
+
 function readScreenClicksEnabled(): boolean {
   return !!(document.getElementById("screenClicksToggle") as HTMLInputElement | null)?.checked;
 }
@@ -7267,6 +7293,7 @@ async function loadCfg(): Promise<void> {
     const autoStopDbEl = $("autoStopSilenceDb") as HTMLInputElement;
     autoStopEnabledEl.checked = ui.auto_stop_silence_enabled === true;
     ($("screenClicksToggle") as HTMLInputElement).checked = ui.screen_clicks === true;
+    ($("bluetoothBuiltinMicToggle") as HTMLInputElement).checked = ui.bluetooth_builtin_mic !== false;
     autoStopSecondsEl.value = String(clampAutoStopSeconds(Number(ui.auto_stop_silence_seconds)));
     autoStopDbEl.value = String(clampAutoStopThresholdDb(Number(ui.auto_stop_silence_db)));
     const upscaleToggle = $("upscaleToggle") as HTMLInputElement;
@@ -7575,6 +7602,12 @@ async function handleKeyAction(provider: RemoteProvider): Promise<void> {
   });
 });
 ($("screenClicksToggle") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
+($("bluetoothBuiltinMicToggle") as HTMLInputElement).addEventListener("change", () => {
+  // A held microphone was chosen under the old setting: let the next
+  // start choose again instead of reusing it.
+  releaseWarmCapture("mic-setting-changed");
+  queueUiPreferencesSave();
+});
 ($("settingsAutoSendEnterToggle") as HTMLInputElement).addEventListener("change", () => {
   setAutoSendEnterEnabled(($("settingsAutoSendEnterToggle") as HTMLInputElement).checked);
   queueUiPreferencesSave();
@@ -10373,6 +10406,9 @@ function releaseWarmCaptureOnLifecycle(reason: WarmHoldLifecycleRelease): void {
 try {
   navigator.mediaDevices?.addEventListener?.("devicechange", () => {
     releaseWarmCaptureOnLifecycle("devicechange");
+    // Headphones connected or gone: refresh the list the next start's
+    // microphone choice is made against (``knownAudioInputs``).
+    void loadMics(false);
   });
 } catch (e) {
   // Older shells expose mediaDevices without EventTarget semantics; the
@@ -11311,10 +11347,23 @@ async function startLive(
   // not at the first frame).
   console.log(`[cue] start ${playRecordingCue("start")}`);
   const startAttemptSeq = ++liveStartAttemptSeq;
+  // What the start needs from disk and the backend is asked for at once,
+  // not one after another (OPTIMIZATION.md §3.4). The archive folder is
+  // the one answer the start waits for — the socket's query names it —
+  // and it is memoized after the first start. The previous run's draft
+  // (FG-08) gates only this session's first autosave, never the
+  // microphone; the capture storage is opened beside the socket and the
+  // microphone, and frames that arrive first are held in memory
+  // (./deferred-pcm-sink).
+  const archiveReady = ensureRecordingsArchiveReady();
+  const staleDraftRead = Promise.race([
+    readStaleLiveDraftOnce(),
+    sleepUnlessAborted(UI_TOKENS.draft.staleReadWaitMs, undefined),
+  ]).then(() => { markStartPhase("staleDraftRead"); }, () => {});
   try {
   let sessionArchiveDir = "";
   try {
-    sessionArchiveDir = await ensureRecordingsArchiveReady();
+    sessionArchiveDir = await archiveReady;
     markStartPhase("archiveReady");
   } catch (e) {
     const message = (e as Error).message || "Recordings archive is not ready yet.";
@@ -11327,10 +11376,6 @@ async function startLive(
     patchCurrentRecordingSummary({ status: message, tone: "error" });
     return;
   }
-  // FG-08: the previous run's draft is captured before this session's
-  // first autosave can replace it (memoized: free after the first start).
-  await Promise.race([readStaleLiveDraftOnce(), sleepUnlessAborted(UI_TOKENS.draft.staleReadWaitMs, undefined)]);
-  markStartPhase("staleDraftRead");
   liveStartAbortReason = "";
   const throwIfStartCancelled = (): void => {
     if (startAttemptSeq === liveStartAttemptSeq) return;
@@ -11374,11 +11419,19 @@ async function startLive(
     pcmSink = null;
     void prior.destroy();
   }
-  // Await the sink so it is ready BEFORE the first audio frame. The
-  // old fire-and-forget path dropped frames that arrived before the
-  // async OPFS init resolved (~50 ms, but up to 500 ms on slow devices).
-  pcmSink = await createPcmSink(sessionUiToken);
-  markStartPhase("pcmSink");
+  // Not awaited: the storage opens (13–190 ms measured, up to ~500 ms on
+  // slow devices) while the socket and the microphone open. Frames that
+  // arrive before it is ready are held in memory and written into it in
+  // order — the old fire-and-forget path dropped them, the old await
+  // put the whole open in front of the first frame.
+  pcmSink = new DeferredPcmSink(
+    createPcmSink(sessionUiToken),
+    () => new MemoryPcmSink(),
+    (_sink, heldFrames) => {
+      markStartPhase("pcmSink");
+      if (heldFrames > 0) console.log(`[trace startLive] capture storage ready; ${heldFrames} early frame(s) written into it`);
+    },
+  );
   workletLastFrameAt = 0;
   captureLevel = createCaptureLevel();
   captureRmsEma = 0;
@@ -11414,12 +11467,21 @@ async function startLive(
   window.__transcriptorLastFrameAt = 0;
 
   startAt = 0;
-  persistLiveDraft(true);
   if (draftSaveTimer) {
     clearInterval(draftSaveTimer);
     draftSaveTimer = null;
   }
-  draftSaveTimer = window.setInterval(() => persistLiveDraft(true), UI_TOKENS.draft.autosaveIntervalMs);
+  // FG-08: the previous run's draft is captured before this session's
+  // first autosave can replace it (memoized: free after the first start).
+  // Waited for here, off the path to the microphone; a take that ended
+  // before the read answered has nothing left to autosave.
+  const draftRecordingId = currentRecordingId;
+  void staleDraftRead.then(() => {
+    if (currentRecordingId !== draftRecordingId || !isCurrentUiSession(sessionUiToken)) return;
+    persistLiveDraft(true);
+    if (draftSaveTimer) clearInterval(draftSaveTimer);
+    draftSaveTimer = window.setInterval(() => persistLiveDraft(true), UI_TOKENS.draft.autosaveIntervalMs);
+  });
   timer = window.setInterval(() => {
     const durationSec = startAt > 0 ? (Date.now() - startAt) / 1000 : 0;
     if (isCurrentUiSession(sessionUiToken)) {
@@ -11618,12 +11680,23 @@ async function startLive(
     if (!navigator.mediaDevices?.getUserMedia) {
       throw new Error("This browser does not support microphone capture.");
     }
-    const selectedDeviceId = (($("micSelect") as HTMLSelectElement).value || "").trim();
+    const preferBuiltInOverBluetooth = readBluetoothBuiltinMicEnabled();
+    // Which microphone this take records from (./capture-warm
+    // ``chooseCaptureDevice``): the picker's device, or — while the system
+    // default is a Bluetooth headset and the setting is on — the Mac's
+    // built-in one, which keeps the headset in A2DP and can be warm-held.
+    // Resolved against the last known device list, so the warm path below
+    // touches no device API.
+    let micChoice = chooseCaptureDevice({
+      requestedDeviceId: (($("micSelect") as HTMLSelectElement).value || "").trim(),
+      preferBuiltInOverBluetooth,
+      devices: knownAudioInputs,
+    });
     // The graph the previous recording left running, if it is still the
     // right one (§4.7). Adopting it skips getUserMedia, the AudioContext
     // and the worklet module — the whole ~310 ms — and its ring has been
     // holding the last half-second of audio the entire time.
-    const warm = takeWarmCapture(selectedDeviceId);
+    const warm = takeWarmCapture(micChoice.deviceId);
     sessionStartedWarm = !!warm;
     sessionPreRollMs = 0;
     if (warm) {
@@ -11646,10 +11719,16 @@ async function startLive(
       // disappeared, a default that resolved), and the request has to
       // carry what the picker says NOW. The warm check above necessarily
       // runs before that, on what the picker said before.
-      const devId = (($("micSelect") as HTMLSelectElement).value || "").trim();
+      // Chosen again on the list ``loadMics`` just enumerated: headphones
+      // connected or disconnected since the last start change the answer.
+      micChoice = chooseCaptureDevice({
+        requestedDeviceId: (($("micSelect") as HTMLSelectElement).value || "").trim(),
+        preferBuiltInOverBluetooth,
+        devices: knownAudioInputs,
+      });
       // Bounded and retried — see acquireMicStream. The old code awaited a
       // bare getUserMedia, so a busy input device hung the start outright.
-      stream = await acquireMicStream(devId);
+      stream = await acquireMicStream(micChoice.deviceId);
       markStartPhase("getUserMedia");
       throwIfStartCancelled();
     }
@@ -11666,6 +11745,11 @@ async function startLive(
     micHealth.reset();
     const initialTracks = stream.getAudioTracks();
     const initialDeviceId = initialTracks[0]?.getSettings?.()?.deviceId || "";
+    // The one line that says which microphone this take records from and why.
+    console.log(
+      `[trace startLive] mic="${initialTracks[0]?.label || micChoice.label}" ` +
+      `choice=${micChoice.reason} warm=${warm ? 1 : 0}`,
+    );
     micHealth.observe({ kind: "session-start", deviceId: initialDeviceId });
     if (initialTracks.some((t) => t.muted)) {
       micHealth.observe({ kind: "track-muted", muted: true });
@@ -11938,6 +12022,12 @@ async function stopLive(
   // backend's post-CloseStream is_final emission and truncate the
   // tail.
   let _wsToCloseAtEnd: WebSocket | null = null;
+  // The take's audio save (./audio-persistence) and the application of
+  // its outcome. Hoisted for the same reason: the outer ``finally``
+  // releases the capture spool once the save has settled, and the steps
+  // that need the saved recording await ``audioSaveApplied``.
+  let audioPersistence: AudioPersistence<SavedRecordingRef> = skippedAudioPersistence(() => {});
+  let audioSaveApplied: Promise<void> = Promise.resolve();
   let tailHoldMs = 0;
   let stopTransitionReleased = false;
   let stoppedRecordingId = 0;
@@ -12510,6 +12600,9 @@ async function stopLive(
   // than firing close() and nulling the slot in the same tick) means the
   // slot is provably empty before the next start can claim it.
   await closeAudioContextSlot();
+  // A cold stop closes the device here (Bluetooth: HFP → A2DP); the mark
+  // keeps that wait visible in the stop's phase line.
+  mark("closeAudioContext");
   workletNode = null;
   teardownScriptProcessorCapture();
   src = null;
@@ -12555,8 +12648,8 @@ async function stopLive(
   recordedWebmChunks = [];
   // Release the PCM sink reference after capture teardown, but DO NOT
   // destroy (delete the OPFS spool file) yet — the File blob from
-  // finalize() may still reference it. Destruction is deferred to
-  // after saveRecordingText serializes the blob into the FormData upload.
+  // finalize() may still reference it. Destruction is deferred until the
+  // audio save has landed (./audio-persistence).
   const deferredSinkDestroy = pcmSink;
   pcmSink = null;
   activeLiveSessionId = "";
@@ -12587,7 +12680,12 @@ async function stopLive(
   // SAID), the live text only when there is none (./stop-epilogue).
   const defaultTitle = title;
   const saveSessionMetadata = createSessionMetadataSaver({
-    target: () => ({ name: persistedRecordingName, archiveDir: persistedRecordingArchiveDir }),
+    // The entry the audio save created — so the metadata write waits for
+    // that save, which runs beside the transcript wait.
+    target: async () => {
+      await audioSaveApplied;
+      return { name: persistedRecordingName, archiveDir: persistedRecordingArchiveDir };
+    },
     liveSourceText: latestSourceForSave,
     fallbackTitle: defaultTitle,
     save: async (request) => saveRecordingText({
@@ -12676,41 +12774,62 @@ async function stopLive(
   const stagedScreenManifest = await screenSessionPromise;
   const recordingCollection = await recordingCollectionPromise;
   let screenManifest = stagedScreenManifest;
-  if (savedAudioFile) {
-    // Two-attempt save: first with the configured archive dir, then
-    // with the DEFAULT dir. The most common cause of "initial save
-    // failed" is a stale custom recordings_dir that became unwritable
-    // (rename, permissions, external drive ejected). Retrying into the
-    // default dir salvages the audio instead of silently losing it.
-    let saveDone = false;
-    // Build unique attempt list — if sessionArchiveDir is already ""
-    // the fallback would be identical, so skip the duplicate.
-    const saveDirs = sessionArchiveDir ? [sessionArchiveDir, ""] : [""];
-    for (const tryArchiveDir of saveDirs) {
-      if (saveDone) break;
-      try {
-        const persisted = await saveRecordingText({
-          archiveDir: tryArchiveDir,
-          title: provisionalTitle,
-          sourceText: latestSourceForSave(),
-          transcriptText: "",
-          provider: metadataProvider,
-          model: modelValue,
-          language: languageValue,
-          recordingCollection,
-          audioFile: savedAudioFile,
-          liveSessionId: liveSessionId,
-          screenSessionId: stagedScreenManifest?.id || undefined,
-          recordedAtMs: takeStartedAt,
-          refreshList: false,
-        });
+  // The audio save runs BESIDE the transcript wait, not before it
+  // (./audio-persistence, OPTIMIZATION.md §3.1): the FINAL signal and the
+  // paste no longer wait ~1 s for an upload they do not need. What does
+  // need the save waits for ``audioPersistence.settled`` itself: the
+  // History metadata write (the entry's archive name, through
+  // ``saveSessionMetadata``'s target), the recovery decode of the saved
+  // file (``fetchRecoveryAudioFile``) and a screen take's marks (below).
+  const releaseCaptureSpool = (): void => {
+    if (deferredSinkDestroy) void deferredSinkDestroy.destroy();
+  };
+  audioPersistence = savedAudioFile
+    ? startAudioPersistence({
+      archiveDir: sessionArchiveDir,
+      save: (tryArchiveDir) => saveRecordingText({
+        archiveDir: tryArchiveDir,
+        title: provisionalTitle,
+        sourceText: latestSourceForSave(),
+        transcriptText: "",
+        provider: metadataProvider,
+        model: modelValue,
+        language: languageValue,
+        recordingCollection,
+        audioFile: savedAudioFile,
+        liveSessionId: liveSessionId,
+        screenSessionId: stagedScreenManifest?.id || undefined,
+        recordedAtMs: takeStartedAt,
+        refreshList: false,
+      }),
+      onAttemptFailed: (tryArchiveDir, e) => {
+        console.warn(`Audio persistence attempt failed (archiveDirSet=${String(tryArchiveDir || "").trim() ? "1" : "0"}, fileSize=${savedAudioFile?.size || 0}, fileNameLen=${String(savedAudioFile?.name || "").length})`, e);
+      },
+      releaseSpool: releaseCaptureSpool,
+    })
+    : skippedAudioPersistence(releaseCaptureSpool);
+  const audioSaveStartedAt = performance.now();
+  // What the save's outcome changes, applied the moment it settles — which
+  // may be after the transcript was pasted. Nothing here may throw into
+  // the stop: a failure is a warning, never an unhandled rejection.
+  audioSaveApplied = audioPersistence.settled.then((outcome) => {
+    try {
+      if (outcome.kind === "skipped") return;
+      console.log(
+        `[trace stopLive] audio save ${outcome.kind} durMs=${(performance.now() - audioSaveStartedAt).toFixed(0)}` +
+        (outcome.kind === "saved" ? ` fallbackDir=${outcome.usedFallbackDir ? 1 : 0}` : ""),
+      );
+      if (outcome.kind === "saved" && savedAudioFile) {
+        const persisted = outcome.persisted;
         persistedRecordingName = persisted.name;
         persistedRecordingArchiveDir = persisted.archiveDir;
-        screenManifest = transcriptScreenManifest(
-          parseScreenManifest(persisted.screensManifest),
-          stagedScreenManifest,
-          persisted.screensError || "",
-        );
+        if (stagedScreenManifest) {
+          screenManifest = transcriptScreenManifest(
+            parseScreenManifest(persisted.screensManifest),
+            stagedScreenManifest,
+            persisted.screensError || "",
+          );
+        }
         setCurrentRecordingAudio(savedAudioFile, persistedRecordingName, persistedRecordingArchiveDir, sessionUiToken);
         // No separate recovery discard (BL-16): the save carried
         // ``liveSessionId``, and the backend discards that session's
@@ -12718,62 +12837,55 @@ async function stopLive(
         // WebSocket handler still owns the spool (BL-01,
         // ``_safe_delete_live_recovery``). The extra POST answered
         // ``deleted:false`` on 1 583 of 1 591 sessions.
-        const fallbackNote = tryArchiveDir !== sessionArchiveDir && sessionArchiveDir
-          ? " (saved to default folder — configured archive was unavailable)"
+        //
+        // Only the entry's name is patched: the save may land after the
+        // transcript's own status, which it must not overwrite.
+        patchCurrentRecordingSummary({ savedName: persistedRecordingName }, sessionUiToken);
+        const fallbackNote = outcome.usedFallbackDir
+          ? " It was saved to the default folder — the configured archive was unavailable."
           : "";
-        patchCurrentRecordingSummary({
-          title: provisionalTitle,
-          status: (enhance && transcribeInputFile ? "Audio saved locally. Starting final transcription." : "Audio saved locally.") + fallbackNote,
-          tone: "success",
-          savedName: persistedRecordingName,
-        }, sessionUiToken);
         if (persisted.screensError) {
           // M3: saved, but not whole — said, not swallowed, and the
           // transcript gets no marks pointing at the swept staging folder.
           console.warn(`[trace screen] screenshots not attached: ${persisted.screensError}`);
           showRecordSessionNotice(
-            `Recording audio is saved, but its screenshots could not be attached (${persisted.screensError}). The transcript has no screen marks.`,
+            `Recording audio is saved, but its screenshots could not be attached (${persisted.screensError}). The transcript has no screen marks.${fallbackNote}`,
             "warning",
             UI_TOKENS.notice.longMs,
             sessionUiToken,
           );
         } else {
           showRecordSessionNotice(
-            "Recording audio is saved and available immediately.",
-            "success",
-            UI_TOKENS.notice.briefMs,
+            `Recording audio is saved and available immediately.${fallbackNote}`,
+            fallbackNote ? "warning" : "success",
+            fallbackNote ? UI_TOKENS.notice.longMs : UI_TOKENS.notice.briefMs,
             sessionUiToken,
           );
         }
-        saveDone = true;
-      } catch (e) {
-        const errMsg = e instanceof Error ? e.message : String(e || "");
-        console.warn(`Audio persistence attempt failed (archiveDirSet=${String(tryArchiveDir || "").trim() ? "1" : "0"}, fileSize=${savedAudioFile?.size || 0}, fileNameLen=${String(savedAudioFile?.name || "").length})`, e);
-        if (tryArchiveDir === "" || saveDirs.length === 1) {
-          // Both attempts failed — truly broken. Surface the ACTUAL
-          // backend error message instead of a generic "check folder
-          // permissions" hint that masks the real cause. The previous
-          // text said the same thing for a Windows path-too-long, an
-          // antivirus block, a 413 oversize, a 5xx backend crash, or a
-          // genuine permission denial — all five looked identical to
-          // the user. Now we name the underlying error verbatim and
-          // append the permission hint as a fallback when the message
-          // is empty (rare; only fires on `String(e)` of a bare object).
-          const detail = errMsg.trim()
-            || "unknown error — check the Recordings folder permissions";
-          patchCurrentRecordingSummary({
-            title: provisionalTitle,
-            status: `Audio capture finished, but save failed: ${detail}`,
-            tone: "error",
-          }, sessionUiToken);
-        }
+        return;
       }
+      if (outcome.kind === "failed") {
+        // Both attempts failed — truly broken. Name the ACTUAL backend
+        // error (a path-too-long, an antivirus block, a 413, a 5xx and a
+        // permission denial used to read the same), with the permission
+        // hint only when the error carries no message at all. Said as a
+        // notice as well as in the summary: the save can settle after the
+        // transcript's status, and the summary alone would be overwritten
+        // by the stop's last word.
+        const detail = outcome.message || "unknown error — check the Recordings folder permissions";
+        const status = `Audio capture finished, but save failed: ${detail}`;
+        patchCurrentRecordingSummary({ title: provisionalTitle, status, tone: "error" }, sessionUiToken);
+        showRecordSessionNotice(status, "error", UI_TOKENS.notice.longMs, sessionUiToken);
+      }
+    } catch (e) {
+      console.warn("[trace stopLive] applying the audio save outcome failed", e);
     }
-  }
-  // NOW safe to destroy the OPFS spool file — saveRecordingText above
-  // has already serialized the File blob into the FormData upload.
-  if (deferredSinkDestroy) {
-    void deferredSinkDestroy.destroy();
+  });
+  // Screen mode: the marks are written from the ARCHIVED manifest, so the
+  // paths in the transcript are the screenshots' permanent ones — a
+  // screen take's transcript waits for the save that moves them.
+  if (stagedScreenManifest) {
+    await audioSaveApplied;
   }
 
   // Screen mode: the strokes and screenshots of this take, from the
@@ -12896,8 +13008,9 @@ async function stopLive(
     // PREFERS the backend re-fetch over the in-memory ``transcribe
     // InputFile``. The in-memory file is the lazy ``Blob([header,
     // OPFS-spool])`` from ``OpfsPcmSink.finalize()``; once
-    // ``deferredSinkDestroy.destroy()`` runs (which already happened
-    // earlier in this function), the spool is gone
+    // ``deferredSinkDestroy.destroy()`` runs (the moment the audio save
+    // lands — ./audio-persistence; a failed save keeps the spool until
+    // the stop is over), the spool is gone
     // and the lazy blob reads as zero bytes — uploads succeed with a
     // 200 status but the backend gets an empty payload, ffmpeg
     // raises "invalid data", and BOTH provider paths fail
@@ -12915,6 +13028,9 @@ async function stopLive(
     // was never persisted (extremely rare — stopLive's two-attempt
     // save with default-dir fallback covers nearly every failure).
     const fetchRecoveryAudioFile = async (): Promise<File | null> => {
+      // The save runs beside the transcript wait: the saved file exists
+      // (or is known not to) only once it has settled.
+      await audioSaveApplied;
       if (persistedRecordingName) {
         try {
           return await fetchSavedAudioFromBackend(
@@ -12960,6 +13076,7 @@ async function stopLive(
         ? LIVE_SHORT_EMPTY_RECOVERY_TIMEOUT_MS
         : LIVE_DEFAULT_EMPTY_RECOVERY_TIMEOUT_MS;
     const recoverFromEmptyTranscriptInner = async (reason: string, signal?: AbortSignal): Promise<string> => {
+      await audioSaveApplied;
       console.log(`[trace recover] enter reason="${reason}" persistedRecordingName="${persistedRecordingName}" hasInMemoryFile=${!!transcribeInputFile}`);
       const decoded = await decodeSavedRecording({
         name: persistedRecordingName,
@@ -13448,6 +13565,11 @@ async function stopLive(
     // Keep this final assignment as the crash-proof fallback for exceptions
     // before that release point; `isBusy` is released only after the full
     // stop/transcribe pipeline completes.
+    //
+    // The capture spool outlives a FAILED audio save until here: the
+    // recovery paths above may still read the in-memory file it backs.
+    // A saved take released it the moment the save landed.
+    audioPersistence.releaseSpoolWhenDone();
     if (stopTransitionOwnerToken === stopTransitionToken) {
       stopTransitionInFlight = false;
       stopTransitionOwnerToken = "";

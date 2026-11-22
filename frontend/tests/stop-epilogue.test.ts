@@ -325,6 +325,30 @@ describe("createSessionMetadataSaver — the History entry a stop writes", () =>
     expect(await failed.save({ spokenTranscript: "a", transcriptText: "a", provider: "p" }))
       .toEqual({ kind: "failed", message: "disk full" });
   });
+
+  it("waits for an asynchronous target: the metadata lands on the entry the audio save creates, never a second one", async () => {
+    // The audio save runs beside the transcript wait (./audio-persistence),
+    // so the entry's name is known only once it lands.
+    let landAudioSave: (ref: { name: string; archiveDir: string }) => void = () => {};
+    const audioSaved = new Promise<{ name: string; archiveDir: string }>((resolve) => { landAudioSave = resolve; });
+    const requests: SessionSaveRequest[] = [];
+    const save = createSessionMetadataSaver({
+      target: () => audioSaved,
+      liveSourceText: () => "",
+      fallbackTitle: "Recording",
+      save: async (request) => { requests.push(request); },
+      classify,
+    });
+    const outcome = save({ spokenTranscript: "words said", transcriptText: "words said", provider: "deepgram" });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(requests).toHaveLength(0);
+    landAudioSave({ name: "rec-late", archiveDir: "/archive" });
+    expect(await outcome).toEqual({ kind: "saved" });
+    expect(requests).toHaveLength(1);
+    expect(requests[0].name).toBe("rec-late");
+    expect(requests[0].requireExisting).toBe(true);
+  });
 });
 
 describe("resolveSessionTitle — titles come from what was SAID", () => {

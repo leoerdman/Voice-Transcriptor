@@ -221,6 +221,30 @@ describe("stopLive has exactly one transcript delivery site (F/7 / U-022)", () =
     expect(String(finalSave)).toMatch(/transcriptText:\s*transcriptRaw,/);
   });
 
+  it("the audio save runs beside the transcript wait: the FINAL delivery never waits for it (OPTIMIZATION.md §3.1)", () => {
+    expect(stopLiveBody).toContain("startAudioPersistence({");
+    // No inline two-attempt upload left on the stop path.
+    expect(stopLiveBody).not.toMatch(/await saveRecordingText\(\{[^}]*audioFile/);
+    expect(stopLiveBody).not.toMatch(/await audioPersistence\.settled/);
+    // Only the steps that consume the saved recording wait for the save:
+    // the metadata write's target, the recovery decode of the saved file,
+    // and a screen take's marks (archived screenshot paths).
+    const allowed = [
+      "if (stagedScreenManifest) {",
+      "const fetchRecoveryAudioFile = async",
+      "const recoverFromEmptyTranscriptInner = async",
+      "target: async () => {",
+    ];
+    const waits = [...stopLiveBody.matchAll(/await audioSaveApplied;/g)];
+    expect(waits.length).toBe(allowed.length);
+    for (const wait of waits) {
+      const before = stopLiveBody.slice(Math.max(0, (wait.index ?? 0) - 400), wait.index);
+      expect(allowed.some((ctx) => before.includes(ctx)), `unexpected wait for the audio save: …${before.slice(-160)}`).toBe(true);
+    }
+    // The spool outlives a failed save until the stop is completely over.
+    expect(mainTsx).toContain("audioPersistence.releaseSpoolWhenDone();");
+  });
+
   it("FL-04: every exit ends the mic-health session through the one session-ending step", () => {
     const endBlock = /const endStopSession = \(\): void => \{([\s\S]*?)\n {2}\};/.exec(stopLiveBody)?.[1];
     expect(endBlock, "endStopSession not found in stopLive").toBeTruthy();
@@ -551,6 +575,35 @@ describe("boot, update check and History bootstrap (FQ-13/FQ-14/FQ-15/FQ-22)", (
     // One clear, gated by FG-08, and only once the draft's text is saved.
     expect(recover.match(/mayClearRecoveredDraft\(sessionId, liveDraftSlotWrittenThisRun\)/g) || []).toHaveLength(1);
     expect(recover).toContain("if (draft && draftSaved) {");
+  });
+
+  it("the start waits only for the archive folder: the draft read and the capture storage run beside the socket and the microphone (OPTIMIZATION.md §3.4)", () => {
+    const start = mainTsxSlice("async function startLive(", "\nasync function ");
+    expect(start).not.toMatch(/await createPcmSink\(/);
+    expect(start).not.toMatch(/await Promise\.race\(\[readStaleLiveDraftOnce\(\)/);
+    expect(start).toContain("pcmSink = new DeferredPcmSink(");
+    // The socket is requested before the microphone is asked for.
+    expect(start.indexOf("new WebSocket(")).toBeGreaterThan(0);
+    expect(start.indexOf("new WebSocket(")).toBeLessThan(start.indexOf('markStartPhase("getUserMedia")'));
+    // The phases stay visible in the start line.
+    for (const phase of ["archiveReady", "staleDraftRead", "pcmSink", "wsRequested"]) {
+      expect(start).toContain(`markStartPhase("${phase}")`);
+    }
+  });
+
+  it("Bluetooth → built-in mic: one setting, on by default, decided by chooseCaptureDevice on both start paths", () => {
+    expect(html).toMatch(/id="bluetoothBuiltinMicToggle" checked \/>/);
+    expect(mainTsxSlice("function collectUiPreferences(", "\n}\n")).toContain("bluetooth_builtin_mic: readBluetoothBuiltinMicEnabled(),");
+    expect(mainTsx).toContain('($("bluetoothBuiltinMicToggle") as HTMLInputElement).checked = ui.bluetooth_builtin_mic !== false;');
+    const start = mainTsxSlice("async function startLive(", "\nasync function ");
+    // The warm path reuses the hold only for the device the choice names;
+    // the cold path chooses again on the freshly enumerated list.
+    expect(start).toContain("const warm = takeWarmCapture(micChoice.deviceId);");
+    expect(start).toContain("stream = await acquireMicStream(micChoice.deviceId);");
+    expect(start.match(/chooseCaptureDevice\(\{/g) || []).toHaveLength(2);
+    expect(start).toContain("choice=${micChoice.reason}");
+    // A hot-plugged headset refreshes the list the next choice uses.
+    expect(mainTsx).toMatch(/"devicechange", \(\) => \{\s*releaseWarmCaptureOnLifecycle\("devicechange"\);[\s\S]{0,200}void loadMics\(false\);/);
   });
 
   it("a crashed take's draft is joined with the entry its audio was promoted into (./take-recovery)", () => {

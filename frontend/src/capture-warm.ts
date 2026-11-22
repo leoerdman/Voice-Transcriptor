@@ -142,6 +142,97 @@ export function decideWarmHold(input: WarmHoldInput): WarmHoldDecision {
   return { hold: true, reason: "held" };
 }
 
+/** One `audioinput` entry of `enumerateDevices()`. */
+export interface InputDeviceInfo {
+  deviceId: string;
+  label: string;
+}
+
+export interface CaptureDeviceInput {
+  /** The picker's value: "" means "system default". */
+  requestedDeviceId: string;
+  /** The setting "record from the built-in microphone while Bluetooth
+   *  headphones are the default" (preferences.ui.bluetooth_builtin_mic). */
+  preferBuiltInOverBluetooth: boolean;
+  /** The current `audioinput` list, in `enumerateDevices()` order. */
+  devices: readonly InputDeviceInfo[];
+}
+
+export interface CaptureDeviceChoice extends CaptureDecision {
+  /** What `getUserMedia` is asked for: "" (or the "default" alias) = the
+   *  system default. */
+  deviceId: string;
+  /** The device's label, for the support log ("" when unknown). */
+  label: string;
+}
+
+/** Chromium's aliases for "whatever the system picks", not devices. */
+const DEVICE_ALIAS_IDS = new Set(["default", "communications"]);
+
+/**
+ * Is this the Mac's own microphone? Chromium on macOS names devices with
+ * their transport in parentheses — "MacBook Pro Microphone (Built-in)",
+ * "Leo Liberty 5 BT (Bluetooth)" — which is the signal used first; the
+ * bare product names are the fallback for a shell that omits it.
+ */
+export function isBuiltInInputLabel(label: string): boolean {
+  const normalized = String(label ?? "").trim().toLowerCase();
+  if (!normalized || isBluetoothInputLabel(normalized)) return false;
+  return normalized.includes("(built-in)")
+    || normalized.includes("built-in microphone")
+    || /\b(macbook|imac)\b.*\bmicrophone\b/.test(normalized);
+}
+
+/**
+ * Which microphone a cold start records from.
+ *
+ * Bluetooth headphones cannot be warm-held (``decideWarmHold``: an open
+ * Bluetooth input forces the headset into the Hands-Free Profile), so a
+ * user whose system default input is their headset started every take
+ * cold — 22 of 173 takes on 22.11 logged ``warm hold=0 reason=bluetooth``.
+ * With the setting on (the default) and the system default being a
+ * Bluetooth input, the take records from the Mac's built-in microphone
+ * instead: the headset stays in high-quality A2DP playback, and the
+ * built-in input can be warm-held and pre-rolled like any other.
+ *
+ * What it never overrides:
+ *  - a device the user picked by name in the list — their choice;
+ *  - a non-Bluetooth default (USB, built-in, virtual);
+ *  - a machine with no built-in microphone (Mac mini / Studio / Pro):
+ *    the Bluetooth default is all there is, recorded as before.
+ *
+ * Every verdict carries a reason code for the one start log line.
+ */
+export function chooseCaptureDevice(input: CaptureDeviceInput): CaptureDeviceChoice {
+  const requested = String(input.requestedDeviceId || "").trim();
+  const devices = input.devices || [];
+  // The list's "Default - <name>" entry is the system default by another
+  // name, not a device the user pinned.
+  if (requested && !DEVICE_ALIAS_IDS.has(requested)) {
+    const picked = devices.find((d) => d.deviceId === requested);
+    return { deviceId: requested, label: picked?.label || "", reason: "picked" };
+  }
+  // The system default: Chromium lists it first as the "default" alias
+  // ("Default - <name>"); without the alias, the first entry is it.
+  const systemDefault = devices.find((d) => d.deviceId === "default") || devices[0];
+  const defaultLabel = systemDefault?.label || "";
+  // Every "default" verdict passes the request through unchanged ("" or
+  // the alias), so the device asked for is exactly what it always was.
+  if (!input.preferBuiltInOverBluetooth) {
+    return { deviceId: requested, label: defaultLabel, reason: "default" };
+  }
+  // No label means no permission yet (or no devices): nothing to judge
+  // by, so the default stands — never a guess that moves the input.
+  if (!defaultLabel.trim() || !isBluetoothInputLabel(defaultLabel)) {
+    return { deviceId: requested, label: defaultLabel, reason: "default" };
+  }
+  const builtIn = devices.find((d) => !DEVICE_ALIAS_IDS.has(d.deviceId) && isBuiltInInputLabel(d.label));
+  if (!builtIn) {
+    return { deviceId: requested, label: defaultLabel, reason: "bluetooth-default-no-built-in" };
+  }
+  return { deviceId: builtIn.deviceId, label: builtIn.label, reason: "bluetooth-default-built-in" };
+}
+
 /**
  * The lifecycle events that end a warm hold, and why each one does.
  *

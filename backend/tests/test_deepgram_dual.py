@@ -718,6 +718,47 @@ class DualLiveSessionFanOutTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(getattr(primary, f"{method}_called"))
             self.assertTrue(getattr(secondary, f"{method}_called"))
 
+    async def test_both_sockets_close_at_once_not_back_to_back(self):
+        # The secondary's shutdown can only finish once the primary's has
+        # STARTED: run back to back (secondary first, as it used to), the
+        # primary never starts and the wait times out.
+        primary, secondary = _primary(), _secondary()
+        primary_started = asyncio.Event()
+
+        async def primary_shutdown(wait_timeout: float = 3.0) -> None:
+            primary_started.set()
+            primary.shutdown_called = True
+
+        async def secondary_shutdown(wait_timeout: float = 3.0) -> None:
+            await asyncio.wait_for(primary_started.wait(), timeout=1.0)
+            secondary.shutdown_called = True
+
+        primary.shutdown = primary_shutdown  # type: ignore[method-assign]
+        secondary.shutdown = secondary_shutdown  # type: ignore[method-assign]
+        dual = DualLiveSession(primary, secondary, secondary_language="ru")
+        await dual.shutdown()
+        self.assertTrue(primary.shutdown_called)
+        self.assertTrue(secondary.shutdown_called)
+
+    async def test_teardown_raises_the_primarys_failure_and_ignores_the_secondarys(self):
+        primary, secondary = _primary(), _secondary()
+
+        async def failing(**_kw) -> None:
+            raise RuntimeError("socket gone")
+
+        secondary.close = failing  # type: ignore[method-assign]
+        dual = DualLiveSession(primary, secondary, secondary_language="ru")
+        await dual.close()
+        self.assertTrue(primary.close_called)
+
+        primary2, secondary2 = _primary(), _secondary()
+        primary2.close = failing  # type: ignore[method-assign]
+        dual2 = DualLiveSession(primary2, secondary2, secondary_language="ru")
+        with self.assertRaises(RuntimeError):
+            await dual2.close()
+        # The secondary was still closed: one failure never leaks the other socket.
+        self.assertTrue(secondary2.close_called)
+
     async def test_replace_primary_swaps_only_the_primary(self):
         primary, secondary = _primary(), _secondary()
         dual = DualLiveSession(primary, secondary, secondary_language="ru")

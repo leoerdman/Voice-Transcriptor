@@ -9082,6 +9082,11 @@ async def _save_recording_audio_source(
     for a screen take — whose renderer sends its first audio sample — it is
     also the clock its screen marks are placed by (``audioStartedAt``).
     """
+    # Phase timings for the one line logged at the end: a slow save is
+    # told apart as transfer/parse (before this handler runs — the line's
+    # ``total`` stays small), the copy, the fsync'd promote, or the
+    # filing step (screenshots, registry, retention scan).
+    started = time.perf_counter()
     raw_existing_name = str(name or "").strip()
     existing_name = _recording_text_name_leaf(raw_existing_name) if raw_existing_name else ""
     fields = _normalize_save_fields(
@@ -9174,9 +9179,14 @@ async def _save_recording_audio_source(
             spoken_text=fields.spoken_text,
         )
 
+    write_ms = place_ms = 0.0
     try:
+        phase = time.perf_counter()
         await write_tmp_audio(tmp_audio)
+        write_ms = (time.perf_counter() - phase) * 1000.0
+        phase = time.perf_counter()
         await asyncio.to_thread(_place_audio_and_text)
+        place_ms = (time.perf_counter() - phase) * 1000.0
         save_completed = True
     except BaseException:
         # Any failure after the prior audio backup was moved aside must
@@ -9236,8 +9246,18 @@ async def _save_recording_audio_source(
         # delete its own audio — but it still counts toward a count limit.
         return manifest, adopt_error, _prune_recording_audio(target_dir, keep_stems=(stem,))
 
+    phase = time.perf_counter()
     screens_manifest, screens_error, pruned = await asyncio.to_thread(_file_the_saved_recording)
+    file_ms = (time.perf_counter() - phase) * 1000.0
     _invalidate_recordings_cache()
+    logger.info(
+        "recording save timing: total=%.0fms write=%.0fms place=%.0fms file=%.0fms pruned=%d",
+        (time.perf_counter() - started) * 1000.0,
+        write_ms,
+        place_ms,
+        file_ms,
+        pruned,
+    )
     # Atomically discard the live recovery spool now that the audio is
     # safely on disk. This closes the race window between a successful
     # save and the separate /api/live/recoveries/{id}/discard call that
