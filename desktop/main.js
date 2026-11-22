@@ -213,6 +213,7 @@ const {
   RECORDING_STATUS_KIND,
   recordingStatusIsLive,
   recordingStatusPresentation,
+  micWakeTransition,
 } = require("./recording-status");
 const {
   IMPORT_CHECK_TIMEOUT_MS,
@@ -1866,6 +1867,16 @@ function recordingStatusCapsuleHtml() {
       border-color: rgba(255,196,74,.66);
       animation: okHalo .8s ease-out infinite;
     }
+    /* The take runs but the microphone has not woken (a Bluetooth headset
+       switching profile): the recording square, dimmed and amber, with no
+       halo — it is not recording sound yet. */
+    #stateIcon.waking::before {
+      width: 8px;
+      height: 8px;
+      background: rgba(214,170,120,.9);
+      border-radius: 2.5px;
+      animation: coreBreathe 1.35s ease-in-out infinite;
+    }
     #stateIcon.ok::before {
       background: rgba(112,210,136,.96);
       box-shadow: 0 0 8px rgba(112,210,136,.4);
@@ -1979,6 +1990,10 @@ function recordingStatusCapsuleHtml() {
       const ss = String(total % 60).padStart(2, "0");
       return mm + ":" + ss;
     }
+    /** A running take: the wave follows the level and a click stops it. */
+    function waveIsLive() {
+      return waveMode === "recording" || waveMode === "waking" || waveMode === "autostop";
+    }
     function applyStatusMode(mode) {
       const next = String(mode || "idle");
       const nextWaveMode = next === "upscaling"
@@ -1987,16 +2002,20 @@ function recordingStatusCapsuleHtml() {
           ? "transcribing"
           : next === "autostop"
             ? "autostop"
-            : next === "recording"
-              ? "recording"
-              : "idle";
+            : next === "waking"
+              ? "waking"
+              : next === "recording"
+                ? "recording"
+                : "idle";
       if (nextWaveMode !== waveMode) {
         waveMode = nextWaveMode;
-        activeWave = waveMode === "recording" || waveMode === "autostop";
+        activeWave = waveIsLive();
       }
       const nextClass = next === "recording"
         ? "rec"
-        : next === "upscaling"
+        : next === "waking"
+          ? "waking"
+          : next === "upscaling"
           ? "upscaling"
           : next === "transcribing"
             ? "transcribing"
@@ -2022,6 +2041,7 @@ function recordingStatusCapsuleHtml() {
     function waveColor() {
       if (waveMode === "recording") return "rgba(255,77,77,.88)";
       if (waveMode === "autostop") return "rgba(255,196,74,.92)";
+      if (waveMode === "waking") return "rgba(214,170,120,.8)";
       if (waveMode === "transcribing") return "rgba(114,174,255,.92)";
       if (waveMode === "upscaling") return "rgba(173,112,255,.92)";
       return "rgba(170,170,170,.62)";
@@ -2061,7 +2081,7 @@ function recordingStatusCapsuleHtml() {
     }
     /** The level of the bar whose tick has just come due. */
     function nextBarLevel() {
-      if (waveMode === "recording" || waveMode === "autostop") {
+      if (waveIsLive()) {
         return barLevel(state.level);
       }
       const idle = activeWave
@@ -2156,7 +2176,7 @@ function recordingStatusCapsuleHtml() {
       // Leaving it out would make the one state where the user is most
       // likely to reach for the capsule the one where clicking does
       // nothing.
-      if (waveMode === "recording" || waveMode === "autostop") {
+      if (waveIsLive()) {
         event.stopPropagation();
         window.__capsule.stop();
       }
@@ -2872,11 +2892,13 @@ function startRecordingStateMonitor() {
           const rms = Number(window.__transcriptorRmsLevel || 0);
           const lastFrameAt = Number(window.__transcriptorLastFrameAt || 0);
           const isRec = !!window.__transcriptorIsRecording;
+          const waking = !!window.__transcriptorMicWaking;
           return {
             vu: Number.isFinite(vu) ? vu : 0,
             rms: Number.isFinite(rms) ? rms : 0,
             lastFrameAt: Number.isFinite(lastFrameAt) ? lastFrameAt : 0,
-            isRec
+            isRec,
+            waking
           };
         })();`,
         true
@@ -2888,6 +2910,22 @@ function startRecordingStateMonitor() {
         const isRec = !!state?.isRec;
         const now = Date.now();
         recordingStatusCapsuleState.level = safeLevel;
+        // The microphone has delivered only digital silence so far (a
+        // Bluetooth headset switching profile): the capsule says so rather
+        // than "recording", and goes back when sound arrives.
+        const wakeChange = isRec && !recordingStopInFlight
+          ? micWakeTransition(
+              recordingStatusPresentation(
+                recordingStatusCapsuleState.status,
+                recordingStatusCapsuleState.kind,
+              ).kind,
+              !!state?.waking,
+            )
+          : null;
+        if (wakeChange) {
+          appendMainLog(`[recording-capsule] microphone ${wakeChange.kind === RECORDING_STATUS_KIND.WAKING ? "waking" : "awake"}`);
+          void publishRecordingStatus(wakeChange.status, wakeChange.kind).catch(() => { });
+        }
         if (recordingStatusWindow && !recordingStatusWindow.isDestroyed() && recordingStatusWindow.isVisible()) {
           const shouldPublishLevel =
             recordingStatusCapsuleLastLevelSent < 0 ||

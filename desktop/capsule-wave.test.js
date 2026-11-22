@@ -212,3 +212,26 @@ test("the bars keep running through a change of mode, a level jump and a stalled
   const step = tokens.waveBarWidth + tokens.waveBarGap;
   for (const gap of gaps) assert.ok(Math.abs(gap - step) < 1e-6, `gap ${gap} is one step after a stall`);
 });
+
+test("a waking microphone is drawn as its own state: its icon, a dimmed wave that still follows the level", () => {
+  // The take runs but the headset has delivered only digital silence
+  // (frontend/src/mic-wake.ts, desktop/recording-status.js ``waking``).
+  const capsule = loadCapsule();
+  capsule.setState({ status: "Recording", mode: "recording", level: 0.8, startedAt: 1000 });
+  for (let i = 0; i < 4; i += 1) capsule.step();
+  assert.ok(capsule.element("stateIcon").classList.contains("rec"));
+  capsule.setState({ status: "Microphone waking", mode: "waking", level: 0.8, startedAt: 1000 });
+  for (let i = 0; i < 4; i += 1) capsule.step(100);
+  const icon = capsule.element("stateIcon");
+  assert.ok(icon.classList.contains("waking"), "its own icon class");
+  assert.ok(!icon.classList.contains("rec"), "not the recording one");
+  const line = capsule.draws.find((d) => d.h === tokens.waveBaselineHeight);
+  assert.ok(line, "the line still runs: the take is live");
+  assert.ok(!/^rgba\(255,77,77,/.test(line.color), "and it is not the recording red");
+  const css = /<style>([\s\S]*)<\/style>/.exec(capsuleHtml())[1];
+  assert.ok(/#stateIcon\.waking::before/.test(css), "the icon has a rule");
+  assert.ok(!/#stateIcon\.waking::after[^{]*\{[^}]*animation/.test(css), "and no halo: it is not recording sound yet");
+  // Sound arrives: back to the recording look.
+  capsule.setState({ status: "Recording", mode: "recording", level: 0.2, startedAt: 1000 });
+  assert.ok(capsule.element("stateIcon").classList.contains("rec"));
+});

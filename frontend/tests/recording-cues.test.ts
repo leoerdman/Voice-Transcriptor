@@ -36,6 +36,11 @@ describe("recording cues", () => {
     expect(RECORDING_CUES.stop.endHz).toBeLessThan(RECORDING_CUES.stop.baseHz);
   });
 
+  it("ready is a higher rise than start, so the two tones never read as one", () => {
+    expect(RECORDING_CUES.ready.endHz).toBeGreaterThan(RECORDING_CUES.ready.baseHz);
+    expect(RECORDING_CUES.ready.baseHz).toBeGreaterThan(RECORDING_CUES.start.endHz);
+  });
+
   it("plays the requested tone through the destination", () => {
     const { ctx, calls } = fakeContext();
     const play = createRecordingCuePlayer(() => ctx);

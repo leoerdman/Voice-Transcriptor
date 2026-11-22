@@ -868,3 +868,23 @@ describe("the capsule waveform's display gain", () => {
     expect(mainTsx.match(/__transcriptorVuLevel = [^;]*vuAmplify/g)?.length).toBe(2);
   });
 });
+
+describe("the microphone's wake state (./mic-wake)", () => {
+  it("the renderer publishes it and the main process's capsule probe is its one reader", () => {
+    expect(mainTsx).toContain("window.__transcriptorMicWaking = true;");
+    expect(mainTsx).toContain("window.__transcriptorMicWaking = false;");
+    expect(desktopMain).toContain("window.__transcriptorMicWaking");
+    expect(desktopMain).toContain("micWakeTransition(");
+  });
+
+  it("is fed by every captured frame, from the frame's own peak", () => {
+    expect(mainTsx).toContain("const wake = micWake.observe(peak, frameMs);");
+    // The tracker is reset at the press, with the first-frame bookkeeping.
+    expect(mainTsx).toContain("micWake = createMicWakeTracker();");
+  });
+
+  it("sounds the ready tone only on the wake, never at the press", () => {
+    expect(mainTsx.match(/playRecordingCue\("ready"\)/g)).toHaveLength(1);
+    expect(mainTsxSlice("if (wake.justWoke) {", "const frameIsSpeech")).toContain('playRecordingCue("ready")');
+  });
+});

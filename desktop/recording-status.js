@@ -37,6 +37,13 @@ const RECORDING_STATUS_KIND = Object.freeze({
   IDLE: "idle",
   STARTING: "starting",
   RECORDING: "recording",
+  /**
+   * The take is running but its microphone has delivered only digital
+   * silence so far (a Bluetooth headset switching to its call profile).
+   * Whatever is said now is not in the recording; the capsule says so
+   * instead of "recording" (frontend/src/mic-wake.ts).
+   */
+  WAKING: "waking",
   /** Silence countdown running: the take will stop unless the user speaks. */
   AUTOSTOP: "autostop",
   TRANSCRIBING: "transcribing",
@@ -57,6 +64,7 @@ const RECORDING_STATUS_PRESENTATION = Object.freeze({
   [RECORDING_STATUS_KIND.IDLE]: Object.freeze({ mode: "idle", tone: "neutral" }),
   [RECORDING_STATUS_KIND.STARTING]: Object.freeze({ mode: "recording", tone: "recording" }),
   [RECORDING_STATUS_KIND.RECORDING]: Object.freeze({ mode: "recording", tone: "recording" }),
+  [RECORDING_STATUS_KIND.WAKING]: Object.freeze({ mode: "waking", tone: "warning" }),
   [RECORDING_STATUS_KIND.AUTOSTOP]: Object.freeze({ mode: "autostop", tone: "warning" }),
   [RECORDING_STATUS_KIND.TRANSCRIBING]: Object.freeze({ mode: "transcribing", tone: "processing" }),
   [RECORDING_STATUS_KIND.UPSCALING]: Object.freeze({ mode: "upscaling", tone: "processing" }),
@@ -69,6 +77,7 @@ const RECORDING_STATUS_PRESENTATION = Object.freeze({
 const LIVE_RECORDING_KINDS = Object.freeze([
   RECORDING_STATUS_KIND.STARTING,
   RECORDING_STATUS_KIND.RECORDING,
+  RECORDING_STATUS_KIND.WAKING,
   RECORDING_STATUS_KIND.AUTOSTOP,
 ]);
 
@@ -160,6 +169,29 @@ function recordingStatusPresentation(status, kind = "") {
   return { kind: resolved, ...RECORDING_STATUS_PRESENTATION[resolved] };
 }
 
+/** What the capsule says while the take's microphone has not woken. */
+const MIC_WAKING_STATUS = "Microphone waking";
+
+/**
+ * Does the microphone's wake state change what the capsule shows?
+ *
+ * The renderer reports one fact — the take has heard only digital silence
+ * so far (`waking`). Only a plain recording turns into "waking" and back:
+ * an auto-stop countdown, a transcribing/terminal state or a status that
+ * is not about this take keeps what it shows. Returns the status to
+ * publish, or null when nothing changes.
+ */
+function micWakeTransition(currentKind, waking) {
+  const K = RECORDING_STATUS_KIND;
+  if (waking && currentKind === K.RECORDING) {
+    return { status: MIC_WAKING_STATUS, kind: K.WAKING };
+  }
+  if (!waking && currentKind === K.WAKING) {
+    return { status: "Recording", kind: K.RECORDING };
+  }
+  return null;
+}
+
 /** Does the capsule run its timer and waveform for this kind? */
 function recordingStatusIsLive(kind) {
   return LIVE_RECORDING_KINDS.includes(kind);
@@ -174,4 +206,6 @@ module.exports = {
   classifyRecordingStatusText,
   recordingStatusPresentation,
   recordingStatusIsLive,
+  MIC_WAKING_STATUS,
+  micWakeTransition,
 };

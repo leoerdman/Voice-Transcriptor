@@ -15,6 +15,7 @@ import {
 } from "./audio-levels";
 import { decideLiveTranscriptAdoption } from "./live-coverage";
 import { playRecordingCue, recordingCueLengthMs } from "./recording-cues";
+import { createMicWakeTracker } from "./mic-wake";
 import { StopTailWait, VoiceTimeline, type StopTailOutcome } from "./stop-tail";
 import { captureInputLatency, type CaptureLatency } from "./capture-latency";
 import { WorkletDeliveryWatchdog } from "./worklet-watchdog";
@@ -801,6 +802,12 @@ declare global {
     __transcriptorRmsLevel?: number;
     __transcriptorLastFrameAt?: number;
     __transcriptorIsRecording?: boolean;
+    /**
+     * The take's microphone has delivered only digital silence so far
+     * (./mic-wake). Read by the desktop shell's level probe: the capsule
+     * says so instead of "recording".
+     */
+    __transcriptorMicWaking?: boolean;
     __transcriptorLastFinishedText?: string;
     __transcriptorCurrentRecordingId?: number;
     __transcriptorLastUiFinalText?: string;
@@ -10190,6 +10197,9 @@ let liveStartAttemptSeq = 0;
 let startTimings: Array<[string, number]> = [];
 let startT0 = 0;
 let startFirstFrameSeen = false;
+// Whether this take's microphone has woken yet (./mic-wake). Reset at the
+// press; fed by every captured frame.
+let micWake = createMicWakeTracker();
 function markStartPhase(label: string): void {
   if (startT0 <= 0 || startFirstFrameSeen) return;
   startTimings.push([label, performance.now() - startT0]);
@@ -11487,6 +11497,24 @@ function pushCapturedFrame(input: Float32Array, preRollMs = 0): void {
   // silence?" question the capture path asks is answered against it
   // (./audio-levels). The per-frame verdict feeds the stop tail.
   const frameMs = preRollMs > 0 ? preRollMs : ac && ac.sampleRate > 0 ? (input.length / ac.sampleRate) * 1000 : 0;
+  // A frame of exact zeros is a microphone that is not up yet, not a quiet
+  // room (./mic-wake). The capsule and the "ready" tone follow it.
+  const wake = micWake.observe(peak, frameMs);
+  if (wake.beganDead) {
+    window.__transcriptorMicWaking = true;
+    console.log(
+      `[trace startLive] first frame is digital silence — the microphone is still waking ` +
+      `warm=${sessionStartedWarm ? 1 : 0} sinceStartMs=${(performance.now() - startT0).toFixed(0)}`,
+    );
+  }
+  if (wake.justWoke) {
+    window.__transcriptorMicWaking = false;
+    console.log(
+      `[trace startLive] microphone woke: ${wake.silentMs.toFixed(0)}ms of digital silence before the first sound, ` +
+      `sinceStartMs=${(performance.now() - startT0).toFixed(0)}`,
+    );
+    console.log(`[cue] ready ${playRecordingCue("ready")}`);
+  }
   const frameIsSpeech = observeCaptureFrame(captureLevel, rms, peak, frameMs);
   voiceTimeline.push(frameMs, frameIsSpeech);
   stopTailFrameCheck?.();
@@ -11646,6 +11674,8 @@ async function startLive(
   startT0 = performance.now();
   startTimings = [];
   startFirstFrameSeen = false;
+  micWake = createMicWakeTracker();
+  window.__transcriptorMicWaking = false;
   // The start tone at the press, warm or cold (recording-cues.ts says why
   // not at the first frame).
   console.log(`[cue] start ${playRecordingCue("start")}`);
@@ -13025,6 +13055,7 @@ async function stopLive(
   // every exit path — including uncaught throws before this point.
   currentRecordingId = 0;
   window.__transcriptorIsRecording = false;
+  window.__transcriptorMicWaking = false;
   window.__transcriptorRmsLevel = 0;
   window.__transcriptorLastFrameAt = 0;
   window.__transcriptorCurrentRecordingId = 0;

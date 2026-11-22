@@ -22,6 +22,8 @@ const {
   isRecordingStatusKind,
   recordingStatusPresentation,
   recordingStatusIsLive,
+  MIC_WAKING_STATUS,
+  micWakeTransition,
 } = require("./recording-status");
 
 test("mode and tone are two views of one value and cannot disagree", () => {
@@ -46,6 +48,8 @@ test("the timer and waveform run for exactly the live kinds", () => {
   assert.equal(recordingStatusIsLive(K.RECORDING), true);
   assert.equal(recordingStatusIsLive(K.STARTING), true);
   assert.equal(recordingStatusIsLive(K.AUTOSTOP), true);
+  // A waking microphone is a running take: the timer runs and a click stops it.
+  assert.equal(recordingStatusIsLive(K.WAKING), true);
   for (const kind of [K.IDLE, K.TRANSCRIBING, K.UPSCALING, K.OK, K.WARN, K.FAIL]) {
     assert.equal(recordingStatusIsLive(kind), false, kind);
   }
@@ -142,4 +146,24 @@ test("main.js no longer carries a second status classifier", () => {
     "the tone ladder must come from ./recording-status",
   );
   assert.match(source, /require\("\.\/recording-status"\)/);
+});
+
+test("a waking microphone has its own look, not the recording one", () => {
+  const p = recordingStatusPresentation(MIC_WAKING_STATUS, K.WAKING);
+  assert.equal(p.kind, K.WAKING);
+  assert.equal(p.mode, "waking");
+  assert.notEqual(p.mode, RECORDING_STATUS_PRESENTATION[K.RECORDING].mode);
+});
+
+test("only a plain recording turns into waking and back", () => {
+  assert.deepEqual(micWakeTransition(K.RECORDING, true), { status: MIC_WAKING_STATUS, kind: K.WAKING });
+  assert.deepEqual(micWakeTransition(K.WAKING, false), { status: "Recording", kind: K.RECORDING });
+  // Nothing to change: already what the fact says.
+  assert.equal(micWakeTransition(K.RECORDING, false), null);
+  assert.equal(micWakeTransition(K.WAKING, true), null);
+  // The wake fact never repaints a state that is not about the take's start.
+  for (const kind of [K.IDLE, K.STARTING, K.AUTOSTOP, K.TRANSCRIBING, K.UPSCALING, K.OK, K.WARN, K.FAIL, ""]) {
+    assert.equal(micWakeTransition(kind, true), null, `${kind} waking`);
+    assert.equal(micWakeTransition(kind, false), null, `${kind} awake`);
+  }
 });

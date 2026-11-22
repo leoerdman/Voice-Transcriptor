@@ -9,7 +9,11 @@
  * button, auto-stop):
  *
  *  - start — the take started (at the press);
- *  - stop  — the take stopped (at the press).
+ *  - stop  — the take stopped (at the press);
+ *  - ready — the microphone woke after the press (./mic-wake): the first
+ *    sound it delivered came after dead frames, so "speak now" is later
+ *    than the start tone said. Only a Bluetooth headset coming up from
+ *    its music profile does this, for hundreds of ms and up to seconds.
  *
  * Both sound at the press, whatever the microphone. The start tone used
  * to wait for the first audio frame on a cold start, and a cold start is
@@ -33,7 +37,7 @@
  * frontend/tests/recording-cues.test.ts.
  */
 
-export type RecordingCueKind = "start" | "stop";
+export type RecordingCueKind = "start" | "stop" | "ready";
 
 export interface RecordingCueSpec {
   durationSec: number;
@@ -47,6 +51,10 @@ export const RECORDING_CUES: Readonly<Record<RecordingCueKind, Readonly<Recordin
   // quiet to notice); the tones stay short so they never mask speech.
   start: Object.freeze({ durationSec: 0.075, baseHz: 760, endHz: 980, gainPeak: 0.25 }),
   stop: Object.freeze({ durationSec: 0.09, baseHz: 560, endHz: 420, gainPeak: 0.3 }),
+  // The microphone woke (./mic-wake): it has delivered its first sound after
+  // dead frames. A second, higher rise than the start tone's, so the two
+  // never read as one — played only for a take that began dead.
+  ready: Object.freeze({ durationSec: 0.075, baseHz: 1040, endHz: 1320, gainPeak: 0.25 }),
 });
 
 /** Attack of the gain envelope, seconds. */
