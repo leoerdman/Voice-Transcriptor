@@ -49,6 +49,7 @@ from typing import Any, Dict
 
 from backend.audio_mime import AUDIO_EXT_TO_MIME
 from backend.data_dir import default_data_dir
+from backend.deepgram_keyterms import AUTO_KEYTERMS_DEFAULT, normalize_auto_keyterms_blocked
 from backend.deepgram_language import DEFAULT_LANGUAGE_HINTS, normalize_language_hints
 from backend.model_catalog import (
     DEFAULT_OPENROUTER_AUDIO_MODEL,
@@ -688,6 +689,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             # should expect (``backend.deepgram_language``). A list of
             # codes from ``LANGUAGE_HINT_OPTIONS``; [] means no hints.
             "language_hints": list(DEFAULT_LANGUAGE_HINTS),
+            # Self-filling vocabulary (``backend.auto_keyterms``): terms
+            # mined from the owner's own archive join ``keyterms`` within
+            # the shared token budget. ``auto_keyterms_blocked`` holds the
+            # automatic terms the owner removed — never re-added.
+            "auto_keyterms": AUTO_KEYTERMS_DEFAULT,
+            "auto_keyterms_blocked": [],
         },
     },
 }
@@ -854,6 +861,26 @@ def _validate_config_shape(cfg: Any) -> Dict[str, Any]:
                     "codes; keeping the valid ones"
                 )
                 repaired["language_hints"] = list(normalize_language_hints(hints_raw))
+            auto_raw = dg_prefs.get("auto_keyterms")
+            if auto_raw is not None and not isinstance(auto_raw, bool):
+                logger.warning(
+                    "config.preferences.deepgram.auto_keyterms must be a boolean; resetting"
+                )
+                repaired["auto_keyterms"] = dg_defaults["auto_keyterms"]
+            blocked_raw = dg_prefs.get("auto_keyterms_blocked")
+            if blocked_raw is not None and (
+                not isinstance(blocked_raw, list)
+                or normalize_auto_keyterms_blocked(blocked_raw) != blocked_raw
+            ):
+                # Keep every usable removal: losing one would silently
+                # bring back a term the owner took out.
+                logger.warning(
+                    "config.preferences.deepgram.auto_keyterms_blocked is malformed; "
+                    "keeping the valid entries"
+                )
+                repaired["auto_keyterms_blocked"] = normalize_auto_keyterms_blocked(
+                    blocked_raw if isinstance(blocked_raw, list) else []
+                )
             if repaired:
                 preferences = dict(preferences)
                 dg_prefs = {**dg_prefs, **repaired}

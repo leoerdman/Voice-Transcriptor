@@ -658,6 +658,26 @@
                 comma-separated. Nova-3 only.
               </p>
               <!--
+                Self-filling vocabulary (backend/auto_keyterms.py): names
+                and jargon that recur across the archive join the list
+                above while the token budget has room. Everything inside is
+                written by renderAutoKeyterms() in main.tsx from
+                GET /api/deepgram/auto-keyterms; the switch is checked to
+                match the backend default (AUTO_KEYTERMS_DEFAULT) and is
+                never saved by the settings autosave — it posts its own
+                request.
+              -->
+              <div class="field-stack auto-keyterms" id="autoKeytermsRow">
+                <label class="toggle-inline settings-toggle">
+                  <span>Add key terms learned from my recordings</span>
+                  <input type="checkbox" id="autoKeytermsToggle" checked />
+                </label>
+                <p class="settings-note" id="autoKeytermsNote">Checking…</p>
+                <ul class="auto-keyterms-list" id="autoKeytermsList"></ul>
+                <div class="auto-keyterms-blocked" id="autoKeytermsBlocked" hidden></div>
+                <div class="settings-save-status settings-save-status-warning" id="autoKeytermsError" hidden></div>
+              </div>
+              <!--
                 Dual-stream Auto. Measured 2026-09-04: two Nova-3 streams
                 (multi + one fixed language) merged by word timestamps
                 closed both language-switch holes on the trilingual test

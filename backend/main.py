@@ -5,6 +5,7 @@ import os
 import sys
 import asyncio
 import base64
+import functools
 import binascii
 import hashlib
 import importlib
@@ -113,7 +114,17 @@ from backend.live_envelope import (
 from backend.jobs import JobCancelledError, JobStore
 from backend.http_retry import RemoteError
 from backend.remote_openrouter import OpenRouterError, openrouter_transcribe, openrouter_upscale_text
-from backend.deepgram_keyterms import MAX_KEYTERM_TOKENS, configured_keyterms
+from backend.auto_keyterms import CACHE_FILENAME as AUTO_KEYTERMS_CACHE_FILENAME
+from backend.auto_keyterms import AutoKeytermStore, CorpusEntry
+from backend.deepgram_keyterms import (
+    AUTO_KEYTERM_MAX_CHARS,
+    MAX_KEYTERM_TOKENS,
+    auto_keyterms_blocked,
+    auto_keyterms_enabled,
+    configured_keyterms,
+    configured_merge,
+    normalize_auto_keyterms_blocked,
+)
 from backend.deepgram_language import (
     DEFAULT_LANGUAGE_HINTS,
     LANGUAGE_HINT_OPTIONS,
@@ -482,12 +493,17 @@ async def _app_lifespan(_app: "FastAPI") -> AsyncIterator[None]:
     # importing this module — or driving the WS handler directly from a
     # test — never leaves a socket open.
     DEEPGRAM_WARM_POOL.start()
+    # Before the boot pre-warm: ``start`` adopts the persisted keyterm
+    # ranking synchronously, so the first warm socket is opened with the
+    # list the first recording will ask for.
+    AUTO_KEYTERMS.start(_retarget_warm_keyterms)
     warm_boot = asyncio.get_running_loop().create_task(
         _prewarm_deepgram_at_boot(), name="deepgram-warm-boot"
     )
 
     yield
 
+    await AUTO_KEYTERMS.stop()
     await cancel_and_await(warm_boot, what="deepgram boot pre-warm", log=logger)
     # Shutdown: drain in-flight transcription jobs before the process
     # exits so Electron's SIGTERM (killBackendHard, 1500 ms hard deadline)
@@ -3143,6 +3159,10 @@ def _invalidate_recordings_cache() -> None:
         _stats_cache = None
         _stats_cache_at = 0.0
         _stats_cache_key = None
+    # The self-filling keyterm vocabulary is derived from the same
+    # archive: every path that changes it comes through here, so this is
+    # the one place that tells it (debounced, off the request path).
+    AUTO_KEYTERMS.schedule_recompute()
 
 
 def _invalidate_recordings_dir_cache() -> None:
@@ -4779,7 +4799,7 @@ async def ws_transcribe(websocket: WebSocket):
                 )
                 _mark_recovery_error(recovery_ctx)
                 return
-            dg_keyterms = configured_keyterms(dg_cfg)
+            dg_keyterms = configured_keyterms(dg_cfg, AUTO_KEYTERMS.terms())
             dg_language_hints = configured_language_hints(dg_cfg)
             # The dual-reading decision is made HERE, where the config
             # has just been read, and passed down — the session runner
@@ -5848,7 +5868,7 @@ async def _prewarm_deepgram_at_boot() -> None:
     # (BW-14). Only the keyterms and language hints come from the config
     # (both are part of the query string the pool keys a socket on).
     primary_cfg = live_config(
-        keyterms=configured_keyterms(cfg),
+        keyterms=configured_keyterms(cfg, AUTO_KEYTERMS.terms()),
         language_hints=configured_language_hints(cfg),
     )
     DEEPGRAM_WARM_POOL.rewarm(api_key, primary_cfg)
@@ -5862,6 +5882,181 @@ async def _prewarm_deepgram_at_boot() -> None:
         DEEPGRAM_WARM_POOL.rewarm(
             api_key, secondary_config(primary_cfg, dual_secondary_language(cfg))
         )
+
+
+def _auto_keyterm_text(path: Path, screen_take: bool) -> Optional[str]:
+    """What was said in one archived transcript, for the vocabulary miner.
+
+    ``None`` for imported media (a transcript with a ``Source file:``
+    header): that is someone else's speech, and its names are not the
+    owner's vocabulary.
+    """
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    if _recording_source_file(raw):
+        return None
+    return _recording_spoken_text(raw, screen_take=screen_take)
+
+
+def _auto_keyterm_corpus() -> list[CorpusEntry]:
+    """Every transcript History shows, except the Uploaded Media
+    collection, as the miner's corpus. The archive layout and the
+    "what was said" reading stay this module's (``_recordings_scan_dirs``,
+    ``_recording_spoken_text``) — ``backend.auto_keyterms`` sees text."""
+    entries: list[CorpusEntry] = []
+    for archive_dir in _recordings_scan_dirs(_resolve_recordings_dir()):
+        collection = _recording_collection_for_dir(archive_dir)
+        if collection == RECORDING_COLLECTION_UPLOADS:
+            continue
+        screen_take = collection == RECORDING_COLLECTION_SCREEN
+        for path in _iter_recording_text_files(archive_dir):
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            entries.append(
+                CorpusEntry(
+                    key=str(path),
+                    identity=(int(st.st_mtime_ns), int(st.st_size)),
+                    mtime=float(st.st_mtime),
+                    read=functools.partial(_auto_keyterm_text, path, screen_take),
+                )
+            )
+    return entries
+
+
+def _auto_keyterms_enabled_now() -> bool:
+    try:
+        return auto_keyterms_enabled(load_config())
+    except Exception:
+        logger.exception("auto-keyterms: config read failed")
+        return False
+
+
+# The self-filling keyterm vocabulary (``backend.auto_keyterms``). Bound
+# to the app lifespan like the warm pool: un-started it schedules
+# nothing, and ``terms()`` is the ranking the previous run persisted —
+# empty until ``start`` loads it.
+AUTO_KEYTERMS = AutoKeytermStore(
+    corpus=_auto_keyterm_corpus,
+    cache_path=DATA_DIR / AUTO_KEYTERMS_CACHE_FILENAME,
+    is_enabled=_auto_keyterms_enabled_now,
+)
+
+
+async def _retarget_warm_keyterms() -> None:
+    """Re-point the warm Deepgram sockets at the current keyterm list.
+
+    Runs after every vocabulary recompute and keyterm settings change.
+    A warm socket opened with the old list could never be adopted (the
+    list is part of its key), but it would hold a concurrency slot until
+    its TTL and leave the next recording a cold connect.
+    """
+    try:
+        cfg = await asyncio.to_thread(load_config)
+    except Exception:
+        logger.exception("auto-keyterms: config read failed; warm sockets left as they are")
+        return
+    await DEEPGRAM_WARM_POOL.retarget_keyterms(
+        _configured_deepgram_key(cfg),
+        configured_keyterms(cfg, AUTO_KEYTERMS.terms()),
+    )
+
+
+def _auto_keyterms_state(cfg: dict) -> dict[str, Any]:
+    """Settings payload of the self-filling vocabulary: what is mined,
+    what goes on the wire, and the budget it spends."""
+    snap = AUTO_KEYTERMS.snapshot()
+    merged = configured_merge(cfg, snap.term_texts)
+    # While the feature is off the list still shows which terms WOULD be
+    # sent, so the owner can prune it before switching it on.
+    would_send = {
+        term.lower()
+        for term in configured_merge(cfg, snap.term_texts, assume_enabled=True).auto
+    }
+    hidden = {term.lower() for term in merged.manual}
+    blocked = auto_keyterms_blocked(cfg)
+    hidden.update(term.lower() for term in blocked)
+    return {
+        "enabled": auto_keyterms_enabled(cfg),
+        "terms": [
+            {
+                "term": t.term,
+                "recordings": t.recordings,
+                "included": t.term.lower() in would_send,
+            }
+            for t in snap.terms
+            if t.term.lower() not in hidden
+        ],
+        "blocked": list(blocked),
+        "manualCount": len(merged.manual),
+        "autoCount": len(merged.auto),
+        "tokensUsed": merged.tokens_used,
+        "tokenBudget": merged.token_budget,
+        "computedAt": (
+            datetime.fromtimestamp(snap.computed_at).isoformat(timespec="seconds")
+            if snap.computed_at
+            else None
+        ),
+        "recordings": snap.recordings,
+    }
+
+
+# Serialises the read-modify-write of the removal list, so two quick
+# removals cannot each save a list that lacks the other.
+_AUTO_KEYTERMS_CONFIG_LOCK = threading.Lock()
+
+
+@app.get("/api/deepgram/auto-keyterms")
+def get_auto_keyterms(_auth: None = Depends(_require_api_auth)):
+    return _auto_keyterms_state(load_config())
+
+
+@app.post("/api/deepgram/auto-keyterms")
+def update_auto_keyterms(payload: dict = Body(...), _auth: None = Depends(_require_api_auth)):
+    """Switch the self-filling vocabulary, or remove/restore one of its
+    terms. Body: any of ``{"enabled": bool, "block": str, "unblock": str}``.
+    Pinning a term into the manual list is an edit of that list, which
+    the Settings field owns and saves through ``/api/config``."""
+    enabled = payload.get("enabled")
+    block = payload.get("block")
+    unblock = payload.get("unblock")
+    if enabled is not None and not isinstance(enabled, bool):
+        raise HTTPException(status_code=400, detail="enabled must be a boolean")
+    for name, value in (("block", block), ("unblock", unblock)):
+        if value is not None and (
+            not isinstance(value, str)
+            or not value.strip()
+            or len(value.strip()) > AUTO_KEYTERM_MAX_CHARS
+        ):
+            raise HTTPException(status_code=400, detail=f"{name} must be a non-empty term")
+    if enabled is None and block is None and unblock is None:
+        raise HTTPException(status_code=400, detail="nothing to change")
+    with _AUTO_KEYTERMS_CONFIG_LOCK:
+        update: dict[str, Any] = {}
+        if enabled is not None:
+            update["auto_keyterms"] = enabled
+        if block is not None or unblock is not None:
+            blocked = list(auto_keyterms_blocked(load_config()))
+            if unblock is not None:
+                blocked = [t for t in blocked if t.lower() != unblock.strip().lower()]
+            if block is not None:
+                blocked.append(block.strip())
+            update["auto_keyterms_blocked"] = normalize_auto_keyterms_blocked(blocked)
+        try:
+            save_config({"preferences": {"deepgram": update}})
+        except (OSError, RuntimeError) as e:
+            logger.error("auto-keyterms: settings not saved: %s", type(e).__name__)
+            raise HTTPException(
+                status_code=500, detail=f"settings not saved: {_safe_error_text(e)}"
+            )
+        cfg = load_config()
+    if enabled:
+        # Switched on: the ranking may be stale (nothing recomputes while
+        # it is off), so recompute now rather than after the next save.
+        AUTO_KEYTERMS.schedule_recompute(delay_sec=0.0)
+    else:
+        AUTO_KEYTERMS.schedule_refresh()
+    return _auto_keyterms_state(cfg)
 
 
 async def _run_deepgram_live_session(
@@ -7274,7 +7469,7 @@ def _decode_remote_once(
     elif prov == "deepgram":
         dg_key = ((cfg.get("providers") or {}).get("deepgram") or {}).get("key") or ""
         model = (explicit_model or DEFAULT_DEEPGRAM_AUDIO_MODEL).strip()
-        dg_keyterms = configured_keyterms(cfg)
+        dg_keyterms = configured_keyterms(cfg, AUTO_KEYTERMS.terms())
         dg_language_hints = configured_language_hints(cfg)
 
         def _provider_call(payload: bytes, filename: str) -> dict[str, Any]:
@@ -8091,6 +8286,8 @@ def set_config(payload: dict = Body(...), _auth: None = Depends(_require_api_aut
         )
     _invalidate_recordings_dir_cache()
     _invalidate_recordings_cache()
+    # The manual keyterm list may have changed: re-point the warm sockets.
+    AUTO_KEYTERMS.schedule_refresh()
     return {"ok": True}
 
 

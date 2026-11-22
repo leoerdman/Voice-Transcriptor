@@ -147,6 +147,13 @@ import {
   normalizeCliStatus,
   type CliAccessStatus,
 } from "./cli-section";
+import {
+  AUTO_KEYTERMS_EMPTY,
+  appendKeyterm,
+  autoKeytermsSummary,
+  parseAutoKeytermsState,
+  type AutoKeytermsState,
+} from "./auto-keyterms";
 import { recordingOutputIsPasteReady } from "./recording-output";
 import { smartRecordingTitle } from "./recording-title";
 import { historyFailureSurfaces, noticeSurfaces } from "./notice-surface";
@@ -5544,6 +5551,9 @@ function switchView(view: ViewName): void {
     // and the defaults line follows the Upload tab. Re-read on every
     // visit rather than caching a sentence that can go stale.
     void refreshCliSection();
+    // The vocabulary is recomputed in the background after saves; read
+    // it on every visit rather than showing a list that went stale.
+    void refreshAutoKeyterms();
   }
   // A popover belongs to the view that opened it.
   setTranscribeSettingsOpen(false);
@@ -7911,6 +7921,140 @@ async function setCliAccess(next: boolean): Promise<void> {
 
 $("cliAccessToggle").addEventListener("change", (e) => {
   void setCliAccess((e.target as HTMLInputElement).checked);
+});
+
+// ── Settings → Deepgram: key terms learned from the archive ─────────────────
+//
+// The backend mines, ranks and budgets the vocabulary (see
+// src/auto-keyterms.ts); the renderer shows it and posts three intents:
+// switch, remove, restore. "Add to my list" edits the manual field, which
+// owns its text and saves it through the normal settings autosave.
+
+let autoKeytermsState: AutoKeytermsState = AUTO_KEYTERMS_EMPTY;
+/** Set while a request is in flight, so the controls cannot race it. */
+let autoKeytermsBusy = false;
+
+function setAutoKeytermsError(message: string): void {
+  const node = $("autoKeytermsError");
+  const text = String(message || "").trim();
+  node.textContent = text;
+  node.hidden = !text;
+}
+
+function autoKeytermButton(label: string, title: string, onClick: () => void): HTMLButtonElement {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "auto-keyterm-action";
+  btn.textContent = label;
+  btn.title = title;
+  btn.setAttribute("aria-label", title);
+  btn.disabled = autoKeytermsBusy;
+  btn.addEventListener("click", onClick);
+  return btn;
+}
+
+function renderAutoKeyterms(): void {
+  const state = autoKeytermsState;
+  const toggle = $("autoKeytermsToggle") as HTMLInputElement;
+  toggle.checked = state.enabled;
+  toggle.disabled = autoKeytermsBusy;
+  $("autoKeytermsNote").textContent = autoKeytermsSummary(state);
+
+  const list = $("autoKeytermsList");
+  list.textContent = "";
+  list.classList.toggle("is-off", !state.enabled);
+  for (const item of state.terms) {
+    const row = document.createElement("li");
+    row.className = item.included ? "auto-keyterm" : "auto-keyterm is-over-budget";
+    // textContent only: a term is text mined from the user's transcripts.
+    const label = document.createElement("span");
+    label.className = "auto-keyterm-term";
+    label.textContent = item.term;
+    label.title = item.included
+      ? `Heard in ${item.recordings} recordings`
+      : `Heard in ${item.recordings} recordings — not sent: the token budget is full`;
+    row.appendChild(label);
+    row.appendChild(
+      autoKeytermButton("+", `Add “${item.term}” to my key terms`, () => pinAutoKeyterm(item.term)),
+    );
+    row.appendChild(
+      autoKeytermButton("×", `Remove “${item.term}”`, () => {
+        void updateAutoKeyterms({ block: item.term });
+      }),
+    );
+    list.appendChild(row);
+  }
+
+  const blocked = $("autoKeytermsBlocked");
+  blocked.textContent = "";
+  blocked.hidden = state.blocked.length === 0;
+  if (state.blocked.length) {
+    const caption = document.createElement("span");
+    caption.className = "settings-note";
+    caption.textContent = "Removed:";
+    blocked.appendChild(caption);
+    for (const term of state.blocked) {
+      blocked.appendChild(
+        autoKeytermButton(`${term} ↺`, `Bring back “${term}”`, () => {
+          void updateAutoKeyterms({ unblock: term });
+        }),
+      );
+    }
+  }
+}
+
+async function refreshAutoKeyterms(): Promise<void> {
+  try {
+    autoKeytermsState = parseAutoKeytermsState(await apiGet<unknown>("/api/deepgram/auto-keyterms"));
+    setAutoKeytermsError("");
+  } catch (e) {
+    autoKeytermsState = AUTO_KEYTERMS_EMPTY;
+    setAutoKeytermsError(sanitizeUiErrorMessage(e, "Could not read the learned key terms."));
+  }
+  renderAutoKeyterms();
+}
+
+async function updateAutoKeyterms(
+  change: { enabled: boolean } | { block: string } | { unblock: string },
+): Promise<void> {
+  if (autoKeytermsBusy) return;
+  autoKeytermsBusy = true;
+  renderAutoKeyterms();
+  let failure = "";
+  try {
+    autoKeytermsState = parseAutoKeytermsState(
+      await apiPost<unknown>("/api/deepgram/auto-keyterms", change),
+    );
+  } catch (e) {
+    failure = sanitizeUiErrorMessage(e, "Could not change the learned key terms.");
+  } finally {
+    autoKeytermsBusy = false;
+  }
+  if (failure) {
+    // Show what the backend holds, not what the click hoped for.
+    await refreshAutoKeyterms();
+    setAutoKeytermsError(failure);
+    return;
+  }
+  setAutoKeytermsError("");
+  renderAutoKeyterms();
+}
+
+function pinAutoKeyterm(term: string): void {
+  const field = $("deepgramKeytermsInput") as HTMLTextAreaElement;
+  const next = appendKeyterm(field.value, term);
+  if (next === field.value) return;
+  field.value = next;
+  queueUiPreferencesSave();
+  void flushUiPreferencesSaveNow().then(() => refreshAutoKeyterms());
+}
+
+$("autoKeytermsToggle").addEventListener("change", (e) => {
+  void updateAutoKeyterms({ enabled: (e.target as HTMLInputElement).checked });
+});
+// A manual edit changes what is sent and which learned terms are shown.
+$("deepgramKeytermsInput").addEventListener("change", () => {
+  void flushUiPreferencesSaveNow().then(() => refreshAutoKeyterms());
 });
 
 let recordingItems: RecordingItem[] = [];

@@ -313,6 +313,88 @@ class InFlightWarmTests(_PoolCase):
         self.assertEqual(len(self.created), 1)
 
 
+class KeytermRetargetTests(_PoolCase):
+    """The self-filling vocabulary changes the keyterm list behind the
+    renderer's back. A warm socket opened with the old list must never
+    be adopted (that holds by construction: the list is in the key) and
+    must not linger either — it is swapped for the same reading with the
+    new list, so the next recording still adopts a warm socket."""
+
+    async def test_a_socket_with_the_old_list_is_replaced_by_one_with_the_new(self):
+        old = await self._warm(cfg=_cfg(keyterms=("Sonnet",)))
+        await self.pool.retarget_keyterms("k", ("Sonnet", "Deepgram"))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertTrue(old.discarded, "the stale socket was released")
+        fresh = self.created[-1]
+        self.assertEqual(fresh.cfg.keyterms, ("Sonnet", "Deepgram"))
+        self.assertEqual(fresh.cfg.language, "ru", "same reading, new list")
+        acquisition = await self.pool.acquire("k", _cfg(keyterms=("Sonnet", "Deepgram")))
+        self.assertTrue(acquisition.adopted)
+        self.assertIs(acquisition.session, fresh)
+
+    async def test_the_old_list_is_never_adopted_after_a_change(self):
+        await self._warm(cfg=_cfg(keyterms=("Sonnet",)))
+        acquisition = await self.pool.acquire("k", _cfg(keyterms=("Sonnet", "Deepgram")))
+        self.assertFalse(acquisition.adopted)
+
+    async def test_an_unchanged_list_leaves_the_socket_alone(self):
+        warm = await self._warm(cfg=_cfg(keyterms=("Sonnet",)))
+        await self.pool.retarget_keyterms("k", ("Sonnet",))
+        await asyncio.sleep(0)
+        self.assertFalse(warm.discarded)
+        self.assertEqual(len(self.created), 1)
+
+    async def test_a_model_without_keyterms_on_the_wire_is_left_alone(self):
+        warm = await self._warm(cfg=_cfg(model="nova-2"))
+        await self.pool.retarget_keyterms("k", ("Deepgram",))
+        await asyncio.sleep(0)
+        self.assertFalse(warm.discarded)
+        self.assertEqual(len(self.created), 1)
+
+    async def test_both_readings_of_a_dual_stream_are_retargeted(self):
+        self.pool.start()
+        self.pool.rewarm("k", _cfg(language="multi"))
+        self.pool.rewarm("k", _cfg(language="ru"))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        await self.pool.retarget_keyterms("k", ("Deepgram",))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        keys = sorted(row["configKey"] for row in self.pool.status()["sockets"])
+        self.assertEqual(
+            keys,
+            sorted(
+                _cfg(language=lang, keyterms=("Deepgram",)).to_query_string()
+                for lang in ("multi", "ru")
+            ),
+        )
+
+    async def test_a_connect_in_flight_with_the_old_list_is_restarted(self):
+        self.pool.start()
+        gate = asyncio.Event()
+        self.next_connect_gate = gate
+        self.pool.rewarm("k", _cfg())
+        await asyncio.sleep(0)
+        await self.pool.retarget_keyterms("k", ("Deepgram",))
+        gate.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        keys = [row["configKey"] for row in self.pool.status()["sockets"]]
+        self.assertEqual(keys, [_cfg(keyterms=("Deepgram",)).to_query_string()])
+
+    async def test_without_an_api_key_stale_sockets_are_only_released(self):
+        warm = await self._warm(cfg=_cfg(keyterms=("Sonnet",)))
+        await self.pool.retarget_keyterms("", ("Deepgram",))
+        await asyncio.sleep(0)
+        self.assertTrue(warm.discarded)
+        self.assertEqual(self.pool.status()["sockets"], [])
+
+    async def test_an_unarmed_pool_does_nothing(self):
+        await self.pool.retarget_keyterms("k", ("Deepgram",))
+        self.assertEqual(self.created, [])
+
+
 class LifecycleTests(_PoolCase):
     async def test_close_all_releases_the_socket_and_disarms(self):
         warm = await self._warm()
