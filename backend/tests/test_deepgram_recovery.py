@@ -488,6 +488,7 @@ class SpliceRecoveredWordsTests(unittest.TestCase):
             splice_recovered_words(
                 segments,
                 [{"word": "секретное", "start": 0.5, "end": 2.5, "source": RECOVERY_SOURCE}],
+                [(0.2, 2.8)],
             )
         line = next(m for m in logs.output if "already owned" in m)
         self.assertNotIn("секретное", line)
@@ -500,6 +501,7 @@ class SpliceRecoveredWordsTests(unittest.TestCase):
         out, spliced = splice_recovered_words(
             segments,
             [{"word": "субагента", "start": 5.5, "end": 6.1, "source": RECOVERY_SOURCE}],
+            [(5.2, 6.5)],
         )
         self.assertEqual(spliced, 1)
         self.assertEqual(out[0]["text"], "три субагента на")
@@ -511,6 +513,7 @@ class SpliceRecoveredWordsTests(unittest.TestCase):
         out, spliced = splice_recovered_words(
             segments,
             [{"word": "хвост", "start": 6.0, "end": 6.6, "source": RECOVERY_SOURCE}],
+            [(5.7, 6.9)],
         )
         self.assertEqual(spliced, 1)
         self.assertEqual(out[-1]["source"], RECOVERY_SOURCE)
@@ -524,9 +527,89 @@ class SpliceRecoveredWordsTests(unittest.TestCase):
         out, spliced = splice_recovered_words(
             segments,
             [{"word": "Привет,", "start": 1.02, "end": 1.58, "source": RECOVERY_SOURCE}],
+            [(0.7, 1.9)],
         )
         self.assertEqual(spliced, 0)
         self.assertEqual(out[0]["text"], "привет")
+
+
+class SpliceRecoveredWordsAlignmentTests(unittest.TestCase):
+    """Which recovered words are new is decided by ORDER, not time alone.
+
+    Real timings from take ``20261123-173222`` (2026-11-23): the
+    assembled transcript around the hole, the span the recovery decoded
+    (7.93-8.86) and the two words the REST re-decode returned for it.
+    """
+
+    @staticmethod
+    def _transcript() -> list[dict]:
+        return [_segment(5.6, 10.23, [
+            ("и", 7.12, 7.2), ("он", 7.2, 7.36), ("слово", 7.36, 7.68),
+            ("деплой", 7.68, 8.08), ("Посмотри,", 8.56, 9.04), ("по", 9.03, 9.19),
+            ("логам", 9.19, 9.51),
+        ])]
+
+    @staticmethod
+    def _rec(word: str, start: float, end: float) -> dict:
+        return {"word": word, "start": start, "end": end, "source": RECOVERY_SOURCE}
+
+    def test_a_missing_word_is_placed_between_its_neighbours(self):
+        # "Потерял," came back stretched to the clip start (7.93-8.65) and
+        # overlapped 37 % of "деплой", so the time-only coverage rule
+        # judged it owned and dropped it. In order it sits between
+        # "деплой" and "посмотрю"(="Посмотри,"), where the transcript has
+        # nothing: it is the missing word, timed into that gap.
+        out, spliced = splice_recovered_words(
+            self._transcript(),
+            [self._rec("Потерял,", 7.93, 8.65), self._rec("посмотрю.", 8.65, 9.13)],
+            [(7.93, 8.86)],
+        )
+        self.assertEqual(spliced, 1)
+        self.assertEqual(
+            out[0]["text"], "и он слово деплой Потерял, Посмотри, по логам"
+        )
+        placed = [w for w in out[0]["words"] if w["word"] == "Потерял,"][0]
+        self.assertEqual((placed["start"], placed["end"]), (8.08, 8.56))
+        self.assertEqual(placed["source"], RECOVERY_SOURCE)
+
+    def test_the_same_place_spelled_differently_is_not_added(self):
+        # Negative control: the re-decode spells the transcript's own
+        # "деплой" differently ("деплоя") at the same place. The
+        # transcript has its word there, so nothing is added.
+        out, spliced = splice_recovered_words(
+            self._transcript(),
+            [self._rec("слово", 7.36, 7.70), self._rec("деплоя", 7.70, 8.10),
+             self._rec("посмотри", 8.56, 9.04)],
+            [(7.30, 9.10)],
+        )
+        self.assertEqual(spliced, 0)
+        self.assertEqual(out[0]["text"], "и он слово деплой Посмотри, по логам")
+
+    def test_a_different_word_over_a_transcript_word_is_not_added(self):
+        # Negative control: the re-decode heard "деплоить" where the
+        # transcript has "деплой" (different stem), between the same two
+        # agreed neighbours. The transcript's reading stands.
+        out, spliced = splice_recovered_words(
+            self._transcript(),
+            [self._rec("слово", 7.36, 7.68), self._rec("задеплоить", 7.68, 8.10),
+             self._rec("посмотри", 8.56, 9.04)],
+            [(7.30, 9.10)],
+        )
+        self.assertEqual(spliced, 0)
+        self.assertEqual(out[0]["text"], "и он слово деплой Посмотри, по логам")
+
+    def test_a_fragment_of_the_word_the_clip_starts_inside_is_not_added(self):
+        # The clip starts inside "деплой" (padding); the decoder writes
+        # its tail as "лой". Mostly on "деплой"'s own time — not a missing
+        # word, even though nothing of the transcript is between it and
+        # the next agreed word.
+        out, spliced = splice_recovered_words(
+            self._transcript(),
+            [self._rec("лой", 7.93, 8.10), self._rec("посмотрю.", 8.56, 9.04)],
+            [(7.93, 8.86)],
+        )
+        self.assertEqual(spliced, 0)
+        self.assertEqual(out[0]["text"], "и он слово деплой Посмотри, по логам")
 
 
 class RunRecoveryEnvelopeTests(unittest.IsolatedAsyncioTestCase):

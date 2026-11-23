@@ -56,6 +56,7 @@ stay in the envelope's ``uncoveredSpeechSec`` — honest, not silent.
 from __future__ import annotations
 
 import asyncio
+import bisect
 import io
 import logging
 import time
@@ -73,7 +74,6 @@ from backend.remote_deepgram_live import (
     DeepgramLiveConfig,
     as_float,
     confirmed_silence_gap,
-    covering_final_word,
     intersect_spans,
     join_segment_texts,
     normalize_words,
@@ -82,6 +82,8 @@ from backend.remote_deepgram_live import (
     segment_words,
     splice_words_into_segments,
     subtract_spans,
+    token_stem,
+    word_duration,
     decoded_end_sec,
     tail_needs_recovery,
     union_spans,
@@ -107,9 +109,10 @@ LIVE_EMPTY_RESULT_MIN_SEC = 2.0
 # so the word that is missing usually starts slightly before the span
 # that betrays it; and a decoder handed 0.4 s of speech with no lead-in
 # has no context to decode it with. The overlap this creates with
-# already-transcribed audio is not a duplication risk: the splice drops
-# any recovered word whose ground a committed word already owns
-# (``covering_final_word``) and guards both seams (``fits_beside``).
+# already-transcribed audio is not a duplication risk: the splice aligns
+# the re-decode with the transcript's own words and keeps only what the
+# transcript is missing (``splice_recovered_words``), and guards both
+# seams (``fits_beside``).
 RECOVERY_SPAN_PAD_SEC = 0.3
 
 # A candidate span shorter than this is not a missing word. The shortest
@@ -330,8 +333,8 @@ def uncovered_spans(
     second apart become one decode instead of two, and a decoder is
     never handed a fragment with no lead-in. The overlap with
     already-transcribed audio that padding creates is not a duplication
-    risk: ``splice_recovered_words`` drops any recovered word whose
-    ground a committed word already owns.
+    risk: ``splice_recovered_words`` keeps only the recovered words the
+    transcript's own words do not already account for.
     """
     limit = max(0.0, float(streamed_sec or 0.0), float(audio_sec or 0.0))
     missing = missing_spans(
@@ -592,43 +595,57 @@ def _merge_recovery_readings(
 
 
 def splice_recovered_words(
-    segments: Sequence[dict], words: Sequence[dict]
+    segments: Sequence[dict],
+    words: Sequence[dict],
+    spans: Sequence[tuple[float, float]],
 ) -> tuple[list[dict], int]:
-    """Place recovered words into the assembled transcript by time.
+    """Place recovered words into the assembled transcript.
 
-    Two filters before placement, both of them rules this product
-    already has rather than new ones:
+    ``spans`` are the spans the words were decoded from (``recover_spans``
+    was handed them). A re-decode returns a SEQUENCE of words over its
+    span, and the transcript already has a sequence of words over the
+    same ground, so which recovered words are new is decided by aligning
+    the two sequences (``_fresh_recovered_words``) — not by time alone.
 
-    * a recovered word whose ground a committed word already owns is
-      dropped (``covering_final_word``). Spans are decoded with padding,
-      so the re-decode always returns some words the transcript already
-      has, and shipping them would read as a stutter — exactly the
-      failure the splice guard was written for;
-    * placement itself is ``splice_words_into_segments``, the same
-      implementation the interim splice uses, so a recovered word lands
-      the same way whether the hole was found by the live reading or by
-      this pass.
+    Time alone is what lost a spoken word (2026-11-23, take
+    ``20261123-173222``): the span 7.93-8.86 s re-decoded as "Потерял,"
+    7.93-8.65 and "посмотрю." 8.65-9.13, around the transcript's
+    "деплой" 7.68-8.08 and "Посмотри," 8.56-9.04. A REST decode of a
+    short clip stretches its first word back to the clip start, so
+    "Потерял," overlapped 37 % of "деплой", and the time-only coverage
+    rule (``covering_final_word``, 25 % of either word) judged its ground
+    owned and dropped it. In order, though, the re-decode says "<X>
+    посмотрю" where the transcript says "деплой Посмотри": "посмотрю" is
+    the transcript's "Посмотри", and nothing of the transcript lies
+    between "деплой" and it — "Потерял," is the missing word, and it
+    belongs in that gap.
+
+    Two filters stay as they were, both rules this product already has:
+    a word inside a final that carried no word list is accounted for by
+    that final (``word_inside_spanless_final``), and placement itself is
+    ``splice_words_into_segments`` — the same implementation the interim
+    splice uses, stutter and room guards included.
     """
-    committed = [
-        w for seg in segments for w in segment_words(seg)
-    ]
-    fresh = [
+    committed = sorted(
+        (w for seg in segments for w in segment_words(seg)),
+        key=lambda w: (as_float(w.get("start")), as_float(w.get("end"))),
+    )
+    candidates = [
         word for word in words
-        if covering_final_word(word, committed) is None
-        # And the other half of the coverage rule, the one the live
-        # splice also applies: a final that arrived WITHOUT a word list
-        # accounts for its whole span, and there is no covering word to
-        # name. Spans are padded before decoding, so a re-decode reaches
-        # into ground such a final owns — and without this the same
-        # speech went into the transcript twice.
-        and not word_inside_spanless_final(word, segments)
+        # A final that arrived WITHOUT a word list accounts for its whole
+        # span, and there is no word to align against — only a span.
+        # Spans are padded before decoding, so a re-decode reaches into
+        # ground such a final owns, and without this the same speech went
+        # into the transcript twice.
+        if not word_inside_spanless_final(word, segments)
     ]
+    fresh = _fresh_recovered_words(committed, candidates, spans)
     # Said out loud, both times. A recovery that decodes ten words and
     # ships none is either working exactly as intended (the padding
     # returned words the transcript already had) or misfiring, and the
     # difference is invisible unless the two reasons are counted apart.
     if len(fresh) != len(words):
-        kept = {id(w) for w in fresh}
+        kept = {id(w.get(_RECOVERED_FROM, w)) for w in fresh}
         # Spans, not the words: main.log is a support artefact and never
         # carries what the user dictated (BL-02). The span is what a
         # reader matches against ``coverage holes`` anyway.
@@ -641,6 +658,7 @@ def splice_recovered_words(
                 if id(w) not in kept
             ][:12],
         )
+    fresh = [{k: v for k, v in w.items() if k != _RECOVERED_FROM} for w in fresh]
     if not fresh:
         return list(segments), 0
     outcome = splice_words_into_segments(
@@ -652,6 +670,157 @@ def splice_recovered_words(
             len(fresh) - outcome.total,
         )
     return outcome.segments, outcome.total
+
+
+# Internal back-reference from a re-timed copy to the decoded word it was
+# made from, so the "already owned" log can name the decoded spans. Never
+# leaves this module.
+_RECOVERED_FROM = "_recovered_from"
+
+
+def _stem_lcs(a: Sequence[str], b: Sequence[str]) -> list[tuple[int, int]]:
+    """Index pairs of a longest common subsequence of two stem lists.
+
+    Empty stems (punctuation, digits-only tokens) never match. Quadratic
+    in the words of ONE span — a padded hole is a handful of words.
+    """
+    n, m = len(a), len(b)
+    table = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n - 1, -1, -1):
+        for j in range(m - 1, -1, -1):
+            if a[i] and a[i] == b[j]:
+                table[i][j] = table[i + 1][j + 1] + 1
+            else:
+                table[i][j] = max(table[i + 1][j], table[i][j + 1])
+    pairs: list[tuple[int, int]] = []
+    i = j = 0
+    while i < n and j < m:
+        if a[i] and a[i] == b[j]:
+            pairs.append((i, j))
+            i += 1
+            j += 1
+        elif table[i + 1][j] >= table[i][j + 1]:
+            i += 1
+        else:
+            j += 1
+    return pairs
+
+
+def _fresh_recovered_words(
+    committed: list[dict],
+    words: Sequence[dict],
+    spans: Sequence[tuple[float, float]],
+) -> list[dict]:
+    """The recovered words the transcript does not have, each timed into
+    the gap it fills.
+
+    Per decoded span:
+
+    1. The transcript's words OF that span are those whose midpoint lies
+       in it; the span's recovered words are those that start in it (a
+       REST word is timed from the clip start, so it can run past the
+       clip end but never start before it — "посмотрю." 8.65-9.13 came
+       from the 7.93-8.86 span).
+    2. The two sequences are aligned by stem — ``token_stem``, the same
+       "one spoken word" rule the splice guard and the dual merge use, so
+       "слушаю"/"слушай" are one word here exactly as they are there.
+       A matched recovered word is already in the transcript.
+    3. Every run of unmatched recovered words sits between two matched
+       neighbours (or a span edge). Between the transcript's partners of
+       those neighbours there is either something or nothing:
+
+       * something — the transcript has its own words for that ground,
+         spelled differently. The transcript's reading stands (a
+         re-decode does not overrule a final word by word: the "трёх"/
+         "в" and stutter cases of the splice guard);
+       * nothing — the run is speech the transcript is missing. Its
+         words belong in the gap between those two transcript words,
+         and that gap is where they are put: the run's own times are
+         mapped linearly onto the part of the gap they reach.
+
+    A recovered word with less than half of its own time in that gap is
+    not put there: at a span edge the clip starts or ends inside a
+    transcript word (the decode is padded), and a fragment of that word
+    ("…лой" of "деплой") is the transcript's word, not a missing one.
+    """
+    if not words:
+        return []
+    ordered_spans = sorted((float(a), float(b)) for a, b in spans)
+    if not ordered_spans:
+        return []
+    span_starts = [a for a, _b in ordered_spans]
+    by_span: list[list[dict]] = [[] for _ in ordered_spans]
+    for word in sorted(words, key=lambda w: (as_float(w.get("start")), as_float(w.get("end")))):
+        index = max(0, bisect.bisect_right(span_starts, as_float(word.get("start"))) - 1)
+        by_span[index].append(word)
+
+    mids = [(as_float(w.get("start")) + as_float(w.get("end"))) / 2.0 for w in committed]
+    fresh: list[dict] = []
+    for (span_start, span_end), recovered in zip(ordered_spans, by_span):
+        if not recovered:
+            continue
+        lo_index = bisect.bisect_left(mids, span_start)
+        hi_index = bisect.bisect_left(mids, span_end)
+        inside = list(range(lo_index, hi_index))
+        matches = _stem_lcs(
+            [token_stem(str(w.get("word") or "")) for w in recovered],
+            [token_stem(str(committed[c].get("word") or "")) for c in inside],
+        )
+        # Anchors as (recovered index, committed index in the FULL list),
+        # bracketed by the span edges: before the span's first transcript
+        # word and after its last.
+        anchors = [(-1, lo_index - 1)]
+        anchors += [(r, inside[c]) for r, c in matches]
+        anchors.append((len(recovered), hi_index))
+        for (r_left, c_left), (r_right, c_right) in zip(anchors, anchors[1:]):
+            run = recovered[r_left + 1:r_right]
+            if not run or c_right - c_left > 1:
+                # Nothing unmatched here, or the transcript has its own
+                # words for this ground.
+                continue
+            lo = as_float(committed[c_left].get("end")) if c_left >= 0 else float("-inf")
+            hi = (
+                as_float(committed[c_right].get("start"))
+                if c_right < len(committed) else float("inf")
+            )
+            fresh.extend(_timed_into_gap(run, lo, hi))
+    return fresh
+
+
+def _timed_into_gap(run: list[dict], lo: float, hi: float) -> list[dict]:
+    """``run`` placed in the transcript gap ``[lo, hi]`` (see
+    ``_fresh_recovered_words``): words mostly outside it dropped, the
+    rest re-timed by one linear map onto the part of the gap they reach.
+    Copies; each remembers the decoded word it came from."""
+    if hi <= lo:
+        return []
+    kept = []
+    for word in run:
+        start, end = as_float(word.get("start")), as_float(word.get("end"))
+        inside = min(end, hi) - max(start, lo)
+        if inside >= 0.5 * word_duration(word):
+            kept.append(word)
+    if not kept:
+        return []
+    src_start = as_float(kept[0].get("start"))
+    src_end = max(as_float(w.get("end")) for w in kept)
+    dst_start, dst_end = max(lo, src_start), min(hi, src_end)
+    if dst_end <= dst_start:
+        return []
+    scale = (dst_end - dst_start) / max(src_end - src_start, 1e-6)
+
+    def _map(t: float) -> float:
+        return round(dst_start + (t - src_start) * scale, 3)
+
+    return [
+        dict(
+            word,
+            start=_map(as_float(word.get("start"))),
+            end=_map(as_float(word.get("end"))),
+            **{_RECOVERED_FROM: word},
+        )
+        for word in kept
+    ]
 
 
 @dataclass
@@ -776,7 +945,7 @@ async def run_recovery(
         transcribe=transcribe,
         secondary_language=secondary_language,
     )
-    segments, spliced = splice_recovered_words(segments, words)
+    segments, spliced = splice_recovered_words(segments, words, spans)
     report = RecoveryReport(
         spans=list(spans),
         ms=(time.perf_counter() - started) * 1000.0,

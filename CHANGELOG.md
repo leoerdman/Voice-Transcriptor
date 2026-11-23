@@ -8,6 +8,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - **Dictation no longer drops a word both readings heard, nor doubles the first word.** Every take is read twice (Russian and multi-language) and the two readings are merged word by word. The merge paired words by time overlap alone, so when the Russian reading skipped a word and stretched its neighbour over it ("сделай деплой на сервер" → the Russian "на" covering "деплой"), the stretched word took the missing word's place and the word vanished. Words both readings wrote the same now pair first, and the same word sitting right next to an agreed pair is one word even when a reading shifted it — "Я Я сейчас…" is gone too.
+- **A word both live readings missed is no longer thrown away when the recovery pass finds it.** "…и он слово деплой потерял, посмотри…" came out without "потерял": the re-decode found it, but stretched its timing over the edge of "деплой", and the time-only ownership test called the slot taken. Recovered words are now matched to the transcript by word order within the re-decoded span; a word with no counterpart between two matched neighbours is a gap and is placed between them.
 - **The log tells a covered window from a hidden one**, and a screen-mode start that was late during a system stall says so, instead of blaming the page load its own teardown cancelled.
 
 ## [1.6.33] - 2026-11-23
