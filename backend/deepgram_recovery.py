@@ -89,6 +89,13 @@ from backend.remote_deepgram_live import (
     union_spans,
     word_inside_spanless_final,
 )
+from backend.word_case import (
+    capital_is_lexical,
+    cased_for_place,
+    ends_sentence,
+    starts_sentence,
+    without_trailing_marks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -661,6 +668,10 @@ def splice_recovered_words(
     fresh = [{k: v for k, v in w.items() if k != _RECOVERED_FROM} for w in fresh]
     if not fresh:
         return list(segments), 0
+    # The words each segment had BEFORE anything was inserted: where a
+    # transcript word stood in its own reading is what its capital can
+    # be judged against once a recovered word lands in front of it.
+    own_starts = _own_sentence_starts(segments)
     outcome = splice_words_into_segments(
         segments, fresh, source=RECOVERY_SOURCE
     )
@@ -669,7 +680,78 @@ def splice_recovered_words(
             "recovery: %d decoded word(s) had no room beside the transcript",
             len(fresh) - outcome.total,
         )
+    _settle_case_around_recovered(outcome.segments, own_starts)
     return outcome.segments, outcome.total
+
+
+def _own_sentence_starts(segments: Sequence[dict]) -> dict[int, bool]:
+    """Per transcript word (by identity): did it stand at a sentence
+    start in the segment it came in — first of it, or after a word that
+    ends a sentence (``backend.word_case``)?"""
+    starts: dict[int, bool] = {}
+    for seg in segments:
+        previous: Optional[dict] = None
+        for word in segment_words(seg):
+            starts[id(word)] = previous is None or ends_sentence(
+                str(previous.get("word") or "")
+            )
+            previous = word
+    return starts
+
+
+def _settle_case_around_recovered(
+    segments: Sequence[dict], own_starts: dict[int, bool]
+) -> None:
+    """The case of the places recovery changed (``backend.word_case``).
+
+    ``_fresh_recovered_words`` already took away the capital a recovered
+    word owed to opening its clip; what is left to decide needs the
+    assembled transcript. A recovered word that lands at a sentence
+    start is capitalised. A transcript word right after a recovered one
+    has a new neighbour, so its case is decided by its place again —
+    "Посмотри," opened its final, and after the inserted "потерял," it
+    is "посмотри,". Words recovery did not touch, and did not put a word
+    in front of, are left exactly as read.
+    """
+    previous: Optional[dict] = None
+    for seg in segments:
+        words = segment_words(seg)
+        for index, word in enumerate(words):
+            recovered = word.get("source") == RECOVERY_SOURCE
+            after_recovered = (
+                previous is not None and previous.get("source") == RECOVERY_SOURCE
+            )
+            if recovered or after_recovered:
+                token = str(word.get("word") or "")
+                lexical = recovered or capital_is_lexical(
+                    [(token, own_starts.get(id(word), True))]
+                )
+                cased = cased_for_place(
+                    token,
+                    sentence_start=starts_sentence(
+                        str(previous.get("word") or "") if previous else None
+                    ),
+                    lexical=lexical,
+                )
+                if cased != token:
+                    _retoken(seg, words, index, cased)
+            previous = word
+
+
+def _retoken(seg: dict, words: list[dict], index: int, token: str) -> None:
+    """Respell one word of a segment, in its word list and its text.
+
+    ``text`` is edited at the same index, as ``insert_word_into_segment``
+    does, when it is the plain join of the words (always, for the dual
+    merge's and recovery's own segments); a provider transcript that
+    does not tokenise like its word list is left as the provider wrote
+    it rather than guessed at."""
+    old = str(words[index].get("word") or "")
+    words[index]["word"] = token
+    tokens = str(seg.get("text") or "").split()
+    if len(tokens) == len(words) and tokens[index] == old:
+        tokens[index] = token
+        seg["text"] = " ".join(tokens)
 
 
 # Internal back-reference from a re-timed copy to the decoded word it was
@@ -783,8 +865,51 @@ def _fresh_recovered_words(
                 as_float(committed[c_right].get("start"))
                 if c_right < len(committed) else float("inf")
             )
-            fresh.extend(_timed_into_gap(run, lo, hi))
+            fresh.extend(
+                _as_read_in_place(
+                    placed,
+                    recovered,
+                    clip_cut_follows=c_right < len(committed),
+                )
+                for placed in _timed_into_gap(run, lo, hi)
+            )
     return fresh
+
+
+def _as_read_in_place(
+    placed: dict, recovered: list[dict], *, clip_cut_follows: bool
+) -> dict:
+    """A recovered word with what it owes to its CLIP taken off.
+
+    A re-decoded clip is formatted as a text of its own, and two marks
+    on its words describe the clip, not the transcript they go into
+    (``backend.word_case``):
+
+    * the capital of a word that opened the clip or followed a
+      sentence end in it is positional, so it is lowered here, and
+      ``_settle_case_around_recovered`` capitalises the word again if
+      its place in the transcript is a sentence start. A capital the
+      clip gave a word mid-sentence is the word's own and stays;
+    * the trailing marks of the clip's LAST word are where the clip was
+      cut, not where the speaker paused — the decoder closes every text
+      it is given. They are dropped unless the word also ends the
+      transcript (nothing of it follows the gap). Marks between two
+      words of the clip are the decoder's reading of a real boundary
+      ("Потерял, посмотрю.": the comma sits before the word the
+      transcript has as "Посмотри,") and stay.
+    """
+    source = placed[_RECOVERED_FROM]
+    index = next(i for i, w in enumerate(recovered) if w is source)
+    token = str(placed.get("word") or "")
+    at_start = index == 0 or ends_sentence(str(recovered[index - 1].get("word") or ""))
+    token = cased_for_place(
+        token,
+        sentence_start=False,
+        lexical=capital_is_lexical([(token, at_start)]),
+    )
+    if clip_cut_follows and index == len(recovered) - 1:
+        token = without_trailing_marks(token)
+    return dict(placed, word=token)
 
 
 def _timed_into_gap(run: list[dict], lo: float, hi: float) -> list[dict]:

@@ -41,7 +41,7 @@ from backend.deepgram_recovery import (
     splice_recovered_words,
     uncovered_spans,
 )
-from backend.remote_deepgram_live import DeepgramLiveConfig
+from backend.remote_deepgram_live import DeepgramLiveConfig, join_segment_texts
 
 
 def _pcm(seconds: float, value: int = 1000) -> bytes:
@@ -565,12 +565,81 @@ class SpliceRecoveredWordsAlignmentTests(unittest.TestCase):
             [(7.93, 8.86)],
         )
         self.assertEqual(spliced, 1)
+        # "Потерял," opened its clip: its capital was positional, and
+        # mid-sentence it is lowered (``backend.word_case``). The comma
+        # stays — in the clip it stood before "посмотрю", the
+        # transcript's "Посмотри,", so it describes a real boundary.
+        # "Посмотри," is capitalised mid-segment in the transcript, which
+        # is evidence about the word, so it keeps its capital here.
         self.assertEqual(
-            out[0]["text"], "и он слово деплой Потерял, Посмотри, по логам"
+            out[0]["text"], "и он слово деплой потерял, Посмотри, по логам"
         )
-        placed = [w for w in out[0]["words"] if w["word"] == "Потерял,"][0]
+        placed = [w for w in out[0]["words"] if w["word"] == "потерял,"][0]
         self.assertEqual((placed["start"], placed["end"]), (8.08, 8.56))
         self.assertEqual(placed["source"], RECOVERY_SOURCE)
+
+    def test_a_word_after_an_inserted_one_takes_the_case_of_its_new_place(self):
+        # As the transcript reached recovery in the single-stream shape:
+        # "Посмотри," opened a final of its own, so its capital was
+        # positional. With "потерял," now in front of it, it is
+        # mid-sentence.
+        transcript = [
+            _segment(5.6, 8.08, [("и", 7.12, 7.2), ("он", 7.2, 7.36),
+                                 ("слово", 7.36, 7.68), ("деплой", 7.68, 8.08)]),
+            # A final starts where the previous one ended, before its
+            # first word.
+            _segment(8.08, 9.51, [("Посмотри,", 8.56, 9.04), ("по", 9.03, 9.19),
+                                  ("логам", 9.19, 9.51)]),
+        ]
+        out, spliced = splice_recovered_words(
+            transcript,
+            [self._rec("Потерял,", 7.93, 8.65), self._rec("посмотрю.", 8.65, 9.13)],
+            [(7.93, 8.86)],
+        )
+        self.assertEqual(spliced, 1)
+        self.assertEqual(
+            join_segment_texts(out), "и он слово деплой потерял, посмотри, по логам"
+        )
+
+    def test_the_mark_where_the_clip_was_cut_is_not_carried_in(self):
+        # The fresh word is the clip's last: its "." closes the clip,
+        # not the speaker's sentence, and the transcript goes on after
+        # it. The mark is dropped; the capital the clip gave its first
+        # word is lowered.
+        transcript = [_segment(5.6, 7.2, [("сделай", 5.6, 6.0), ("на", 6.6, 6.8),
+                                          ("сервер", 6.8, 7.2)])]
+        out, spliced = splice_recovered_words(
+            transcript,
+            [self._rec("Сделай", 5.55, 6.0), self._rec("деплой.", 6.0, 6.58)],
+            [(5.55, 6.58)],
+        )
+        self.assertEqual(spliced, 1)
+        self.assertEqual(out[0]["text"], "сделай деплой на сервер")
+
+    def test_a_capital_the_clip_gave_mid_sentence_is_kept(self):
+        # Negative control: "Deepgram" did not open the clip; its capital
+        # is the word's own.
+        transcript = [_segment(1.0, 2.5, [("через", 1.0, 1.3), ("работает", 2.0, 2.5)])]
+        out, spliced = splice_recovered_words(
+            transcript,
+            [self._rec("Через", 0.95, 1.3), self._rec("Deepgram", 1.4, 1.9),
+             self._rec("работает.", 2.0, 2.5)],
+            [(0.95, 2.5)],
+        )
+        self.assertEqual(spliced, 1)
+        self.assertEqual(out[0]["text"], "через Deepgram работает")
+
+    def test_a_word_inserted_after_a_sentence_end_is_capitalised(self):
+        transcript = [_segment(1.0, 3.0, [("сервер.", 1.0, 1.5), ("на", 2.4, 2.6),
+                                          ("сервер", 2.6, 3.0)])]
+        out, spliced = splice_recovered_words(
+            transcript,
+            [self._rec("сервер.", 1.0, 1.5), self._rec("сделай", 1.6, 2.0),
+             self._rec("деплой", 2.0, 2.35), self._rec("на", 2.4, 2.6)],
+            [(0.9, 2.7)],
+        )
+        self.assertEqual(spliced, 2)
+        self.assertEqual(out[0]["text"], "сервер. Сделай деплой на сервер")
 
     def test_the_same_place_spelled_differently_is_not_added(self):
         # Negative control: the re-decode spells the transcript's own
@@ -727,7 +796,8 @@ class RunRecoveryEnvelopeTests(unittest.IsolatedAsyncioTestCase):
             transcribe=lambda **kw: _rest_result([("привет", 0.5, 1.0)]),
         )
         self.assertEqual(announced, [])
-        self.assertEqual(out["text"], "привет")
+        # The transcript's first word opens a sentence (``backend.word_case``).
+        self.assertEqual(out["text"], "Привет")
 
     async def test_whole_recording_recovery_produces_a_non_empty_envelope(self):
         # The connect-failure shape, at the module level: no reading, no
@@ -754,7 +824,8 @@ class RunRecoveryEnvelopeTests(unittest.IsolatedAsyncioTestCase):
                 [("так", 0.5, 0.9), ("слушай", 1.0, 1.6)]
             ),
         )
-        self.assertEqual(out["text"], "так слушай")
+        # The transcript's first word opens a sentence (``backend.word_case``).
+        self.assertEqual(out["text"], "Так слушай")
         self.assertEqual(out["stats"]["recovery"]["words"], 2)
         self.assertEqual(out["stats"]["recovery"]["spans"], [[0.0, 6.0]])
         self.assertEqual(out["coveredEndSec"], 1.6)
@@ -898,7 +969,7 @@ class LiveSessionRecoveryWiringTests(unittest.IsolatedAsyncioTestCase):
         # The renderer is told how long this stop may now take.
         self.assertIn("finalizing", types)
         envelope = ws.sent[-1]
-        self.assertEqual(envelope["text"], "так слушай")
+        self.assertEqual(envelope["text"], "Так слушай")
         self.assertEqual(envelope["stats"]["recovery"]["words"], 2)
         self.assertTrue(envelope["error"])
         # Same language decision the dead live stream would have used.

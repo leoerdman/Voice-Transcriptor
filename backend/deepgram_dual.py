@@ -95,8 +95,15 @@ from backend.remote_deepgram_live import (
     word_core,
     word_duration,
 )
+from backend.word_case import (
+    capital_is_lexical,
+    cased_for_place,
+    ends_sentence,
+    is_capitalised,
+    starts_sentence,
+)
 
-logger = logging.getLogger(__name__)
+logger =logging.getLogger(__name__)
 
 
 # Two words with the same stem, this close in time, are one spoken word
@@ -445,6 +452,24 @@ def _pairs(
     deleted, and ``multi``'s orphaned "на" then had to be removed as a
     duplicate.
 
+    Disagreement must be mutual. A disagreeing pair is admitted only
+    when each word is the other's largest overlap among every candidate
+    the other reading offers — agreeing candidates included. Overlap
+    against EITHER word's length is evidence that two records touch, not
+    that they are one word: a short word clears the fraction against a
+    long neighbour it merely abuts. Measured 2026-09-03 23:28:42 on
+    "слова он не должен": ``multi`` heard "он" 33.51-33.59 and "должен"
+    33.62-34.10, ``ru`` heard "не" 33.54-33.86 and "должен" 33.86-34.18.
+    "не" and "он" share 0.05 s — 62 % of "он", so the pair qualified —
+    yet 0.24 s of "не" lies under ``multi``'s "должен": the time "не"
+    occupies is best explained by a word that already has its own
+    counterpart, so "не" is no rival spelling of "он", and pairing them
+    deleted one of two spoken words ("слова не должен"). Under the
+    mutual rule both stay, each filling the slot its reading heard.
+    The "деплой"/"на" case passes the same test: ``ru``'s stretched "на"
+    is best matched by "деплой" (0.40 s), but "на" already agrees with
+    ``multi``'s own "на", so "деплой" stays unpaired either way.
+
     After the greedy pass, ``_pair_same_slot_neighbours`` pairs the
     words the time rules cannot see as one because one reading
     mis-timed them (see there).
@@ -494,6 +519,19 @@ def _pairs(
                 candidates.append(
                     (not _agree(pw, secondary[si]), overlap, pi, si)
                 )
+    # A disagreeing pair says "these two records are one spoken word";
+    # that holds only when each is the other's strongest time match
+    # among ALL of the other reading's words — agreeing ones included.
+    # See "Disagreement must be mutual" in the docstring.
+    best_p: dict[int, float] = {}
+    best_s: dict[int, float] = {}
+    for _disagrees, overlap, pi, si in candidates:
+        best_p[pi] = max(best_p.get(pi, 0.0), overlap)
+        best_s[si] = max(best_s.get(si, 0.0), overlap)
+    candidates = [
+        c for c in candidates
+        if not c[0] or (c[1] >= best_p[c[2]] and c[1] >= best_s[c[3]])
+    ]
     # Explicit tie-break on (pi, si) rather than sort stability: the
     # sweep visits the active set in heap order, so insertion order is
     # no longer the source order, and two candidates with identical
@@ -942,6 +980,91 @@ def _drop_self_shadowed(
     return kept, len(unpaired) - len(kept)
 
 
+def _word_key(word: dict) -> tuple:
+    """A reading record's identity across the merge's copies of it."""
+    return (word["source"], word["start"], word["end"], word["word"])
+
+
+def _reading_context(
+    segments: list[dict], source: str
+) -> dict[tuple, tuple[Optional[tuple], bool, bool]]:
+    """Per record of one reading: the key of the record before it in
+    that reading (``None`` for its first); whether it stood at a
+    position Deepgram capitalises for — first of its final (Deepgram
+    formats every final as a text of its own) or after a sentence-ending
+    word; and whether it followed a sentence-ending word, i.e. the
+    reading itself says a sentence begins with it.
+
+    Built from ``flatten_words`` one final at a time, so the records are
+    the ones the merge itself works on."""
+    context: dict[tuple, tuple[Optional[tuple], bool, bool]] = {}
+    previous: Optional[dict] = None
+    for segment in segments:
+        for i, record in enumerate(flatten_words([segment], source)):
+            # The reading's first word opens only the reading's text; where
+            # the merge puts it, that is the merge's start or not.
+            opens = previous is not None and ends_sentence(previous["word"])
+            context[_word_key(record)] = (
+                _word_key(previous) if previous is not None else None,
+                i == 0 or previous is None or opens,
+                opens,
+            )
+            previous = record
+    return context
+
+
+def _settle_case(
+    merged: list[dict],
+    readings_of: dict[int, tuple[dict, ...]],
+    context: dict[tuple, tuple[Optional[tuple], bool, bool]],
+) -> None:
+    """Give a merged word whose case is in question the case of its
+    place (``backend.word_case``); mutates ``merged`` in place.
+
+    A word's case is in question when the readings it stands for
+    disagree on it ("Же" against "же,") or when it no longer follows
+    the word it followed in any reading that has it — then its capital
+    may have been its old position's ("Иногда" opening a ``ru`` final,
+    now after a ``multi`` word). A word that agrees with every reading
+    that has it and keeps a neighbour it had is left exactly as read.
+    Clause records (``SPANLESS_WORD_FLAG``) are a whole clause, not a
+    word, and are left as read.
+
+    The place is a sentence start when the merged word before it ends a
+    sentence — or when every reading that has the word says a sentence
+    begins with it. The second is the readings' own punctuation outliving
+    the merge's word order: 2026-09-04 02:43:24, both readings wrote
+    "31. Посмотри", and the merge put ``multi``'s "2" between them.
+    """
+    merged_index: dict[tuple, int] = {}
+    for i, word in enumerate(merged):
+        for record in readings_of.get(id(word), ()):
+            merged_index[_word_key(record)] = i
+    for i, word in enumerate(merged):
+        records = readings_of.get(id(word), ())
+        if not records or word.get(SPANLESS_WORD_FLAG):
+            continue
+        own = [context.get(_word_key(r), (None, True, False)) for r in records]
+        agree = len({is_capitalised(r["word"]) for r in records}) == 1
+        kept_neighbour = any(
+            (merged_index.get(prev) if prev is not None else None)
+            == (i - 1 if i > 0 else None)
+            for prev, _start, _opens in own
+        )
+        if agree and kept_neighbour:
+            continue
+        word["word"] = cased_for_place(
+            word["word"],
+            sentence_start=(
+                starts_sentence(merged[i - 1]["word"] if i > 0 else None)
+                or all(opens for _prev, _start, opens in own)
+            ),
+            lexical=capital_is_lexical(
+                (r["word"], at_start) for r, (_prev, at_start, _opens) in zip(records, own)
+            ),
+        )
+
+
 def _speaker_turns(segments: list[dict]) -> list[tuple[float, float, int]]:
     """``(start, end, speaker)`` for every primary segment that has one.
 
@@ -1046,7 +1169,10 @@ def merge_readings(
     silently change which stretches count as contested.
     """
     primary_segments = list(primary_segments or [])
-    turns = _speaker_turns(primary_segments)
+    # Read twice — flattened for the merge, and per segment for the case
+    # evidence — so a one-shot iterable must not be consumed by the first.
+    secondary_segments = list(secondary_segments or [])
+    turns =_speaker_turns(primary_segments)
     primary = flatten_words(primary_segments, primary_language)
     secondary = flatten_words(secondary_segments, secondary_language)
     if not secondary:
@@ -1081,12 +1207,30 @@ def merge_readings(
     only_secondary, shadowed_secondary = _drop_self_shadowed(
         only_secondary, [sw for _pw, sw in paired]
     )
-    merged = [_resolve(pw, sw) for pw, sw in paired]
-    merged.extend(dict(w) for w in settled)
-    merged.extend(dict(w) for w in only_primary)
-    merged.extend(dict(w) for w in only_secondary)
+    # Which reading records each merged word stands for — the evidence
+    # ``_settle_case`` reads. Keyed by the merged dict's identity: the
+    # sort and the duplicate drop below move and delete words but never
+    # copy them.
+    readings_of: dict[int, tuple[dict, ...]] = {}
+    merged = []
+    for pw, sw in paired:
+        word = _resolve(pw, sw)
+        readings_of[id(word)] = (pw, sw)
+        merged.append(word)
+    for w in (*settled, *only_primary, *only_secondary):
+        word = dict(w)
+        readings_of[id(word)] = (w,)
+        merged.append(word)
     merged.sort(key=lambda w: (w["start"], w["end"]))
     merged, duplicates = _drop_duplicate_runs(merged)
+    _settle_case(
+        merged,
+        readings_of,
+        {
+            **_reading_context(primary_segments, primary_language),
+            **_reading_context(secondary_segments, secondary_language),
+        },
+    )
     _label_speakers(merged, turns)
     return MergedReading(
         words=merged,

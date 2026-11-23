@@ -264,7 +264,7 @@ class MergeReadingsTests(unittest.TestCase):
         ])]
         merged = merge_readings(primary, secondary)
         self.assertEqual(
-            merged.text, "Сразу Же как починишь, сделай деплой на сервер."
+            merged.text, "Сразу же как починишь, сделай деплой на сервер."
         )
         self.assertEqual(merged.filled_from_primary, 1)
         self.assertEqual(merged.filled_from_secondary, 0)
@@ -368,7 +368,8 @@ class MergeReadingsTests(unittest.TestCase):
             _w("Я", 3.00 - gap - 0.5, 3.00 - gap), _w("сейчас", 3.20, 3.60),
         ])]
         merged = merge_readings(primary, secondary)
-        self.assertEqual([w["word"] for w in merged.words], ["Я", "Я", "сейчас"])
+        # Both kept; the second is mid-sentence, so lower case (``_settle_case``).
+        self.assertEqual([w["word"] for w in merged.words], ["Я", "я", "сейчас"])
 
     def test_a_hole_in_the_primary_is_filled_from_the_secondary(self):
         # The measured 21.82-25.99s hole: multi has nothing there, ru
@@ -441,7 +442,8 @@ class MergeReadingsTests(unittest.TestCase):
         primary = [_segment([_w("Локи", 1.0, 1.5)])]
         secondary = [_segment([_w("который", 1.05, 1.45)])]
         merged = merge_readings(primary, secondary)
-        self.assertEqual([w["word"] for w in merged.words], ["который"])
+        # Capitalised: it is the first word of the merged text (``_settle_case``).
+        self.assertEqual([w["word"] for w in merged.words], ["Который"])
 
     def test_ngram_guard_keeps_a_genuine_disjoint_time_repeat(self):
         # "subagents, subagents" — spoken twice, far apart in time. Must
@@ -1440,6 +1442,154 @@ class DualDefaultsSsotTests(unittest.TestCase):
         self.assertEqual(
             dual_secondary_language({}), DUAL_SECONDARY_LANGUAGE_DEFAULT
         )
+
+# ---------------------------------------------------------------------
+# A disagreeing pair must be mutual
+# ---------------------------------------------------------------------
+
+class MutualDisagreementTests(unittest.TestCase):
+    """Real timings from the 2026-09-03 23:28:42 evidence take, where
+    "слова он не должен" was merged into "слова не должен"."""
+
+    @staticmethod
+    def _primary(he: tuple[float, float] = (33.51, 33.59)) -> list[dict]:
+        return [_segment([
+            _w("слова", 33.03, 33.35), _w("он", *he),
+            _w("должен", 33.62, 34.10), _w("пригласить.", 34.10, 35.06),
+        ])]
+
+    @staticmethod
+    def _secondary() -> list[dict]:
+        return [_segment([
+            _w("слова", 32.95, 33.35), _w("не", 33.54, 33.86),
+            _w("должен", 33.86, 34.18), _w("проглатывать.", 34.18, 35.06),
+        ])]
+
+    def test_a_word_that_only_touches_another_does_not_replace_it(self):
+        # "не" and "он" share 0.05 s — 62 % of "он", over the 25 % pair
+        # threshold — but "не" overlaps multi's "должен" (0.24 s) far
+        # more, and that "должен" has its own counterpart. Neither is the
+        # other's best match, so both are words: nothing is deleted.
+        merged = merge_readings(self._primary(), self._secondary())
+        self.assertEqual(merged.text, "слова он не должен проглатывать.")
+        self.assertEqual(merged.filled_from_primary, 1)
+        self.assertEqual(merged.filled_from_secondary, 1)
+
+    def test_rival_spellings_of_one_slot_still_resolve_to_one_word(self):
+        # Negative control: had multi's word covered the same 0.32 s as
+        # "не", each is the other's best match — one spoken word, two
+        # spellings — and the merge keeps one, as before.
+        merged = merge_readings(self._primary(he=(33.52, 33.86)), self._secondary())
+        self.assertEqual(merged.text, "слова не должен проглатывать.")
+
+
+# ---------------------------------------------------------------------
+# Case by place (backend.word_case)
+# ---------------------------------------------------------------------
+
+class MergedCaseTests(unittest.TestCase):
+    def test_a_capital_one_reading_gave_mid_sentence_is_lowered(self):
+        # 2026-11-23 take 20261123-173206: multi "Сразу Же", ru "Сразу же,".
+        primary = [_segment([_w("Сразу", 0.0, 0.32), _w("Же", 0.32, 0.48), _w("как", 0.48, 0.72)])]
+        secondary = [_segment([_w("Сразу", 0.08, 0.32), _w("же,", 0.32, 0.48), _w("как", 0.48, 0.72)])]
+        self.assertEqual(merge_readings(primary, secondary).text, "Сразу же как")
+
+    def test_a_capital_that_opened_a_final_is_lowered_mid_sentence(self):
+        # 2026-09-03 23:29:40: multi opened a final with "Иногда"; ru
+        # read "нету, иногда" in one final. Mid-sentence, lower case.
+        primary = [
+            _segment([_w("огромных", 17.18, 17.74)]),
+            _segment([_w("Иногда", 18.62, 18.94), _w("он", 18.94, 19.10)]),
+        ]
+        secondary = [
+            _segment([_w("огромных", 17.34, 17.82)]),
+            _segment([_w("нету,", 17.90, 18.70), _w("иногда", 18.70, 18.94), _w("он", 18.94, 19.10)]),
+        ]
+        self.assertEqual(
+            merge_readings(primary, secondary).text, "огромных нету, иногда он"
+        )
+
+    def test_a_word_after_a_sentence_end_is_capitalised(self):
+        # 2026-09-03 23:49:57: ru's "Возможно," was paired away and
+        # multi's "возможно," landed right after "стол.".
+        primary = [
+            _segment([_w("кнопки", 38.90, 39.20), _w("стол.", 39.20, 39.60)]),
+            _segment([_w("возможно,", 39.71, 40.35), _w("в", 40.75, 41.15)]),
+        ]
+        secondary = [_segment([
+            _w("кнопки", 38.90, 39.20), _w("стол.", 39.20, 39.60),
+            _w("Возможно,", 40.03, 40.11), _w("в", 40.83, 40.99),
+        ])]
+        self.assertEqual(
+            merge_readings(primary, secondary).text, "кнопки стол. Возможно, в"
+        )
+
+    def test_a_sentence_both_readings_open_stays_open_whatever_precedes_it(self):
+        # 2026-09-04 02:43:24: both readings wrote "31. Посмотри"; the
+        # merge put multi's "2" (30.99) between ru's "31." and the word.
+        primary = [_segment([_w("4", 30.43, 30.99), _w("2", 30.99, 31.23),
+                             _w("31.", 31.23, 32.5), _w("Посмотри", 32.91, 33.47)])]
+        secondary = [_segment([_w("4", 30.59, 30.91), _w("31.", 30.91, 31.2),
+                               _w("Посмотри", 32.91, 33.39)])]
+        merged = merge_readings(primary, secondary)
+        self.assertEqual(merged.words[-1]["word"], "Посмотри")
+
+    def test_a_name_both_readings_capitalise_keeps_its_capital(self):
+        # Negative control: multi opened a final with "Claude" (a
+        # positional capital on its own), ru capitalised its "Клод"
+        # mid-sentence. Capitalised in both readings: the word's own.
+        primary = [
+            _segment([_w("спроси", 1.0, 1.4)]),
+            _segment([_w("Claude", 1.5, 1.9), _w("сейчас", 1.9, 2.3)]),
+        ]
+        secondary = [_segment([
+            _w("спроси", 1.0, 1.4), _w("Клод", 1.5, 1.9), _w("сейчас", 1.9, 2.3),
+        ])]
+        self.assertEqual(
+            merge_readings(primary, secondary).text, "спроси Claude сейчас"
+        )
+
+    def test_a_name_against_a_lower_case_transliteration_keeps_its_capital(self):
+        # multi capitalised "Claude" mid-sentence — not a position Deepgram
+        # capitalises for — and ru wrote the different spelling "клод".
+        primary = [_segment([_w("спроси", 1.0, 1.4), _w("Claude", 1.5, 1.9), _w("сейчас", 1.9, 2.3)])]
+        secondary = [_segment([_w("спроси", 1.0, 1.4), _w("клод", 1.5, 1.9), _w("сейчас", 1.9, 2.3)])]
+        self.assertEqual(
+            merge_readings(primary, secondary).text, "спроси Claude сейчас"
+        )
+
+    def test_a_capital_owed_to_opening_a_final_is_lowered(self):
+        # "Же" opened a multi final (positional); ru: "же," mid-sentence.
+        primary = [
+            _segment([_w("Сразу", 0.0, 0.32)]),
+            _segment([_w("Же", 0.32, 0.48), _w("как", 0.48, 0.72)]),
+        ]
+        secondary = [_segment([_w("Сразу", 0.08, 0.32), _w("же,", 0.32, 0.48), _w("как", 0.48, 0.72)])]
+        self.assertEqual(merge_readings(primary, secondary).text, "Сразу же как")
+
+    def test_a_name_only_one_reading_heard_keeps_its_mid_sentence_capital(self):
+        # Negative control: a fill whose reading capitalised it away from
+        # any sentence start ("Deepgram") keeps its capital.
+        primary = [_segment([_w("через", 1.0, 1.3), _w("работает", 2.0, 2.5)])]
+        secondary = [_segment([
+            _w("через", 1.0, 1.3), _w("Deepgram", 1.4, 1.9), _w("работает", 2.0, 2.5),
+        ])]
+        self.assertEqual(
+            merge_readings(primary, secondary).text, "через Deepgram работает"
+        )
+
+    def test_an_abbreviation_is_never_recased(self):
+        # Negative control: casing beyond a leading capital is the word's own.
+        primary = [_segment([_w("через", 1.0, 1.3), _w("API", 1.4, 1.9)])]
+        secondary = [_segment([_w("через", 1.0, 1.3), _w("апи", 1.4, 1.9)])]
+        self.assertEqual(merge_readings(primary, secondary).text, "через API")
+
+    def test_a_genuine_repeat_is_kept_and_keeps_its_case(self):
+        # Negative control: "Да, да" said twice, read alike by both.
+        primary = [_segment([_w("Да,", 1.0, 1.3), _w("да,", 1.5, 1.8), _w("конечно.", 1.8, 2.4)])]
+        secondary = [_segment([_w("Да,", 1.0, 1.32), _w("да,", 1.52, 1.8), _w("конечно.", 1.8, 2.4)])]
+        self.assertEqual(merge_readings(primary, secondary).text, "Да, да, конечно.")
+
 
 if __name__ == "__main__":
     unittest.main()
