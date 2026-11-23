@@ -1240,6 +1240,89 @@ class ContestedStretchTests(unittest.TestCase):
         self.assertEqual(words[0]["language"], "en")
 
 
+def _reading_records_used_twice(merged) -> list[tuple]:
+    """Reading records the merge put into its transcript more than once.
+
+    Every merged word is a copy of exactly one reading record (``_resolve``
+    copies the winner of a pair), and within one reading no two records
+    share word, start, end — so a repeated key is one heard word printed
+    twice, while a genuine repeat ("ты, ты") has its own times."""
+    counts: dict[tuple, int] = {}
+    for w in merged.words:
+        key = (w["word"], w["start"], w["end"], w["source"])
+        counts[key] = counts.get(key, 0) + 1
+    return [key for key, n in counts.items() if n > 1]
+
+
+class OverlappingTakesTests(unittest.TestCase):
+    """Every word of either reading lands in the transcript at most once,
+    even where one reading delivered overlapping takes of the same audio.
+
+    Real readings of the 2026-09-03 23:49:57 evidence take, 22.72-25.92 s
+    (``backend.tools.deepgram_live_ab --dump-readings``): ``multi`` had no
+    final there and the stretch was rebuilt from interim snapshots
+    (``interim-fallback``), so its words overlap — "Tai" (lt) and "Ти"
+    (en) for one word, "mažaš", "mažeš" (lt) and "можеш" (en) for the
+    next, "taip tek" (lt) under "detect" (en). Split by language kind they
+    were four contested stretches over one piece of ground; each claimed
+    the ``ru`` words its span reached and the merge printed
+    "И И ты ты можешь detect".
+    """
+
+    MULTI = [
+        _ev("Tai", 22.72, 23.04, 0.307, "lt"), _ev("Ти", 22.80, 23.12, 0.357, "en"),
+        _ev("mažaš", 22.96, 23.92, 0.604, "lt"), _ev("mažeš", 23.04, 23.92, 0.519, "lt"),
+        _ev("можеш", 23.12, 23.84, 0.994, "en"), _ev("detect", 23.84, 24.64, 0.97, "en"),
+        _ev("taip", 23.92, 24.24, 0.645, "lt"), _ev("tek", 24.24, 24.48, 0.72, "lt"),
+        _ev("and", 24.64, 25.12, 0.997, "en"), _ev("find", 25.12, 25.92, 1.0, "en"),
+    ]
+    RU = [
+        _ev("долго.", 21.39, 22.19, 0.941),
+        _ev("И", 22.72, 22.96, 0.568), _ev("ты", 22.96, 23.12, 0.999),
+        _ev("можешь", 23.12, 23.76, 1.0), _ev("detect", 23.92, 24.72, 0.816),
+        _ev("and", 24.72, 25.12, 0.974), _ev("find", 25.12, 25.84, 0.99),
+        _ev("the", 25.92, 26.24, 0.46),
+    ]
+
+    def _merge(self, multi, ru):
+        return merge_readings(
+            [_segment(multi)], [_segment(ru)], expected_languages=["ru", "en"],
+        )
+
+    def test_overlapping_takes_are_one_stretch_decided_once(self):
+        merged = self._merge(self.MULTI, self.RU)
+        self.assertEqual(merged.text, "долго. И ты можешь detect and find the")
+        self.assertEqual(_reading_records_used_twice(merged), [])
+        # Nothing was settled twice and left to the duplicate filter.
+        self.assertEqual(merged.duplicates_removed, 0)
+        self.assertEqual((merged.contested_to_secondary, merged.contested_to_primary), (1, 1))
+
+    def test_takes_that_only_touch_stay_separate_stretches(self):
+        # "and find" starts exactly where "можеш detect" ends: neighbouring
+        # ground, not the same ground — still its own (English) stretch.
+        merged = self._merge(self.MULTI, self.RU)
+        self.assertEqual(
+            [w["source"] for w in merged.words if w["word"] in ("and", "find")],
+            ["multi", "multi"],
+        )
+
+    def test_a_spoken_repeat_survives_beside_overlapping_takes(self):
+        # Negative control: "ты, ты" and "да, да" said twice are four ``ru``
+        # records with their own times — none of them is a word used twice.
+        ru = [
+            _ev("И", 22.72, 22.96, 0.568), _ev("ты,", 22.96, 23.12, 0.999),
+            _ev("ты", 23.12, 23.30, 0.99), _ev("можешь", 23.30, 23.76, 1.0),
+            _ev("да,", 23.80, 23.90, 0.98), _ev("да", 23.92, 24.10, 0.97),
+        ]
+        multi = [
+            _ev("Tai", 22.72, 23.04, 0.307, "lt"), _ev("Ти", 22.80, 23.12, 0.357, "en"),
+            _ev("mažaš", 22.96, 23.92, 0.604, "lt"), _ev("taip", 23.20, 24.10, 0.4, "lt"),
+        ]
+        merged = self._merge(multi, ru)
+        self.assertEqual(merged.text, "И ты, ты можешь да, да")
+        self.assertEqual(_reading_records_used_twice(merged), [])
+
+
 class WordlessFinalMergeTests(unittest.TestCase):
     """A final Deepgram sent without a word list must still be read.
 

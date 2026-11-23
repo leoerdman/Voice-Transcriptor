@@ -677,7 +677,22 @@ def _contested_runs(
     cross between declared and undeclared: each run is then one kind, so
     the rule deciding it (``_settle_contested_stretches``) never lets a
     mislabelled word hand a neighbouring real-English clause to the
-    monolingual reading, or the other way round."""
+    monolingual reading, or the other way round.
+
+    Runs whose time spans overlap are returned as ONE stretch. Within one
+    reading words follow one another; two that cover the same time are
+    contradictory takes of the same audio, delivered side by side when a
+    stretch had no final and was rebuilt from interim snapshots
+    (``interim-fallback``, see ``_drop_self_shadowed``). Measured on the
+    2026-09-03 23:49:57 evidence take: ``multi`` delivered "Tai" (lt)
+    22.72-23.04, "Ти" (en) 22.80-23.12, "mažaš mažeš" (lt) 22.96-23.92 and
+    "можеш detect" (en) 23.12-24.64 for ``ru``'s "И ты можешь detect".
+    Split by kind, those were four stretches over one stretch of ground:
+    each claimed the ``ru`` words its span reached, so "И" and "ты" were
+    settled twice ("И И ты ты") and "можешь" went to ``ru`` in one
+    stretch while ``multi``'s "можеш" was settled in the next. One
+    stretch per piece of ground is what makes every word of either
+    reading belong to at most one stretch — and be decided once."""
     runs: list[list[dict]] = []
     run: list[dict] = []
     for word in primary:
@@ -705,7 +720,18 @@ def _contested_runs(
             run = []
     if run:
         runs.append(run)
-    return runs
+    # ``primary`` is in start order, so the runs are too: a run that
+    # starts before the ground gathered so far ends belongs to it.
+    stretches: list[list[dict]] = []
+    stretch_end = 0.0
+    for run in runs:
+        if stretches and run[0]["start"] < stretch_end:
+            stretches[-1].extend(run)
+        else:
+            stretches.append(list(run))
+            stretch_end = run[0]["start"]
+        stretch_end = max(stretch_end, max(w["end"] for w in run))
+    return stretches
 
 
 def _language_base(tag: object) -> str:
@@ -824,7 +850,9 @@ def _settle_contested_stretches(
         w for w in secondary if not w.get(SPANLESS_WORD_FLAG)
     )
     for run in _contested_runs(primary, secondary_language, frozenset(expected)):
-        start, end = run[0]["start"], run[-1]["end"]
+        # A stretch that gathered overlapping takes (``_contested_runs``)
+        # ends where its longest word does, not where its last one does.
+        start, end = run[0]["start"], max(w["end"] for w in run)
         # A word belongs to the stretch its midpoint falls in, half-open
         # [start, end): no overlap threshold to tune, and a word that only
         # grazes an edge (the "Да," after "Agents workflow.") stays out.
@@ -840,9 +868,15 @@ def _settle_contested_stretches(
         coverage = _covered_fraction(secondary_ground, start, end)
         removed_primary.update(id(w) for w in run)
         removed_secondary.update(id(w) for w in rivals)
-        # One kind per run (``_contested_runs`` splits at the boundary), so
-        # the first word speaks for all of it.
-        undeclared = bool(expected) and _language_base(run[0].get("language")) not in expected
+        # One kind per run (``_contested_runs`` splits at the boundary),
+        # except where the reading's own overlapping takes of one ground
+        # were gathered into a single stretch. Only a stretch EVERY take
+        # of which is in an undeclared language is the mislabelling the
+        # rule overrides confidence for; where the reading also offered
+        # a declared-language take of the same ground, confidence decides.
+        undeclared = bool(expected) and all(
+            _language_base(w.get("language")) not in expected for w in run
+        )
         to_secondary_here = coverage >= SPANLESS_SHADOW_MIN_FRACTION and (
             undeclared or secondary_conf >= primary_conf
         )

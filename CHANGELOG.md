@@ -3,6 +3,15 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.35] - 2026-11-23
+
+### Fixed
+
+- **Short words next to each other no longer merge into one.** "слова он не должен" came out as "слова не должен": two different words were treated as one place when one of them mostly belonged to its neighbour. Now two different words count as one place only when each is the other's best match in time.
+- **No capital letters in the middle of a sentence.** Words taken from the other reading or from the recovery pass brought their sentence-start capital along ("Сразу Же", "деплой Потерял, Посмотри"). One case rule now decides by the word's place: capitals at sentence starts, names and acronyms keep theirs (Claude, Deepgram, API).
+- **No more doubled words where the two readings disagree on the language** ("И И ты ты" → "И ты"). Overlapping disputed stretches are now decided once, as one stretch.
+- **The recordings list is ready sooner after launch.** It is built as soon as the backend starts, without blocking the backend while it is sent, and the keyword recompute waits until start-up is done.
+
 ## [1.6.34] - 2026-11-23
 
 ### Fixed
