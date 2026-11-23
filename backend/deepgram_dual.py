@@ -423,10 +423,31 @@ def _pairs(
 ) -> tuple[list[tuple[dict, dict]], list[dict], list[dict]]:
     """Pair words across readings, greedily, strongest evidence first.
 
-    Ranked by time overlap so the best-matching pair claims each word
-    before a weaker candidate can. Pairs accepted with no overlap at all
-    (the same-stem neighbour rule) rank last, which is right: they are
-    the weakest evidence of sameness and must not outbid a real overlap.
+    Two kinds of evidence, ranked in this order:
+
+    1. AGREEMENT — the two readings wrote the same word (same stem).
+       Every agreeing candidate claims its words before any disagreeing
+       one may; among agreeing candidates the larger overlap wins, so a
+       same-stem neighbour with no overlap at all (the "без без" rule in
+       ``_pair_overlap``) still yields to a real overlap.
+    2. DISAGREEMENT — the two readings wrote different words over the
+       same time, and ``_resolve`` picks one spelling. Ranked by overlap.
+
+    Agreement must come first because a disagreeing pair REPLACES a word,
+    and a word is only a rival spelling of another when neither has its
+    own counterpart in the other reading. Measured 2026-11-23 on "сделай
+    деплой на сервер" (``20261123-173206``): ``ru`` skipped "деплой" and
+    stretched its "на" back over it (2.24-2.80 s), so its "на" overlapped
+    ``multi``'s "деплой" (2.16-2.64, 0.40 s) more than ``multi``'s own
+    "на" (2.64-2.80, 0.16 s). Ranked by overlap alone, "на" claimed
+    "деплой", ``_resolve`` let the Cyrillic secondary win, and the user
+    got "сделай на сервер" — the one word only ``multi`` heard was
+    deleted, and ``multi``'s orphaned "на" then had to be removed as a
+    duplicate.
+
+    After the greedy pass, ``_pair_same_slot_neighbours`` pairs the
+    words the time rules cannot see as one because one reading
+    mis-timed them (see there).
 
     Linear in the number of words, by a time sweep. This used to rescan
     the WHOLE secondary list from index 0 for every primary word — the
@@ -470,26 +491,105 @@ def _pairs(
         for _end, si in active:
             overlap = _pair_overlap(pw, secondary[si])
             if overlap is not None:
-                candidates.append((overlap, pi, si))
+                candidates.append(
+                    (not _agree(pw, secondary[si]), overlap, pi, si)
+                )
     # Explicit tie-break on (pi, si) rather than sort stability: the
     # sweep visits the active set in heap order, so insertion order is
     # no longer the source order, and two candidates with identical
-    # overlap have to resolve the same way every run.
-    candidates.sort(key=lambda t: (-t[0], t[1], t[2]))
-    used_p: set[int] = set()
+    # evidence have to resolve the same way every run.
+    candidates.sort(key=lambda t: (t[0], -t[1], t[2], t[3]))
+    p_to_s: dict[int, int] = {}
     used_s: set[int] = set()
-    paired: list[tuple[dict, dict]] = []
-    for _overlap, pi, si in candidates:
-        if pi in used_p or si in used_s:
+    for _disagrees, _overlap, pi, si in candidates:
+        if pi in p_to_s or si in used_s:
             continue
-        used_p.add(pi)
+        p_to_s[pi] = si
         used_s.add(si)
-        paired.append((primary[pi], secondary[si]))
+    _pair_same_slot_neighbours(primary, secondary, p_to_s, used_s)
     return (
-        paired,
-        [w for i, w in enumerate(primary) if i not in used_p],
+        [(primary[pi], secondary[si]) for pi, si in sorted(p_to_s.items())],
+        [w for i, w in enumerate(primary) if i not in p_to_s],
         [w for i, w in enumerate(secondary) if i not in used_s],
     )
+
+
+def _agree(a: dict, b: dict) -> bool:
+    """Did the two readings write the same word? The stem test
+    ``_pair_overlap`` and ``_drop_duplicate_runs`` already use. Clause
+    records (``SPANLESS_WORD_FLAG``) carry a whole clause, not a word, so
+    they never "agree" — they pair on overlap alone."""
+    if a.get(SPANLESS_WORD_FLAG) or b.get(SPANLESS_WORD_FLAG):
+        return False
+    stem = token_stem(a["word"])
+    return bool(stem) and stem == token_stem(b["word"])
+
+
+def _pair_same_slot_neighbours(
+    primary: list[dict],
+    secondary: list[dict],
+    p_to_s: dict[int, int],
+    used_s: set[int],
+) -> None:
+    """Pair the same word both readings put in the same place in the
+    sentence, when one of them mis-timed it.
+
+    Time is the merge's evidence everywhere else, but a reading's time
+    can be wrong for a whole word. Measured 2026-11-23 on "Я сейчас
+    записывал …" (``20261123-173222``): the audio is silent until 1.12 s
+    and ``multi`` placed "Я" at 1.20-1.44 s, but ``ru`` — whose first
+    word of the stream it was — stretched it back to the stream start,
+    0.00-0.64 s. 0.56 s apart, the two "Я" neither overlap nor fall
+    within ``ADJACENT_SAME_STEM_MAX_GAP_SEC``, so both survived and the
+    user got "Я Я сейчас".
+
+    The evidence the time rules miss is ORDER. Both "Я" are the word
+    right before "сейчас", and the two "сейчас" are already paired: two
+    readings of one stretch that agree on a word and on its neighbour
+    heard one word there, not two. So a pair (p, s) — any pair, agreeing
+    or not — extends to its immediate neighbours on the same side,
+    ``p±1`` with ``s±1``, when both are still unpaired, are words (not
+    clause records), write the same stem, and sit no further apart than
+    ``INTERIM_WORD_GAP_SPLIT_SEC`` — the pause beyond which this product
+    already treats speech as a different clause. A new pair is itself an
+    anchor, so a run of mis-timed words is walked word by word.
+
+    The anchor is what keeps this from merging a genuine repeat: "да"
+    said twice is two words in the reading that heard both, so the
+    second "да" is not the neighbour of the anchor the other reading's
+    single "да" is next to. With no anchor at all (two isolated words)
+    nothing changes — ``ADJACENT_SAME_STEM_MAX_GAP_SEC`` alone decides.
+
+    Linear: one sweep each way over the pairs in primary order; mutates
+    ``p_to_s``/``used_s``.
+    """
+
+    def _try(pi: int, si: int) -> bool:
+        if not (0 <= pi < len(primary) and 0 <= si < len(secondary)):
+            return False
+        if pi in p_to_s or si in used_s:
+            return False
+        pw, sw = primary[pi], secondary[si]
+        if not _agree(pw, sw):
+            return False
+        gap = max(pw["start"], sw["start"]) - min(pw["end"], sw["end"])
+        if gap > INTERIM_WORD_GAP_SPLIT_SEC:
+            return False
+        p_to_s[pi] = si
+        used_s.add(si)
+        return True
+
+    # Rightward: an anchor at pi claims (pi+1, si+1); visiting pi in
+    # increasing order lets a fresh pair anchor the next one.
+    for pi in range(len(primary)):
+        si = p_to_s.get(pi)
+        if si is not None:
+            _try(pi + 1, si + 1)
+    # Leftward, mirror image.
+    for pi in range(len(primary) - 1, -1, -1):
+        si = p_to_s.get(pi)
+        if si is not None:
+            _try(pi - 1, si - 1)
 
 
 def _mean_confidence(words: list[dict]) -> Optional[float]:
@@ -803,6 +903,45 @@ def _drop_duplicate_runs(words: list[dict]) -> tuple[list[dict], int]:
     return out, dropped
 
 
+def _drop_self_shadowed(
+    unpaired: list[dict], paired_own: list[dict]
+) -> tuple[list[dict], int]:
+    """Drop unpaired words whose ground their OWN reading already gave
+    to a paired word.
+
+    An unpaired word is a hole fill — speech the other reading missed —
+    only where its own reading has no other word for that time. Within
+    one reading words follow one another; two that cover the same time
+    are two contradictory takes the reading delivered side by side,
+    which happens when a stretch had no final and was rebuilt from
+    interim snapshots (``interim-fallback``). Measured on the 2026-09-04
+    02:45:13 evidence take: ``multi`` delivered "открытая" 12.42-13.94
+    and, inside it, "Причем" 13.38-13.54 (confidence 0.46) from another
+    snapshot; ``ru`` had "Причем" at 11.54 and "открыта" 13.38-13.94.
+    Once "открытая" pairs with its counterpart "открыта" (``_pairs``),
+    the stray "Причем" is no unheard word — the reading itself already
+    accounted for that ground — and filling it in printed "Причем"
+    twice.
+
+    "Already accounted for" is the module's one coverage measure:
+    the paired words of the same reading cover at least
+    ``SPANLESS_SHADOW_MIN_FRACTION`` of the word (``_covered_fraction``).
+    A word only the other reading's words overlap is untouched — that is
+    "деплой" under ``ru``'s stretched "на", the case agreement-first
+    pairing exists for. Clause records are left to
+    ``_reconcile_spanless``, which owns them.
+    """
+    if not unpaired or not paired_own:
+        return unpaired, 0
+    ground = _word_spans(w for w in paired_own if not w.get(SPANLESS_WORD_FLAG))
+    kept = [
+        w for w in unpaired
+        if w.get(SPANLESS_WORD_FLAG)
+        or _covered_fraction(ground, w["start"], w["end"]) < SPANLESS_SHADOW_MIN_FRACTION
+    ]
+    return kept, len(unpaired) - len(kept)
+
+
 def _speaker_turns(segments: list[dict]) -> list[tuple[float, float, int]]:
     """``(start, end, speaker)`` for every primary segment that has one.
 
@@ -936,6 +1075,12 @@ def merge_readings(
         _settle_contested_stretches(primary, secondary, secondary_language, expected_languages)
     )
     paired, only_primary, only_secondary = _pairs(primary, secondary)
+    only_primary, shadowed_primary = _drop_self_shadowed(
+        only_primary, [pw for pw, _sw in paired]
+    )
+    only_secondary, shadowed_secondary = _drop_self_shadowed(
+        only_secondary, [sw for _pw, sw in paired]
+    )
     merged = [_resolve(pw, sw) for pw, sw in paired]
     merged.extend(dict(w) for w in settled)
     merged.extend(dict(w) for w in only_primary)
@@ -951,7 +1096,7 @@ def merge_readings(
         secondary_word_count=secondary_count,
         filled_from_secondary=len(only_secondary),
         filled_from_primary=len(only_primary),
-        duplicates_removed=duplicates,
+        duplicates_removed=duplicates + shadowed_primary + shadowed_secondary,
         contested_to_secondary=contested_to_secondary,
         contested_to_primary=contested_to_primary,
     )

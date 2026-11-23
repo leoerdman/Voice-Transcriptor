@@ -30,7 +30,11 @@ from backend.deepgram_dual import (
     merge_readings,
     secondary_config,
 )
-from backend.remote_deepgram_live import DeepgramLiveConfig, DeepgramLiveSession
+from backend.remote_deepgram_live import (
+    INTERIM_WORD_GAP_SPLIT_SEC,
+    DeepgramLiveConfig,
+    DeepgramLiveSession,
+)
 
 
 def _cfg(**over) -> dict:
@@ -230,6 +234,141 @@ class MergeReadingsTests(unittest.TestCase):
         merged = merge_readings(primary, secondary)
         bez_count = sum(1 for w in merged.words if w["word"] == "без")
         self.assertEqual(bez_count, 2)
+
+    # The two takes of 2026-11-23, as both live readings delivered them
+    # (``deepgram_live_ab --language multi --dual ru``, replayed through
+    # ``dual_replay``; identical in three runs). Primary words carry the
+    # ``ru`` tag ``multi`` gave them, so no stretch is contested and only
+    # the word-by-word rules are under test.
+
+    def test_a_word_only_the_primary_heard_is_not_replaced_by_a_stretched_neighbour(self):
+        # "Сразу же как починишь, сделай деплой на сервер." ``ru`` skipped
+        # "деплой" and stretched its "на" back over it (2.24-2.80), so
+        # ru's "на" overlaps multi's "деплой" (0.40 s) more than multi's
+        # own "на" (0.16 s). Ranked by overlap alone, "на" claimed
+        # "деплой", the Cyrillic secondary won the disagreement, and the
+        # user got "сделай на сервер" (dups_removed=1 for the orphaned
+        # "на"). The same word in both readings pairs first.
+        def p(word, start, end):
+            return dict(_w(word, start, end), language="ru")
+
+        primary = [_segment([
+            p("Сразу", 0.00, 0.32), p("Же", 0.32, 0.48), p("как", 0.48, 0.72),
+            p("починишь,", 0.72, 1.44), p("сделай", 1.44, 2.16),
+            p("деплой", 2.16, 2.64), p("на", 2.64, 2.80), p("сервер.", 2.80, 3.44),
+        ])]
+        secondary = [_segment([
+            _w("Сразу", 0.08, 0.32), _w("же,", 0.32, 0.48), _w("как", 0.48, 0.72),
+            _w("починишь,", 0.72, 1.28), _w("сделай", 1.28, 2.08),
+            _w("на", 2.24, 2.80), _w("сервер.", 2.80, 3.36),
+        ])]
+        merged = merge_readings(primary, secondary)
+        self.assertEqual(
+            merged.text, "Сразу Же как починишь, сделай деплой на сервер."
+        )
+        self.assertEqual(merged.filled_from_primary, 1)
+        self.assertEqual(merged.filled_from_secondary, 0)
+        self.assertEqual(merged.duplicates_removed, 0)
+
+    def test_agreement_outranks_a_larger_disagreeing_overlap(self):
+        # The rule itself, isolated: one secondary word overlapping a
+        # different primary word more than its own counterpart.
+        primary = [_segment([_w("деплой", 2.16, 2.64), _w("на", 2.64, 2.80)])]
+        secondary = [_segment([_w("на", 2.24, 2.80)])]
+        merged = merge_readings(primary, secondary)
+        self.assertEqual([w["word"] for w in merged.words], ["деплой", "на"])
+
+    def test_a_word_one_reading_mistimed_pairs_by_its_place_in_the_sentence(self):
+        # "Я сейчас записывал сообщение…": silence until 1.12 s; multi put
+        # "Я" at 1.20-1.44, ru stretched its first word of the stream back
+        # to 0.00-0.64. 0.56 s apart — beyond ADJACENT_SAME_STEM_MAX_GAP_SEC
+        # — so both survived as "Я Я сейчас". Both are the word right
+        # before the paired "сейчас": one word.
+        def p(word, start, end):
+            return dict(_w(word, start, end), language="ru")
+
+        primary = [_segment([
+            p("Я", 1.20, 1.44), p("сейчас", 1.44, 1.76),
+            p("записывал", 1.76, 2.24), p("сообщение", 2.24, 2.88),
+        ])]
+        secondary = [_segment([
+            _w("Я", 0.00, 0.64), _w("сейчас", 1.52, 1.76),
+            _w("записывал", 1.76, 2.16), _w("сообщение", 2.16, 2.88),
+        ])]
+        merged = merge_readings(primary, secondary)
+        self.assertEqual(merged.text, "Я сейчас записывал сообщение")
+        self.assertEqual((merged.words[0]["start"], merged.words[0]["end"]), (1.20, 1.44))
+        self.assertEqual(merged.filled_from_primary, 0)
+        self.assertEqual(merged.filled_from_secondary, 0)
+
+    def test_same_slot_pairing_walks_a_run_of_mistimed_words(self):
+        # A new pair anchors the next: two leading words ru stretched.
+        primary = [_segment([
+            _w("ну", 1.00, 1.20), _w("вот", 1.20, 1.40), _w("сейчас", 1.40, 1.80),
+        ])]
+        secondary = [_segment([
+            _w("ну", 0.00, 0.30), _w("вот", 0.30, 0.60), _w("сейчас", 1.40, 1.80),
+        ])]
+        merged = merge_readings(primary, secondary)
+        self.assertEqual(merged.text, "ну вот сейчас")
+
+    def test_same_slot_pairing_keeps_a_genuine_repeat(self):
+        # Negative control: "да, да сейчас" with the secondary hearing one
+        # "да". Its "да" is the neighbour of the anchor, and so is the
+        # primary's SECOND "да" — which it already overlaps; the first
+        # "да" is nobody's neighbour and stays.
+        primary = [_segment([
+            _w("да,", 1.00, 1.30), _w("да", 1.80, 2.10), _w("сейчас", 2.10, 2.50),
+        ])]
+        secondary = [_segment([_w("да", 1.80, 2.10), _w("сейчас", 2.10, 2.50)])]
+        merged = merge_readings(primary, secondary)
+        self.assertEqual(merged.text, "да, да сейчас")
+
+    def test_a_stray_word_inside_its_own_readings_paired_word_is_not_a_fill(self):
+        # 2026-09-04 02:45:13 evidence take: multi's stretch with no final
+        # was rebuilt from interim snapshots and carried "Причем" INSIDE
+        # its own "открытая"; ru had "Причем" earlier and "открыта" on
+        # that ground. With "открытая" paired to "открыта", the stray
+        # "Причем" is not speech ru missed — filling it in printed it
+        # twice ("Причем скриншоте Причем открыта").
+        def p(word, start, end):
+            return dict(_w(word, start, end), language="ru")
+
+        primary = [_segment([
+            p("открытая", 12.42, 13.94), p("Причем", 13.38, 13.54),
+            p("сессия,", 13.94, 14.50),
+        ])]
+        secondary = [_segment([
+            _w("Причем", 11.54, 11.86), _w("скриншоте", 12.42, 13.38),
+            _w("открыта", 13.38, 13.94), _w("сессия,", 13.94, 14.58),
+        ])]
+        merged = merge_readings(primary, secondary)
+        self.assertEqual(merged.text, "Причем скриншоте открыта сессия,")
+        self.assertEqual(merged.duplicates_removed, 1)
+
+    def test_a_word_its_reading_delivered_twice_on_one_span_is_kept_once(self):
+        # Same evidence set (23:29:40): multi delivered "1" twice on
+        # 19.10-19.42, ru once.
+        primary = [_segment([
+            _w("он", 18.94, 19.10), _w("1", 19.10, 19.42), _w("1", 19.10, 19.42),
+            _w("слово", 19.42, 19.74),
+        ])]
+        secondary = [_segment([
+            _w("он", 18.94, 19.10), _w("1", 19.10, 19.42), _w("слово", 19.42, 19.82),
+        ])]
+        merged = merge_readings(primary, secondary)
+        self.assertEqual(merged.text, "он 1 слово")
+
+    def test_same_slot_pairing_stops_at_a_clause_break(self):
+        # Negative control: further apart than a clause-length pause, the
+        # two are not one word, whatever their place in the sentence.
+        gap = INTERIM_WORD_GAP_SPLIT_SEC + 0.3
+        primary = [_segment([_w("Я", 3.00, 3.20), _w("сейчас", 3.20, 3.60)])]
+        secondary = [_segment([
+            _w("Я", 3.00 - gap - 0.5, 3.00 - gap), _w("сейчас", 3.20, 3.60),
+        ])]
+        merged = merge_readings(primary, secondary)
+        self.assertEqual([w["word"] for w in merged.words], ["Я", "Я", "сейчас"])
 
     def test_a_hole_in_the_primary_is_filled_from_the_secondary(self):
         # The measured 21.82-25.99s hole: multi has nothing there, ru

@@ -3,6 +3,13 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.34] - 2026-11-23
+
+### Fixed
+
+- **Dictation no longer drops a word both readings heard, nor doubles the first word.** Every take is read twice (Russian and multi-language) and the two readings are merged word by word. The merge paired words by time overlap alone, so when the Russian reading skipped a word and stretched its neighbour over it ("сделай деплой на сервер" → the Russian "на" covering "деплой"), the stretched word took the missing word's place and the word vanished. Words both readings wrote the same now pair first, and the same word sitting right next to an agreed pair is one word even when a reading shifted it — "Я Я сейчас…" is gone too.
+- **The log tells a covered window from a hidden one**, and a screen-mode start that was late during a system stall says so, instead of blaming the page load its own teardown cancelled.
+
 ## [1.6.33] - 2026-11-23
 
 ### Fixed
