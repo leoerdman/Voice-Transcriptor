@@ -98,7 +98,7 @@ function subscribePowerEvents(powerMonitor, handlers = {}) {
   const note = typeof log === "function" ? log : () => { };
   const registered = [];
   for (const event of POWER_EVENTS) {
-    const action = POWER_EVENT_ACTIONS[event];
+    const action = powerEventAction(event);
     powerMonitor.on(event, () => {
       note(`[power] ${event} — ${action}`);
       try {
