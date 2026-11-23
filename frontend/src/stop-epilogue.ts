@@ -394,10 +394,50 @@ export interface TranscriptStopSummary extends StopSummaryCopy {
   savedName: string;
 }
 
+/** What a stop that heard no speech says. */
+export const NO_SPEECH_STATUS = "Recording completed, no speech detected.";
+
+/** What a stop says when it ends with no transcript, and whether that is a failure. */
+export interface EmptyTranscriptCopy extends StopSummaryCopy {
+  /**
+   * True when the audio was never transcribed (every transcription pass
+   * failed), as opposed to transcribed and found silent. The capsule
+   * shows a failure as an error, never as "no speech".
+   */
+  failed: boolean;
+}
+
+/**
+ * Why a stop ended with no transcript — the one place that decides it.
+ *
+ * ``evidence`` is the capture's own verdict (a dead or muted microphone,
+ * measured silence); it wins because it says what the audio held.
+ * Without it, a ``transcriptionFailure`` (the live stream failed AND the
+ * pass over the saved audio produced nothing) is reported as exactly
+ * that: the audio was never heard, so "no speech detected" would be a
+ * guess — and on 2026-11-23 it was a wrong one, shown for two takes
+ * recorded while the internet was down.
+ */
+export function resolveEmptyTranscriptCopy(input: {
+  evidence: StopSummaryCopy;
+  transcriptionFailure: string;
+}): EmptyTranscriptCopy {
+  if (input.evidence.status) return { ...input.evidence, failed: false };
+  const failure = input.transcriptionFailure.trim();
+  if (failure) {
+    return {
+      status: `${failure} The audio is saved — re-transcribe it from History.`,
+      tone: "error",
+      failed: true,
+    };
+  }
+  return { status: NO_SPEECH_STATUS, tone: "info", failed: false };
+}
+
 /** The summary a stop that ran the transcription pass ends on. */
 export function resolveTranscriptStopSummary(input: {
   transcriptReady: boolean;
-  noSpeechStatus: string;
+  empty: StopSummaryCopy;
   persistedName: string;
   outcome: FinalSaveOutcome;
 }): TranscriptStopSummary {
@@ -415,15 +455,16 @@ export function resolveTranscriptStopSummary(input: {
     return {
       status: input.transcriptReady
         ? `${HISTORY_SAVE_FAILED} ${outcome.message} The transcript was delivered but is not in History; the audio is saved.`
-        : `${input.noSpeechStatus} ${HISTORY_SAVE_FAILED} ${outcome.message}`,
+        : `${input.empty.status} ${HISTORY_SAVE_FAILED} ${outcome.message}`,
       tone: "warning",
       savedName: persistedName,
     };
   }
+  if (!input.transcriptReady) {
+    return { status: input.empty.status, tone: input.empty.tone, savedName: persistedName };
+  }
   return {
-    status: input.transcriptReady
-      ? "Final transcript is ready. Audio and transcript are both available."
-      : input.noSpeechStatus,
+    status: "Final transcript is ready. Audio and transcript are both available.",
     tone: "success",
     savedName: persistedName,
   };

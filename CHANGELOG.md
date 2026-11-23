@@ -3,6 +3,12 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.33] - 2026-11-23
+
+### Fixed
+
+- **A take that could not be transcribed no longer says "no speech detected".** When the internet dropped (2026-11-23, 05:20), the live stream and the pass over the saved audio both failed, yet the capsule and History reported "Recording completed, no speech detected." — as if you had said nothing. Now such a take says what happened ("Couldn't transcribe: Deepgram is unreachable…") and that the audio is saved and can be re-transcribed from History. "No speech detected" is reserved for audio that was actually transcribed and held no speech; a dead or muted microphone still reports itself first.
+
 ## [1.6.32] - 2026-11-23
 
 ### Fixed

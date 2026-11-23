@@ -49,6 +49,8 @@ import {
   resolveFailedStopSummary,
   resolveSessionTitle,
   resolveTranscriptStopSummary,
+  resolveEmptyTranscriptCopy,
+  type StopEpilogueTone,
   runStopEpilogue,
   withKeptNote,
   type FinalSaveOutcome,
@@ -12633,7 +12635,7 @@ async function stopLive(
   // also the single definition of "the capture hardware was at fault",
   // which the branches below read instead of re-listing the states.
   const STOP_COPY: Partial<
-    Record<MicHealthState, { status: string; tone: UiTone; notice: boolean }>
+    Record<MicHealthState, { status: string; tone: StopEpilogueTone; notice: boolean }>
   > = {
     silent: {
       status:
@@ -12656,7 +12658,7 @@ async function stopLive(
   const micHealthBad = !!STOP_COPY[finalMicHealth.state];
   const stopFailureReason = (liveText: string): {
     status: string;
-    tone: UiTone;
+    tone: StopEpilogueTone;
     notice: string | null;
   } => {
     const health = STOP_COPY[finalMicHealth.state];
@@ -13362,7 +13364,7 @@ async function stopLive(
       save: true,
       summary: {
         status: drainedFailureReason?.status || "Silence detected. Audio remains available for review.",
-        tone: drainedFailureReason?.tone === "neutral" ? "info" : drainedFailureReason?.tone || "success",
+        tone: drainedFailureReason?.tone || "success",
       },
       conflictStatus: drainedFailureReason?.notice ||
         "Silence was detected, but the original archive changed before the session could be finalized. The entry was not recreated elsewhere.",
@@ -13564,6 +13566,10 @@ async function stopLive(
     };
     let transcriptRaw = "";
     let transcriptForPaste = "";
+    // Why every transcription pass failed, in the user's words; "" when
+    // none did. Feeds ``resolveEmptyTranscriptCopy`` — a take that was
+    // never transcribed must not end on "no speech detected".
+    let transcriptionFailure = "";
     // Provenance of ``transcriptRaw`` for the ``[trace stopLive] FINAL``
     // line. On the Deepgram path there are exactly two possible values —
     // ``envelope`` or ``ondisk-fallback`` — and which one a stop printed
@@ -13702,6 +13708,7 @@ async function stopLive(
           `No final envelope (${failure}).`,
         );
         transcriptSource = transcriptRaw ? "ondisk-fallback" : "none";
+        if (!transcriptRaw) transcriptionFailure = explainNetworkError(failure, "Couldn't transcribe");
         patchCurrentRecordingSummary({
           title: provisionalTitle,
           status: transcriptRaw
@@ -13711,24 +13718,15 @@ async function stopLive(
         }, sessionUiToken);
       }
 
-      // Nothing delivered: say WHY, from the capture evidence (a mic
-      // that never delivered audio reads differently to the user than a
-      // room that was quiet), instead of the generic "no speech
-      // detected" the shared tail would print. ``stopFailureReason``
-      // owns that judgement — mic health and the session's own measured
-      // silence — and is not re-derived here. Status only: this branch
-      // cannot change ``transcriptRaw``.
+      // Nothing delivered: WHY is decided once, in the shared tail
+      // below (``resolveEmptyTranscriptCopy``), from the capture
+      // evidence and ``transcriptionFailure``.
       if (!transcriptRaw) {
-        const failureReason = stopFailureReason(getSessionCanonicalLiveSourceText(sessionUiToken));
         console.log(
           `[trace stopLive] empty transcript streamingActivity=` +
-          `${hasStreamingActivity(getLiveTranscriptBuffer(sessionUiToken)) ? 1 : 0}`,
+          `${hasStreamingActivity(getLiveTranscriptBuffer(sessionUiToken)) ? 1 : 0}` +
+          ` failed=${transcriptionFailure ? 1 : 0}`,
         );
-        patchCurrentRecordingSummary({
-          title: provisionalTitle,
-          status: failureReason.status || "Recording completed, no speech detected.",
-          tone: failureReason.tone,
-        }, sessionUiToken);
       }
     } else {
       // OpenRouter (or any future non-streaming remote): transcribe from the
@@ -13858,16 +13856,24 @@ async function stopLive(
       );
     }
     const transcriptReadyLatencyMs = performance.now() - transcribeStartedAt;
-    const noSpeechFinalStatus = "Recording completed, no speech detected.";
-    const finalUiText = transcriptRaw || noSpeechFinalStatus;
+    // A take with no transcript says why: the capture's own evidence (a
+    // dead or muted microphone, measured silence) first, then a failed
+    // transcription, and only then "no speech detected".
+    const emptyCopy = resolveEmptyTranscriptCopy({
+      evidence: transcriptRaw
+        ? { status: "", tone: "info" }
+        : stopFailureReason(getSessionCanonicalLiveSourceText(sessionUiToken)),
+      transcriptionFailure,
+    });
+    const finalUiText = transcriptRaw || emptyCopy.status;
     patchCurrentRecordingSummary({
       // Titles come from what was SAID: a screen recording's transcript
       // opens with its marks, which say nothing about the recording.
       title: plainTranscriptRaw ? _smartTitle(plainTranscriptRaw) : provisionalTitle,
       status: transcriptRaw
         ? "Final transcript is ready. Saving audio and transcript."
-        : noSpeechFinalStatus,
-      tone: transcriptRaw ? "success" : "info",
+        : emptyCopy.status,
+      tone: transcriptRaw ? "success" : emptyCopy.tone,
       transcribeLatencyMs: transcriptReadyLatencyMs,
     }, sessionUiToken);
 
@@ -13879,11 +13885,13 @@ async function stopLive(
       recordingId,
       pasteText: "",
       domText: finalUiText,
-      kind: "status",
+      // A failed transcription is an error the capsule shows as such
+      // (desktop/transcript-signal.js: a non-empty error is the status).
+      kind: !transcriptRaw && emptyCopy.failed ? "error" : "status",
       // The provisional publish §6.8 is about: this text is what the
       // recording has BEFORE the paste upscale runs, and it must never
       // be what gets pasted.
-      phase: transcriptRaw ? "upscaling" : "no-speech",
+      phase: transcriptRaw ? "upscaling" : emptyCopy.failed ? "" : "no-speech",
       sessionToken: sessionUiToken,
     });
     if (isCurrentUiSession(sessionUiToken)) {
@@ -13926,7 +13934,7 @@ async function stopLive(
       title,
       ...resolveTranscriptStopSummary({
         transcriptReady: !!transcriptRaw,
-        noSpeechStatus: noSpeechFinalStatus,
+        empty: emptyCopy,
         persistedName: persistedRecordingName,
         outcome: finalSave,
       }),

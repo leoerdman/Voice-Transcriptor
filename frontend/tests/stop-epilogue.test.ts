@@ -22,6 +22,8 @@ import {
   resolveFailedStopSummary,
   resolveSessionTitle,
   resolveTranscriptStopSummary,
+  resolveEmptyTranscriptCopy,
+  NO_SPEECH_STATUS,
   runStopEpilogue,
   withKeptNote,
   type DrainedSilenceInput,
@@ -158,7 +160,7 @@ describe("resolveEpilogueSummary", () => {
 });
 
 describe("resolveTranscriptStopSummary — FL-02 on the success path", () => {
-  const base = { transcriptReady: true, noSpeechStatus: "Recording completed, no speech detected.", persistedName: "2026-11-20 rec.txt" };
+  const base = { transcriptReady: true, empty: { status: "Recording completed, no speech detected.", tone: "info" as const }, persistedName: "2026-11-20 rec.txt" };
 
   it("a saved transcript reports both available and links the entry", () => {
     expect(resolveTranscriptStopSummary({ ...base, outcome: { kind: "saved" } })).toEqual({
@@ -184,6 +186,39 @@ describe("resolveTranscriptStopSummary — FL-02 on the success path", () => {
   it("no speech + saved keeps the no-speech copy", () => {
     expect(resolveTranscriptStopSummary({ ...base, transcriptReady: false, outcome: { kind: "saved" } }).status)
       .toBe("Recording completed, no speech detected.");
+  });
+});
+
+describe("resolveEmptyTranscriptCopy — why a take ended with no transcript", () => {
+  const none = { status: "", tone: "info" as const };
+
+  it("a take that was transcribed and held nothing says no speech", () => {
+    expect(resolveEmptyTranscriptCopy({ evidence: none, transcriptionFailure: "" }))
+      .toEqual({ status: NO_SPEECH_STATUS, tone: "info", failed: false });
+  });
+
+  it("a take that was never transcribed says so, not \"no speech\" (2026-11-23 network outage)", () => {
+    const out = resolveEmptyTranscriptCopy({
+      evidence: none,
+      transcriptionFailure: "Couldn't transcribe: Deepgram is unreachable.",
+    });
+    expect(out.failed).toBe(true);
+    expect(out.tone).toBe("error");
+    expect(out.status).toContain("Couldn't transcribe: Deepgram is unreachable.");
+    expect(out.status).toContain("The audio is saved");
+    expect(out.status).not.toContain("no speech");
+  });
+
+  it("the capture's own evidence wins over a transcription failure", () => {
+    const mic = { status: "Recording saved, but the microphone delivered no audio.", tone: "error" as const };
+    expect(resolveEmptyTranscriptCopy({ evidence: mic, transcriptionFailure: "Couldn't transcribe: offline." }))
+      .toEqual({ ...mic, failed: false });
+  });
+
+  it("the final summary keeps the failure's copy and tone", () => {
+    const empty = resolveEmptyTranscriptCopy({ evidence: none, transcriptionFailure: "Couldn't transcribe: offline." });
+    expect(resolveTranscriptStopSummary({ transcriptReady: false, empty, persistedName: "a.txt", outcome: { kind: "saved" } }))
+      .toEqual({ status: empty.status, tone: "error", savedName: "a.txt" });
   });
 });
 
