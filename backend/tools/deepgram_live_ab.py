@@ -82,9 +82,11 @@ from backend.deepgram_recovery import (  # noqa: E402
 from backend.deepgram_warm import DeepgramWarmPool  # noqa: E402
 from backend.remote_deepgram_live import (  # noqa: E402
     DeepgramLiveError,
+    DeepgramLiveSession,
     live_config,
     resolve_live_language,
 )
+from backend.tools.dual_dump import build_dump, write_dump  # noqa: E402
 
 # One code path for opening a live session, in the app and here alike:
 # ``acquire()`` adopts a warm socket when the pool is armed and connects
@@ -95,6 +97,16 @@ from backend.remote_deepgram_live import (  # noqa: E402
 # plain ``connect()`` this tool did before the pool existed. Going
 # through it anyway is what keeps the measured path the shipped path.
 _POOL = DeepgramWarmPool()
+
+
+class _MessageCaptureSession(DeepgramLiveSession):
+    def __init__(self, *args, captured: dict[str, list[dict]], **kwargs):
+        super().__init__(*args, **kwargs)
+        self._captured_messages = captured
+
+    def _process_deepgram_message(self, msg: dict):
+        self._captured_messages.setdefault(self._cfg.language, []).append(dict(msg))
+        return super()._process_deepgram_message(msg)
 
 DEFAULT_CHUNK_MS = 100
 _TEXT_TRUNCATE_CHARS = 200
@@ -170,6 +182,7 @@ async def _run_one(
     dual_language: str = "",
     dump_dir: "Path | None" = None,
     language_hints: "tuple[str, ...]" = (),
+    dump_messages: bool = False,
 ) -> RunResult:
     # The app's own builder. Constructing a ``DeepgramLiveConfig``
     # directly here meant this tool measured a socket opened with
@@ -177,12 +190,20 @@ async def _run_one(
     # pool keys on exactly that query string.
     cfg = live_config(model=model, language=language, keyterms=keyterms, language_hints=language_hints)
     try:
-        session = (await _POOL.acquire(api_key, cfg)).session
+        captured: dict[str, list[dict]] = {}
+        pool = _POOL
+        if dump_messages:
+            pool = DeepgramWarmPool(
+                session_factory=lambda key, config: _MessageCaptureSession(
+                    key, config, captured=captured,
+                ),
+            )
+        session = (await pool.acquire(api_key, cfg)).session
         if dual_language:
             # The same facade the app runs, so what is measured here is
             # the merge that ships — not a second implementation of it.
             secondary = (
-                await _POOL.acquire(api_key, secondary_config(cfg, dual_language))
+                await pool.acquire(api_key, secondary_config(cfg, dual_language))
             ).session
             session = DualLiveSession(
                 primary=session,
@@ -225,6 +246,8 @@ async def _run_one(
         if dump_dir is not None and isinstance(session, DualLiveSession):
             _dump_readings(
                 dump_dir, file_label, run_index, session, language, dual_language,
+                keyterms=cfg.keyterms,
+                messages=captured if dump_messages else None,
             )
         evidence = evidence_from_session(session)
         stream_death_sec = session.stream_death_sec
@@ -282,6 +305,8 @@ def _dump_readings(
     session: DualLiveSession,
     language: str,
     dual_language: str,
+    *, keyterms: "tuple[str, ...]" = (),
+    messages: "dict[str, list[dict]] | None" = None,
 ) -> None:
     """Write the two readings this run merged, for ``dual_replay``."""
     readings = session.last_readings
@@ -290,15 +315,17 @@ def _dump_readings(
     primary_result, secondary_result = readings
     dump_dir.mkdir(parents=True, exist_ok=True)
     path = dump_dir / f"{Path(file_label).stem}.{language}+{dual_language}.run{run_index}.json"
-    payload = {
-        "file": file_label,
-        "primary_language": resolve_live_language(language),
-        "secondary_language": dual_language,
-        "expected_languages": list(session.expected_languages),
-        "primary_segments": primary_result.get("segments") or [],
-        "secondary_segments": (secondary_result or {}).get("segments") or [],
-    }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+    payload = build_dump(
+        file=file_label,
+        primary_language=resolve_live_language(language),
+        secondary_language=dual_language,
+        expected_languages=list(session.expected_languages),
+        keyterms=list(keyterms),
+        primary_segments=primary_result.get("segments") or [],
+        secondary_segments=(secondary_result or {}).get("segments") or [],
+        messages=messages,
+    )
+    write_dump(path, payload)
     print(f"readings: {path}", file=sys.stderr)
 
 
@@ -340,6 +367,9 @@ def _language_counts(r: RunResult) -> str:
 
 
 async def _main_async(args: argparse.Namespace) -> int:
+    if args.dump_messages and (not args.dump_readings or not args.dual):
+        print("error: --dump-messages requires --dump-readings DIR and --dual", file=sys.stderr)
+        return 3
     if args.dual:
         not_multi = [lang for lang in args.language if not dual_applies(lang)]
         if not_multi:
@@ -401,6 +431,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                         dual_language=args.dual or "",
                         dump_dir=dump_dir,
                         language_hints=language_hints,
+                        dump_messages=args.dump_messages,
                     )
                 )
 
@@ -466,6 +497,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="With --dual: write both readings each run merged to a JSON "
              "file in DIR, for offline re-merging with "
              "`python -m backend.tools.dual_replay`.",
+    )
+    parser.add_argument(
+        "--dump-messages", action="store_true",
+        help="With --dual and --dump-readings, also save each decoded raw Deepgram JSON payload.",
     )
     parser.add_argument(
         "--keyterms", default="",
