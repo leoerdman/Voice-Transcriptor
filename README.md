@@ -174,8 +174,8 @@ cp .env.example .env
 ## Документация
 
 - [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) — структура кода.
-- [VERIFIED_AUDIT.md](docs/VERIFIED_AUDIT.md) — аудит багов и фиксы.
-- [AUDIT_2026-08.md](docs/AUDIT_2026-08.md) — релиз-аудит: 30 дефектов с кодом и фиксами.
+- [VERIFIED_AUDIT.md](docs/archive/VERIFIED_AUDIT.md) — аудит багов и фиксы.
+- [AUDIT_2026-08.md](docs/archive/AUDIT_2026-08.md) — релиз-аудит: 30 дефектов с кодом и фиксами.
 - [CHANGELOG.md](CHANGELOG.md) — история релизов.
 - [INSTALL_OTHER_MAC.md](docs/INSTALL_OTHER_MAC.md) — установка внутренней сборки на другой Mac.
 

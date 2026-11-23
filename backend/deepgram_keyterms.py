@@ -4,7 +4,7 @@ REST).
 
 Why this exists
 ----------------
-2026-09-03 measurement (see ``BUGS_AUDIT_2026-09-03.md`` §1, and
+2026-09-03 measurement (see ``docs/archive/BUGS_AUDIT_2026-09-03.md`` §1, and
 ``backend/tools/deepgram_live_ab.py`` — the tool that reproduces it): on
 this app's own saved Russian recordings, Deepgram nova-3's
 ``language=multi`` mode — what "auto" maps to in

@@ -2,7 +2,7 @@
 
 Why
 ---
-``BUGS_AUDIT_2026-09-03.md`` §1 measured ``language=multi`` dropping
+``docs/archive/BUGS_AUDIT_2026-09-03.md`` §1 measured ``language=multi`` dropping
 whole clauses of Russian speech, non-deterministically, on this app's
 own recordings — and ``language=ru`` on the identical audio keeping
 every one of them while losing the French and English ones instead.

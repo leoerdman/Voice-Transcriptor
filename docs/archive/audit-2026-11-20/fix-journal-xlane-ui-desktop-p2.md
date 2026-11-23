@@ -1,6 +1,6 @@
 # Fix journal — cross-domain lane `ui-desktop-p2` (Ultra-Audit 2026-11-20)
 
-Branch `worktree-agent-a522f964456e813d9`, cut from `main` at 3cc7666. Source: `docs/NEXT_SESSION_2026-11-20.md`
+Branch `worktree-agent-a522f964456e813d9`, cut from `main` at 3cc7666. Source: `docs/archive/NEXT_SESSION_2026-11-20.md`
 §3.2 "P2 — Рендерер / Desktop" and Appendix A. "Before" runs = the new/changed tests run against the HEAD sources
 (`git archive HEAD` into the scratchpad, new test files copied over).
 

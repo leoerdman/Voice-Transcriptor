@@ -151,7 +151,7 @@ Fixed: one `spawnSync("/usr/bin/codesign", [...])` capturing both streams, no sh
 ### DX-23 · P2 · confirmed · INSTALL_ON_OTHER_MAC.command lacks the identity guard BUILD.command applies, and takes its expected bundle id from a file beside it
 File: INSTALL_ON_OTHER_MAC.command L71-81, L101-108; BUILD.command L326 runs `check-designated-requirement.js`.
 Gist: installing over a copy the user has already granted, with a bundle signed by a different certificate (or ad hoc), strands every TCC grant (the failure BUILD.command's header and the whole 1.6.3 self-heal exist for); the installer only runs `codesign --verify`, which accepts ad hoc. `EXPECTED_BUNDLE_ID` is overridden by `app_id=` in the manifest next to the installer, so the check can be moved by whoever supplies the manifest.
-Known and still present: H-6 (`NEEDS_SUDO` read under `set -u`, only assigned in `main`, L57/L260) and H-7 (L193 `pkill` then `sleep 1; break` without checking the process died) from docs/audit-2026-09-04/desktop-findings.md.
+Known and still present: H-6 (`NEEDS_SUDO` read under `set -u`, only assigned in `main`, L57/L260) and H-7 (L193 `pkill` then `sleep 1; break` without checking the process died) from docs/archive/audit-2026-09-04/desktop-findings.md.
 
 ### DX-24 · P2 · known, not fixed (old IDs) · Still present
 - D-023 residual: BUILD.command L90 `INTERNAL_SIGNING_IDENTITY="AntigravityTelegramDev"` default (moved to one place, still one developer's keychain name).

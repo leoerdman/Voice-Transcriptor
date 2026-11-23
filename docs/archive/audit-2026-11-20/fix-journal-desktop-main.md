@@ -656,7 +656,7 @@ Baseline before any fix: `npm --prefix desktop test` → `ℹ tests 311 / ℹ pa
 - **H-04, main.js part** → nothing to fix: no "non-activating panel", "exclusion rectangle", "prune list" or
   "non-focusable panel" wording exists in main.js (grep, verified); the stale wording is in PROJECT_STRUCTURE.md,
   screen-mode-controller.js, main.swift, window-lifecycle.js.
-- **DM-21, docs part** → `docs/VERIFIED_AUDIT.md` cites `desktop/main.js:NNNN`; historical audit, not this lane's file.
+- **DM-21, docs part** → `docs/archive/VERIFIED_AUDIT.md` cites `desktop/main.js:NNNN`; historical audit, not this lane's file.
 
 ## Cross-domain, for the lead
 

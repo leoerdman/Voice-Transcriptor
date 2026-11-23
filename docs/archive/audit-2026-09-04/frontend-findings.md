@@ -84,7 +84,7 @@ Backend в дереве тоже правится (`deepgram_dual.py`, `remote_d
    (`~/Library/Application Support/transcriptor/main.log`) — см. F-001.
 
 Прочитано: `AGENTS.md`, `BUGS_AUDIT_2026-09-03.md` (включая «Реестр долга» и
-«Состояние на 2026-09-04»), `docs/NEXT_SESSION_2026-09-04.md`, `CHANGELOG.md`.
+«Состояние на 2026-09-04»), `docs/archive/NEXT_SESSION_2026-09-04.md`, `CHANGELOG.md`.
 Пункты, закрытые в 1.5.0/1.6.0, не переоткрываются; открытые пункты реестра
 помечены `known-but-open`.
 

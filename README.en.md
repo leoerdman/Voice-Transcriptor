@@ -192,8 +192,8 @@ Whisper thread counts, cache paths and more. The full list is in
 ## Documentation
 
 - [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) — code layout.
-- [VERIFIED_AUDIT.md](docs/VERIFIED_AUDIT.md) — bug audit and fixes.
-- [AUDIT_2026-08.md](docs/AUDIT_2026-08.md) — release audit: 30 defects with code and fixes.
+- [VERIFIED_AUDIT.md](docs/archive/VERIFIED_AUDIT.md) — bug audit and fixes.
+- [AUDIT_2026-08.md](docs/archive/AUDIT_2026-08.md) — release audit: 30 defects with code and fixes.
 - [CHANGELOG.md](CHANGELOG.md) — release history.
 - [INSTALL_OTHER_MAC.md](docs/INSTALL_OTHER_MAC.md) — installing an internal build on another Mac.
 

@@ -9,7 +9,7 @@ recording against the envelope, unioned the two texts, and grafted a
 duplication defect of 2026-09-03/04 happened — the preview restates
 ground the envelope already covers, in slightly different words, and no
 alignment can reliably tell that apart from new speech
-(``BUGS_AUDIT_2026-09-03.md`` §2.2/§2.3/§4.8).
+(``docs/archive/BUGS_AUDIT_2026-09-03.md`` §2.2/§2.3/§4.8).
 
 So the envelope becomes complete BY CONSTRUCTION and the renderer
 becomes a consumer. After the live drain — single stream or dual — the

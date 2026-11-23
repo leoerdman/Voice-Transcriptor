@@ -131,7 +131,7 @@ main.tsx:4455-4480 probeAudioFileDuration.
 Gist: the 2500 ms timer is never cleared and the `<audio>` element is never detached (`src=""`/load) after timeout/finish; revoking the URL while metadata is still loading leaves an element with a dead src until GC; reached on every stop with PCM coverage <0.95.
 
 ## Known, not fixed
-None of FG-01..20 matches an ID in docs/audit-2026-09-04/frontend-findings.md (summary list read); F-002/F-011-style swallowed catches there are in other ranges.
+None of FG-01..20 matches an ID in docs/archive/audit-2026-09-04/frontend-findings.md (summary list read); F-002/F-011-style swallowed catches there are in other ranges.
 
 ## Clean places (checked, no defect found)
 - downsample :3977-4005: carry preserves a continuous grid; floor/round consistent.

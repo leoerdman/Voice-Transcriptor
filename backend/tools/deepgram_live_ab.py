@@ -14,7 +14,7 @@ keyterms list, ``--runs`` times each, and prints one row per run: file,
 language, keyterms count, connect ms, finalize ms, final segment count,
 word count, char count, and the transcript text.
 
-This is the tool ``BUGS_AUDIT_2026-09-03.md`` §1 and
+This is the tool ``docs/archive/BUGS_AUDIT_2026-09-03.md`` §1 and
 ``backend.remote_deepgram_live.DeepgramLiveConfig.to_query_string``
 point at as the way to re-run the measurement that found
 ``language=multi`` silently dropping Russian clauses
@@ -471,7 +471,7 @@ def build_parser() -> argparse.ArgumentParser:
             "WebSocket API at real-time pacing, across one or more "
             "--language settings and an optional keyterms list, to "
             "reproduce and re-run the 2026-09-03 multi-vs-ru "
-            "measurement (see BUGS_AUDIT_2026-09-03.md §1)."
+            "measurement (see docs/archive/BUGS_AUDIT_2026-09-03.md §1)."
         ),
     )
     parser.add_argument(

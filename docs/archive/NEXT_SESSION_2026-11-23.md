@@ -1,8 +1,8 @@
 # Передача дел — сессия 22–23.11.2026 (оптимизация Transcriptor, 1.6.22 → 1.6.25)
 
 Последний коммит сессии перед этим файлом: `cfa1144`. Установлена и запущена **1.6.25**.
-План и статус оптимизации — [`OPTIMIZATION.md`](OPTIMIZATION.md) (раздел 0); что вошло в версии —
-[`CHANGELOG.md`](../CHANGELOG.md), разделы 1.6.22–1.6.25.
+План и статус оптимизации — [`OPTIMIZATION.md`](../OPTIMIZATION.md) (раздел 0); что вошло в версии —
+[`CHANGELOG.md`](../../CHANGELOG.md), разделы 1.6.22–1.6.25.
 
 ---
 
@@ -134,7 +134,7 @@
 
 ### O-10. Нестабильные тесты и уборка — **НИЗКИЙ**
 - `desktop/window-liveness.electron.test.js` нестабилен (по отчёту дорожки G: то 1/3, то 3/3).
-- `WarmSwapAtFinalizeTests` нестабилен (из `docs/TASKS_2026-11-20.md`).
+- `WarmSwapAtFinalizeTests` нестабилен (из `docs/archive/TASKS_2026-11-20.md`).
 - В `.claude/worktrees/` лежат ворктри всех дорожек (все ветки слиты) — можно убрать.
 
 ### O-11. Прочее из логов — **НАБЛЮДАТЬ**
@@ -174,12 +174,12 @@
 
 ## 6. Ссылки на документы и артефакты
 
-- [`OPTIMIZATION.md`](OPTIMIZATION.md) — план, замеры, Hex, волны, статус.
-- [`CHANGELOG.md`](../CHANGELOG.md) — 1.6.22–1.6.25.
-- [`AGENTS.md`](../AGENTS.md) — правила и команды проверки.
-- [`PROJECT_STRUCTURE.md`](../PROJECT_STRUCTURE.md).
-- [`docs/PRODUCT.md`](PRODUCT.md), [`docs/VISION.md`](VISION.md), [`docs/TASKS_2026-11-20.md`](TASKS_2026-11-20.md),
-  [`docs/NEXT_SESSION_2026-11-20b.md`](NEXT_SESSION_2026-11-20b.md), [`BUGSAUDIT-2026-11-20.md`](BUGSAUDIT-2026-11-20.md).
+- [`OPTIMIZATION.md`](../OPTIMIZATION.md) — план, замеры, Hex, волны, статус.
+- [`CHANGELOG.md`](../../CHANGELOG.md) — 1.6.22–1.6.25.
+- [`AGENTS.md`](../../AGENTS.md) — правила и команды проверки.
+- [`PROJECT_STRUCTURE.md`](../../PROJECT_STRUCTURE.md).
+- [`docs/PRODUCT.md`](../PRODUCT.md), [`docs/VISION.md`](../VISION.md), [`docs/archive/TASKS_2026-11-20.md`](TASKS_2026-11-20.md),
+  [`docs/archive/NEXT_SESSION_2026-11-20b.md`](NEXT_SESSION_2026-11-20b.md), [`BUGSAUDIT-2026-11-20.md`](BUGSAUDIT-2026-11-20.md).
 - `contracts/live-final-envelope.json` — контракт финального envelope.
 - Hex: https://github.com/anomalyco/hex (локальная копия только для чтения:
   `/private/tmp/claude-501/-Users-leoerdman--claude-spares-spare-UlrDRG/7001051b-3fce-4208-949d-3bbc30dacab3/scratchpad/hex-src`).

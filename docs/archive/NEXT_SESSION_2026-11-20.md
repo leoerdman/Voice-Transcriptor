@@ -79,7 +79,7 @@
 - Двойной тап с протяжкой: протяжка рисует всегда, даже без увиденного нажатия; на нажатие — строка лога `[screen-mode] press outcome=… clicks=… drags=…`. После аудита (DX-07): при отключении тапа macOS классификатор сбрасывается, лог `[screen-mode] tap disabled reason=… abandoned=…`. **Пользователь сообщил «не починилось ни то не другое» до DX-07 и до сборки с аудитом; новая сборка не ставилась** — первое, что проверить (§5).
 
 ### 2.4 Ultra-Audit 2026-11-20 (процедура: `/Users/leoerdman/Programming - Main/M Code/.agents/skills/ultra-audit/SKILL.md`)
-- 12 проходов, **275 находок** (257 код + 18 логи), отчёт `BUGSAUDIT-2026-11-20.md`, полные блоки §5 — `docs/audit-2026-11-20/*.md`.
+- 12 проходов, **275 находок** (257 код + 18 логи), отчёт `BUGSAUDIT-2026-11-20.md`, полные блоки §5 — `docs/archive/audit-2026-11-20/*.md`.
 - 6 полос починки (Opus, отдельные ворктри) — **все слиты в main и запушены**:
   | Полоса | Журнал | Итог |
   |---|---|---|
@@ -101,7 +101,7 @@
 
 ## 3. ВСЕ открытые задачи — детально
 
-### 3.1 Ревью-фикс (ветка `worktree-agent-a2f9e91fa1a6d3247`; ревью сохранено: `docs/audit-2026-11-20/review-merged.md`, ревью веток: `docs/audit-2026-11-20/review-branches.md` — короткое, полный текст в §3.2 этого файла)
+### 3.1 Ревью-фикс (ветка `worktree-agent-a2f9e91fa1a6d3247`; ревью сохранено: `docs/archive/audit-2026-11-20/review-merged.md`, ревью веток: `docs/archive/audit-2026-11-20/review-branches.md` — короткое, полный текст в §3.2 этого файла)
 Независимый ревьюер слитых полос (desktop/main.js и renderer live) нашёл:
 1. ✅ **P1 регрессия** (коммит `d975368`): `saveSessionMetadata` писал `title: latestSourceTitle()` — записи с пустым/иным live-текстом сохранялись как «Recording <дата>». Починено `9c2ba71`.
 2. ✅ Потеряно состояние капсулы «Upscaling» (коммит `a0be23d` удалил единственного вызывающего). Починено `67469a4` (фаза из IPC-сигнала).
@@ -181,8 +181,8 @@
 ---
 
 ## 8. Документы и ссылки
-- Отчёт: `BUGSAUDIT-2026-11-20.md`; находки: `docs/audit-2026-11-20/{history,desktop-main,desktop-modules,frontend-ui,frontend-gaps,frontend-live,frontend-upload,backend-main,backend-live-ws,backend-engines,backend-logs,scenarios}.md`; журналы фиксов: `docs/audit-2026-11-20/fix-journal-*.md`.
-- Прошлый аудит: `BUGSAUDIT-2026-09-04.md`, `docs/audit-2026-09-04/`; прошлые хендоффы: `docs/NEXT_SESSION_2026-09-04.md`, `docs/NEXT_SESSION_2026-09-04b.md`.
+- Отчёт: `BUGSAUDIT-2026-11-20.md`; находки: `docs/archive/audit-2026-11-20/{history,desktop-main,desktop-modules,frontend-ui,frontend-gaps,frontend-live,frontend-upload,backend-main,backend-live-ws,backend-engines,backend-logs,scenarios}.md`; журналы фиксов: `docs/archive/audit-2026-11-20/fix-journal-*.md`.
+- Прошлый аудит: `BUGSAUDIT-2026-09-04.md`, `docs/archive/audit-2026-09-04/`; прошлые хендоффы: `docs/archive/NEXT_SESSION_2026-09-04.md`, `docs/archive/NEXT_SESSION_2026-09-04b.md`.
 - Процедура аудита: `/Users/leoerdman/Programming - Main/M Code/.agents/skills/ultra-audit/SKILL.md`.
 - Правила: `AGENTS.md`; продукт: `docs/PRODUCT.md`; структура: `PROJECT_STRUCTURE.md`; env: `.env.example`; CHANGELOG `CHANGELOG.md` (1.6.6).
 - Режим экрана: `desktop/screen-mode.js`, `desktop/screen-mode-controller.js`, `desktop/native/screen-input/{main.swift,PressClassifier.swift}`, `desktop/scripts/build-native.sh`, `backend/screen_sessions.py`, `frontend/src/screen-annotations.ts`, `contracts/screen-session.json`.
@@ -219,7 +219,7 @@
 - **H-04, main.js part** → nothing to fix: no "non-activating panel", "exclusion rectangle", "prune list" or
   "non-focusable panel" wording exists in main.js (grep, verified); the stale wording is in PROJECT_STRUCTURE.md,
   screen-mode-controller.js, main.swift, window-lifecycle.js.
-- **DM-21, docs part** → `docs/VERIFIED_AUDIT.md` cites `desktop/main.js:NNNN`; historical audit, not this lane's file.
+- **DM-21, docs part** → `docs/archive/VERIFIED_AUDIT.md` cites `desktop/main.js:NNNN`; historical audit, not this lane's file.
 
 ## Cross-domain, for the lead
 1. **frontend/src/main.tsx `recordingOutputIsInvalidTranscript`** (≈ :10720): `lower.startsWith("http ")` (and

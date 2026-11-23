@@ -8,7 +8,7 @@ at module level, before any per-test isolation runs, would otherwise
 touch the developer's real ``~/Library/Application Support/Transcriptor``
 or ``~/.transcriptor``. See ``backend/tests/__init__.py``'s module
 docstring for the mechanism and
-``docs/audit-2026-09-04/backend-fix-journal.md`` ("Швы" section) for the
+``docs/archive/audit-2026-09-04/backend-fix-journal.md`` ("Швы" section) for the
 incident (debt D-10) that motivated it.
 
 This suite does not re-verify that mechanism (it cannot, without

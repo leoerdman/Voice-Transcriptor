@@ -2,7 +2,7 @@
 
 Why
 ---
-``BUGS_AUDIT_2026-09-03.md`` §2.4 measured the Deepgram connect on the
+``docs/archive/BUGS_AUDIT_2026-09-03.md`` §2.4 measured the Deepgram connect on the
 user's own log: **p50 880 ms, p90 1.2 s, max 9.7 s**, plus one 12 s
 timeout during which 126 s of dictation went into a stream that never
 existed (§3.7). That cost sits at the very start of every recording —

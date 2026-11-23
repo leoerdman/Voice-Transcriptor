@@ -13,7 +13,7 @@ Revision read: HEAD acbf737 (main, clean). Read-only. Scope: frontend/src/main.t
 | 11917-13693 waitForCaptureDrain, stopLive | read | full (all 8 exits traced) | FL-01, FL-02, FL-04, FL-08, FL-10, FL-11 |
 | 13695-13730 record button + hotkey listeners | read | full | FL-13 |
 | 13732-14230 bootstrap, update check, boot overlay | skimmed 13732-14035 | read, not audited deeply | outside live recording |
-| 14230-15754 upload queue | symbol map only | NOT audited | not live-recording; regional audit U exists (docs/audit-2026-09-04/frontend-findings.md) |
+| 14230-15754 upload queue | symbol map only | NOT audited | not live-recording; regional audit U exists (docs/archive/audit-2026-09-04/frontend-findings.md) |
 | retranscribe handler 8988-9215 | read | full | FL-08 |
 | live-envelope.ts, live-coverage.ts, live-pane.ts, envelope-deadline.ts | read | full | FL-05, FL-15, FL-21 |
 | live-source.ts, text-match.ts, transcript-merge.ts | read | full | FL-18, FL-19 |
@@ -162,7 +162,7 @@ Private `\S+` match vs exported `split(/\s+/).filter(Boolean)`; text-match.ts's 
 
 ### FL-22 · known, not fixed (do not re-count)
 - D-13/U-022 (F/7): stopLive epilogues - still 6 early returns + the catch + success, five different inline save blocks (12669, 12784, 12831, 12877, 12934). Only the bookkeeping triplet is shared. FL-01/02/04 are live consequences.
-- desktop-findings §"executeJavaScript-опрос как API рендерера" (docs/audit-2026-09-04/desktop-findings.md:1110): renderer still publishes ~20 `window.__transcriptor*` globals that main polls (`desktop/main.js` 2401-2404, 3074-3091, 2689) in parallel with the pushed `window.transcriptor.recordingFinal` channel (10770) - two sources of truth for "paste-ready text" (Channel 1 scalars + Channel 1b IPC). Still present.
+- desktop-findings §"executeJavaScript-опрос как API рендерера" (docs/archive/audit-2026-09-04/desktop-findings.md:1110): renderer still publishes ~20 `window.__transcriptor*` globals that main polls (`desktop/main.js` 2401-2404, 3074-3091, 2689) in parallel with the pushed `window.transcriptor.recordingFinal` channel (10770) - two sources of truth for "paste-ready text" (Channel 1 scalars + Channel 1b IPC). Still present.
 - BUGSAUDIT-2026-09-04 §"Preload ... уберёт `document.title`-канал": `postTitleBridgeMessage` (940, uses 13703, 14413) still the renderer->main IPC for record-toggle/reveal/shortcuts, while preload already exposes `ipcRenderer.invoke` (`screenFinish`, `recordingFinal`); the desktop comment (8395) "the renderer cannot use ipcRenderer" is stale since 1.6.6.
 
 ## 3. Clean places (checked, no defect)

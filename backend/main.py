@@ -3590,7 +3590,7 @@ class AudioRetentionPolicy:
 AUDIO_RETENTION_POLICIES: dict[str, AudioRetentionPolicy] = {
     RECORDING_COLLECTION_LIVE: AudioRetentionPolicy(
         # 3 → 100 → 20. Three deleted a working day's evidence within
-        # hours (BUGS_AUDIT_2026-09-03.md, addendum (a)); a hundred kept
+        # hours (docs/archive/BUGS_AUDIT_2026-09-03.md, addendum (a)); a hundred kept
         # ~75 MB of takes nobody replays. The user set twenty on
         # 2026-11-23: enough to re-transcribe or check the recent takes,
         # bounded on disk. The env var below still overrides it.

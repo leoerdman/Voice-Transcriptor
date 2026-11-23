@@ -1,8 +1,8 @@
 # Fix journal — cross-domain lane p1-backend (2026-11-20)
 
 Branch `worktree-agent-a20e6e245bf863957`, cut from `main` at 3cc7666.
-Source: `docs/NEXT_SESSION_2026-11-20.md` §3.2 and Appendix A; original
-findings in `docs/audit-2026-11-20/*.md`.
+Source: `docs/archive/NEXT_SESSION_2026-11-20.md` §3.2 and Appendix A; original
+findings in `docs/archive/audit-2026-11-20/*.md`.
 
 Every commit was verified with the full set from AGENTS.md: backend suite
 (throwaway venv), `npm --prefix desktop test`, `node --check` main/preload,

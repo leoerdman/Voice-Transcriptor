@@ -1,5 +1,5 @@
 # PRODUCT pass (SKILL §1(3)) — scenarios, seams, findings S-01…S-17
-Revision audited: HEAD acbf737 (main, clean). Read-only; nothing run. Known/closed lists (BUGSAUDIT-2026-09-04 §6, docs/audit-2026-09-04) consulted; screen mode (1.6.6), CLI (1.6.5), window-lifecycle (1.6.4), TCC repair (1.6.3) postdate them, so most findings are new.
+Revision audited: HEAD acbf737 (main, clean). Read-only; nothing run. Known/closed lists (BUGSAUDIT-2026-09-04 §6, docs/archive/audit-2026-09-04) consulted; screen mode (1.6.6), CLI (1.6.5), window-lifecycle (1.6.4), TCC repair (1.6.3) postdate them, so most findings are new.
 
 ## A. Scenario walk-throughs (scenario → steps → files → verdict)
 

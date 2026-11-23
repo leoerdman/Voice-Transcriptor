@@ -1,7 +1,7 @@
 # Ultra-Audit · backend transcription engines (read-only) · HEAD acbf737
 
 Auditor: backend-engines. Scope: deepgram_* modules, remote_deepgram(_live), remote_openrouter, live.py, live_envelope.py, transcribe.py, transcribe_gigaam.py, tools/deepgram_live_ab.py, contracts/live-*.json, their tests.
-Known/closed not re-reported: B-001/B-002/B-005/B-007/B-038/B-040/B-041/B-042/B-083/B-088 (docs/audit-2026-09-04).
+Known/closed not re-reported: B-001/B-002/B-005/B-007/B-038/B-040/B-041/B-042/B-083/B-088 (docs/archive/audit-2026-09-04).
 
 ## Coverage
 

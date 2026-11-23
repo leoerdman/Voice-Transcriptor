@@ -19,7 +19,7 @@ app installed, that is the real
 config, API keys and recordings archive. This already happened once
 (the encryption key was created on a developer's real ``~/.transcriptor``
 by an early version of a test, before it redirected ``HOME`` — see
-``docs/audit-2026-09-04/backend-fix-journal.md``, "Швы" section, debt
+``docs/archive/audit-2026-09-04/backend-fix-journal.md``, "Швы" section, debt
 D-10) and is exactly what running the suite must never risk again.
 
 ``backend/tests/__init__.py`` is imported before ANY module inside this

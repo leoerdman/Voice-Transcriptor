@@ -85,7 +85,7 @@ OK
 
 **Заголовок:** «The stop trace can state how many seconds were re-decoded, because the envelope now reports the number the renderer reads»
 
-**ID:** контракт из `docs/NEXT_SESSION_2026-09-04b.md` §5.3 (рендерер `889c91a` ↔ бэкенд `bf84d6b`).
+**ID:** контракт из `docs/archive/NEXT_SESSION_2026-09-04b.md` §5.3 (рендерер `889c91a` ↔ бэкенд `bf84d6b`).
 
 **Файлы:** `backend/deepgram_recovery.py`, `backend/tests/test_deepgram_recovery.py`.
 
@@ -758,7 +758,7 @@ hello everybody that's close up agents workflow that we говорю прост�
 
 Кросс-доменный агент, продолжающий работу после `52dab76` (единая схема
 конверта `final`, закрывает **D-01 / B-038** из раздела выше). Задание —
-`docs/NEXT_SESSION_2026-09-04b.md` §2, §7; журналы `frontend-fix-journal.md`
+`docs/archive/NEXT_SESSION_2026-09-04b.md` §2, §7; журналы `frontend-fix-journal.md`
 / `desktop-fix-journal.md` (разделы «долг» / «не сделано»).
 
 ### Коммит: B-027 / R-016 — дефолты dual-stream, backend SSOT

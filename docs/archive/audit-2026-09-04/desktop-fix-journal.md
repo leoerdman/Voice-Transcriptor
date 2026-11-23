@@ -1191,7 +1191,7 @@ literals, six had already gone with earlier commits (`sleep(180)` ×3,
 ## Commit 20 — closing the two indexes, and what is left
 
 **Files:** `desktop/main.js` (the paste-dedup rationale),
-`docs/audit-2026-09-04/desktop-fix-journal.md`.
+`docs/archive/audit-2026-09-04/desktop-fix-journal.md`.
 
 **Verification**
 - `npm --prefix desktop test` -> `tests 255 / pass 255 / fail 0 / skipped 0`
