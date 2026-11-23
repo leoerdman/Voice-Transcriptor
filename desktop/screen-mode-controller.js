@@ -162,6 +162,8 @@ const SCREEN_MODE_WARNING = Object.freeze({
   SCREEN_RECORDING: "screen-recording",
   /** The mouse helper died mid-take: nothing draws from then on. */
   HELPER: "helper",
+  /** No overlay loaded, so the screen take cannot be shown. */
+  OVERLAY: "overlay",
   /** A screenshot could not be taken; its strokes stay for the next one. */
   CAPTURE_FAILED: "capture-failed",
 });
@@ -1573,9 +1575,10 @@ function createScreenModeController(deps) {
       const shown = await presenter.done;
       clearTimeout(expiry);
       if (shown === PRESENTER_STATE.FAILED) {
-        throw new Error(lateSurfaces.includes(SCREEN_SURFACE.OVERLAYS)
+        const overlayFailure = lateSurfaces.includes(SCREEN_SURFACE.OVERLAYS)
           ? `the overlay was not ready within ${SURFACES_READY_TIMEOUT_MS} ms`
-          : "no overlay could be shown");
+          : "no overlay could be shown";
+        throw Object.assign(new Error(overlayFailure), { warning: SCREEN_MODE_WARNING.OVERLAY });
       }
       await helperDone;
       if (helperError) throw helperError;

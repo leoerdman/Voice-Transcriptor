@@ -65,11 +65,11 @@ function createSurfacePresenter({ required, optional = [], present }) {
 
   function decide() {
     if (state !== PRESENTER_STATE.PENDING) return;
-    if (!names.every((n) => results.has(n))) return;
-    if (!required.every((n) => results.get(n) === true)) {
+    if (required.some((n) => results.get(n) === false)) {
       finish(PRESENTER_STATE.FAILED);
       return;
     }
+    if (!names.every((n) => results.has(n))) return;
     const ready = names.filter((n) => results.get(n) === true);
     // The state changes before `present` runs, so a present that throws
     // can never be retried into a second, partial showing.

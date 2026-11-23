@@ -193,6 +193,7 @@ import {
 } from "./recording-save";
 import { skippedAudioPersistence, startAudioPersistence, type AudioPersistence } from "./audio-persistence";
 import { DeferredPcmSink } from "./deferred-pcm-sink";
+import { PendingWsFrames } from "./pending-ws-frames";
 import {
   RECORDING_COLLECTIONS,
   liveRecordingCollection,
@@ -9861,22 +9862,19 @@ dualSecondaryLanguageSelect()?.addEventListener("change", () => {
 
 let ws: WebSocket | null = null;
 // Buffer for PCM frames that arrive while the WS is still CONNECTING.
-// Flushed in FIFO order on the first ``pushCapturedFrame`` call after
-// the socket transitions to OPEN. Prevents word loss at the start of
-// a recording when the AudioWorklet fires frames before the WS
-// handshake completes (50–300 ms window).
-let wsPendingFrames: ArrayBuffer[] = [];
+// Flushed in FIFO order as soon as the socket transitions to OPEN.
+// Ten seconds covers the measured 7.6-second screen-mode handshake while
+// keeping memory bounded; the canonical PCM sink remains the full-take
+// source if a transport takes longer than that.
+const WS_PENDING_MAX_SEC = 10;
+const wsPendingFrames = new PendingWsFrames(LIVE_SAMPLE_RATE_HZ * WS_PENDING_MAX_SEC);
 // Cap measured in OUTPUT SAMPLES, not frame count (BUG-59): a frame
 // holds the worklet's input quantum (e.g. 128 samples at 48 kHz),
-// which downsamples to ~42.7 output samples — 500 frames were ~1.3 s
-// of audio, not the 4 s the old comment promised, so a slow handshake
-// silently dropped opening words. The cap is a DURATION, so it is
+// which downsamples to ~42.7 output samples — a frame-count cap can
+// silently drop opening words on a slow handshake. The cap is a DURATION, so it is
 // derived from the live sample rate the backend reports (8-96 kHz)
-// rather than written as 64 000 samples — which is 4 s only at 16 kHz
-// and 1.3 s at 48 kHz, the same regression again (FL-06).
-const WS_PENDING_MAX_SEC = 4;
-const wsPendingMaxSamples = (): number => LIVE_SAMPLE_RATE_HZ * WS_PENDING_MAX_SEC;
-let wsPendingFrameSamples = 0;
+// rather than written as a sample count that means a different duration
+// at another negotiated rate (FL-06).
 /**
  * Frames captured for this session that never reached the backend —
  * discarded at the pending-buffer cap, lost to a failed ``send``, or
@@ -9927,22 +9925,19 @@ function recordWsFrameSent(byteLength: number): void {
  */
 function flushPendingWsFrames(socket: WebSocket | null): number {
   if (!socket || socket.readyState !== WebSocket.OPEN) return wsPendingFrames.length;
-  while (wsPendingFrames.length > 0) {
-    const queued = wsPendingFrames[0];
+  return wsPendingFrames.flush((queued) => {
     try {
       socket.send(queued);
       recordWsFrameSent(queued.byteLength);
+      return true;
     } catch (e) {
       // The socket transitioned to CLOSING between the readyState read
       // and the native send. Leave the rest queued; the caller accounts
       // for them as never-sent.
       console.debug("live ws flush interrupted", e);
-      break;
+      return false;
     }
-    wsPendingFrames.shift();
-  }
-  if (wsPendingFrames.length === 0) wsPendingFrameSamples = 0;
-  return wsPendingFrames.length;
+  });
 }
 let ac: AudioContext | null = null;
 let stream: MediaStream | null = null;
@@ -11616,10 +11611,7 @@ function pushCapturedFrame(input: Float32Array, preRollMs = 0): void {
     // worklet frame downsamples to ~42.7 samples at 16 kHz, so slow
     // handshakes silently dropped opening words and failed the
     // coverage contract.
-    if (wsPendingFrameSamples + ds.length <= wsPendingMaxSamples()) {
-      wsPendingFrames.push(pcm);
-      wsPendingFrameSamples += ds.length;
-    } else {
+    if (!wsPendingFrames.enqueue(pcm, ds.length)) {
       wsFramesNeverSent += 1;
     }
   } else {
@@ -11805,8 +11797,7 @@ async function startLive(
   // audio; clear it so a new recording never starts with a stale frame.
   resetDownsampleState();
 
-  wsPendingFrames = [];
-  wsPendingFrameSamples = 0;
+  wsPendingFrames.clear();
   wsFramesNeverSent = 0;
   wsFramesSent = 0;
   wsBytesSent = 0;
@@ -12887,8 +12878,7 @@ async function stopLive(
     const strandedFrames = flushPendingWsFrames(ws);
     if (strandedFrames > 0) {
       wsFramesNeverSent += strandedFrames;
-      wsPendingFrames = [];
-      wsPendingFrameSamples = 0;
+      wsPendingFrames.clear();
       console.warn(`[trace stopLive] ${strandedFrames} captured frames never reached the live transport`);
     }
     if (discarding) {
@@ -13070,8 +13060,7 @@ async function stopLive(
   // we still prevent leaked closures.
   _wsToCloseAtEnd = ws;
   ws = null;
-  wsPendingFrames = [];
-  wsPendingFrameSamples = 0;
+  wsPendingFrames.clear();
   mediaRecorder = null;
   recordedWebmChunks = [];
   // Release the PCM sink reference after capture teardown, but DO NOT
