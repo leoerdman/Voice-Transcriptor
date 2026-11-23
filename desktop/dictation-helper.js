@@ -304,7 +304,6 @@ module.exports = {
   NATIVE_PASTE,
   interpretNativePaste,
   nativePasteRequest,
-  READY_TIMEOUT_MS,
   REQUEST_TIMEOUT_MS,
   RESTART_DELAYS_MS,
   createDictationHelper,

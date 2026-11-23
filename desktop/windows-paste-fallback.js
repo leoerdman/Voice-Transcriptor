@@ -53,4 +53,4 @@ function buildPwshPasteFallbackScript({ hwndHex = "", pid = 0 } = {}) {
   );
 }
 
-module.exports = { ERR_ACTIVATE, OK_PWSH_PASTE, buildPwshPasteFallbackScript };
+module.exports = { ERR_ACTIVATE, buildPwshPasteFallbackScript };

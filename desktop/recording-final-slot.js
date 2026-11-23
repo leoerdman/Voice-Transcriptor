@@ -223,7 +223,6 @@ function createRecordingFinalSlot(options = {}) {
 
 module.exports = {
   RECORDING_SIGNAL_KINDS,
-  DEFAULT_MAX_RECORDINGS,
   validateRecordingFinalPayload,
   createRecordingFinalSlot,
 };

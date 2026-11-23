@@ -117,8 +117,6 @@ function userDataDirCandidates(appDataRoot, legacyName, preferredName) {
 }
 
 module.exports = {
-  USER_DATA_DIR_NAMES,
-  USER_DATA_DIR_NAME_DEFAULT,
   USER_DATA_MIGRATION,
   userDataDirName,
   decideUserDataMigration,

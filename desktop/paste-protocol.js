@@ -75,8 +75,6 @@ const PASTE_SENT_RECEIPT_RE = new RegExp(`(^|[\\r\\n])(${PASTE_SENT_PREFIX}[A-Za
 
 module.exports = {
   PASTE_OK_PREFIX,
-  VBS_PASTE_METHOD,
-  PWSH_PASTE_METHOD,
   VBS_PASTE_OK,
   VBS_PASTE_SENT,
   PWSH_PASTE_OK,

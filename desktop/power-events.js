@@ -123,7 +123,6 @@ function _resetPowerEventSubscriptions(powerMonitor) {
 
 module.exports = {
   POWER_EVENTS,
-  POWER_EVENT_ACTIONS,
   POWER_ACTIONS,
   powerEventAction,
   subscribePowerEvents,

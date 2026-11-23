@@ -200,7 +200,6 @@ function recordingStatusIsLive(kind) {
 module.exports = {
   RECORDING_STATUS_KIND,
   RECORDING_STATUS_PRESENTATION,
-  LIVE_RECORDING_KINDS,
   RENDERER_STATUS_VOCABULARY,
   isRecordingStatusKind,
   classifyRecordingStatusText,

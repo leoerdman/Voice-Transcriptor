@@ -302,7 +302,6 @@ function createHotkeyRouter(deps) {
 }
 
 module.exports = {
-  HOTKEYS_REQUEST_TIMEOUT_MS,
   SAME_PRESS_WINDOW_MS,
   createHotkeyRouter,
   pressedAtFromEvent,
