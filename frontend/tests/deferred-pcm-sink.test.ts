@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { DeferredPcmSink, type PcmSinkLike } from "../src/deferred-pcm-sink";
+import { DEFERRED_PCM_SINK_MAX_SAMPLES, DeferredPcmSink, type PcmSinkLike } from "../src/deferred-pcm-sink";
 
 class RecordingSink implements PcmSinkLike {
   frames: number[][] = [];
@@ -81,5 +81,19 @@ describe("DeferredPcmSink — frames before the storage opens are kept, in order
     await sink.ready;
     expect(fallback.frames).toEqual([[7, 8]]);
     warn.mockRestore();
+  });
+
+  it("bounds early capture to two seconds and fails the take rather than losing audio", async () => {
+    const storage = deferred<PcmSinkLike>();
+    const overflow = vi.fn();
+    const sink = new DeferredPcmSink(storage.promise, () => new RecordingSink(), undefined, overflow);
+    sink.append(new Float32Array(DEFERRED_PCM_SINK_MAX_SAMPLES));
+    sink.append(new Float32Array([1]));
+    expect(sink.totalSamples).toBe(0);
+    expect(overflow).toHaveBeenCalledOnce();
+    const target = new RecordingSink();
+    storage.resolve(target);
+    await sink.ready;
+    expect(target.frames).toEqual([]);
   });
 });
