@@ -585,22 +585,6 @@ def rank_terms(
     return (seeded + mined)[:max_terms]
 
 
-def extract_candidates(
-    texts: Iterable[str],
-    *,
-    min_recordings: int = MIN_RECORDINGS,
-    max_terms: int = MAX_AUTO_TERMS,
-    builtin: Iterable[str] = (),
-) -> list[AutoTerm]:
-    """The ranked vocabulary of *texts*, one text per recording."""
-    return rank_terms(
-        (extract_document_stats(t) for t in texts),
-        min_recordings=min_recordings,
-        max_terms=max_terms,
-        builtin=builtin,
-    )
-
-
 # ---------------------------------------------------------------------
 # The store: cache, recompute, scheduling
 # ---------------------------------------------------------------------

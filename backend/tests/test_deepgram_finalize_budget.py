@@ -38,6 +38,7 @@ from backend.remote_deepgram_live import (
     tail_needs_flush,
     tail_needs_recovery,
 )
+from backend.deepgram_recovery import evidence_from_session
 
 
 class FakeUpstreamWs:
@@ -94,6 +95,22 @@ def _session(
     if interim_window_overhang_sec > 0:
         session._latest_interim_window_end = covered_end + interim_window_overhang_sec
     return session
+
+
+def _recovers_tail(
+    session: DeepgramLiveSession, tail_gap: float, tail_speech: float, covered_end: float
+) -> bool:
+    """The recovery pass's tail rule, asked with the evidence it reads off
+    *session* (``evidence_from_session``) — the question
+    ``deepgram_recovery`` puts to every stopped recording."""
+    evidence = evidence_from_session(session)
+    return tail_needs_recovery(
+        tail_gap,
+        tail_speech,
+        evidence.interim_window_end - covered_end,
+        evidence.endpointing_sec,
+        evidence.utterance_end_sec,
+    )
 
 
 def _deliver_final(
@@ -289,7 +306,8 @@ class WaitBudgetTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch(
             "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 5.0
         ):
-            await session.finalize(wait_timeout=0.5)
+            await session.drain_transcript()
+            await session.shutdown(wait_timeout=0.5)
         await task
         elapsed = time.perf_counter() - started
         self.assertIn("CloseStream", ws.types)
@@ -308,7 +326,8 @@ class WaitBudgetTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch(
             "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.25
         ):
-            await session.finalize(wait_timeout=0.5)
+            await session.drain_transcript()
+            await session.shutdown(wait_timeout=0.5)
         elapsed = time.perf_counter() - started
         self.assertIn("CloseStream", ws.types)
         # First wait (0.25) plus the tail-guard retry wait (0.25).
@@ -336,7 +355,8 @@ class WaitBudgetTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch(
             "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 5.0
         ):
-            await session.finalize(wait_timeout=0.5)
+            await session.drain_transcript()
+            await session.shutdown(wait_timeout=0.5)
         await task
         self.assertLess(time.perf_counter() - started, 1.0)
 
@@ -365,7 +385,8 @@ class WaitBudgetTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch(
             "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.30
         ):
-            await session.finalize(wait_timeout=0.5)
+            await session.drain_transcript()
+            await session.shutdown(wait_timeout=0.5)
         elapsed = time.perf_counter() - started
         self.assertGreaterEqual(
             elapsed, 0.30,
@@ -380,7 +401,8 @@ class WaitBudgetTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch(
             "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.05
         ):
-            await session.finalize(wait_timeout=0.5)
+            await session.drain_transcript()
+            await session.shutdown(wait_timeout=0.5)
         self.assertEqual(ws.types.count("Finalize"), 1)
 
 
@@ -399,7 +421,8 @@ class TrailingSilenceTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch(
             "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.05
         ):
-            await session.finalize(wait_timeout=0.5)
+            await session.drain_transcript()
+            await session.shutdown(wait_timeout=0.5)
         self.assertEqual(ws.types.count("Finalize"), 1, "no retry — nothing was voiced")
         self.assertIn("CloseStream", ws.types)
 
@@ -411,7 +434,8 @@ class TrailingSilenceTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch(
             "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.05
         ):
-            await session.finalize(wait_timeout=0.5)
+            await session.drain_transcript()
+            await session.shutdown(wait_timeout=0.5)
         self.assertEqual(ws.types.count("Finalize"), 2)
 
     async def test_the_covered_case_still_closes_fast(self):
@@ -422,7 +446,8 @@ class TrailingSilenceTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch(
             "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.05
         ):
-            await session.finalize(wait_timeout=0.5)
+            await session.drain_transcript()
+            await session.shutdown(wait_timeout=0.5)
         self.assertEqual(ws.types.count("Finalize"), 1)
 
     def test_only_voiced_evidence_can_ask_for_a_retry(self):
@@ -485,10 +510,10 @@ class BudgetAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch(
             "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.05
         ):
-            await session.finalize(
-                wait_timeout=0.3,
+            await session.drain_transcript(
                 on_budget=lambda budget, more: seen.append((budget, more)),
             )
+            await session.shutdown(wait_timeout=0.3)
         self.assertEqual(len(seen), 1, "announced exactly once")
         budget, expects_more = seen[0]
         self.assertTrue(expects_more, "an uncovered tail expects the wait to add words")
@@ -505,10 +530,10 @@ class BudgetAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch(
             "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.02
         ):
-            await session.finalize(
-                wait_timeout=0.3,
+            await session.drain_transcript(
                 on_budget=lambda budget, more: seen.append((budget, more)),
             )
+            await session.shutdown(wait_timeout=0.3)
         self.assertEqual(len(seen), 1)
         budget, expects_more = seen[0]
         # No retry is possible, so the announced bound is ONE ceiling and
@@ -527,10 +552,10 @@ class BudgetAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch(
             "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.10
         ):
-            await session.finalize(
-                wait_timeout=0.5,
+            await session.drain_transcript(
                 on_budget=lambda budget, more: seen.append((budget, more)),
             )
+            await session.shutdown(wait_timeout=0.5)
         self.assertEqual(len(seen), 1)
         budget, expects_more = seen[0]
         self.assertFalse(expects_more, "no voiced evidence: nothing more is expected")
@@ -552,10 +577,10 @@ class BudgetAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch(
             "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.05
         ):
-            await session.finalize(
-                wait_timeout=0.5,
+            await session.drain_transcript(
                 on_budget=lambda budget, more: seen.append((budget, more)),
             )
+            await session.shutdown(wait_timeout=0.5)
         self.assertEqual(len(seen), 1)
         _budget, expects_more = seen[0]
         self.assertTrue(expects_more, "recognised speech in the tail expects more")
@@ -571,16 +596,18 @@ class BudgetAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch(
             "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.02
         ):
-            await session.finalize(wait_timeout=0.3, on_budget=explode)
+            await session.drain_transcript(on_budget=explode)
+            await session.shutdown(wait_timeout=0.3)
         self.assertIn("CloseStream", ws.types, "the stop completed anyway")
 
     async def test_no_consumer_is_the_default(self):
         session = _session(streamed_sec=90.0, covered_end=89.95)
-        ws = session._ws   # finalize() releases the socket on its way out
+        ws = session._ws   # shutdown() releases the socket on its way out
         with mock.patch(
             "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.02
         ):
-            await session.finalize(wait_timeout=0.3)
+            await session.drain_transcript()
+            await session.shutdown(wait_timeout=0.3)
         self.assertIn("CloseStream", ws.types)
 
 
@@ -835,7 +862,7 @@ class AwaitsMoreFinalsTests(unittest.TestCase):
         self.assertEqual(speech, 0.0)
         self.assertTrue(session._last_final_ended_the_utterance())
         self.assertFalse(session._tail_awaits_more_finals(gap, speech, covered))
-        self.assertTrue(session._tail_needs_recovery(gap, speech, covered))
+        self.assertTrue(_recovers_tail(session, gap, speech, covered))
 
     def test_a_covered_tail_is_finished(self):
         session = _session(streamed_sec=14.26, covered_end=14.26)
@@ -1021,7 +1048,7 @@ class UnexplainedTailTests(unittest.TestCase):
         session = _session(**self.EIGHT_24)
         _s, covered, gap, speech = session._tail_coverage()
         self.assertTrue(
-            session._tail_needs_recovery(gap, speech, covered),
+            _recovers_tail(session, gap, speech, covered),
             "the loss this rule exists for must be re-decodable",
         )
 
@@ -1037,7 +1064,7 @@ class UnexplainedTailTests(unittest.TestCase):
         session._last_utterance_end = 10.10
         _s, covered, gap, speech = session._tail_coverage()
         self.assertAlmostEqual(gap, 0.10, places=2)
-        self.assertFalse(session._tail_needs_recovery(gap, speech, covered))
+        self.assertFalse(_recovers_tail(session, gap, speech, covered))
 
     def test_the_f94121ae_shape_neither_retries_nor_recovers(self):
         # 0.91 s of audio past the last final, 0.05 s of it decoder
@@ -1048,7 +1075,7 @@ class UnexplainedTailTests(unittest.TestCase):
         _s, covered, gap, speech = session._tail_coverage()
         self.assertAlmostEqual(gap, 0.91, places=2)
         self.assertFalse(session._tail_needs_flush(speech, covered))
-        self.assertFalse(session._tail_needs_recovery(gap, speech, covered))
+        self.assertFalse(_recovers_tail(session, gap, speech, covered))
 
     def test_the_threshold_is_the_configured_utterance_end_promise(self):
         session = _session(streamed_sec=10.0, covered_end=0.0)

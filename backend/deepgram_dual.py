@@ -87,7 +87,6 @@ from backend.remote_deepgram_live import (
     SPANLESS_WORD_FLAG,
     resolve_live_language,
     segment_word_records,
-    segment_words,
     subtract_spans,
     time_overlap,
     token_stem,
@@ -1675,25 +1674,6 @@ class DualLiveSession:
         return old
 
     # ----- Stop --------------------------------------------------------
-
-    async def finalize(
-        self,
-        wait_timeout: float = 3.0,
-        on_budget=None,
-    ) -> dict:
-        """Back-compat convenience: ``drain_transcript()`` then ``shutdown()``.
-
-        Mirrors ``DeepgramLiveSession.finalize`` (see its docstring) —
-        the same "one interface either way" promise this class exists
-        for means a caller that only knows the single-session API must
-        not have to special case a dual recording to get its transcript
-        and clean up. The WS handler and the A/B tool both drive
-        ``drain_transcript`` + recovery + ``shutdown`` instead; this is
-        the convenience the session tests drive.
-        """
-        result = await self.drain_transcript(on_budget=on_budget)
-        await self.shutdown(wait_timeout=wait_timeout)
-        return result
 
     async def drain_transcript(self, on_budget=None) -> dict:
         """Drain both readings under ONE budget and merge them.

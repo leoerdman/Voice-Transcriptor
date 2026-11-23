@@ -400,7 +400,7 @@ class LifecycleTests(_PoolCase):
         warm = await self._warm()
         await self.pool.close_all()
         self.assertTrue(warm.discarded)
-        self.assertFalse(self.pool.armed)
+        self.assertFalse(self.pool.status()["armed"])
         self.assertEqual(self.pool.status()["sockets"], [])
 
     async def test_the_ttl_reaper_closes_an_idle_socket(self):

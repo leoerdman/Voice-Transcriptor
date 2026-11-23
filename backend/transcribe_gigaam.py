@@ -25,7 +25,6 @@ from __future__ import annotations
 from bisect import bisect_left, bisect_right
 from collections import OrderedDict
 import logging
-import os
 import socket
 import ssl
 import tempfile

@@ -273,10 +273,6 @@ class DeepgramWarmPool:
         """Arm the pool. Called once, from the app lifespan."""
         self._armed = True
 
-    @property
-    def armed(self) -> bool:
-        return self._armed
-
     async def close_all(self) -> None:
         """Release every warm socket and every task the pool owns."""
         self._armed = False

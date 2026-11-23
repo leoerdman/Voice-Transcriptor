@@ -115,12 +115,6 @@ def screenshots_in(folder: Path) -> list[str]:
         return []
 
 
-def list_screenshots(target_dir: Path, stem: str) -> list[str]:
-    """Screenshot file names of one recording, in shot order."""
-    d = recording_screens_dir(target_dir, stem)
-    return screenshots_in(d) if d is not None else []
-
-
 def is_served_image_name(file_name: object) -> bool:
     """A screenshot or one of its cheap copies — the image names the shell
     writes into a screens folder, and the only ones ever served."""

@@ -68,7 +68,7 @@ from functools import lru_cache
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Optional
 
-from backend.deepgram_language import LANGUAGE_HINT_OPTIONS, configured_language_hints
+from backend.deepgram_language import configured_language_hints
 
 SCRIPT_LATIN = "Latin"
 SCRIPT_CYRILLIC = "Cyrillic"

@@ -21,9 +21,16 @@ from backend.auto_keyterms import (
     BUILTIN_TERMS,
     AutoKeytermStore,
     CorpusEntry,
-    extract_candidates,
+    extract_document_stats,
+    rank_terms,
 )
 from backend.english_frequent_words import is_frequent_english
+
+
+def extract_candidates(texts, **kwargs):
+    """The ranking the store computes over *texts*, one text per
+    recording: each read into its statistics, then ranked together."""
+    return rank_terms((extract_document_stats(t) for t in texts), **kwargs)
 
 
 def _terms(texts, **kwargs) -> list[str]:

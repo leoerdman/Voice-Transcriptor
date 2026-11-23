@@ -61,17 +61,17 @@ class SplitChannelsTests(unittest.TestCase):
             self.assertEqual(split_channels(str(src)), (None, None))
 
     def test_it_never_materialises_the_whole_file(self):
-        # ``load_wav`` returns float32 for the entire recording: a
-        # two-hour 16 kHz stereo file is 921 MB resident, plus a
-        # contiguous copy per channel. Every other path in this module
-        # was converted to streaming, with a docstring saying why.
+        # A whole-file ``sf.read`` returns float32 for the entire
+        # recording: a two-hour 16 kHz stereo file is 921 MB resident,
+        # plus a contiguous copy per channel. Every other path in this
+        # module was converted to streaming, with a docstring saying why.
         from backend import audio
 
         with tempfile.TemporaryDirectory() as td:
             src = Path(td) / "stereo.wav"
             _stereo_wav(src)
             with mock.patch.object(
-                audio, "load_wav", side_effect=AssertionError("whole file read")
+                audio.sf, "read", side_effect=AssertionError("whole file read")
             ):
                 audio.split_channels(str(src))
 

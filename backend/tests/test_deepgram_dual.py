@@ -1071,22 +1071,6 @@ class DualLiveSessionDrainTests(unittest.IsolatedAsyncioTestCase):
         # reported hole span, so nothing should remain uncovered.
         self.assertAlmostEqual(envelope["uncoveredSpeechSec"], 0.0, places=3)
 
-    async def test_finalize_drains_then_shuts_down_both_sockets(self):
-        # The single-session back-compat convenience
-        # (DeepgramLiveSession.finalize) — a caller that only knows that
-        # API (the A/B tool) must get it here too, not an
-        # AttributeError, or the facade is not really "one interface
-        # either way".
-        primary, secondary = _primary(), _secondary()
-        dual = DualLiveSession(
-            primary, secondary,
-            secondary_language="ru", primary_language="multi",
-        )
-        envelope = await dual.finalize()
-        self.assertEqual(envelope["text"], "before hole after")
-        self.assertTrue(primary.shutdown_called)
-        self.assertTrue(secondary.shutdown_called)
-
     async def test_the_stop_line_reports_both_word_counts(self):
         primary, secondary = _primary(), _secondary()
         dual = DualLiveSession(

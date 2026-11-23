@@ -69,15 +69,9 @@ def _content_text(raw_content: Any, *, what: str) -> str:
         ]
         if parts and all(isinstance(p, str) for p in parts):
             return "".join(parts)
-    raise RemoteError(
+    raise OpenRouterError(
         f"{what}: unexpected message content type {type(raw_content).__name__}"
     )
-
-
-# Re-export under the legacy name so any downstream import that used
-# ``from backend.remote_openrouter import RemoteError`` keeps working.
-# New code should import ``OpenRouterError`` directly.
-RemoteError = OpenRouterError  # type: ignore[misc]
 
 
 def _b64(data: bytes) -> str:
@@ -117,9 +111,9 @@ def _json_response(response: Any, context: str) -> Dict[str, Any]:
     try:
         payload = response.json()
     except ValueError as exc:
-        raise RemoteError(f"{context}: invalid JSON response") from exc
+        raise OpenRouterError(f"{context}: invalid JSON response") from exc
     if not isinstance(payload, dict):
-        raise RemoteError(f"{context}: unexpected JSON response type {type(payload).__name__}")
+        raise OpenRouterError(f"{context}: unexpected JSON response type {type(payload).__name__}")
     return payload
 
 
@@ -133,7 +127,7 @@ def openrouter_transcribe(
     """
     key = (api_key or "").strip()
     if not key:
-        raise RemoteError("OpenRouter key is not configured")
+        raise OpenRouterError("OpenRouter key is not configured")
 
     fmt = _openrouter_audio_format(filename or "audio.wav")
 
@@ -195,12 +189,12 @@ def openrouter_transcribe(
         # content type, so match the phrase, not one word.
         lowered = error_text.lower()
         if "input_audio" in lowered or "image input" in lowered:
-            raise RemoteError(
+            raise OpenRouterError(
                 f"Model '{model}' does not support audio input. Please use a model that supports audio, "
                 f"such as: {', '.join(OPENROUTER_AUDIO_MODELS)}",
                 status_code=r.status_code,
             )
-        raise RemoteError(f"openrouter failed: HTTP {r.status_code} {error_text}", status_code=r.status_code)
+        raise OpenRouterError(f"openrouter failed: HTTP {r.status_code} {error_text}", status_code=r.status_code)
 
     js = _json_response(r, "OpenRouter transcribe")
     text = ""
@@ -213,7 +207,7 @@ def openrouter_transcribe(
         # opaque HTTP 500 instead of a typed provider error the caller
         # could fall back from.
         if raw_content is None:
-            raise RemoteError(
+            raise OpenRouterError(
                 f"OpenRouter model '{model or DEFAULT_OPENROUTER_AUDIO_MODEL}' "
                 "returned no transcript content for this audio"
             )
@@ -224,10 +218,10 @@ def openrouter_transcribe(
         # API response — potentially echoing the user's prompt and
         # the audio's base64 payload — visible to the caller as if
         # it were the transcribed text. Far better to surface the
-        # shape mismatch as a RemoteError so the route handler maps
+        # shape mismatch as an OpenRouterError so the route handler maps
         # it to a 502 with a sane message and the renderer falls
         # back to local Whisper.
-        raise RemoteError(
+        raise OpenRouterError(
             f"OpenRouter response shape unexpected: {type(shape_err).__name__}"
         ) from shape_err
 
@@ -246,11 +240,11 @@ def openrouter_upscale_text(
     """Upscale/improve transcript text via OpenRouter chat completion."""
     key = (api_key or "").strip()
     if not key:
-        raise RemoteError("OpenRouter key is not configured")
+        raise OpenRouterError("OpenRouter key is not configured")
 
     source_text = (text or "").strip()
     if not source_text:
-        raise RemoteError("empty text for upscale")
+        raise OpenRouterError("empty text for upscale")
 
     url = OPENROUTER_CHAT_COMPLETIONS_URL
     headers = {
@@ -283,7 +277,7 @@ def openrouter_upscale_text(
     r = request_with_retry("POST", url, headers=headers, json=payload, timeout=(10, 120))
 
     if r.status_code >= 400:
-        raise RemoteError(
+        raise OpenRouterError(
             f"openrouter upscale failed: HTTP {r.status_code} {r.text[:400]}",
             status_code=r.status_code,
         )
@@ -294,7 +288,7 @@ def openrouter_upscale_text(
     except (KeyError, IndexError, TypeError) as shape_err:
         # A response-shape change must not masquerade as "empty text"
         # (BUG-66): triage needs to see WHAT was actually received.
-        raise RemoteError(
+        raise OpenRouterError(
             f"openrouter upscale: unexpected response shape ({shape_err}): {str(js)[:200]}"
         ) from shape_err
     # ``openrouter_transcribe`` coerces defensively for exactly this
@@ -304,10 +298,10 @@ def openrouter_upscale_text(
     # above — so it escaped as an unredacted 500 instead of a provider
     # error the caller could fall back from.
     if raw_content is None:
-        raise RemoteError("openrouter upscale returned no content")
+        raise OpenRouterError("openrouter upscale returned no content")
     out_text = _content_text(raw_content, what="openrouter upscale").strip()
     if not out_text:
-        raise RemoteError("openrouter upscale returned empty text")
+        raise OpenRouterError("openrouter upscale returned empty text")
 
     logger.info("openrouter_upscale: success, %d chars", len(out_text))
     return {"text": out_text, "raw": js}

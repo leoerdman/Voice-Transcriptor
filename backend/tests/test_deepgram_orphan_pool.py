@@ -74,7 +74,7 @@ class OrphanPoolTests(unittest.TestCase):
         # And no final ever covers 30.9..31.45; a later final lands beyond it.
         s._process_deepgram_message(_final_msg(41.74, 43.99, "Гигаам."))
 
-        # finalize() is async; exercise the sync splice path directly:
+        # drain_transcript() is async; exercise the sync splice path directly:
         spliced = s._splice_uncovered_interim_words()
         texts = [str(seg.get("text") or "") for seg in s._finalized_segments]
         # Case-blind: the word opens the transcript, so it is capitalised.

@@ -481,15 +481,6 @@ def ensure_wav_16k(path_in: str, path_out: str, channels: Optional[int] = 1) -> 
     return path_out
 
 
-def load_wav(path_wav: str) -> Tuple[np.ndarray, int]:
-    data, sr = sf.read(path_wav, always_2d=True, dtype="float32")
-    return data, int(sr)
-
-
-def write_wav(path_wav: str, data: np.ndarray, sr: int = LIVE_SAMPLE_RATE_HZ) -> None:
-    sf.write(path_wav, data, sr, subtype="PCM_16")
-
-
 # Frames per streaming chunk (1 MiB of int16 = 2 MB RAM per block).
 _PCM16_STREAM_CHUNK_FRAMES = 1 << 20
 
@@ -551,9 +542,9 @@ def split_channels(path_wav_16k: str) -> Tuple[Optional[str], Optional[str]]:
     # ch1/ch2.wav that no orphan sweep recognised.
     tmp_ch1 = f"{ch1}.tmp-{uuid.uuid4().hex}"
     tmp_ch2 = f"{ch2}.tmp-{uuid.uuid4().hex}"
-    # STREAMED, in blocks. ``load_wav`` returns float32, so a two-hour
-    # 16 kHz stereo file was 921 MB resident plus a contiguous copy per
-    # channel — on a path this module has already converted to streaming
+    # STREAMED, in blocks. A whole-file float32 read (``sf.read``) of a
+    # two-hour 16 kHz stereo file was 921 MB resident plus a contiguous
+    # copy per channel — on a path this module has already converted to streaming
     # everywhere else, with a docstring saying why ("OOM-kills 8-16 GB
     # hosts"). This was the one place it had not been applied.
     try:

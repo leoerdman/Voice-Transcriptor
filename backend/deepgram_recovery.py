@@ -70,7 +70,6 @@ from backend.live_envelope import envelope_from_result, live_final_stats
 from backend.model_catalog import DEFAULT_DEEPGRAM_AUDIO_MODEL
 from backend.remote_deepgram import deepgram_transcribe
 from backend.remote_deepgram_live import (
-    INTERIM_FALLBACK_SOURCE,
     DeepgramLiveConfig,
     as_float,
     confirmed_silence_gap,

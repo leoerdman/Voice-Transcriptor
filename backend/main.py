@@ -142,7 +142,6 @@ from backend.transcript_scripts import (
 from backend.remote_deepgram import (
     DEEPGRAM_SMALL_AUDIO_BYTES,
     DEEPGRAM_SMALL_AUDIO_READ_TIMEOUT_SEC,
-    DeepgramRemoteError,
     deepgram_transcribe,
 )
 from backend.deepgram_dual import (
@@ -835,11 +834,8 @@ UPSCALE_OUTPUT_LANGUAGES: tuple[str, ...] = LANGUAGE_HINT_OPTIONS
 DEFAULT_UPSCALE_PRESET_ID = f"builtin_{DEFAULT_UPSCALE_PRESET_KEY}"
 MAX_UPSCALE_INPUT_CHARS = 120_000
 
-# The built-in presets. Their ids used to be written out a second time
-# as a bare set (``UPSCALE_PRESETS``) for the legacy ``preset`` field's
-# validation, with nothing connecting the two — so adding a fifth
-# built-in would have answered "unsupported upscale preset" to a legacy
-# client asking for a preset that exists.
+# The built-in presets — the one list of them: their files, their ids
+# (``builtin_<key>``) and the default all derive from this table.
 BUILTIN_UPSCALE_PRESETS: dict[str, dict[str, str]] = {
     "clean": {
         "name": "Clean",
@@ -8168,12 +8164,9 @@ async def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require
             MAX_UPSCALE_INPUT_CHARS,
         )
     _ensure_builtin_upscale_presets()
-    preset_id = str(payload.get("preset_id") or "").strip()
-    if not preset_id:
-        legacy = str(payload.get("preset") or DEFAULT_UPSCALE_PRESET_KEY).strip().lower()
-        if legacy not in BUILTIN_UPSCALE_PRESETS:
-            raise HTTPException(status_code=400, detail="unsupported upscale preset")
-        preset_id = f"builtin_{legacy}"
+    # ``preset_id`` is the one field that names a preset; a request
+    # without one gets the default built-in.
+    preset_id = str(payload.get("preset_id") or "").strip() or DEFAULT_UPSCALE_PRESET_ID
     preset = _resolve_upscale_preset(preset_id)
 
     cfg = load_config()

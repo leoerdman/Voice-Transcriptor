@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Optional
 
 # ``__name__`` (``backend.async_tasks``): the one handler main.py installs is on
 # the ``backend`` logger, so a hand-typed name outside that namespace is

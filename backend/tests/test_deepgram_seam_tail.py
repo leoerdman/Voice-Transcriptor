@@ -292,7 +292,8 @@ class TailGuardTests(unittest.IsolatedAsyncioTestCase):
 
         blocker = asyncio.create_task(silent())
         try:
-            await session.finalize(wait_timeout=0.2)
+            await session.drain_transcript()
+            await session.shutdown(wait_timeout=0.2)
         finally:
             blocker.cancel()
         finalize_sends = [i for i, t in enumerate(ws.types) if t == "Finalize"]
@@ -331,7 +332,8 @@ class TailGuardTests(unittest.IsolatedAsyncioTestCase):
 
         blocker = asyncio.create_task(silent())
         try:
-            await session.finalize(wait_timeout=0.2)
+            await session.drain_transcript()
+            await session.shutdown(wait_timeout=0.2)
         finally:
             blocker.cancel()
         self.assertEqual(
@@ -355,7 +357,8 @@ class TailGuardTests(unittest.IsolatedAsyncioTestCase):
 
         blocker = asyncio.create_task(silent())
         try:
-            await session.finalize(wait_timeout=0.2)
+            await session.drain_transcript()
+            await session.shutdown(wait_timeout=0.2)
         finally:
             blocker.cancel()
         finalize_count = sum(1 for t in ws.types if t == "Finalize")

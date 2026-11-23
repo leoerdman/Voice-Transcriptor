@@ -9,7 +9,7 @@ audio undecoded on average, while sessions still mid-utterance at Stop
 spoken. That is the difference the user described between "it ended
 exactly where I stopped" and "the last sentence is missing".
 
-``finalize()`` now waits for the flushed transcript before closing,
+The stop now waits for the flushed transcript before closing,
 bounded by ``FINALIZE_FLUSH_WAIT_SEC`` and short-circuited the moment it
 arrives.
 """
@@ -45,7 +45,7 @@ class FakeUpstreamWs:
 def _session() -> DeepgramLiveSession:
     session = DeepgramLiveSession(api_key="k")
     session._ws = FakeUpstreamWs()
-    # finalize() drains background work it never started in this harness.
+    # shutdown() drains background work it never started in this harness.
     session._keepalive_task = None
     session._recv_task = None
     return session
@@ -61,10 +61,11 @@ class FinalizeFlushOrderingTests(unittest.IsolatedAsyncioTestCase):
             arrival["final"] = time.perf_counter()
             session._final_arrived.set()
 
-        ws = session._ws  # finalize() releases the reference on close
+        ws = session._ws  # shutdown() releases the reference on close
         started = time.perf_counter()
         task = asyncio.create_task(deliver_final_after(0.20))
-        await session.finalize(wait_timeout=0.5)
+        await session.drain_transcript()
+        await session.shutdown(wait_timeout=0.5)
         await task
 
         self.assertIn("Finalize", ws.types)
@@ -90,7 +91,8 @@ class FinalizeFlushOrderingTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch(
             "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 5.0
         ):
-            await session.finalize(wait_timeout=0.5)
+            await session.drain_transcript()
+            await session.shutdown(wait_timeout=0.5)
         await task
         elapsed = time.perf_counter() - started
         self.assertLess(elapsed, 1.0, f"finalize waited {elapsed:.2f}s despite an early final")
@@ -98,12 +100,13 @@ class FinalizeFlushOrderingTests(unittest.IsolatedAsyncioTestCase):
     async def test_silent_upstream_still_closes_within_the_ceiling(self):
         """No transcript ever arrives — the stream must still close."""
         session = _session()
-        ws = session._ws  # finalize() releases the reference on close
+        ws = session._ws  # shutdown() releases the reference on close
         started = time.perf_counter()
         with mock.patch(
             "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.15
         ):
-            await session.finalize(wait_timeout=0.5)
+            await session.drain_transcript()
+            await session.shutdown(wait_timeout=0.5)
         elapsed = time.perf_counter() - started
         self.assertIn("CloseStream", ws.types)
         self.assertGreaterEqual(elapsed, 0.15)
@@ -118,7 +121,8 @@ class FinalizeFlushOrderingTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch(
             "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.15
         ):
-            await session.finalize(wait_timeout=0.5)
+            await session.drain_transcript()
+            await session.shutdown(wait_timeout=0.5)
         self.assertGreaterEqual(time.perf_counter() - started, 0.15)
 
 
@@ -211,19 +215,6 @@ class DrainTranscriptShutdownSplitTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(shutdown_returned_at, drained_at["t"])
         self.assertTrue(session._recv_task.done())
         self.assertFalse(session._recv_task.cancelled())
-
-    async def test_finalize_thin_wrapper_still_does_both_in_order(self):
-        """Back-compat: finalize() == drain_transcript() then shutdown()."""
-        session = _session()
-        ws = session._ws
-        assert ws is not None
-        with mock.patch(
-            "backend.remote_deepgram_live.FINALIZE_FLUSH_WAIT_SEC", 0.02
-        ):
-            result = await session.finalize(wait_timeout=0.3)
-        self.assertIn("CloseStream", ws.types)
-        self.assertTrue(session.is_closed)
-        self.assertIn("text", result)
 
 
 if __name__ == "__main__":

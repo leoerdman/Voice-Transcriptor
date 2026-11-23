@@ -42,7 +42,6 @@ import copy
 import json
 import logging
 import os
-import sys
 import threading
 from pathlib import Path
 from typing import Any, Dict

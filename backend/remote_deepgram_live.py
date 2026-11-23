@@ -12,8 +12,9 @@ Deepgram ``Results`` events into the app's canonical live protocol:
 Lifecycle is session-scoped: ``connect()`` opens the upstream socket and
 starts a background task that drains Deepgram events into an internal
 queue. ``send_pcm()`` forwards audio; ``events()`` is the async iterator
-consumers iterate to receive normalized events; ``finalize()`` tells
-Deepgram to flush and returns the accumulated final transcript.
+consumers iterate to receive normalized events; ``drain_transcript()``
+tells Deepgram to flush and returns the accumulated final transcript,
+and ``shutdown()`` closes the stream afterwards.
 
 Production-grade features:
 
@@ -55,7 +56,6 @@ from itertools import groupby
 from typing import AsyncIterator, Callable, Iterable, Optional
 from urllib.parse import parse_qsl, urlencode
 
-import websockets
 from websockets.asyncio.client import ClientConnection, connect as ws_connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketException
 
@@ -63,7 +63,7 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketExce
 # 950 lines down behind six ``# noqa: E402`` markers. ``DEEPGRAM_LIVE_URL``
 # comes from the same centralised host as the REST module, so a regional
 # override (``TRANSCRIPTOR_DEEPGRAM_HOST``) sets both at once.
-from backend.async_tasks import await_cancelled, cancel_and_await
+from backend.async_tasks import cancel_and_await
 from backend.audio_constants import LIVE_SAMPLE_RATE_HZ, pcm16_bytes_per_sec
 from backend.deepgram_endpoints import DEEPGRAM_LIVE_URL
 from backend.deepgram_format import shared_format_params
@@ -1869,9 +1869,9 @@ class DeepgramLiveSession:
 
     Not reentrant. Create one per recording, call ``connect()`` once,
     then ``send_pcm()`` for each audio chunk and iterate ``events()`` from
-    a single consumer. Call ``finalize()`` at stop to drain remaining
-    results and return the canonical transcript. Always ``close()`` in
-    ``finally`` (``finalize()`` closes implicitly on success).
+    a single consumer. Call ``drain_transcript()`` at stop to drain
+    remaining results and return the canonical transcript, then
+    ``shutdown()``. Always ``close()`` in ``finally``.
     """
 
     _QUEUE_SENTINEL = object()
@@ -1927,7 +1927,7 @@ class DeepgramLiveSession:
         # and then resume the next final past the difference, leaving a
         # hole no final ever covers — words the user definitely spoke and
         # the service definitely recognised, missing from the committed
-        # transcript. Keeping the interim spans lets ``finalize()``
+        # transcript. Keeping the interim spans lets ``drain_transcript()``
         # measure exactly that, instead of the transcript being trusted
         # blind. Silence produces no interims, so ordinary pauses do not
         # register here.
@@ -1953,7 +1953,7 @@ class DeepgramLiveSession:
         # ``_interim_speech_spans`` docstring above for a measured
         # example). The interim words are real recognitions of real
         # audio — discarding them throws away the only transcript that
-        # exists for that ground. We retain them so ``finalize()`` can
+        # exists for that ground. We retain them so ``drain_transcript()`` can
         # splice exactly the words NO final covers back into the
         # committed transcript.
         #
@@ -2417,9 +2417,9 @@ class DeepgramLiveSession:
     ) -> dict:
         """Flush Deepgram and return the final transcript — nothing else.
 
-        This is the half of the old ``finalize()`` that produces the
-        transcript: send ``Finalize``, decide and announce the wait
-        budget, wait for the flush — for as many finals as it takes to
+        This is the half of the stop that produces the transcript: send
+        ``Finalize``, decide and announce the wait budget, wait for the
+        flush — for as many finals as it takes to
         cover the streamed tail, inside that one budget, then the
         tail-guard retry — splice uncovered interim words, merge seams
         once. It deliberately stops
@@ -2469,7 +2469,7 @@ class DeepgramLiveSession:
             # succeeds, NOT before. Previously a CancelledError fired
             # between the flag-set and the actual ``ws.send`` would
             # leave ``_finalize_sent=True`` even though Deepgram never
-            # got the Finalize signal — a follow-up finalize() call
+            # got the Finalize signal — a follow-up drain_transcript() call
             # then early-returned and the trailing is_final was never
             # flushed. Moving the flag below the send-success makes
             # the flag a faithful witness of "Finalize was actually
@@ -2826,23 +2826,6 @@ class DeepgramLiveSession:
 
         await self.close()
 
-    async def finalize(
-        self,
-        wait_timeout: float = 3.0,
-        on_budget: "Optional[Callable[[float, bool], None]]" = None,
-    ) -> dict:
-        """Back-compat convenience: ``drain_transcript()`` then ``shutdown()``.
-
-        Existing callers that want "give me the transcript and clean
-        everything up, in one call" still get exactly that behaviour.
-        The WS handler calls the two halves separately so it can send the
-        ``final`` envelope in between — see ``drain_transcript()``'s
-        docstring and C4.
-        """
-        result = await self.drain_transcript(on_budget=on_budget)
-        await self.shutdown(wait_timeout=wait_timeout)
-        return result
-
     def _word_covered_by_finals(self, word: dict) -> bool:
         """Is this interim word already in the committed transcript?
 
@@ -2932,25 +2915,6 @@ class DeepgramLiveSession:
             else:
                 self._note_overruled_word(word, owner)
         return kept
-
-    def _spanless_coverage(self) -> list[tuple[float, float]]:
-        """Merged spans of the finals that carry no word list.
-
-        Their span is the only thing knowable about what they contain,
-        so it stays the coverage test for them — and only for them.
-        Read through ``segment_word_records``, the one rule for what such
-        a final accounts for, so this module, the dual merge and the
-        recovery pass cannot answer that question differently.
-        """
-        return spanless_coverage_spans(self._finalized_segments)
-
-    def _host_final_for(self, word: dict) -> Optional[dict]:
-        """This session's finals asked ``host_segment_for``."""
-        return host_segment_for(word, self._finalized_segments)
-
-    def _nearest_final_word(self, time: float, before: bool) -> Optional[dict]:
-        """This session's finals asked ``nearest_segment_word``."""
-        return nearest_segment_word(self._finalized_segments, time, before=before)
 
     def _standing_hypothesis_words(
         self, *, note_overruled: bool = False
@@ -3046,7 +3010,7 @@ class DeepgramLiveSession:
             return 0
         # Hypotheses are consumed exactly once: whether they were
         # spliced or judged covered-and-discarded here, keeping them
-        # would let a second finalize() call splice duplicates.
+        # would let a second drain_transcript() call splice duplicates.
         orphan_count = len(self._orphan_interim_words)
         self._interim_words = []
         self._orphan_interim_words = []
@@ -3347,18 +3311,6 @@ class DeepgramLiveSession:
             self.endpointing_sec,
         )
 
-    def _tail_needs_recovery(
-        self, tail_gap: float, tail_speech: float, covered_end: float
-    ) -> bool:
-        """Is the trailing region worth re-decoding? See ``tail_needs_recovery``."""
-        return tail_needs_recovery(
-            tail_gap,
-            tail_speech,
-            self._latest_interim_window_end - covered_end,
-            self.endpointing_sec,
-            self.utterance_end_sec,
-        )
-
     def _last_final_ended_the_utterance(self) -> bool:
         """Did the newest final claim to end where the speaker stopped?
 
@@ -3605,7 +3557,7 @@ class DeepgramLiveSession:
         # potentially seconds. During that window, _recv_task holds
         # references to the socket, queue, and closures, leaking the
         # whole session object well past the caller's lifetime.
-        # Mirror finalize()'s bounded cancel pattern.
+        # Mirror shutdown()'s bounded cancel pattern.
         if self._recv_task is not None and not self._recv_task.done():
             self._recv_task.cancel()
             try:

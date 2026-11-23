@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from backend.model_catalog import GIGAAM_MODEL_PREFIX, WHISPER_LOCAL_MODELS
 

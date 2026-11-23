@@ -50,7 +50,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import logging
 import sys
 import time
@@ -239,9 +238,10 @@ async def _run_one(
         # Let the last chunk actually reach Deepgram before finalizing.
         await asyncio.sleep(0.2)
         # Drain, then RECOVER, then shut down — the exact order the WS
-        # handler uses. ``finalize()`` (drain + shutdown) would measure
-        # only the half of the stop that happens before the envelope is
-        # completed, and the envelope is what the user receives.
+        # handler uses. Shutting down straight after the drain would
+        # measure only the half of the stop that happens before the
+        # envelope is completed, and the envelope is what the user
+        # receives.
         result = await session.drain_transcript()
         if dump_dir is not None and isinstance(session, DualLiveSession):
             _dump_readings(

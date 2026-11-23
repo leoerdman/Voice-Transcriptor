@@ -26,6 +26,13 @@ SESSION = "screen-20261120-100000-000"
 NOW = 1_000_000_000.0
 
 
+def _listed_screenshots(target_dir: Path, stem: str) -> list[str]:
+    """The screenshots a recording's payload lists: its screens folder
+    (``recording_screens_dir``, None for a symlink) read in shot order."""
+    folder = screen_sessions.recording_screens_dir(target_dir, stem)
+    return screen_sessions.screenshots_in(folder) if folder is not None else []
+
+
 def _stage(data_dir: Path, session_id: str = SESSION, shots: int = 2) -> Path:
     folder = data_dir / "screen-sessions" / session_id
     folder.mkdir(parents=True)
@@ -147,7 +154,7 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(manifest["events"][1]["files"], [str(dest / "shot-01.png")])
         on_disk = json.loads((dest / "events.json").read_text(encoding="utf-8"))
         self.assertEqual(on_disk, manifest)
-        self.assertEqual(screen_sessions.list_screenshots(self.archive, "Bug report"), ["shot-01.png", "shot-02.png"])
+        self.assertEqual(_listed_screenshots(self.archive, "Bug report"), ["shot-01.png", "shot-02.png"])
 
     def test_adoption_records_the_audio_clock_origin(self) -> None:
         _stage(self.data)
@@ -191,7 +198,7 @@ class AdoptionTests(unittest.TestCase):
         dest = self.archive / "r.screens"
         self.assertTrue((dest / "shot-01-preview.jpg").is_file())
         self.assertTrue((dest / "shot-01-n1.jpg").is_file())
-        self.assertEqual(screen_sessions.list_screenshots(self.archive, "r"), ["shot-01.png", "shot-02.png"])
+        self.assertEqual(_listed_screenshots(self.archive, "r"), ["shot-01.png", "shot-02.png"])
         served = screen_sessions.screenshot_path(self.archive, "r", "shot-01-n1.jpg")
         self.assertEqual(served, dest / "shot-01-n1.jpg")
         self.assertEqual(screen_sessions.image_media_type(served.name), "image/jpeg")
@@ -270,7 +277,7 @@ class AdoptionTests(unittest.TestCase):
             manifest = screen_sessions.adopt_session(self.data, SESSION, self.archive, "r")
         self.assertEqual(manifest["dir"], str(self.archive / "r.screens"))
         self.assertFalse(staged.exists())
-        self.assertEqual(screen_sessions.list_screenshots(self.archive, "r"), ["shot-01.png", "shot-02.png"])
+        self.assertEqual(_listed_screenshots(self.archive, "r"), ["shot-01.png", "shot-02.png"])
         self._no_work_dirs()
 
     def test_a_reasave_replaces_the_previous_screenshots_atomically(self) -> None:
@@ -464,7 +471,7 @@ class OneRecordingOneRuleTests(unittest.TestCase):
         elsewhere.mkdir()
         (elsewhere / "shot-01.png").write_bytes(b"png")
         (self.screen_dir / "take.screens").symlink_to(elsewhere, target_is_directory=True)
-        self.assertEqual(screen_sessions.list_screenshots(self.screen_dir, "take"), [])
+        self.assertEqual(_listed_screenshots(self.screen_dir, "take"), [])
         self.assertIsNone(screen_sessions.screenshot_path(self.screen_dir, "take", "shot-01.png"))
 
 
@@ -565,7 +572,7 @@ class CrashedScreenTakeRecoveryTests(unittest.TestCase):
         self.assertEqual(Path(result["archive_dir"]), self.screen_dir)
         stem = Path(result["name"]).stem
         self.assertEqual(
-            self.main.screen_sessions.list_screenshots(self.screen_dir, stem),
+            _listed_screenshots(self.screen_dir, stem),
             ["shot-01.png", "shot-02.png"],
         )
         self.assertIsNotNone(result["screens"])
