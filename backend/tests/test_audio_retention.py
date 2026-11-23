@@ -3,11 +3,10 @@
 The rule the user asked for, and what these tests pin:
 
   Live Capsule   — voice notes dictated all day. Keep the audio of the
-                   newest 100 takes; older audio goes. (Was 3, which
-                   deleted a day's evidence within hours — see the
-                   policy table in backend/main.py.)
+                   newest 20 takes; older audio goes (owner's limit,
+                   2026-11-23 — see the policy table in backend/main.py).
   Uploaded Media — the track extracted from a file the user brought in.
-                   Keep it for 7 days regardless of how many there are.
+                   Keep the newest 20, and none older than 7 days.
   Transcripts    — never deleted, at any age or count, anywhere.
 
 That replaced a single global "only the newest recording keeps audio"
@@ -134,18 +133,18 @@ class AudioRetentionTestBase(unittest.TestCase):
 class PolicyTableTests(AudioRetentionTestBase):
     """The declarative SSOT itself."""
 
-    def test_live_keeps_the_newest_hundred_and_has_no_age_limit(self) -> None:
+    def test_live_keeps_the_newest_twenty_and_has_no_age_limit(self) -> None:
         policy = self.main.AUDIO_RETENTION_POLICIES[self.main.RECORDING_COLLECTION_LIVE]
-        self.assertEqual(policy.max_items, 100)
+        self.assertEqual(policy.max_items, 20)
         self.assertEqual(policy.max_age_sec, 0)
         self.assertTrue(policy.enabled)
 
-    def test_uploads_age_out_after_seven_days_with_no_count_limit(self) -> None:
+    def test_uploads_keep_the_newest_twenty_for_at_most_seven_days(self) -> None:
         policy = self.main.AUDIO_RETENTION_POLICIES[
             self.main.RECORDING_COLLECTION_UPLOADS
         ]
         self.assertEqual(policy.max_age_sec, 7 * 24 * 3600)
-        self.assertEqual(policy.max_items, 0)
+        self.assertEqual(policy.max_items, 20)
         self.assertTrue(policy.enabled)
 
     def test_screen_sessions_keep_the_newest_five_and_have_no_age_limit(self) -> None:

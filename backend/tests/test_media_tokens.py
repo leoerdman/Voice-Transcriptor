@@ -154,6 +154,16 @@ class StreamRouteTests(unittest.TestCase):
         self.assertEqual(part.status_code, 206)
         self.assertEqual(part.content, self.AUDIO[100:200])
 
+    def test_the_authenticated_audio_route_is_never_cached(self) -> None:
+        # Every /api response defaults to no-store: the window's HTTP cache
+        # had kept a copy of every recording played (746 MB, 2026-11-23).
+        r = self.client.get(
+            f"/api/recordings/{self.NAME}/audio",
+            headers={"x-api-token": self.main.API_TOKEN},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.headers.get("cache-control"), "no-store")
+
     def test_the_stream_route_needs_a_token_and_ignores_the_api_token(self) -> None:
         base = f"/api/recordings/{self.NAME}/audio/stream"
         self.assertEqual(self.client.get(base).status_code, 401)

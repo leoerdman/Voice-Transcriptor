@@ -770,6 +770,15 @@ let BASE_URL = `http://${HOST}:${PORT}`;
 let BACKEND_BOOT_NONCE = "";
 const BACKEND_API_TOKEN = createLaunchApiToken();
 const LAST_TRANSCRIPT_FILE = "last_transcript.json";
+// The window's HTTP cache (userData/Cache) has one job here: the hashed
+// frontend bundle, a few MB. Chromium sizes it from free disk space
+// instead, and it had grown to 746 MB of recording audio by 2026-11-23 —
+// copies that outlived the retention rule deleting the originals. The
+// backend now answers /api/* with no-store; this cap bounds whatever is
+// left and makes Chromium evict the old copies. Must be set before
+// `ready`, so it lives at module load.
+const HTTP_DISK_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+app.commandLine.appendSwitch("disk-cache-size", String(HTTP_DISK_CACHE_MAX_BYTES));
 const singleInstanceLock = app.requestSingleInstanceLock();
 if (!singleInstanceLock) {
   // app.quit() is async and allows module-level code to keep running

@@ -1917,7 +1917,12 @@ if frontend_assets_dir.exists():
 #   /           → no-store (HTML entry changes on every rebuild; clients must
 #                 always fetch the latest bundle hashes).
 #   /assets/*   → immutable, 1 year (Vite emits hashed filenames).
-#   /api/*      → no caching headers (let FastAPI responses decide).
+#   /api/*      → no-store unless the route set its own Cache-Control.
+#                 Everything here is private, local and read from disk on
+#                 demand; a cached response only duplicates it. Without
+#                 this the window's HTTP cache kept a copy of every
+#                 recording ever played (746 MB on 2026-11-23) — copies
+#                 that outlived the retention rule deleting the originals.
 _INDEX_CACHE_HEADERS = {
     "Cache-Control": "no-store, no-cache, must-revalidate",
     "Pragma": "no-cache",
@@ -1980,6 +1985,8 @@ async def guard_host_and_set_cache_control(request: Request, call_next):
     if path.startswith("/assets/"):
         for k, v in _ASSETS_CACHE_HEADERS.items():
             response.headers[k] = v
+    elif path.startswith("/api/") and "cache-control" not in response.headers:
+        response.headers["Cache-Control"] = "no-store"
     return response
 
 
@@ -3549,7 +3556,8 @@ _RECORDING_COLLECTION_DIR_NAME_TO_KEY: dict[str, str] = {
 #   Uploaded Media — the audio track extracted from a file the user
 #                    brought in. Worth keeping around while they are
 #                    still working with that material, but not forever,
-#                    so this is an *age* rule.
+#                    so this is an *age* rule AND a count rule (the
+#                    files are large).
 #   Screen Sessions — screen-mode takes. A count rule over the recording's
 #                    media as one thing: its audio AND its screenshots
 #                    folder are kept or collected together (default count
@@ -3585,25 +3593,21 @@ class AudioRetentionPolicy:
 
 AUDIO_RETENTION_POLICIES: dict[str, AudioRetentionPolicy] = {
     RECORDING_COLLECTION_LIVE: AudioRetentionPolicy(
-        # 3 → 100. A keep-count of three meant the audio behind a
-        # transcript was gone within hours of a working day: the four
-        # recordings the 2026-09-03 word-loss audit was built on were
-        # deleted while it was being written, and the comparison could
-        # only be reproduced because copies had been taken by hand
-        # (BUGS_AUDIT_2026-09-03.md, addendum (a)). The audio IS the
-        # evidence — without it a report of missing words cannot be
-        # checked against what was said.
-        #
-        # The cost is bounded and small: live capture is 16 kHz mono
-        # PCM16, ~1.9 MB per minute, so 100 takes of a minute each is
-        # under 200 MB. The count is still a limit, not "keep
-        # everything", and the env var below still overrides it.
-        max_items=max(0, _env_int("TRANSCRIPTOR_LIVE_AUDIO_KEEP_COUNT", 100)),
+        # 3 → 100 → 20. Three deleted a working day's evidence within
+        # hours (BUGS_AUDIT_2026-09-03.md, addendum (a)); a hundred kept
+        # ~75 MB of takes nobody replays. The user set twenty on
+        # 2026-11-23: enough to re-transcribe or check the recent takes,
+        # bounded on disk. The env var below still overrides it.
+        max_items=max(0, _env_int("TRANSCRIPTOR_LIVE_AUDIO_KEEP_COUNT", 20)),
     ),
     RECORDING_COLLECTION_UPLOADS: AudioRetentionPolicy(
         max_age_sec=max(
             0, _env_int("TRANSCRIPTOR_UPLOAD_AUDIO_RETENTION_SEC", 7 * 24 * 3600)
         ),
+        # An uploaded file is often an hour of video (tens to hundreds of
+        # MB), so a week of them is not bounded by age alone: the newest
+        # 20 are kept, and within those nothing older than the window.
+        max_items=max(0, _env_int("TRANSCRIPTOR_UPLOAD_AUDIO_KEEP_COUNT", 20)),
     ),
     RECORDING_COLLECTION_SCREEN: AudioRetentionPolicy(
         max_items=max(0, _env_int("TRANSCRIPTOR_SCREEN_AUDIO_KEEP_COUNT", 5)),
