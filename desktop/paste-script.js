@@ -119,6 +119,38 @@ function safeInt(value, max = 2 ** 31) {
 }
 
 /**
+ * The QWERTY position of V (kVK_ANSI_V), and the LAST resort of the
+ * paste: the code AppleScript presses when nothing could read the
+ * keyboard layout. It mirrors `qwertyVKeyCode` in
+ * native/dictation-helper/KeyLayout.swift — the one place the layout's
+ * ⌘ table is read — which falls back to the same position when a layout
+ * gives no "v". A virtual key code names a position, not a letter:
+ * code 9 is V on QWERTY and K on Dvorak, so this is only correct when
+ * the layout question could not be asked at all. The test keeps the two
+ * copies of the number equal.
+ */
+const QWERTY_V_KEY_CODE = 9;
+
+/** The 0…127 range of real key positions (KeyLayout.swift's loop bound). */
+function safeKeyCode(value) {
+  return Number.isInteger(value) && value >= 0 && value < 128 ? value : QWERTY_V_KEY_CODE;
+}
+
+/**
+ * What the helper's `paste-key` answer means: the key the current
+ * layout's ⌘ table calls V, or the QWERTY last resort when there was no
+ * answer (helper absent, crashed, or too slow). `source` is logged, so a
+ * wrong-key report is traceable to the fallback rather than guessed at.
+ */
+function pasteKeyFromAnswer(answer) {
+  const code = answer && answer.t === "paste-key" ? answer.code : null;
+  if (Number.isInteger(code) && code >= 0 && code < 128) {
+    return { code, layout: String(answer.layout || ""), source: "helper" };
+  }
+  return { code: QWERTY_V_KEY_CODE, layout: "", source: "fallback" };
+}
+
+/**
  * Build the primary macOS paste script.
  *
  * @param {object}  target
@@ -126,6 +158,9 @@ function safeInt(value, max = 2 ** 31) {
  * @param {string}  target.windowTitle  raw window title (escaped here)
  * @param {number}  target.pid          unix pid of the target process
  * @param {number}  target.pastedTextLen  length of the text on the clipboard
+ * @param {number}  target.vKeyCode     the key the layout's ⌘ table calls
+ *                                      V (the helper's paste-key answer;
+ *                                      QWERTY's 9 when nothing answered)
  * @param {boolean} target.verify       attempt AX verification at all
  * @returns {string} AppleScript source for `osascript -e`
  *
@@ -142,12 +177,14 @@ function robustPasteScript({
   windowTitle = "",
   pid = 0,
   pastedTextLen = 0,
+  vKeyCode = QWERTY_V_KEY_CODE,
   verify = false,
 } = {}) {
   const escapedApp = escapeAppleScriptString(appName);
   const escapedWindowTitle = escapeAppleScriptString(windowTitle);
   const safePid = safeInt(pid);
   const safeLen = safeInt(pastedTextLen);
+  const safeKey = safeKeyCode(vKeyCode);
   const wantVerify = !!verify;
 
   // The four verification-only fragments. Each is interpolated into a
@@ -299,10 +336,18 @@ function robustPasteScript({
         end if
       end try
 
-      -- Perform physical V key press (key code 9) + Cmd
-      -- This bypasses keyboard layout issues (like Russian "m") where keystroke "v" fails
+      -- Press ⌘V on the key the current layout's ⌘ table calls "v".
+      --
+      -- The code is a parameter, not a literal: KeyLayout.swift reads it
+      -- from the layout (via the helper's paste-key answer) because a
+      -- virtual key code names a POSITION — code 9 is V on QWERTY and K
+      -- on Dvorak, where ⌘V is code 47. The default here is the same
+      -- QWERTY last resort the native path uses when no layout answers.
+      --
+      -- keystroke "v" is not an alternative: it types through the plain
+      -- layout and fails on a non-Latin one (Russian "м").
       tell p
-        key code 9 using {command down}
+        key code ${safeKey} using {command down}
       end tell
 
       -- Same reasoning as the menu path: the settle allowance lives with
@@ -508,7 +553,9 @@ module.exports = {
   AX_VERIFY_POLL_INTERVAL_SEC,
   AX_TRACE_PREFIX,
   PASTE_SENT_PREFIX,
+  QWERTY_V_KEY_CODE,
   escapeAppleScriptString,
+  pasteKeyFromAnswer,
   robustPasteScript,
   menuPasteFallbackScript,
 };

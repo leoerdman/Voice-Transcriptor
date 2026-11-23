@@ -49,7 +49,12 @@ const { MAC_VERIFICATION, evaluatePasteOutcome } = require("./paste-result");
 // SSOT for the AppleScript the macOS paste runs, in both its verifying
 // and non-verifying shape, and for escaping anything interpolated into
 // an AppleScript — unit-tested by desktop/paste-script.test.js.
-const { robustPasteScript, menuPasteFallbackScript, escapeAppleScriptString } = require("./paste-script");
+const {
+  robustPasteScript,
+  menuPasteFallbackScript,
+  escapeAppleScriptString,
+  pasteKeyFromAnswer,
+} = require("./paste-script");
 
 // SSOT for the paste wire protocol — the markers the paste scripts
 // print and every parser reads.
@@ -114,6 +119,7 @@ const {
   pasteBudgetFor,
   pasteAttemptDelayMs,
   pasteMethodTimeoutMs,
+  pasteKeyAnswerTimeoutMs,
   planModifierRelease,
   modifierReleaseCommand,
   parseModifierReleaseResult,
@@ -202,7 +208,15 @@ const {
 // The one rule for where this shell keeps its data (DM-07, DM-11, S-12).
 const { MAIN_LOG_FILE, resolveDataDir, oneDriveMigrationEntries } = require("./data-dir");
 // main.log is created 0600 and an older world-readable one tightened (BL-02).
-const { createPrivateAppender } = require("./private-log");
+// The same module is the one place a foreign window becomes log text
+// (P3-4): window identity only — app, bundleId, pid, platform window id —
+// never the title, which is the text its user is reading elsewhere.
+const {
+  createPrivateAppender,
+  windowLogFields,
+  windowLogSummary,
+  redactWindowTitles,
+} = require("./private-log");
 const appendPrivateLog = createPrivateAppender();
 
 // SSOT for "which system power events the app reacts to, and what each
@@ -909,7 +923,7 @@ function appendMainLog(message) {
 
 function logPasteTrace(step, details = {}) {
   try {
-    appendMainLog(`[paste-trace] ${JSON.stringify({ step, ...details })}`);
+    appendMainLog(`[paste-trace] ${JSON.stringify({ step, ...redactWindowTitles(details) })}`);
   } catch (e) {
     // JSON.stringify cycles or unrepresentable values — fall back to
     // a single-line dump. Do NOT recurse via appendMainLog with
@@ -976,7 +990,7 @@ function textDigest(input) {
 function createTrace(scope, seed = {}, { startedAt = 0 } = {}) {
   const id = `${scope}-${Date.now()}-${(++traceCounter % 100000).toString().padStart(5, "0")}`;
   const ctx = { id, scope, startedAt: startedAt > 0 ? startedAt : Date.now(), step: 0 };
-  appendMainLog(`[trace-start] ${JSON.stringify({ id, scope, ...seed })}`);
+  appendMainLog(`[trace-start] ${JSON.stringify({ id, scope, ...redactWindowTitles(seed) })}`);
   return ctx;
 }
 
@@ -990,7 +1004,7 @@ function traceStep(ctx, stage, details = {}) {
       step: ctx.step,
       ms: Date.now() - ctx.startedAt,
       stage,
-      ...details,
+      ...redactWindowTitles(details),
     })}`
   );
 }
@@ -1004,7 +1018,7 @@ function traceEnd(ctx, status = "done", details = {}) {
       status,
       totalMs: Date.now() - ctx.startedAt,
       steps: ctx.step,
-      ...details,
+      ...redactWindowTitles(details),
     })}`
   );
 }
@@ -3482,9 +3496,7 @@ async function toggleRecordingFromShortcut(mode = "voice", { pressedAt: pressSta
       // needs its answer at stop, not at start.
       const front = await frontAtHotkeyPromise;
       traceStep(trace, "front_before", {
-        name: front.name || "",
-        pid: front.pid || 0,
-        windowTitle: compactLogText(front.windowTitle || "", 80),
+        ...windowLogFields(front),
         timedOut: !!front.timedOut,
         source: "hotkey-press",
       });
@@ -3494,7 +3506,7 @@ async function toggleRecordingFromShortcut(mode = "voice", { pressedAt: pressSta
       // not have to read it (used only if nothing changes it meanwhile).
       void dictationHelper.request("clipboard-prepare");
       traceStep(trace, "target_captured", {
-        target: pasteTargetSummary(pasteTarget),
+        target: windowLogSummary(pasteTarget),
       });
       traceStep(trace, "recording_started", {
         auto: !!result.auto,
@@ -3834,11 +3846,6 @@ function capturePasteTargetFromFrontInfo(front) {
     instanceName: front?.instanceName,
     bundleId: front?.bundleId,
   });
-}
-
-function pasteTargetSummary(target) {
-  const normalized = normalizeCapturedPasteTarget(target);
-  return `app="${normalized.appName}" pid=${normalized.pid} windowTitle="${compactLogText(normalized.windowTitle, 80)}" windowId="${normalized.windowId}" hwnd="${normalized.hwnd}" class="${normalized.className}" instance="${normalized.instanceName}" bundleId="${normalized.bundleId}"`;
 }
 
 function getLastTranscriptPath() {
@@ -5676,7 +5683,7 @@ async function awaitModifierRelease(options = {}) {
 
 async function runPasteLadder(text, target = emptyCapturedPasteTarget(), options = {}) {
   const trace = createTrace("paste", {
-    target: pasteTargetSummary(normalizeCapturedPasteTarget(target)),
+    target: windowLogSummary(normalizeCapturedPasteTarget(target)),
     textLen: String(text || "").length,
     textDigest: textDigest(text),
   });
@@ -5862,11 +5869,7 @@ async function pasteFromClipboard(text, target, options, trace, clipboardLease) 
     // demand rather than making every paste pay for it.
     frontBefore = (await getFrontmostAppIdentityFast()) || (await getFrontmostAppInfo());
   } catch { }
-  traceStep(trace, "front_before", {
-    frontBeforeName: frontBefore.name || "",
-    frontBeforePid: frontBefore.pid || 0,
-    frontBeforeWindowTitle: compactLogText(frontBefore.windowTitle || "", 80),
-  });
+  traceStep(trace, "front_before", windowLogFields(frontBefore));
   const targetLooksGenericElectron = /^electron$/i.test(effectiveTarget.appName);
   if (targetLooksGenericElectron && shouldUsePasteTarget(frontBefore)) {
     // This branch routes by the front window, so it needs the title the
@@ -5880,15 +5883,15 @@ async function pasteFromClipboard(text, target, options, trace, clipboardLease) 
     }
     effectiveTarget = capturePasteTargetFromFrontInfo(frontBefore);
     traceStep(trace, "target_normalized_from_front", {
-      from: pasteTargetSummary(originalTarget),
-      to: pasteTargetSummary(effectiveTarget),
+      from: windowLogSummary(originalTarget),
+      to: windowLogSummary(effectiveTarget),
       reason: "generic-electron-target",
     });
   } else if (targetLooksGenericElectron) {
     // Avoid routing by generic app name when we don't have a safe concrete pid.
     effectiveTarget.appName = "";
     traceStep(trace, "target_name_cleared", {
-      from: pasteTargetSummary(originalTarget),
+      from: windowLogSummary(originalTarget),
       reason: "generic-electron-without-safe-front",
     });
   }
@@ -5898,10 +5901,14 @@ async function pasteFromClipboard(text, target, options, trace, clipboardLease) 
   // the target "to force the global frontmost route" — but an empty
   // target is refused as no-target just below, so every paste into such
   // an app failed with "In Clipboard · No Focus" (DM-17).
-  const targetHint = `${effectiveTarget.appName} ${effectiveTarget.windowTitle} ${String(frontBefore.name || "")}`.toLowerCase();
-  traceStep(trace, "paste_strategy", { targetHint: compactLogText(targetHint, 80) });
+  // Diagnostics, not an input to a decision: the window title that used
+  // to be part of this hint was the only reason the trace carried one.
+  traceStep(trace, "paste_strategy", {
+    target: windowLogSummary(effectiveTarget),
+    front: String(frontBefore.name || ""),
+  });
   logPasteTrace("start", {
-    target: pasteTargetSummary(effectiveTarget),
+    target: windowLogSummary(effectiveTarget),
     frontBeforeName: frontBefore.name || "",
     frontBeforePid: frontBefore.pid || 0,
     textLen: String(text).length,
@@ -5919,14 +5926,14 @@ async function pasteFromClipboard(text, target, options, trace, clipboardLease) 
     // nothing, and on macOS the bounce can pull our own window forward
     // mid-sequence and fight the paste it is supposed to help.
     traceStep(trace, "target_activation_skipped", {
-      target: pasteTargetSummary(effectiveTarget),
+      target: windowLogSummary(effectiveTarget),
       reason: "already-frontmost",
     });
   } else if (hasCapturedPasteTarget(effectiveTarget)) {
     try {
       const restored = await activateCapturedPasteTarget(effectiveTarget);
       traceStep(trace, restored ? "target_activated" : "target_activation_failed", {
-        target: pasteTargetSummary(effectiveTarget),
+        target: windowLogSummary(effectiveTarget),
       });
       await sleep(pasteBudget.preflightSettleMs);
     } catch { }
@@ -6254,11 +6261,22 @@ async function pasteFromClipboard(text, target, options, trace, clipboardLease) 
       ...pasteVerificationPolicy.stateFor(verificationKey),
       verify: verifyPaste,
     });
+    // ⌘V is pressed on the key the current layout's ⌘ table calls V.
+    // KeyLayout.swift is the one place that reads it; the AppleScript
+    // fallback asks the helper for that answer instead of spelling a
+    // QWERTY position (P3-3), and presses the QWERTY last resort only
+    // when the helper has nothing cached to give.
+    const pasteKeyAnswer = await dictationHelper.request("paste-key", {}, {
+      timeoutMs: pasteKeyAnswerTimeoutMs(process.platform),
+    });
+    const pasteKey = pasteKeyFromAnswer(pasteKeyAnswer);
+    traceStep(trace, "paste_key", pasteKey);
     const pasteScript = robustPasteScript({
       appName: effectiveTarget.appName,
       windowTitle: effectiveTarget.windowTitle,
       pid,
       pastedTextLen,
+      vKeyCode: pasteKey.code,
       verify: verifyPaste,
     });
     for (let attempt = 0; attempt < pasteBudget.maxAttempts; attempt++) {
@@ -6620,7 +6638,7 @@ function enqueuePostStopTask(options = {}) {
   cancelTerminalStatusReset();
   postStopQueue.push(task);
   pendingTranscriptionCount += 1;
-  appendMainLog(`[post-stop-queue] enqueue pending=${pendingTranscriptionCount} rec=${task.recordingId} ${pasteTargetSummary(task.target)}`);
+  appendMainLog(`[post-stop-queue] enqueue pending=${pendingTranscriptionCount} rec=${task.recordingId} ${windowLogSummary(task.target)}`);
   void setRecordingStatus("Transcribing", RECORDING_STATUS_KIND.TRANSCRIBING).catch((e) => {
     appendMainLog(`[post-stop-queue] status-publish failed: ${compactLogText(e?.message || e)}`);
   });
@@ -6786,20 +6804,20 @@ async function processPostStopTask(task) {
     let effectiveTarget = destination.target;
     if (destination.alreadyFront) {
       traceStep(trace, "target_current_focus", {
-        target: pasteTargetSummary(effectiveTarget),
+        target: windowLogSummary(effectiveTarget),
       });
     } else if (!hasCapturedPasteTarget(effectiveTarget)) {
       try {
         effectiveTarget = capturePasteTargetFromFrontInfo(await getFrontmostAppInfo());
         traceStep(trace, "target_fallback_current_front", {
-          target: pasteTargetSummary(effectiveTarget),
+          target: windowLogSummary(effectiveTarget),
         });
       } catch { }
     } else {
       try {
         const restored = await activateCapturedPasteTarget(effectiveTarget);
         traceStep(trace, restored ? "target_restored" : "target_restore_failed", {
-          target: pasteTargetSummary(effectiveTarget),
+          target: windowLogSummary(effectiveTarget),
         });
         if (!restored) {
           effectiveTarget = emptyCapturedPasteTarget();
@@ -6819,7 +6837,7 @@ async function processPostStopTask(task) {
       reason: compactLogText(pasted.reason || ""),
     });
     appendMainLog(
-      `[paste-auto] ${pasteTargetSummary(effectiveTarget)} ok=${pasted.ok} method=${pasted.method || "unknown"} verified=${pasted.verified ? "1" : "0"} reason="${pasted.reason || ""}" len=${transcript.length}`
+      `[paste-auto] ${windowLogSummary(effectiveTarget)} ok=${pasted.ok} method=${pasted.method || "unknown"} verified=${pasted.verified ? "1" : "0"} reason="${pasted.reason || ""}" len=${transcript.length}`
     );
     if (pasted.ok) {
       // Mark this recordingId as pasted BEFORE returning so any
@@ -6850,7 +6868,7 @@ async function processPostStopTask(task) {
         reason: compactLogText(sent.reason || ""),
       });
       appendMainLog(
-        `[cmd-enter] ${pasteTargetSummary(effectiveTarget)} ok=${sent.ok ? "1" : "0"} reason="${sent.reason || ""}"`
+        `[cmd-enter] ${windowLogSummary(effectiveTarget)} ok=${sent.ok ? "1" : "0"} reason="${sent.reason || ""}"`
       );
       if (sent.ok) {
         await setRecordingStatus("Sent", RECORDING_STATUS_KIND.OK);
@@ -7026,9 +7044,7 @@ async function pasteLatestTranscriptFromShortcut() {
     await publishRecordingStatus("Pasting");
     const front = await getFrontmostAppInfoWithTimeout(1200);
     traceStep(trace, "front_before", {
-      name: front.name || "",
-      pid: front.pid || 0,
-      windowTitle: compactLogText(front.windowTitle || "", 80),
+      ...windowLogFields(front),
       timedOut: !!front.timedOut,
     });
     const shortcutPasteTarget = capturePasteTargetFromFrontInfo(front);
@@ -7066,7 +7082,7 @@ async function pasteLatestTranscriptFromShortcut() {
       reason: compactLogText(pasted.reason || ""),
     });
     appendMainLog(
-      `[paste-last] ${pasteTargetSummary(shortcutPasteTarget)} ok=${pasted.ok} method=${pasted.method || "unknown"} verified=${pasted.verified ? "1" : "0"} reason="${pasted.reason || ""}" len=${text.length}`
+      `[paste-last] ${windowLogSummary(shortcutPasteTarget)} ok=${pasted.ok} method=${pasted.method || "unknown"} verified=${pasted.verified ? "1" : "0"} reason="${pasted.reason || ""}" len=${text.length}`
     );
     await setRecordingStatus(
       // The paste-last hotkey is what the user just pressed, so the advice

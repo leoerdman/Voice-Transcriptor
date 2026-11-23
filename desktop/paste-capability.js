@@ -760,6 +760,13 @@ function parseBundleIdentity(text) {
 //                        up to activationLadderSteps of them per attempt
 //                        (window handle, then pid, then app name).
 //   activationLadderSteps — how many of those one attempt may spend.
+//   pasteKeyAnswerMs   — bound for the helper's `paste-key` answer, asked
+//                        ONCE before the macOS AppleScript ladder so the
+//                        script presses the key the layout's ⌘ table
+//                        calls V (KeyLayout.swift) instead of a fixed
+//                        QWERTY position. The answer is a cached value on
+//                        the helper's command queue, so this is slack for
+//                        a busy queue, not a computation.
 //   autoSendTimeoutMs  — bound for the one auto-send child (Cmd+Enter /
 //                        Ctrl+Enter), which runs after a successful
 //                        paste when the user enabled auto-send.
@@ -828,6 +835,7 @@ const PASTE_BUDGET = Object.freeze({
     // per attempt, so the ladder itself spends none of this.
     activationTimeoutMs: 1500,
     activationLadderSteps: 0,
+    pasteKeyAnswerMs: 250,
     autoSendTimeoutMs: 5000,
     autoSendSettleMs: AUTO_SEND_SETTLE_MS,
     ...ACTIVATION_SETTLES,
@@ -856,6 +864,7 @@ const PASTE_BUDGET = Object.freeze({
     // and counted.
     activationTimeoutMs: 2500,
     activationLadderSteps: 3,
+    pasteKeyAnswerMs: 0,
     autoSendTimeoutMs: 2000,
     autoSendSettleMs: AUTO_SEND_SETTLE_MS,
     ...ACTIVATION_SETTLES,
@@ -875,6 +884,7 @@ const PASTE_BUDGET = Object.freeze({
     // nothing here compiles C# on the way in.
     activationTimeoutMs: 1200,
     activationLadderSteps: 3,
+    pasteKeyAnswerMs: 0,
     autoSendTimeoutMs: 2000,
     autoSendSettleMs: AUTO_SEND_SETTLE_MS,
     ...ACTIVATION_SETTLES,
@@ -936,6 +946,7 @@ function pasteBudgetWorstCaseMs(platform) {
   return (
     b.preflightMs +
     b.preflightSettleMs +
+    b.pasteKeyAnswerMs +
     delays +
     b.maxAttempts * (perAttemptMethods + perAttemptActivation + b.activationSettleMs) +
     b.tailFallbackTimeoutMs
@@ -945,6 +956,11 @@ function pasteBudgetWorstCaseMs(platform) {
 /** Bound for ONE target-activation child on this platform. */
 function pasteActivationTimeoutMs(platform) {
   return pasteBudgetFor(platform).activationTimeoutMs;
+}
+
+/** Bound for the helper's one `paste-key` answer on this platform. */
+function pasteKeyAnswerTimeoutMs(platform) {
+  return pasteBudgetFor(platform).pasteKeyAnswerMs;
 }
 
 /** Bound for the one auto-send (Cmd+Enter / Ctrl+Enter) child. */
@@ -1165,6 +1181,7 @@ module.exports = {
   pasteAttemptDelayMs,
   pasteMethodTimeoutMs,
   pasteBudgetWorstCaseMs,
+  pasteKeyAnswerTimeoutMs,
   NS_EVENT_MODIFIER_FLAGS,
   NS_EVENT_MODIFIER_MASK,
   MODIFIER_HOLD_MS,

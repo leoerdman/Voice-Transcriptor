@@ -134,8 +134,9 @@ let commandKeyCode: CGKeyCode = 55
 /// source, so the user's physical keys never leak into their flags, each
 /// marked as ours so the helper's own keyboard tap lets it through.
 /// `vKey` is the key the current layout reads as ⌘V (KeyLayout.swift
-/// PasteKey); the AppleScript fallback, with no layout to read, presses
-/// the QWERTY position `key code 9`.
+/// PasteKey). The AppleScript fallback asks the same PasteKey for that
+/// code (`paste-key`) instead of spelling a position: only when no
+/// helper answers does it press the QWERTY position `qwertyVKeyCode`.
 func postCommandV(vKey: CGKeyCode, gapMs: Int) -> Bool {
   let source = CGEventSource(stateID: .privateState)
   let specs: [(CGKeyCode, Bool, CGEventFlags)] = [
