@@ -9360,7 +9360,6 @@ async function showMainWindowBackendFailure(err, { present }) {
   } else {
     recoveryHtml = (
       `<h3 style="margin:0 0 10px 0;color:#e0e0e0">If it doesn't recover automatically</h3>` +
-      `<p style="color:#bbb;margin-bottom:6px">Find the <b>Voice Transcriptor</b> folder you downloaded:</p>` +
       `<p style="color:#ddd;margin:8px 0">Quit and reopen Transcriptor. For a source checkout, run the current root installer:</p>` +
       `<pre style="background:#111;padding:10px 14px;border-radius:8px;border:1px solid #444;color:#7defa0;font-size:12px;user-select:all;cursor:text">cd ~/Downloads/Voice\\ Transcriptor && ./INSTALL.command</pre>` +
       `<p style="color:#888;font-size:12px;margin-top:14px">Log file: <code style="background:#222;padding:2px 6px;border-radius:4px;user-select:all">${escapeHtml(logPath)}</code></p>`
