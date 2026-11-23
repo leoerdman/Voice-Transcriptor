@@ -98,6 +98,8 @@ from backend.cli_access import (
 )
 from backend.config import APP_ROOT, DATA_DIR, load_config, redact_config, save_config
 from backend import recording_names, screen_sessions
+from backend.recordings_index import INDEX_FILENAME as RECORDINGS_INDEX_FILENAME
+from backend.recordings_index import RecordingsMetadataIndex, code_fingerprint
 from backend.storage import (
     TMP_ORPHAN_RE,
     atomic_promote_file,
@@ -8717,15 +8719,35 @@ _list_cache_rebuild_lock: Optional[asyncio.Lock] = None
 #
 # Two structural fixes, no change to the response contract:
 #
-#   * Per-file metadata cache keyed by identity + (mtime_ns, size). A
-#     saved transcript is immutable, so after the first scan every
-#     unchanged file is a dict lookup instead of a read + parse. The
-#     cache is pruned to exactly the set of files seen by each scan, so
-#     deletions cannot make it grow without bound and it needs no LRU.
+#   * Per-file metadata index keyed by path + (mtime_ns, size), persisted
+#     in the data dir (``backend.recordings_index``). A saved transcript
+#     is immutable, so every unchanged file is a lookup instead of a read
+#     + parse — across launches too: the in-memory-only cache this
+#     replaced made every launch re-read the whole archive (~10.7k
+#     transcripts, 2-5 s, 2026-11-23). The index is pruned to exactly the
+#     set of files seen by each scan, so deletions cannot make it grow.
 #   * One directory listing builds a stem -> audio-path index, replacing
 #     the per-item extension probe. O(entries) once, not O(items x exts).
-_recordings_entry_cache: dict[str, tuple[tuple[int, int], dict]] = {}
-_recordings_entry_cache_lock = threading.Lock()
+
+
+def _parse_recording_entry(raw: str, stem: str, *, screen_take: bool) -> dict[str, str]:
+    """The History fields read out of one transcript's text — everything
+    the recordings index stores per file. The index's rules version is
+    the fingerprint of this function and everything it calls, so a change
+    to any of it re-parses the archive on the next launch."""
+    return {
+        "display_name": _recording_display_name_from_content(raw, stem, screen_take=screen_take),
+        "source_file": _recording_source_file(raw),
+        "provider": _extract_meta_field(raw, "Provider").lower() or "",
+        "language": _extract_meta_field(raw, "Language").lower() or "",
+    }
+
+
+RECORDINGS_INDEX = RecordingsMetadataIndex(
+    DATA_DIR / RECORDINGS_INDEX_FILENAME,
+    rules_version=functools.partial(code_fingerprint, _parse_recording_entry),
+    fields=("display_name", "source_file", "provider", "language"),
+)
 
 
 def _recording_audio_index(archive_dir: Path) -> dict[str, Path]:
@@ -8781,18 +8803,6 @@ def _audio_payload_from_index(
     }
 
 
-def _prune_recordings_entry_cache(live_keys: set[str]) -> None:
-    """Drop cache entries for transcripts the latest scan did not see.
-
-    Keeps the cache exactly the size of the archive — a deleted or moved
-    recording releases its entry on the next scan, so no eviction policy
-    is required.
-    """
-    with _recordings_entry_cache_lock:
-        for stale in [k for k in _recordings_entry_cache if k not in live_keys]:
-            _recordings_entry_cache.pop(stale, None)
-
-
 def _build_recordings_list_payload(d: "Path") -> dict:
     """Expensive sync scan — runs in a thread pool via asyncio.to_thread.
 
@@ -8801,8 +8811,9 @@ def _build_recordings_list_payload(d: "Path") -> dict:
     there's no async stdlib equivalent.
 
     Per transcript the scan needs four header fields and the identity of
-    the sibling audio file. Both are cached: header parsing behind a
-    (mtime_ns, size) identity check, audio lookup behind one directory
+    the sibling audio file. Both are cached: header parsing in the
+    persistent ``RECORDINGS_INDEX`` behind a (mtime_ns, size) identity
+    check, audio lookup behind one directory
     listing per archive dir. See the cache block above for the numbers
     that motivated it.
     """
@@ -8814,28 +8825,19 @@ def _build_recordings_list_payload(d: "Path") -> dict:
         for p in _iter_recording_text_files(archive_dir):
             try:
                 st = p.stat()
-                cache_key = str(p)
-                live_keys.add(cache_key)
+                index_key = str(p)
+                live_keys.add(index_key)
                 # A saved transcript never changes in place, so identity
                 # plus (mtime_ns, size) is a sound freshness test — and
                 # a rewritten file changes at least one of them.
                 identity = (int(st.st_mtime_ns), int(st.st_size))
-                with _recordings_entry_cache_lock:
-                    cached = _recordings_entry_cache.get(cache_key)
-                if cached is not None and cached[0] == identity:
-                    parsed = cached[1]
-                else:
+                parsed = RECORDINGS_INDEX.lookup(index_key, identity)
+                if parsed is None:
                     raw = p.read_text(encoding="utf-8", errors="replace")
-                    parsed = {
-                        "display_name": _recording_display_name_from_content(
-                            raw, p.stem, screen_take=collection == RECORDING_COLLECTION_SCREEN
-                        ),
-                        "source_file": _recording_source_file(raw),
-                        "provider": _extract_meta_field(raw, "Provider").lower() or "",
-                        "language": _extract_meta_field(raw, "Language").lower() or "",
-                    }
-                    with _recordings_entry_cache_lock:
-                        _recordings_entry_cache[cache_key] = (identity, parsed)
+                    parsed = _parse_recording_entry(
+                        raw, p.stem, screen_take=collection == RECORDING_COLLECTION_SCREEN
+                    )
+                    RECORDINGS_INDEX.store(index_key, identity, parsed)
                 items.append(
                     {
                         "name": p.name,
@@ -8864,7 +8866,12 @@ def _build_recordings_list_payload(d: "Path") -> dict:
                 # name and exception class are still in the support log.
                 logger.debug("recordings list: skipped %s (%s)", _log_safe_recording_name(p.name), type(e).__name__)
                 continue
-    _prune_recordings_entry_cache(live_keys)
+    RECORDINGS_INDEX.retain_only(live_keys)
+    # Persisted after every scan that changed it: a save, delete or
+    # rename invalidates the list (``_invalidate_recordings_cache``), the
+    # next scan re-reads exactly the files that changed, and the next
+    # launch starts from here instead of from nothing.
+    RECORDINGS_INDEX.flush()
     items.sort(key=lambda x: x["modified_at"], reverse=True)
     return {"items": items, "directory": str(d)}
 
@@ -8944,9 +8951,11 @@ async def list_recordings(_auth: None = Depends(_require_api_auth)):
 async def _warm_recordings_list_at_boot() -> None:
     """Build the History list once at start-up, before the window asks.
 
-    The first build after a launch reads and parses every transcript
-    (the per-file metadata cache is in memory only) — seconds on an
-    archive of thousands. Started from the lifespan, it runs while the
+    The first build after a launch loads the persistent metadata index
+    (``RECORDINGS_INDEX``) and parses only the transcripts added or
+    changed since the last launch; without an index (first launch, or
+    the parsing rules changed) it parses every transcript — seconds on
+    an archive of thousands. Started from the lifespan, it runs while the
     renderer is still loading, and the renderer's first
     ``GET /api/recordings`` joins it through the rebuild lock instead of
     starting it. The auto-keyterm boot recompute reads the same archive

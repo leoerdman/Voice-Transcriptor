@@ -59,6 +59,7 @@ backend/
 ├── deepgram_warm.py           # warm Deepgram live-socket pool SSOT (KeepAlive cadence, liveness probe, replay ring)
 ├── deepgram_dual.py           # dual-stream Auto SSOT: second Deepgram session + word-timestamp merge of the two readings
 ├── word_case.py               # one case rule for words moved between readings: sentence-initial capital, positional vs lexical capitals (names keep theirs)
+├── recordings_index.py        # persistent recordings-list metadata index (DATA_DIR/recordings_index.json): freshness by mtime+size, rebuilt when the parse rules' fingerprint changes
 ├── deepgram_language.py       # what a configured language means per Deepgram endpoint (live resolve vs REST detect_language); Nova-3 language hints (options, default ru+en)
 ├── deepgram_recovery.py       # re-decode of uncovered spans before the final envelope is sent (one owner of recovery)
 ├── recording_names.py         # recording file-name SSOT: `YYYYMMDD-HHMMSS[-xxxx]` from the recording's local time; recognises legacy `<timestamp>__<title>` stems
