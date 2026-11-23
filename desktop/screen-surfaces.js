@@ -42,11 +42,13 @@ const PRESENTER_STATE = Object.freeze({
 
 /**
  * @param {{required: string[], optional?: string[], present: (ready: string[]) => void}} opts
- * @returns {{settle(name: string, ok: boolean): void, expire(): void, abort(): void,
+ * @returns {{settle(name: string, ok: boolean): void, expire(): string[], abort(): void,
  *   state(): string, done: Promise<string>}}
  *   `settle` reports one surface ready (ok) or failed; a second report of
  *   the same surface is ignored. `expire` counts every surface not yet
- *   reported as failed (the bound on how long the picture may wait).
+ *   reported as failed (the bound on how long the picture may wait) and
+ *   returns their names, so the caller can say which surface was late
+ *   instead of blaming what the late surface's teardown did afterwards.
  *   `done` resolves with the final state.
  */
 function createSurfacePresenter({ required, optional = [], present }) {
@@ -82,9 +84,11 @@ function createSurfacePresenter({ required, optional = [], present }) {
       decide();
     },
     expire() {
-      if (state !== PRESENTER_STATE.PENDING) return;
-      for (const n of names) if (!results.has(n)) results.set(n, false);
+      if (state !== PRESENTER_STATE.PENDING) return [];
+      const late = names.filter((n) => !results.has(n));
+      for (const n of late) results.set(n, false);
       decide();
+      return late;
     },
     abort() {
       if (state === PRESENTER_STATE.PENDING) finish(PRESENTER_STATE.ABORTED);

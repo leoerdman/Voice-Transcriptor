@@ -1524,7 +1524,20 @@ function createScreenModeController(deps) {
           }
         },
       });
-      expiry = setTimeout(() => presenter.expire(), SURFACES_READY_TIMEOUT_MS);
+      // Surfaces still loading at the deadline. Named in the log and in the
+      // start failure: once the start fails, teardown destroys those
+      // windows mid-load and their loads reject with ERR_FAILED — the
+      // consequence, which the log used to present as the cause
+      // (2026-11-23, a start during a 5 s system stall).
+      let lateSurfaces = [];
+      const startedSession = session;
+      const abandoned = () => session !== startedSession;
+      expiry = setTimeout(() => {
+        lateSurfaces = presenter.expire();
+        if (lateSurfaces.length) {
+          log(`[screen-mode] not ready within ${SURFACES_READY_TIMEOUT_MS} ms: ${lateSurfaces.join(",")}`);
+        }
+      }, SURFACES_READY_TIMEOUT_MS);
       expiry.unref?.();
       let helperError = null;
       const helperDone = startHelper().catch((e) => {
@@ -1540,7 +1553,10 @@ function createScreenModeController(deps) {
       );
       Promise.allSettled(screen.getAllDisplays().map((d) => createOverlay(d))).then((results) => {
         for (const r of results) {
-          if (r.status === "rejected") log(`[screen-mode] overlay failed: ${r.reason?.message || r.reason}`);
+          if (r.status !== "rejected") continue;
+          log(abandoned()
+            ? `[screen-mode] overlay load abandoned (the start had already failed): ${r.reason?.message || r.reason}`
+            : `[screen-mode] overlay failed: ${r.reason?.message || r.reason}`);
         }
         presenter.settle(SCREEN_SURFACE.OVERLAYS, [...overlays.values()].some((entry) => entry.ready));
       });
@@ -1548,13 +1564,19 @@ function createScreenModeController(deps) {
       createPalette().then(
         () => presenter.settle(SCREEN_SURFACE.PALETTE, true),
         (e) => {
-          log(`[screen-mode] palette failed: ${e?.message || e}`);
+          log(abandoned()
+            ? `[screen-mode] palette load abandoned (the start had already failed): ${e?.message || e}`
+            : `[screen-mode] palette failed: ${e?.message || e}`);
           presenter.settle(SCREEN_SURFACE.PALETTE, false);
         },
       );
       const shown = await presenter.done;
       clearTimeout(expiry);
-      if (shown === PRESENTER_STATE.FAILED) throw new Error("no overlay could be shown");
+      if (shown === PRESENTER_STATE.FAILED) {
+        throw new Error(lateSurfaces.includes(SCREEN_SURFACE.OVERLAYS)
+          ? `the overlay was not ready within ${SURFACES_READY_TIMEOUT_MS} ms`
+          : "no overlay could be shown");
+      }
       await helperDone;
       if (helperError) throw helperError;
     } catch (e) {

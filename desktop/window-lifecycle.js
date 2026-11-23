@@ -286,6 +286,25 @@ function decideCloseRequest(state = {}) {
 const CLOSE_CONFIRM_BUTTONS = Object.freeze(["Keep Running", "Quit"]);
 const CLOSE_CONFIRM_QUIT_INDEX = 1;
 
+/**
+ * What an Electron `hide` event on the main window actually was.
+ *
+ * On macOS Electron emits `hide` (and `show`) not only when the window
+ * is ordered out but also when its occlusion state changes — another
+ * app's window covering it entirely fires `hide` while the window is
+ * still on screen. The log used to call every one of those
+ * "os-initiated" hides, which read as "something hid the window" and
+ * pointed a whole investigation at the wrong evidence (2026-11-23).
+ * The window's own visibility tells the two apart: an occluded window
+ * is still visible.
+ *
+ * @param {{ visible: boolean }} state
+ * @returns {"occluded" | "hidden"}
+ */
+function classifyMainWindowHide(state) {
+  return state && state.visible ? "occluded" : "hidden";
+}
+
 module.exports = {
   WINDOW_LIFECYCLE_EVENTS,
   WINDOW_LIFECYCLE_ACTIONS,
@@ -296,4 +315,5 @@ module.exports = {
   decideWindowAction,
   decideMainWindowBounds,
   normalizeStoredWindowState,
+  classifyMainWindowHide,
 };

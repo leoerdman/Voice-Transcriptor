@@ -328,3 +328,10 @@ test("every lifecycle event main.js reports is one the table knows", () => {
     assert.match(fn, /decideCloseRequest\(/);
   });
 }
+
+test("a hide while the window is still visible is occlusion, not a hide", () => {
+  const { classifyMainWindowHide } = require("./window-lifecycle");
+  assert.equal(classifyMainWindowHide({ visible: true }), "occluded");
+  assert.equal(classifyMainWindowHide({ visible: false }), "hidden");
+  assert.match(MAIN_JS, /event=occluded/);
+});

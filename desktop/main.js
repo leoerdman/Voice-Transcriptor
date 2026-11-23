@@ -39,6 +39,7 @@ const {
   decideWindowAction,
   decideMainWindowBounds,
   normalizeStoredWindowState,
+  classifyMainWindowHide,
 } = require("./window-lifecycle");
 const { floatingWindowOptions, spanAllWorkspaces } = require("./floating-window");
 // SSOT for "did this paste attempt actually succeed, and is it verified
@@ -9178,11 +9179,19 @@ async function createWindow(options = {}) {
     applyWindowLifecycleEvent(WINDOW_LIFECYCLE_EVENTS.mainWindowMinimize);
   });
   win.on("hide", () => {
-    // Nothing in this process hides the main window any more, so a hide
-    // is the user's own Cmd+H / Hide Others. Kept as the canary: if this
-    // line ever appears without one of those, something grew a new
-    // visibility crutch.
-    appendMainLog(`[main-window] event=hide reason=os-initiated ${mainWindowSnapshot()}`);
+    // Nothing in this process hides the main window, so a real hide is
+    // the user's own Cmd+H / Hide Others — the canary: `event=hide`
+    // without one of those means something grew a visibility crutch.
+    // macOS also fires `hide` when the window is merely covered by
+    // another app; that is `event=occluded` (./window-lifecycle).
+    let visible = false;
+    try { visible = !!win && !win.isDestroyed() && win.isVisible(); } catch { }
+    const kind = classifyMainWindowHide({ visible });
+    appendMainLog(
+      kind === "occluded"
+        ? `[main-window] event=occluded ${mainWindowSnapshot()}`
+        : `[main-window] event=hide reason=os-initiated ${mainWindowSnapshot()}`,
+    );
   });
   win.on("focus", () => {
     // How long the user waited between asking for the app and having it.

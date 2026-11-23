@@ -87,3 +87,15 @@ test("the wait is bounded: expiry counts the late surfaces as failed", async () 
   assert.deepEqual(late.shown, []);
   assert.equal(await late.p.done, PRESENTER_STATE.FAILED);
 });
+
+test("expire names the surfaces that were late, and only while pending", () => {
+  const p = createSurfacePresenter({
+    required: [SCREEN_SURFACE.OVERLAYS],
+    optional: [SCREEN_SURFACE.CAPSULE, SCREEN_SURFACE.PALETTE],
+    present: () => {},
+  });
+  p.settle(SCREEN_SURFACE.CAPSULE, true);
+  assert.deepEqual(p.expire(), [SCREEN_SURFACE.OVERLAYS, SCREEN_SURFACE.PALETTE]);
+  assert.equal(p.state(), PRESENTER_STATE.FAILED);
+  assert.deepEqual(p.expire(), [], "a decided presenter has nothing late");
+});
