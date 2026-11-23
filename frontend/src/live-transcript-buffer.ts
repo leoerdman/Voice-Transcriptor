@@ -127,7 +127,7 @@ export function mergeTranscriptSegments(
  * prefix. Speaker transitions start a new paragraph so the user can
  * visually separate voices in the live preview.
  */
-export function formatSegmentsForDisplay(segments: TranscriptSegment[], separator: string): string {
+function formatSegmentsForDisplay(segments: TranscriptSegment[], separator: string): string {
   if (!segments.length) return "";
   const parts: string[] = [];
   let lastSpeaker: number | undefined;

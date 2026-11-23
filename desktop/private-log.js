@@ -122,9 +122,7 @@ function createPrivateAppender(fsImpl = fs) {
 }
 
 module.exports = {
-  PRIVATE_FILE_MODE,
   createPrivateAppender,
-  WINDOW_TITLE_KEY,
   windowLogFields,
   windowLogSummary,
   redactWindowTitles,

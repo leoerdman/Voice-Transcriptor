@@ -495,8 +495,8 @@ export function handOverHeldCapture<P extends { hold: boolean }>(
  * same user's headset takes 30-60 %. A take shorter than
  * ``BUILT_IN_HEARING_MIN_TAKE_MS`` says too little to judge.
  */
-export const BUILT_IN_HEARING_MIN_TAKE_MS = 3_000;
-export const BUILT_IN_HEARING_MIN_SPEECH_SHARE = 0.1;
+const BUILT_IN_HEARING_MIN_TAKE_MS = 3_000;
+const BUILT_IN_HEARING_MIN_SPEECH_SHARE = 0.1;
 
 export interface BuiltInHearingInput {
   /** ``CaptureDeviceChoice.reason`` of the take. */

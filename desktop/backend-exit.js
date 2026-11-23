@@ -77,8 +77,6 @@ function backendRestartPlan(attempt) {
 module.exports = {
   BACKEND_HANDLE,
   BACKEND_RESTART_MAX_ATTEMPTS,
-  BACKEND_RESTART_BACKOFF_STEP_MS,
-  BACKEND_RESTART_BACKOFF_MAX_MS,
   backendHandleOf,
   decideBackendExit,
   backendRestartPlan,

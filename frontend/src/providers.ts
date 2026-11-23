@@ -21,7 +21,7 @@ interface ProviderInfo {
 }
 
 /** Insertion order is the display order. */
-export const PROVIDERS: Readonly<Record<ProviderId, ProviderInfo>> = {
+const PROVIDERS: Readonly<Record<ProviderId, ProviderInfo>> = {
   local: { label: "Local", remote: false },
   openrouter: { label: "OpenRouter", remote: true },
   deepgram: { label: "Deepgram", remote: true },

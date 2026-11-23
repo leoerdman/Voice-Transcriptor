@@ -735,7 +735,6 @@ module.exports = {
   screenSessionId,
   screenSessionManifest,
   shotFileName,
-  strokeBounds,
   strokeCropRect,
   strokePlacement,
   strokeShape,

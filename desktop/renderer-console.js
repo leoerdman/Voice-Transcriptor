@@ -228,9 +228,7 @@ function createConsoleMirrorLimiter(limit = MIRROR_RATE_LIMIT) {
 }
 
 module.exports = {
-  ALWAYS_MIRRORED_PREFIXES,
   MAX_MESSAGE_CHARS,
-  MIRROR_RATE_LIMIT,
   createConsoleMirrorLimiter,
   formatConsoleMirrorLine,
   normalizeConsoleMessage,

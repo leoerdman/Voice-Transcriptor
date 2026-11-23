@@ -74,8 +74,6 @@ function screenShotSlotStatus({ desired = "", supported = true, error = "", boun
 }
 
 module.exports = {
-  REQUIRED_SLOTS,
-  OPTIONAL_SLOTS,
   normalizeShortcutSet,
   applyShortcutUpdate,
   screenShotSlotStatus,

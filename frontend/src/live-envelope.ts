@@ -110,7 +110,7 @@ export interface LiveFinalEnvelopeFields<Segment> {
  * Adopt a wire number only when it is finite and non-negative.
  * Everything else is absent — see the reading rules in the module doc.
  */
-export function parseOptionalNonNegativeNumber(value: unknown): number | undefined {
+function parseOptionalNonNegativeNumber(value: unknown): number | undefined {
   const n = Number(value);
   return Number.isFinite(n) && n >= 0 ? n : undefined;
 }
@@ -161,7 +161,7 @@ export function parseLiveFinalStats(raw: unknown): LiveFinalStats | undefined {
  * together or none of them, and a partial block would mean a corrupted
  * message rather than an older build.
  */
-export function parseLiveCoverage(raw: unknown): LiveCoverageReport | undefined {
+function parseLiveCoverage(raw: unknown): LiveCoverageReport | undefined {
   if (!raw || typeof raw !== "object") return undefined;
   const source = raw as Record<string, unknown>;
   if (typeof source.complete !== "boolean") return undefined;

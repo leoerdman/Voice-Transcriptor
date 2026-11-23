@@ -199,8 +199,8 @@ test("timeout: a zero or missing timeout is a non-blocking read", async () => {
 
 test("an unusable recordingId degrades to a plain timer", async () => {
   const slot = createRecordingFinalSlot();
-  // The legacy recordingId 0 (renderer too old to supply one) can never
-  // be matched, so the poll fallback can use the same call as its sleep.
+  // An id that can never be matched gets no slot, and still sleeps for
+  // the timeout so a caller looping until a deadline cannot spin.
   const started = Date.now();
   assert.equal(await slot.waitForSignal(0, { timeoutMs: 60 }), null);
   assert.ok(Date.now() - started >= 50);

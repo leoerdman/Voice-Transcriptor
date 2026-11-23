@@ -58,7 +58,7 @@ const DEVICE_ALIAS_IDS = new Set(["default", "communications"]);
 /** Chromium's prefix on the alias entries: "Default - MacBook Pro Microphone". */
 const ALIAS_LABEL_PREFIX = /^\s*(default|communications)\s+-\s+/i;
 
-export function isDeviceAliasId(deviceId: string): boolean {
+function isDeviceAliasId(deviceId: string): boolean {
   return DEVICE_ALIAS_IDS.has(String(deviceId || "").trim());
 }
 
@@ -68,7 +68,7 @@ function sameLabel(a: string, b: string): boolean {
   return !!left && left === norm(b);
 }
 
-export function isSystemDefaultMic(pref: MicPreference): boolean {
+function isSystemDefaultMic(pref: MicPreference): boolean {
   const id = String(pref.deviceId || "").trim();
   return (!id || isDeviceAliasId(id)) && !String(pref.label || "").trim();
 }

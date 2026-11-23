@@ -79,7 +79,6 @@ function oneDriveMigrationEntries(names) {
 
 module.exports = {
   MAIN_LOG_FILE,
-  REGENERATED_ENTRIES,
   resolveDataDir,
   isRegeneratedEntry,
   oneDriveMigrationEntries,

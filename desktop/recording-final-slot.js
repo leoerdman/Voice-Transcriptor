@@ -178,11 +178,12 @@ function createRecordingFinalSlot(options = {}) {
    * Wait for the next signal for ``recordingId`` newer than ``sinceSeq``.
    *
    * Resolves with that signal, or with ``null`` when ``timeoutMs``
-   * elapses or the slot is superseded. An unusable recordingId (the
-   * legacy ``0`` from a renderer too old to send one) can never receive
-   * a signal, so the call degrades to a plain timer — which is exactly
-   * what the poll fallback needs it to be, with no branch at the call
-   * site.
+   * elapses or the slot is superseded. An unusable recordingId can never
+   * receive a signal (``set`` refuses it), and post-stop admission turns
+   * one away before anything waits on it; should one reach here anyway it
+   * gets no slot, and the call still waits out ``timeoutMs`` rather than
+   * resolving at once, so a caller that loops until a deadline
+   * (./post-stop-handoff) sleeps instead of spinning.
    */
   function waitForSignal(recordingId, waitOptions = {}) {
     const sinceSeq = Math.max(0, Number(waitOptions.sinceSeq) || 0);
@@ -222,7 +223,6 @@ function createRecordingFinalSlot(options = {}) {
 
 module.exports = {
   RECORDING_SIGNAL_KINDS,
-  DEFAULT_MAX_RECORDINGS,
   validateRecordingFinalPayload,
   createRecordingFinalSlot,
 };
