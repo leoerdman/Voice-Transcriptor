@@ -364,6 +364,24 @@ describe("planColdCapture — the one rule for running ahead of a fresh device l
     expect(plan([alias(builtIn), builtIn, { deviceId: "x", label: "" }], "x").reason).toBe("bluetooth-choice");
   });
 
+  it("a request naming 'communications' is judged by the communications row, not by 'default'", () => {
+    // The two aliases are separate devices in Chromium's list. With the
+    // built-in mic behind "communications", that open is not a Bluetooth
+    // one — whatever the "default" row says.
+    const devices = [
+      alias(headset),
+      headset,
+      { deviceId: "communications", label: "Default - MacBook Pro Microphone (Built-in)" },
+      builtIn,
+    ];
+    expect(plan(devices, "communications")).toEqual({ mode: "parallel", reason: "known-list" });
+    expect(plan(devices, "default")).toEqual({ mode: "sequential", reason: "bluetooth-default" });
+    expect(plan(devices, "")).toEqual({ mode: "sequential", reason: "bluetooth-default" });
+    // Without a row of its own the alias is the default, and the default
+    // here is the headset.
+    expect(plan([alias(headset), headset, builtIn], "communications")).toEqual({ mode: "sequential", reason: "bluetooth-default" });
+  });
+
   it("an explicit built-in mic over a Bluetooth default runs ahead: it is opened exact, so the default plays no part", () => {
     expect(plan([alias(headset), headset, builtIn], "mac")).toEqual({ mode: "parallel", reason: "known-list" });
     expect(plan([headset, builtIn], "mac")).toEqual({ mode: "parallel", reason: "known-list" });
@@ -372,7 +390,8 @@ describe("planColdCapture — the one rule for running ahead of a fresh device l
   it("a choice that lands on a Bluetooth default reads the list first: the default itself, or an id the list does not have", () => {
     expect(plan([alias(headset), headset, builtIn], "")).toEqual({ mode: "sequential", reason: "bluetooth-default" });
     expect(plan([alias(headset), headset, builtIn], "default")).toEqual({ mode: "sequential", reason: "bluetooth-default" });
-    // Chromium's other alias for the same thing.
+    // Chromium's other alias, with no row of its own in this list: it
+    // lands on the same device as "default".
     expect(plan([alias(headset), headset, builtIn], "communications")).toEqual({ mode: "sequential", reason: "bluetooth-default" });
     expect(plan([headset, builtIn], "")).toEqual({ mode: "sequential", reason: "bluetooth-default" });
     expect(plan([alias(headset), headset, builtIn], "gone")).toEqual({ mode: "sequential", reason: "choice-not-listed" });

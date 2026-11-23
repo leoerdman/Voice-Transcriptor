@@ -116,15 +116,66 @@ class UpscalePresetContractTests(unittest.TestCase):
                 )
         self.assertEqual(raised.exception.status_code, 404)
 
+    # ── Which preset a request names ──────────────────────────────────
+    #
+    # Three shapes and no fourth: a ``preset_id`` that exists, no field at
+    # all, or a client error. The tests below drive the real route, so the
+    # contract they pin is the one a caller meets.
+
+    def _configure_openrouter_key(self) -> None:
+        self.main.save_config({
+            "providers": {"openrouter": {"key": "sk-or-v1-test-upscale-key-12345678"}},
+            "preferences": {},
+        })
+
+    def test_the_removed_legacy_preset_field_is_refused_not_substituted(self):
+        # ``preset="business"`` used to fall through to the DEFAULT preset
+        # with ok=true: the caller asked for Business and got Clean back
+        # with no sign that its request had been ignored. (Argument first:
+        # the refusal must not depend on a provider being configured.)
+        with self.assertRaises(self.main.HTTPException) as raised:
+            asyncio.run(self.main.upscale_text({"text": "raw", "preset": "business"}, _auth=None))
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("preset_id", raised.exception.detail)
+
+    def test_an_unknown_preset_id_is_a_client_error_naming_the_id(self):
+        self._configure_openrouter_key()
+        with mock.patch.object(self.main, "openrouter_upscale_text") as upscale:
+            with self.assertRaises(self.main.HTTPException) as raised:
+                asyncio.run(self.main.upscale_text(
+                    {"text": "raw", "preset_id": "no-such-preset"}, _auth=None
+                ))
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("no-such-preset", raised.exception.detail)
+        upscale.assert_not_called()
+
+    def test_every_builtin_preset_id_is_accepted_and_is_the_one_used(self):
+        self._configure_openrouter_key()
+        for key in self.main.BUILTIN_UPSCALE_PRESETS:
+            preset_id = f"builtin_{key}"
+            with self.subTest(preset_id=preset_id):
+                with mock.patch.object(
+                    self.main, "openrouter_upscale_text", return_value={"text": "improved"}
+                ) as upscale:
+                    response = asyncio.run(self.main.upscale_text(
+                        {"text": "raw", "preset_id": preset_id}, _auth=None
+                    ))
+                self.assertEqual(response["preset_id"], preset_id)
+                self.assertEqual(
+                    upscale.call_args.kwargs["instruction"],
+                    self.main.BUILTIN_UPSCALE_PRESETS[key]["instruction"],
+                )
+
 
 class BuiltinPresetIdSsotTests(unittest.TestCase):
     """One list of built-in presets (B-030).
 
-    Their ids were written out a second time as a bare set, used in
-    exactly one place: validating the legacy ``preset`` field. Nothing
-    connected the two, so a fifth built-in would have answered
-    "unsupported upscale preset" to a legacy client asking for a preset
-    that exists.
+    Their ids were written out a second time as a bare set beside the
+    table. Nothing connected the two, so a fifth built-in would have been
+    invisible to whatever validated ids against the copy. The route's
+    contract is pinned on the real endpoint in
+    ``UpscalePresetContractTests``; what is left here is that the copy
+    has not come back.
     """
 
     def setUp(self):
@@ -143,14 +194,6 @@ class BuiltinPresetIdSsotTests(unittest.TestCase):
 
     def test_there_is_no_second_list_of_builtin_ids(self):
         self.assertFalse(hasattr(self.main, "UPSCALE_PRESETS"))
-
-    def test_every_builtin_is_accepted_as_a_legacy_preset(self):
-        # The legacy field's validation and the presets themselves must
-        # answer from the same list.
-        for pid in self.main.BUILTIN_UPSCALE_PRESETS:
-            with self.subTest(preset=pid):
-                self.assertIn(pid, self.main.BUILTIN_UPSCALE_PRESETS)
-        self.assertNotIn("no-such-preset", self.main.BUILTIN_UPSCALE_PRESETS)
 
     def test_the_default_preset_is_one_of_them(self):
         self.assertIn(

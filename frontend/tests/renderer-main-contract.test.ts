@@ -970,22 +970,37 @@ describe("the warm hold: its length, its output, and its releases", () => {
     expect(mainTsxSlice("function planWarmCaptureHold(", "\nfunction commitWarmCaptureHold(")).toContain("warmHoldMs: warmHoldMs(),");
     expect(mainTsxSlice("function commitWarmCaptureHold(", "\nfunction ")).toContain("warmHoldMs(),");
     // One reader, one resolver: the control names an option id and the
-    // table in ./capture-warm says what it means.
-    expect(mainTsxSlice("function readMicHoldSetting(", "\n}\n")).toContain('getElementById("micHoldSelect")');
+    // table in ./capture-warm says what it means. The reader reads STATE —
+    // a start has to know the duration with Settings closed.
+    const reader = mainTsxSlice("function readMicHoldSetting(", "\n}\n");
+    expect(reader).toContain("return micHoldOptionId;");
+    expect(reader).not.toContain("getElementById");
     expect(mainTsxSlice("function warmHoldMs(", "\n}\n")).toContain("warmHoldMsForOption(readMicHoldSetting())");
     // The control offers exactly the table's ids, and says what it costs.
     const select = html.slice(html.indexOf('<select id="micHoldSelect">'), html.indexOf("</select>", html.indexOf('<select id="micHoldSelect">')));
+    expect(select).toContain('<option value="off">');
     expect(select).toContain('<option value="30s">');
     expect(select).toContain('<option value="5m">');
     expect(select).toContain('<option value="15m">');
+    // Both prices the hold has: the indicator, and the audio system left running.
     expect(html).toContain("the macOS microphone indicator stays on");
+    expect(html).toContain("the audio system keeps running");
   });
 
   it("stores the setting and restores the control from it", () => {
     expect(mainTsxSlice("function collectUiPreferences(", "\n}\n")).toContain("mic_hold: readMicHoldSetting(),");
-    expect(mainTsx).toContain('($("micHoldSelect") as HTMLSelectElement).value = warmHoldOptionFor(ui.mic_hold);');
-    expect(mainTsxSlice('($("micHoldSelect") as HTMLSelectElement).addEventListener("change", () => {', "\n});"))
-      .toContain('releaseWarmCapture("mic-hold-changed")');
+    // The value lives in state, like the microphone pick; the select is
+    // written from it, never read back as the source of truth.
+    const setter = mainTsxSlice("function setMicHoldSetting(", "\n}\n");
+    expect(setter).toContain("micHoldOptionId = warmHoldOptionFor(id);");
+    expect(setter).toContain('el.value !== micHoldOptionId');
+    expect(setter).not.toMatch(/\.value\)?\s*;?\s*\n\s*return/);
+    expect(mainTsxSlice("function readMicHoldSetting(", "\n}\n")).toContain("return micHoldOptionId;");
+    expect(mainTsx).toContain("setMicHoldSetting(ui.mic_hold);");
+    const change = mainTsxSlice('($("micHoldSelect") as HTMLSelectElement).addEventListener("change", () => {', "\n});");
+    expect(change).toContain("setMicHoldSetting(($(\"micHoldSelect\") as HTMLSelectElement).value)");
+    // Switching it off is its own release reason; a new duration another.
+    expect(change).toContain('id === "off" ? "mic-hold-off" : "mic-hold-changed"');
   });
 
   it("keeps the input and opens no output device, on both the branch and the fallback", () => {
@@ -1023,8 +1038,32 @@ describe("the warm hold: its length, its output, and its releases", () => {
     expect(handler).toContain("held.silent = data.silent === true;");
     expect(mainTsxSlice("function warmReuseDecision(", "\n}\n")).toContain("audioSilent: held.silent,");
     expect(mainTsxSlice("function commitWarmCaptureHold(", "\nfunction ")).toContain("silent: false,");
-    // The release trace reaches main.log: INFO + a mirrored prefix.
-    expect(mainTsx).toContain("console.info(`[trace warmCapture] released reason=${reason} heldMs=${heldMs}`);");
-    expect(mainTsxSlice("function releaseWarmCapture(", "\n}\n")).toContain("console.info(");
+    // One summary line per hold, not one per transition: the release trace
+    // carries how often the device changed state and how long it was quiet.
+    const release = mainTsxSlice("function releaseWarmCapture(", "\n}\n");
+    expect(release).toContain("console.info(");
+    expect(release).toContain("signalChanges=${held.signalChanges}");
+    expect(release).toContain("silentMs=${silentMs}");
+    expect(release).toContain("[trace warmCapture] released reason=${reason} heldMs=${heldMs}");
+    // ...and the transition itself writes nothing.
+    const signalHandler = mainTsxSlice("function handleWorkletMessage(", "\nfunction ");
+    expect(signalHandler).toContain("held.signalChanges += 1;");
+    expect(signalHandler).not.toMatch(/data\.type === "signal"[\s\S]{0,600}console\.(log|info|warn)/);
+  });
+});
+
+/**
+ * P3 (2026-11-24): the start's trace names each step once. The context
+ * the graph branch builds and the context the capture branch resumes are
+ * two steps; printing both as "audioContext" said one context had been
+ * built twice.
+ */
+describe("the start trace — one label per step", () => {
+  it("marks the capture's context resume as its own step", () => {
+    expect(mainTsx.match(/markStartPhase\("audioContextResume", "capture"\)/g) || []).toHaveLength(1);
+    // The creation label on the capture branch belongs to the context that
+    // branch built itself — the one case the graph branch cannot have marked.
+    expect(mainTsx.match(/markStartPhase\("audioContext", "capture"\)/g) || []).toHaveLength(1);
+    expect(mainTsx).not.toContain("contextWaited");
   });
 });

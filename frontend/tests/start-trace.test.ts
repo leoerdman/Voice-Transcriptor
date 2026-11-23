@@ -66,6 +66,28 @@ describe("start trace — the chain that set the total", () => {
     expect(s.offPath.map((m) => m.label)).toEqual(["warmCapture"]);
   });
 
+  it("names the capture's context resume as a step of its own, never a second step of the same name", () => {
+    // The graph branch marked the context it built; the capture branch then
+    // resumed that same context after it had been suspended. Marking the
+    // resume as "audioContext" printed the name twice and said two contexts
+    // had been built when one had.
+    const s = summarizeStartTrace([
+      mark("audioContext", "graph", 40),
+      mark("workletModule", "graph", 60),
+      mark("getUserMedia", "mic", 300),
+      mark("audioContextResume", "capture", 301),
+      mark("captureConnected", "capture", 303),
+      mark("first-frame", "capture", 350),
+    ], 350);
+    // The capture branch is the one that finished last here, so its resume
+    // is a step of the chain and the graph's creation is off-path; both
+    // are named, and no name appears twice.
+    const labels = [...s.chain.map(([l]) => l), ...s.offPath.map((m) => m.label)];
+    expect(labels).toContain("audioContext");
+    expect(labels).toContain("audioContextResume");
+    expect(new Set(labels).size).toBe(labels.length);
+  });
+
   it("a graph slower than the microphone is the critical branch", () => {
     const s = summarizeStartTrace([
       mark("getUserMedia", "mic", 60),

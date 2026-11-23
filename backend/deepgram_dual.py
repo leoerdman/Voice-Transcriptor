@@ -246,10 +246,11 @@ def flatten_words(segments: Iterable[dict], source: str) -> list[dict]:
     nothing at all: since ``merged.text`` is built from words, the whole
     clause disappeared from the transcript of a recording running the
     default Auto mode, with no error and no log line. The single-stream
-    path had named that case three times over (``_spanless_coverage``,
-    ``_word_covered_by_spanless_final``, the wordless branch of
-    ``_process_deepgram_message``); the merge is the fourth asker and
-    now shares their answer instead of inventing a fourth.
+    path had asked what a final's words are three times over
+    (``_word_covered_by_spanless_final``, the wordless branch of
+    ``_process_deepgram_message``, and the segment reader behind both);
+    the merge is the fourth asker and now shares ``segment_word_records``
+    — their common answer — instead of inventing a fourth.
     """
     out: list[dict] = []
     for seg in segments or []:

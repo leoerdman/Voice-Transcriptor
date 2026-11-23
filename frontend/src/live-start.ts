@@ -163,7 +163,7 @@ export function planColdCapture(input: ColdCapturePlanInput): ColdCapturePlan {
   if (!input.listCurrent) return { mode: "sequential", reason: "list-not-current" };
   if (!input.devices.some((d) => d.label.trim())) return { mode: "sequential", reason: "list-unnamed" };
   if (opensSystemDefault(input.choiceDeviceId)) {
-    if (isBluetoothInputLabel(systemDefaultInput(input.devices)?.label ?? "")) {
+    if (isBluetoothInputLabel(systemDefaultInput(input.devices, input.choiceDeviceId)?.label ?? "")) {
       return { mode: "sequential", reason: "bluetooth-default" };
     }
     return { mode: "parallel", reason: "known-list" };
@@ -285,7 +285,18 @@ export function beginColdCapture<Stream, Graph, Choice extends MicChoiceLike>(
     );
     return graphOutcome;
   };
-  const freshChoice = (): Promise<Choice> => deps.refreshChoice().then((c) => c, () => deps.initialChoice);
+  /**
+   * The device list, read again, with the choice made on it.
+   *
+   * The contract is that this NEVER rejects: ``deps.refreshChoice`` may
+   * (enumeration failed), and the answer to that is the choice already
+   * made — not an error. That is what lets the early open wait on the
+   * list beside it without a gate that could hang, and why its caller has
+   * no catch of its own. Pinned by "a list that cannot be read keeps the
+   * known choice" in ./tests/live-start.test.ts.
+   */
+  const freshChoice = (): Promise<Choice> =>
+    deps.refreshChoice().then((c) => c, () => deps.initialChoice);
 
   const mic = parallel ? openAhead() : openInOrder();
   if (parallel) void settleGraph();
@@ -317,17 +328,9 @@ export function beginColdCapture<Stream, Graph, Choice extends MicChoiceLike>(
     const confirmed = new Promise<boolean>((resolve) => { confirmChoice = resolve; });
     const firstOpen = acquire(initialId, confirmed);
     void firstOpen.then(() => { firstOpenAt = deps.now(); }, () => { /* reported below */ });
-    let choice: Choice;
-    try {
-      choice = await freshChoice();
-    } catch (e) {
-      // The gate has to settle whatever the list does: an early open that
-      // failed waiting on it would hang the start. ``freshChoice`` maps a
-      // rejection to the initial choice, so this is the backstop, not the
-      // contract.
-      confirmChoice(false);
-      throw e;
-    }
+    // Cannot reject (see ``freshChoice``), so the gate below always gets
+    // its answer and an early open can never hang on it.
+    const choice = await freshChoice();
     const listAt = deps.now();
     confirmChoice(!abandoned && choice.deviceId === initialId);
     if (choice.deviceId === initialId) {

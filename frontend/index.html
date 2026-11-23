@@ -774,11 +774,12 @@
               -->
               <label class="field"><span class="lbl">Keep the microphone ready</span>
                 <select id="micHoldSelect">
+                  <option value="off">Off — release it after each recording</option>
                   <option value="30s">30 seconds</option>
                   <option value="5m">5 minutes</option>
                   <option value="15m">15 minutes</option>
                 </select>
-                <span class="hint">While it is ready, the macOS microphone indicator stays on</span>
+                <span class="hint">While it is ready, the macOS microphone indicator stays on and the audio system keeps running (a little more power)</span>
               </label>
               <label class="toggle-inline settings-toggle"><span>Auto stop on silence</span><input type="checkbox"
                   id="autoStopSilenceEnabled" /></label>

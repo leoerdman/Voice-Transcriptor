@@ -21,20 +21,34 @@ from backend.auto_keyterms import (
     BUILTIN_TERMS,
     AutoKeytermStore,
     CorpusEntry,
-    extract_document_stats,
-    rank_terms,
 )
 from backend.english_frequent_words import is_frequent_english
 
 
-def extract_candidates(texts, **kwargs):
-    """The ranking the store computes over *texts*, one text per
-    recording: each read into its statistics, then ranked together."""
-    return rank_terms((extract_document_stats(t) for t in texts), **kwargs)
+def _ranked(texts, **kwargs):
+    """The store's own ranking over one recording per text.
+
+    What this used to do — read each text into its statistics, then rank
+    them together — is ``AutoKeytermStore.recompute``'s composition. A
+    copy of it here could drift from the store while both kept passing,
+    so the tests build the archive the store reads (``_Corpus``) and let
+    the store rank it; only the fake archive is local.
+    """
+    corpus = _Corpus()
+    for index, text in enumerate(texts):
+        corpus.put(f"r{index}", text, float(index))
+    store = AutoKeytermStore(
+        corpus=corpus.entries,
+        cache_path=None,
+        builtin_terms=kwargs.pop("builtin", ()),
+        **kwargs,
+    )
+    store.recompute()
+    return list(store.snapshot().terms)
 
 
 def _terms(texts, **kwargs) -> list[str]:
-    return [t.term for t in extract_candidates(texts, **kwargs)]
+    return [t.term for t in _ranked(texts, **kwargs)]
 
 
 class CandidateTests(unittest.TestCase):
@@ -130,7 +144,7 @@ class CandidateTests(unittest.TestCase):
             "проверь Ultra Gen",
             "Ultra Gen готов, а UltraGen ждёт",
         ]
-        found = extract_candidates(texts)
+        found = _ranked(texts)
         variants = [t for t in found if t.term.replace(" ", "").lower() == "ultragen"]
         self.assertEqual(len(variants), 1, found)
         self.assertEqual(variants[0].recordings, 5)
@@ -196,7 +210,7 @@ class CandidateTests(unittest.TestCase):
             "вечером Deepgram опять",
             "утром Deepgram работает",
         ]
-        found = extract_candidates(texts, builtin=BUILTIN_TERMS)
+        found = _ranked(texts, builtin=BUILTIN_TERMS)
         self.assertEqual([t.term for t in found], [*BUILTIN_TERMS, "Deepgram"])
         heard = {t.term: t.recordings for t in found}
         self.assertEqual(heard["Транскриптор"], 2)
@@ -205,7 +219,7 @@ class CandidateTests(unittest.TestCase):
 
     def test_a_mined_form_of_the_built_in_name_is_not_listed_twice(self):
         texts = [f"снова Транскриптора нет, Транскриптором доволен {i}" for i in range(4)]
-        found = [t.term for t in extract_candidates(texts, builtin=BUILTIN_TERMS)]
+        found = [t.term for t in _ranked(texts, builtin=BUILTIN_TERMS)]
         self.assertEqual([t for t in found if t.lower().startswith("транскриптор")], ["Транскриптор"])
 
     def test_the_list_is_bounded_and_ranked_by_recordings(self):
@@ -213,7 +227,7 @@ class CandidateTests(unittest.TestCase):
         for i in range(10):
             names = ", ".join(f"Name{j}x" for j in range(i + 1))
             texts.append(f"тут {names} есть")
-        found = extract_candidates(texts, max_terms=3)
+        found = _ranked(texts, max_terms=3)
         self.assertEqual(len(found), 3)
         self.assertEqual(found[0].term, "Name0x")
         self.assertGreaterEqual(found[0].recordings, found[-1].recordings)

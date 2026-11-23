@@ -6757,15 +6757,30 @@ function readBluetoothBuiltinMicEnabled(): boolean {
 
 /**
  * preferences.ui.mic_hold — how long the built-in input stays ready after
- * a Stop: one of ./capture-warm ``WARM_HOLD_OPTIONS``.
+ * a Stop: one of ./capture-warm ``WARM_HOLD_OPTIONS``, by id.
  *
- * The value is the option's id, and the duration it means lives only in
- * that table; this reader hands the id over rather than any number, so a
- * duration cannot be restated here.
+ * Held as state, the way the microphone pick is (``micPreference``), and
+ * not read back out of the form: the select is a view of this value, and
+ * a start that runs while Settings is closed must still know the answer.
+ * The duration an id means lives only in the table; this holds the id.
  */
+let micHoldOptionId: string = WARM_HOLD_DEFAULT_ID;
+
+/** The hold's option id. */
 function readMicHoldSetting(): string {
+  return micHoldOptionId;
+}
+
+/**
+ * Set the option from the config or from the control — the one writer of
+ * ``micHoldOptionId``. Returns the id actually stored, which is the
+ * default when the value names no option.
+ */
+function setMicHoldSetting(id: string | null | undefined): string {
+  micHoldOptionId = warmHoldOptionFor(id);
   const el = document.getElementById("micHoldSelect") as HTMLSelectElement | null;
-  return (el?.value || "").trim() || WARM_HOLD_DEFAULT_ID;
+  if (el && el.value !== micHoldOptionId) el.value = micHoldOptionId;
+  return micHoldOptionId;
 }
 
 /** The hold's TTL: the user's setting, resolved once, in one place. */
@@ -7456,7 +7471,7 @@ async function loadCfg(): Promise<void> {
     autoStopEnabledEl.checked = ui.auto_stop_silence_enabled === true;
     ($("screenClicksToggle") as HTMLInputElement).checked = ui.screen_clicks === true;
     ($("bluetoothBuiltinMicToggle") as HTMLInputElement).checked = ui.bluetooth_builtin_mic === true;
-    ($("micHoldSelect") as HTMLSelectElement).value = warmHoldOptionFor(ui.mic_hold);
+    setMicHoldSetting(ui.mic_hold);
     autoStopSecondsEl.value = String(clampAutoStopSeconds(Number(ui.auto_stop_silence_seconds)));
     autoStopDbEl.value = String(clampAutoStopThresholdDb(Number(ui.auto_stop_silence_db)));
     const upscaleToggle = $("upscaleToggle") as HTMLInputElement;
@@ -7769,7 +7784,10 @@ async function handleKeyAction(provider: RemoteProvider): Promise<void> {
 ($("micHoldSelect") as HTMLSelectElement).addEventListener("change", () => {
   // The timer in force was the old duration: drop the hold and let the
   // next take hold under the new one (./capture-warm WARM_HOLD_OPTIONS).
-  releaseWarmCapture("mic-hold-changed");
+  // Switched off, the reason says so — the one fact the log cannot infer
+  // from a shorter or longer timer.
+  const id = setMicHoldSetting(($("micHoldSelect") as HTMLSelectElement).value);
+  releaseWarmCapture(id === "off" ? "mic-hold-off" : "mic-hold-changed");
   queueUiPreferencesSave();
 });
 ($("bluetoothBuiltinMicToggle") as HTMLInputElement).addEventListener("change", () => {
@@ -10498,6 +10516,17 @@ interface WarmCapture {
    * a silent hold is released instead of adopted.
    */
   silent: boolean;
+  /**
+   * How the held device behaved over the whole hold — the facts the
+   * release line reports, one line per hold instead of one per transition.
+   * The worklet's own hysteresis already keeps a brief flicker out; these
+   * say whether the device went quiet at all, and for how long.
+   */
+  signalChanges: number;
+  /** `Date.now()` when the device went silent, or null while it delivers. */
+  silentSince: number | null;
+  /** Silence accumulated over completed silent periods, in milliseconds. */
+  silentMs: number;
 }
 
 let warmCapture: WarmCapture | null = null;
@@ -10575,6 +10604,8 @@ function releaseWarmCapture(reason: string): void {
   warmCapture = null;
   if (held.expiryTimer !== null) window.clearTimeout(held.expiryTimer);
   const heldMs = Date.now() - held.heldSince;
+  // A silent period still running when the hold ends is part of the hold.
+  const silentMs = held.silentMs + (held.silentSince === null ? 0 : Date.now() - held.silentSince);
   try { held.workletNode.port.onmessage = null; } catch { /* port already dead */ }
   try { held.workletNode.disconnect(); } catch { /* already disconnected */ }
   try { held.src.disconnect(); } catch { /* already disconnected */ }
@@ -10584,7 +10615,10 @@ function releaseWarmCapture(reason: string): void {
   // console.info, not console.log: the support log's mirror keeps INFO
   // only for the prefixes it names (./desktop/renderer-console), and this
   // line is the one that says why the microphone was let go.
-  console.info(`[trace warmCapture] released reason=${reason} heldMs=${heldMs}`);
+  console.info(
+    `[trace warmCapture] released reason=${reason} heldMs=${heldMs} ` +
+    `signalChanges=${held.signalChanges} silentMs=${silentMs}`,
+  );
 }
 
 /**
@@ -10733,6 +10767,9 @@ function commitWarmCaptureHold(plan: WarmHoldPlan): boolean {
     // A fresh hold has not been judged silent yet; the worklet reports it
     // if the device stops delivering while it is held.
     silent: false,
+    signalChanges: 0,
+    silentSince: null,
+    silentMs: 0,
     expiryTimer: window.setTimeout(
       () => releaseWarmCaptureOnLifecycle("ttl"),
       warmHoldMs(),
@@ -10963,13 +11000,23 @@ function handleWorkletMessage(ev: MessageEvent): void {
   if (data.type === "signal") {
     // Only meaningful while held: during a recording, silence is the
     // user's own and the mic-health path owns what to say about it.
+    //
+    // Nothing is logged per transition. A microphone that comes and goes
+    // (a sleeping USB device, a headset being switched) would otherwise
+    // write a line every second or two for the whole hold; what the
+    // support log needs is the verdict — did the held device deliver, and
+    // for how long was it quiet — and ``releaseWarmCapture`` prints that
+    // once.
     const held = warmCapture;
-    if (held) {
+    if (held && (data.silent === true) !== held.silent) {
       held.silent = data.silent === true;
-      console.info(
-        `[trace warmCapture] device signal silent=${held.silent ? 1 : 0} ` +
-        `heldMs=${Date.now() - held.heldSince}`,
-      );
+      held.signalChanges += 1;
+      if (held.silent) {
+        held.silentSince = Date.now();
+      } else {
+        if (held.silentSince !== null) held.silentMs += Date.now() - held.silentSince;
+        held.silentSince = null;
+      }
     }
     return;
   }
@@ -12442,12 +12489,14 @@ async function connectLiveCapture(session: LiveStartSession, capture: LiveCaptur
     // Waited for here only when the graph branch did not deliver a
     // running context: it failed (built now, after the stream, as every
     // start used to), or the prepared one has been suspended since.
-    let contextWaited = false;
     if (!ac) {
       // Same context as the graph branch builds: no output device (see
-      // ``createSilentCaptureContext``).
+      // ``createSilentCaptureContext``). This label is free only because
+      // the graph branch marks it at the end of its own construction: a
+      // branch that never got there is exactly the one that builds the
+      // context here.
       ac = createSilentCaptureContext();
-      contextWaited = true;
+      markStartPhase("audioContext", "capture");
     }
     // One non-null reference for the rest of the start path. The module
     // slot is reassigned by the teardown helpers, so narrowing it once
@@ -12461,9 +12510,12 @@ async function connectLiveCapture(session: LiveStartSession, capture: LiveCaptur
       } catch (e) {
         console.debug("AudioContext resume rejected (non-fatal)", e);
       }
-      contextWaited = true;
+      // Resuming a context that already existed is a step of its own: the
+      // graph branch marked its creation as ``audioContext``, and printing
+      // that name twice in one start told a reader two contexts had been
+      // built when one had.
+      markStartPhase("audioContextResume", "capture");
     }
-    if (contextWaited) markStartPhase("audioContext", "capture");
     throwIfStartCancelled();
     recordedWebmChunks = [];
     try {

@@ -17,6 +17,7 @@ import {
   freezeCaptureForStop,
   handOverHeldCapture,
   isBluetoothInputLabel,
+  systemDefaultInput,
   type WarmHoldInput,
   type WarmReuseInput,
 } from "../src/capture-warm";
@@ -61,6 +62,29 @@ describe("isBluetoothInputLabel", () => {
     // for the whole hold window.
     expect(isBluetoothInputLabel("")).toBe(true);
     expect(isBluetoothInputLabel("   ")).toBe(true);
+  });
+});
+
+describe("systemDefaultInput — the alias a request names is the device it opens", () => {
+  const list = [
+    { deviceId: "default", label: "Default - Leo Liberty 5 BT (Bluetooth)" },
+    { deviceId: "communications", label: "Default - MacBook Pro Microphone (Built-in)" },
+    { deviceId: "mac", label: "MacBook Pro Microphone (Built-in)" },
+  ];
+
+  it("reads the requested alias's own row, not the one labelled 'default'", () => {
+    // The two aliases can name different devices; a rule that judges the
+    // "default" row while the open uses "communications" judges a device
+    // the open will not touch.
+    expect(systemDefaultInput(list, "communications")?.deviceId).toBe("communications");
+    expect(systemDefaultInput(list, "default")?.deviceId).toBe("default");
+  });
+
+  it("falls back to 'default', then to the first row, when the request names nothing the list has", () => {
+    expect(systemDefaultInput(list)?.deviceId).toBe("default");
+    expect(systemDefaultInput(list, "")?.deviceId).toBe("default");
+    expect(systemDefaultInput(list, "gone")?.deviceId).toBe("default");
+    expect(systemDefaultInput([{ deviceId: "mac", label: "Mac" }], "communications")?.deviceId).toBe("mac");
   });
 });
 
@@ -241,22 +265,33 @@ describe("captureElapsedMs — one clock for 'is this a recording yet?'", () => 
 });
 
 describe("WARM_HOLD_OPTIONS — the durations Settings offers, and what each means", () => {
-  it("offers exactly three, and the default is the fifteen-minute one", () => {
-    expect(WARM_HOLD_OPTIONS.map((o) => o.id)).toEqual(["30s", "5m", "15m"]);
-    expect(WARM_HOLD_OPTIONS.map((o) => o.ms)).toEqual([30_000, 300_000, 900_000]);
+  it("offers off and three durations, and the default is the fifteen-minute one", () => {
+    expect(WARM_HOLD_OPTIONS.map((o) => o.id)).toEqual(["off", "30s", "5m", "15m"]);
+    expect(WARM_HOLD_OPTIONS.map((o) => o.ms)).toEqual([0, 30_000, 300_000, 900_000]);
     expect(WARM_HOLD_DEFAULT_ID).toBe("15m");
     expect(warmHoldMsForOption(WARM_HOLD_DEFAULT_ID)).toBe(900_000);
   });
 
   it("resolves every id, and turns an unknown or missing one into the default", () => {
+    expect(warmHoldMsForOption("off")).toBe(0);
     expect(warmHoldMsForOption("30s")).toBe(30_000);
     expect(warmHoldMsForOption("5m")).toBe(300_000);
     expect(warmHoldMsForOption("15m")).toBe(900_000);
-    // An unreadable setting must not quietly turn the hold off.
-    for (const stored of ["", "  ", undefined, null, "60m", "0", "15"]) {
+    // An unreadable setting must not quietly turn the hold off: "off" is a
+    // choice the user makes, never one a broken value falls into.
+    for (const stored of ["", "  ", undefined, null, "60m", "0", "15", "OFF"]) {
       expect(warmHoldMsForOption(stored as string)).toBe(900_000);
       expect(warmHoldOptionFor(stored as string)).toBe("15m");
     }
+  });
+
+  it("switched off, the stop refuses the hold — the documented off switch", () => {
+    // The reason the setting exists: "off" has to reach ``decideWarmHold``
+    // as a plain zero, and stop meaning "hold nothing".
+    expect(decideWarmHold({ ...holdInput, warmHoldMs: warmHoldMsForOption("off") })).toEqual({
+      hold: false,
+      reason: "disabled",
+    });
   });
 });
 

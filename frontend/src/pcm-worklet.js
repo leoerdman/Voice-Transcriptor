@@ -48,8 +48,8 @@
 const MAX_PENDING_SAMPLES = 512;
 
 /**
- * How long an armed ring must see nothing but digital zeros before the
- * device is reported as not delivering.
+ * How long the device must KEEP delivering a state before that state is
+ * reported — the hysteresis for the held-device signal, in one place.
  *
  * A live input always carries its own noise floor — measured on the
  * owner's built-in microphone at peak ~0.008 with the room silent — so
@@ -59,11 +59,15 @@ const MAX_PENDING_SAMPLES = 512;
  * wakes (``microphone woke: 104 ms of digital silence``); anything
  * shorter would call a healthy device dead at every cold start.
  *
- * Nothing is posted while the device is healthy: a transition is one
- * ~40-byte message, into silence and back out of it, so a 15-minute hold
- * costs one message if nothing goes wrong.
+ * The rule runs in BOTH directions. A device that flaps — a USB input
+ * being reset, a headset switching profiles — would otherwise post a
+ * transition per second for the whole hold, and each one used to become
+ * a log line. A state that cannot hold for a second is not a state the
+ * renderer's decisions should act on, so it is not reported at all: the
+ * renderer then learns the shape of the hold once, from the release
+ * line, instead of watching it flicker.
  */
-const SILENT_HOLD_MS = 1000;
+const SIGNAL_HOLD_MS = 1000;
 
 /**
  * Ring buffer holding the most recent `capacity` samples.
@@ -132,6 +136,9 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
     // Context clock at the first zero-only quantum since the last real
     // sample; -1 means "the device is delivering". See ``watchDevice``.
     this.quietSince = -1;
+    // The same for sound, so both directions need a second to count: a
+    // device that alternates faster than SIGNAL_HOLD_MS reports nothing.
+    this.loudSince = -1;
     this.silent = false;
     this.port.onmessage = (event) => {
       const msg = event?.data;
@@ -169,6 +176,7 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
     this.lastRingWriteTime = currentTime;
     // A new hold starts unjudged, whatever the previous one looked like.
     this.quietSince = -1;
+    this.loudSince = -1;
     this.silent = false;
     this.armed = true;
   }
@@ -239,14 +247,16 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
     }
     if (sound) {
       this.quietSince = -1;
-      if (this.silent) {
+      if (this.loudSince < 0) this.loudSince = currentTime;
+      if (this.silent && (currentTime - this.loudSince) * 1000 >= SIGNAL_HOLD_MS) {
         this.silent = false;
         this.port.postMessage({ type: "signal", silent: false });
       }
       return;
     }
+    this.loudSince = -1;
     if (this.quietSince < 0) this.quietSince = currentTime;
-    if (!this.silent && (currentTime - this.quietSince) * 1000 >= SILENT_HOLD_MS) {
+    if (!this.silent && (currentTime - this.quietSince) * 1000 >= SIGNAL_HOLD_MS) {
       this.silent = true;
       this.port.postMessage({ type: "signal", silent: true });
     }

@@ -315,13 +315,28 @@ describe("the armed ring's device watch", () => {
     expect(signals(h)).toEqual([{ type: "signal", silent: true }]);
   });
 
-  it("clears the report when audio comes back, and can report the next gap", () => {
+  it("clears the report only once sound has held for a second too", () => {
     h.send({ type: "arm", preRollMs: 500 });
     renderSilence(h, 1.2);
-    renderRamp(h, 0.5, 2);
+    renderRamp(h, 0.5, 4);
+    // A 10 ms blip is not a recovery: the same hysteresis runs both ways.
+    expect(signals(h).map((m) => m.silent)).toEqual([true]);
+    renderRamp(h, 0.5, Math.round(QUANTA_PER_SECOND));
     expect(signals(h).map((m) => m.silent)).toEqual([true, false]);
     renderSilence(h, 1.2);
     expect(signals(h).map((m) => m.silent)).toEqual([true, false, true]);
+  });
+
+  it("says nothing at all about a device that flaps faster than the hysteresis", () => {
+    // The case this exists for: a USB input being reset, a headset
+    // switching profiles. Each transition used to be a message and a log
+    // line; the renderer's verdict comes from the release summary instead.
+    h.send({ type: "arm", preRollMs: 500 });
+    for (let i = 0; i < 4; i++) {
+      renderSilence(h, 0.4);
+      renderRamp(h, 0.5, Math.round(0.4 * QUANTA_PER_SECOND));
+    }
+    expect(signals(h)).toEqual([]);
   });
 
   it("counts a quantum with no channel at all as silence", () => {

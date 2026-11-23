@@ -429,6 +429,28 @@ class BluetoothBuiltinMicMigrationTests(SchemaStampTests):
         self.assertIs(cfg["preferences"]["ui"]["bluetooth_builtin_mic"], True)
 
 
+class RendererOwnedUiPreferenceTests(SchemaStampTests):
+    """``preferences.ui`` keys the backend does not interpret survive a save.
+
+    That object is the renderer's (``collectUiPreferences`` writes it
+    whole), and every key in it — ``mic_hold`` today, the warm hold's
+    duration — is data the backend has to store and hand back untouched.
+    There is deliberately no schema of it here: a backend list of renderer
+    settings would be a second copy of the markup, and it would start
+    dropping new settings until someone remembered to add them.
+    """
+
+    def test_a_renderer_owned_key_survives_save_and_reload(self):
+        self.config_mod.save_config({
+            "providers": {},
+            "preferences": {"ui": {"mic_hold": "5m", "mic_id": "mac"}},
+        })
+        reloaded = self.config_mod.load_config()
+        self.assertEqual(
+            reloaded["preferences"]["ui"], {"mic_hold": "5m", "mic_id": "mac"}
+        )
+
+
 class OpenRouterPreferenceValidationTests(unittest.TestCase):
     """``preferences.openrouter`` is repaired like ``preferences.deepgram`` (B-019)."""
 

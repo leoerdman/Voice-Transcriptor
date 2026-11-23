@@ -182,10 +182,11 @@ class FlattenWordsTests(unittest.TestCase):
         ``merged.text`` is built from words, a wordless final deleted
         its whole clause from the transcript of an Auto recording, with
         no error and no log line. The single-stream path had already
-        named this case three times (``_spanless_coverage``,
-        ``_word_covered_by_spanless_final``, the wordless branch of
-        ``_process_deepgram_message``): its span is the only placement
-        knowable and its text is what was said.
+        asked what a final's words are three times
+        (``_word_covered_by_spanless_final``, the wordless branch of
+        ``_process_deepgram_message``, and ``segment_word_records`` behind
+        both): its span is the only placement knowable and its text is
+        what was said.
         """
         out = flatten_words([{"text": "hi there", "start": 0, "end": 1}], "primary")
         self.assertEqual(

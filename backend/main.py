@@ -4880,6 +4880,43 @@ def _resolve_upscale_preset(preset_id: str) -> dict[str, Any]:
     return item
 
 
+def _upscale_preset_for_request(payload: dict[str, Any]) -> dict[str, Any]:
+    """The preset a ``POST /api/upscale`` request names.
+
+    The request has exactly three shapes, and this is the one place that
+    says what each means:
+
+      * ``preset_id`` naming a preset — that preset. No caller in this
+        repository sends it otherwise (checked across ``frontend/``,
+        ``desktop/`` and ``backend/tools/``).
+      * neither field — the default built-in.
+      * anything else — a client error, never a quiet substitution. The
+        legacy ``preset`` field (a bare key, ``preset="business"``) was
+        removed with the presets rework; answering such a request with
+        the DEFAULT preset was the worst of the two possible readings: a
+        caller that asked for Business got Clean back, with ``ok: true``
+        and no sign that its request had been ignored. It is refused with
+        the field's replacement named. Likewise an id that matches no
+        preset is a 400: the route resolves a *client-named* resource, so
+        a miss is the client's mistake — 404 is for the preset CRUD
+        routes, where the id is the URL and the resource is the subject.
+    """
+    if "preset" in payload:
+        raise HTTPException(
+            status_code=400,
+            detail="preset is no longer supported; send preset_id instead",
+        )
+    preset_id = str(payload.get("preset_id") or "").strip()
+    if not preset_id:
+        return _resolve_upscale_preset(DEFAULT_UPSCALE_PRESET_ID)
+    try:
+        return _resolve_upscale_preset(preset_id)
+    except HTTPException as e:
+        if e.status_code != 404:
+            raise
+        raise HTTPException(status_code=400, detail=f"unknown preset_id: {preset_id}") from e
+
+
 @app.websocket("/ws/transcribe")
 async def ws_transcribe(websocket: WebSocket):
     """Provider-aware live transcription WebSocket.
@@ -8164,10 +8201,7 @@ async def upscale_text(payload: dict = Body(...), _auth: None = Depends(_require
             MAX_UPSCALE_INPUT_CHARS,
         )
     _ensure_builtin_upscale_presets()
-    # ``preset_id`` is the one field that names a preset; a request
-    # without one gets the default built-in.
-    preset_id = str(payload.get("preset_id") or "").strip() or DEFAULT_UPSCALE_PRESET_ID
-    preset = _resolve_upscale_preset(preset_id)
+    preset = _upscale_preset_for_request(payload)
 
     cfg = load_config()
     providers = cfg.get("providers") or {}

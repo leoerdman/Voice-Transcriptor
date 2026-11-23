@@ -117,12 +117,22 @@ export function isBluetoothInputLabel(label: string): boolean {
  * setting's value means and nothing else is allowed to restate it.
  */
 export const WARM_HOLD_OPTIONS = Object.freeze([
+  /** Off: the input is released at Stop, as it was before the hold existed. */
+  { id: "off", ms: 0 },
   { id: "30s", ms: 30_000 },
   { id: "5m", ms: 300_000 },
   { id: "15m", ms: 900_000 },
 ] as const);
 
 export type WarmHoldOptionId = (typeof WARM_HOLD_OPTIONS)[number]["id"];
+
+/**
+ * The table above, indexed — so "every option has a duration" is a fact
+ * of the type rather than a lookup that could come back empty.
+ */
+const WARM_HOLD_MS_BY_ID: Readonly<Record<WarmHoldOptionId, number>> = Object.freeze(
+  Object.fromEntries(WARM_HOLD_OPTIONS.map((o) => [o.id, o.ms])) as Record<WarmHoldOptionId, number>,
+);
 
 /**
  * The shipped default: long enough that a working session's takes are
@@ -134,25 +144,22 @@ export const WARM_HOLD_DEFAULT_ID: WarmHoldOptionId = "15m";
 /**
  * The option a stored setting value names.
  *
- * An unknown or missing value is the default, never "no hold": a setting
- * that cannot be read (an older config, a markup change) must not quietly
- * turn the feature off. Settings restores the control to this answer, so
- * what the user sees and what the hold does cannot disagree.
+ * An unknown or missing value is the default, never "off": a setting that
+ * cannot be read (an older config, a markup change) must not quietly stop
+ * holding the microphone, because that is the silent loss of the feature.
+ * Settings restores the control to this answer, so what the user sees and
+ * what the hold does cannot disagree.
  */
 export function warmHoldOptionFor(id: string | null | undefined): WarmHoldOptionId {
   const key = String(id ?? "").trim();
-  const found = WARM_HOLD_OPTIONS.find((o) => o.id === key);
-  return found ? found.id : WARM_HOLD_DEFAULT_ID;
+  return WARM_HOLD_OPTIONS.some((o) => o.id === key)
+    ? (key as WarmHoldOptionId)
+    : WARM_HOLD_DEFAULT_ID;
 }
 
-/**
- * The hold's TTL for a stored setting value — ``warmHoldOptionFor``'s
- * option, in milliseconds. Zero only if the table itself is empty, which
- * would mean the hold has no duration to honour.
- */
+/** The hold's TTL for a stored setting value: zero means "do not hold". */
 export function warmHoldMsForOption(id: string | null | undefined): number {
-  const option = WARM_HOLD_OPTIONS.find((o) => o.id === warmHoldOptionFor(id));
-  return option ? option.ms : 0;
+  return WARM_HOLD_MS_BY_ID[warmHoldOptionFor(id)];
 }
 
 export interface WarmHoldInput {
@@ -248,11 +255,34 @@ export function isBuiltInInputLabel(label: string): boolean {
 }
 
 /**
- * The system default input as the list names it: Chromium lists it first
- * as the "default" alias ("Default - <name>"); without the alias, the
- * first entry is it.
+ * The system default input, as the list names it.
+ *
+ * The answer depends on WHAT WAS ASKED FOR, which is why the request is
+ * a parameter and not a caller-side special case: ``getUserMedia`` opens
+ * one device per alias, and ``communications`` is not ``default`` on a
+ * machine whose "default" and "communications" inputs differ. Three
+ * steps, in this order:
+ *
+ *   1. the alias the request names, when the list has an entry for it —
+ *      that entry IS what the request would open;
+ *   2. the list's own "default" alias ("Default - <name>");
+ *   3. the first entry, which is where Chromium puts the default.
+ *
+ * The caller passes its requested id (``""`` for "no preference").
+ * Reading the row labelled "default" for a request that named
+ * ``communications`` was the defect this signature exists to fix: the
+ * Bluetooth-default rule was then judging a device the open would not
+ * touch.
  */
-export function systemDefaultInput<D extends InputDeviceInfo>(devices: readonly D[]): D | undefined {
+export function systemDefaultInput<D extends InputDeviceInfo>(
+  devices: readonly D[],
+  requestedAlias = "",
+): D | undefined {
+  const requested = String(requestedAlias ?? "").trim();
+  if (requested) {
+    const byRequest = devices.find((d) => d.deviceId === requested);
+    if (byRequest) return byRequest;
+  }
   return devices.find((d) => d.deviceId === "default") || devices[0];
 }
 
@@ -292,7 +322,7 @@ export function chooseCaptureDevice(input: CaptureDeviceInput): CaptureDeviceCho
     const picked = devices.find((d) => d.deviceId === requested);
     return { deviceId: requested, label: picked?.label || "", reason: "picked" };
   }
-  const defaultLabel = systemDefaultInput(devices)?.label || "";
+  const defaultLabel = systemDefaultInput(devices, requested)?.label || "";
   // Every "default" verdict passes the request through unchanged ("" or
   // the alias), so the device asked for is exactly what it always was.
   if (!input.preferBuiltInOverBluetooth) {
