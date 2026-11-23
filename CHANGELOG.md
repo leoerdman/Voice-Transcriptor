@@ -3,6 +3,14 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.41] - 2026-11-24
+
+### Changed
+
+- **Recording starts sooner after the hotkey.** The microphone now opens the moment you press, while the archive, the connection and the recording file get ready beside it; the audio engine and its processing module are prepared alongside the microphone instead of after it. With the built-in microphone the wait before the "ready" sound is now essentially the time macOS takes to open the device.
+- **Bluetooth headsets are never switched into call mode early.** When the default or chosen input is a Bluetooth headset, or the device list has not caught up with a change yet, the start keeps the old safe order: the device list first, then the chosen microphone, then the audio engine.
+- **A failed start no longer cools the next one.** If a start fails before recording, the microphone kept warm from the previous take stays warm.
+
 ## [1.6.40] - 2026-11-23
 
 ### Removed
