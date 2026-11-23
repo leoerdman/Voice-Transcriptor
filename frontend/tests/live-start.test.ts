@@ -29,6 +29,11 @@ interface Choice { deviceId: string; reason: string }
 /**
  * The resources of a start, each answered by the test: every microphone
  * open, the device list and the graph are pending until settled.
+ *
+ * A microphone open is main.tsx ``acquireMicStream`` in miniature: the
+ * asked device either answers (``answerOpen``) or fails (``failDevice``),
+ * and a failed device falls back to the system default — the event
+ * ``open:system-default`` — once ``fallbackToDefault`` resolves true.
  */
 function fakeCapture(options: { initial?: string; mode?: ColdCaptureMode } = {}) {
   const initial = options.initial ?? "built-in";
@@ -37,7 +42,11 @@ function fakeCapture(options: { initial?: string; mode?: ColdCaptureMode } = {})
   // The marks' clock, advanced by the test; ``at`` is when a mark records.
   const clock = { now: 0 };
   const markedAt: number[] = [];
-  const opens: Array<{ deviceId: string; answer: ReturnType<typeof deferred<FakeStream>> }> = [];
+  const opens: Array<{
+    deviceId: string;
+    answer: ReturnType<typeof deferred<FakeStream>>;
+    failDevice: () => void;
+  }> = [];
   const list = deferred<Choice>();
   const graphs: Array<ReturnType<typeof deferred<FakeGraph>>> = [];
   const streams: FakeStream[] = [];
@@ -45,10 +54,16 @@ function fakeCapture(options: { initial?: string; mode?: ColdCaptureMode } = {})
   const deps: ColdCaptureDeps<FakeStream, FakeGraph, Choice> = {
     initialChoice: { deviceId: initial, reason: "known-list" },
     refreshChoice: () => { events.push("list"); return list.promise; },
-    acquireMic: (deviceId) => {
+    acquireMic: (deviceId, fallbackToDefault) => {
       events.push(`open:${deviceId}`);
       const answer = deferred<FakeStream>();
-      opens.push({ deviceId, answer });
+      const failDevice = () => {
+        void fallbackToDefault.then((allowed) => {
+          if (allowed) events.push("open:system-default");
+          else answer.reject(new Error(`${deviceId} could not be opened`));
+        });
+      };
+      opens.push({ deviceId, answer, failDevice });
       return answer.promise;
     },
     releaseMic: (s) => { s.stopped = true; events.push(`release:${s.id}`); },
@@ -335,30 +350,46 @@ describe("planColdCapture — the one rule for running ahead of a fresh device l
   const usb = { deviceId: "usb", label: "Shure MV7 (USB)" };
   const headset = { deviceId: "bt", label: "Leo Liberty 5 BT (Bluetooth)" };
   const alias = (d: { label: string }) => ({ deviceId: "default", label: `Default - ${d.label}` });
+  const plan = (devices: Array<{ deviceId: string; label: string }>, choiceDeviceId: string, listCurrent = true) =>
+    planColdCapture({ listCurrent, devices, choiceDeviceId });
 
-  it("runs ahead only on a current, named list where neither the choice nor the default is Bluetooth", () => {
-    expect(planColdCapture({ listCurrent: true, devices: [alias(builtIn), builtIn, usb], choiceLabel: builtIn.label }))
-      .toEqual({ mode: "parallel", reason: "known-list" });
-    expect(planColdCapture({ listCurrent: false, devices: [alias(builtIn), builtIn], choiceLabel: builtIn.label }).reason)
-      .toBe("list-not-current");
-    expect(planColdCapture({ listCurrent: true, devices: [{ deviceId: "", label: "" }], choiceLabel: "" }).reason)
-      .toBe("list-unnamed");
-    expect(planColdCapture({ listCurrent: true, devices: [alias(builtIn), builtIn, headset], choiceLabel: headset.label }).reason)
-      .toBe("bluetooth-choice");
+  it("runs ahead only when the device the open lands on is known and is not Bluetooth", () => {
+    expect(plan([alias(builtIn), builtIn, usb], "mac")).toEqual({ mode: "parallel", reason: "known-list" });
+    expect(plan([alias(builtIn), builtIn, usb], "")).toEqual({ mode: "parallel", reason: "known-list" });
+    expect(plan([alias(builtIn), builtIn, usb], "default")).toEqual({ mode: "parallel", reason: "known-list" });
+    expect(plan([alias(builtIn), builtIn], "mac", false).reason).toBe("list-not-current");
+    expect(plan([{ deviceId: "", label: "" }], "").reason).toBe("list-unnamed");
+    expect(plan([alias(builtIn), builtIn, headset], "bt").reason).toBe("bluetooth-choice");
     // A device the list cannot name counts as Bluetooth.
-    expect(planColdCapture({ listCurrent: true, devices: [alias(builtIn), builtIn], choiceLabel: "" }).reason)
-      .toBe("bluetooth-choice");
-    // The built-in mic chosen over a Bluetooth default: the default is still
-    // what a failed or default open lands on.
-    expect(planColdCapture({ listCurrent: true, devices: [alias(headset), headset, builtIn], choiceLabel: builtIn.label }).reason)
-      .toBe("bluetooth-default");
+    expect(plan([alias(builtIn), builtIn, { deviceId: "x", label: "" }], "x").reason).toBe("bluetooth-choice");
   });
 
-  // The two ways an open ahead of the list put a Bluetooth headset into
-  // its call profile: run each through the plan and the capture together.
-  async function runStart(plan: ReturnType<typeof planColdCapture>, initial: string, fresh: string) {
-    const world = fakeCapture({ initial, mode: plan.mode });
+  it("an explicit built-in mic over a Bluetooth default runs ahead: it is opened exact, so the default plays no part", () => {
+    expect(plan([alias(headset), headset, builtIn], "mac")).toEqual({ mode: "parallel", reason: "known-list" });
+    expect(plan([headset, builtIn], "mac")).toEqual({ mode: "parallel", reason: "known-list" });
+  });
+
+  it("a choice that lands on a Bluetooth default reads the list first: the default itself, or an id the list does not have", () => {
+    expect(plan([alias(headset), headset, builtIn], "")).toEqual({ mode: "sequential", reason: "bluetooth-default" });
+    expect(plan([alias(headset), headset, builtIn], "default")).toEqual({ mode: "sequential", reason: "bluetooth-default" });
+    // Chromium's other alias for the same thing.
+    expect(plan([alias(headset), headset, builtIn], "communications")).toEqual({ mode: "sequential", reason: "bluetooth-default" });
+    expect(plan([headset, builtIn], "")).toEqual({ mode: "sequential", reason: "bluetooth-default" });
+    expect(plan([alias(headset), headset, builtIn], "gone")).toEqual({ mode: "sequential", reason: "choice-not-listed" });
+  });
+
+  // Run the plan and the capture together, the fresh list answering with
+  // ``fresh``; ``failFirst`` makes the first device open fail before then.
+  async function runStart(
+    verdict: ReturnType<typeof planColdCapture>,
+    initial: string,
+    fresh: string,
+    options: { failFirst?: boolean } = {},
+  ) {
+    const world = fakeCapture({ initial, mode: verdict.mode });
     const handle = beginColdCapture(world.deps);
+    await settle();
+    if (options.failFirst) world.opens[0].failDevice();
     await settle();
     const before = [...world.events];
     world.list.resolve({ deviceId: fresh, reason: "fresh-list" });
@@ -366,34 +397,82 @@ describe("planColdCapture — the one rule for running ahead of a fresh device l
     world.answerOpen(world.opens.length - 1);
     await settle();
     world.graphs[0]?.resolve({ id: 1, closed: false });
-    await handle.ready;
-    return { before, world };
+    const opened = await handle.ready;
+    return { before, world, opened };
   }
 
-  it("a headset that has just connected (the list not yet refreshed): no open and no graph before the fresh list, and the graph after the microphone", async () => {
-    // The known list still says built-in; the devicechange has arrived but
-    // its enumeration has not finished.
-    const plan = planColdCapture({ listCurrent: false, devices: [alias(builtIn), builtIn], choiceLabel: builtIn.label });
-    const { before, world } = await runStart(plan, "", "");
-    expect(before).toEqual(["list"]);
-    expect(world.opens.map((o) => o.deviceId)).toEqual([""]);
-    expect(world.events.indexOf("graph")).toBeGreaterThan(world.events.indexOf("open:"));
+  it("the owner's case — built-in picked, a Bluetooth headset the default: parallel, and the headset's input is opened at no step", async () => {
+    const devices = [alias(headset), headset, builtIn];
+    const choice = chooseCaptureDevice({ requestedDeviceId: "mac", preferBuiltInOverBluetooth: false, devices });
+    expect(choice).toMatchObject({ deviceId: "mac", reason: "picked" });
+    const verdict = plan(devices, choice.deviceId);
+    expect(verdict.mode).toBe("parallel");
+    const { before, world } = await runStart(verdict, choice.deviceId, choice.deviceId);
+    expect(before).toEqual(["open:mac", "list", "graph"]);
+    expect(world.events.filter((e) => e.startsWith("open:"))).toEqual(["open:mac"]);
   });
 
-  it("'Bluetooth → built-in' with a Bluetooth default: the headset's microphone is never opened", async () => {
+  it("'Bluetooth → built-in' with a Bluetooth default runs ahead on the built-in mic and never opens the headset", async () => {
     const devices = [alias(headset), headset, builtIn];
     const choice = chooseCaptureDevice({ requestedDeviceId: "", preferBuiltInOverBluetooth: true, devices });
     expect(choice.deviceId).toBe("mac");
-    // Even on a current list: a failed open would fall back to the default.
-    const plan = planColdCapture({ listCurrent: true, devices, choiceLabel: choice.label });
-    const { before, world } = await runStart(plan, choice.deviceId, choice.deviceId);
-    expect(before).toEqual(["list"]);
-    expect(world.opens.map((o) => o.deviceId)).toEqual(["mac"]);
+    const { before, world } = await runStart(plan(devices, choice.deviceId), choice.deviceId, choice.deviceId);
+    expect(before).toEqual(["open:mac", "list", "graph"]);
+    expect(world.events.filter((e) => e.startsWith("open:"))).toEqual(["open:mac"]);
     // A stale list that still names the built-in mic as the default: the
     // default-alias open would land on the headset — not attempted either.
-    const stale = planColdCapture({ listCurrent: false, devices: [alias(builtIn), builtIn], choiceLabel: alias(builtIn).label });
+    const stale = plan([alias(builtIn), builtIn], "", false);
     const second = await runStart(stale, "", "mac");
     expect(second.before).toEqual(["list"]);
     expect(second.world.opens.map((o) => o.deviceId)).toEqual(["mac"]);
+  });
+
+  it("the system default chosen while it is a Bluetooth headset: the list is read before any open", async () => {
+    const devices = [alias(headset), headset, builtIn];
+    const choice = chooseCaptureDevice({ requestedDeviceId: "", preferBuiltInOverBluetooth: false, devices });
+    expect(choice.deviceId).toBe("");
+    const verdict = plan(devices, choice.deviceId);
+    expect(verdict).toEqual({ mode: "sequential", reason: "bluetooth-default" });
+    const { before } = await runStart(verdict, choice.deviceId, choice.deviceId);
+    expect(before).toEqual(["list"]);
+  });
+
+  it("an id the current list does not have, with a Bluetooth default: the list is read before any open", async () => {
+    const verdict = plan([alias(headset), headset, builtIn], "gone");
+    expect(verdict.mode).toBe("sequential");
+    const { before } = await runStart(verdict, "gone", "");
+    expect(before).toEqual(["list"]);
+  });
+
+  it("a head-start device that fails does not fall back to the (Bluetooth) default before the fresh list confirms it", async () => {
+    const devices = [alias(headset), headset, builtIn];
+    const { before, world } = await runStart(plan(devices, "mac"), "mac", "mac", { failFirst: true });
+    // The device failed before the list answered: no fallback yet.
+    expect(before).toEqual(["open:mac", "list", "graph"]);
+    // The list confirmed the choice: the fallback is taken from there, as
+    // the sequential order would take it.
+    expect(world.events.filter((e) => e.startsWith("open:"))).toEqual(["open:mac", "open:system-default"]);
+  });
+
+  it("a head-start device that fails and that the fresh list replaces never falls back to the default", async () => {
+    const devices = [alias(headset), headset, builtIn, usb];
+    const { world, opened } = await runStart(plan(devices, "mac"), "mac", "usb", { failFirst: true });
+    expect(world.events.filter((e) => e.startsWith("open:"))).toEqual(["open:mac", "open:usb"]);
+    expect(opened.reopened).toBe(true);
+    expect(opened.stream.deviceId).toBe("usb");
+  });
+
+  it("sequential: the device chosen on the fresh list keeps its fallback to the default", async () => {
+    const world = fakeCapture({ initial: "mac", mode: "sequential" });
+    const handle = beginColdCapture(world.deps);
+    world.list.resolve({ deviceId: "mac", reason: "fresh-list" });
+    await settle();
+    world.opens[0].failDevice();
+    await settle();
+    expect(world.events).toEqual(["list", "open:mac", "open:system-default"]);
+    world.answerOpen(0);
+    await settle();
+    world.graphs[0].resolve({ id: 1, closed: false });
+    await handle.ready;
   });
 });

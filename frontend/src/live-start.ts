@@ -34,7 +34,12 @@
  * (tests/live-start.test.ts).
  */
 
-import { isBluetoothInputLabel, systemDefaultInput, type InputDeviceInfo } from "./capture-warm";
+import {
+  isBluetoothInputLabel,
+  opensSystemDefault,
+  systemDefaultInput,
+  type InputDeviceInfo,
+} from "./capture-warm";
 import type { StartBranch } from "./start-trace";
 
 /**
@@ -97,12 +102,13 @@ export type ColdCapturePlanReason =
   | "known-list"
   | "list-not-current"
   | "list-unnamed"
+  | "choice-not-listed"
   | "bluetooth-choice"
   | "bluetooth-default";
 
 export interface ColdCapturePlan {
   mode: ColdCaptureMode;
-  /** Support-log reason code: printed on the start's ``mic=`` line. */
+  /** Support-log reason code: printed as the start line's ``open=``. */
   reason: ColdCapturePlanReason;
 }
 
@@ -111,8 +117,11 @@ export interface ColdCapturePlanInput {
   listCurrent: boolean;
   /** The known ``audioinput`` list. */
   devices: readonly InputDeviceInfo[];
-  /** Label of the device the known list chose ("" when it does not name it). */
-  choiceLabel: string;
+  /**
+   * What the known list chose to open: a device id, or "" / an alias for
+   * the system default (./capture-warm ``opensSystemDefault``).
+   */
+  choiceDeviceId: string;
 }
 
 /**
@@ -120,26 +129,32 @@ export interface ColdCapturePlanInput {
  * fresh device list.
  *
  * Opening before the list is read means opening by the list known at the
- * press, and the device that open lands on is only as right as that list:
- * a picked id is asked for ``exact`` (main.tsx ``micCaptureConstraints``),
- * so a stale one fails and ``acquireMicStream`` falls back to the system
- * default; the default itself ("" — the alias) is whatever the OS names at
- * the moment of the open, not what the list said. For a built-in or USB
- * input a wrong first open costs a second open. For a Bluetooth headset
- * it costs the headset: opening its microphone switches it from
- * high-quality playback (A2DP) to the call profile (HFP) — the very thing
- * "Bluetooth → built-in mic" exists to avoid — and an AudioContext opened
- * before it starts its output in the profile that is about to be torn
- * away. So the branches run ahead only when nothing Bluetooth can be on
- * the path:
+ * press, and the device that open lands on is only as right as that list.
+ * For a built-in or USB input a wrong first open costs a second open. For
+ * a Bluetooth headset it costs the headset: opening its microphone
+ * switches it from high-quality playback (A2DP) to the call profile (HFP)
+ * — the very thing "Bluetooth → built-in mic" exists to avoid. So the
+ * branches run ahead only when the device the open lands on is known and
+ * is not Bluetooth:
  *
  *  - the list is current — enumerated after the last ``devicechange``;
  *  - it is named — before microphone permission the labels are empty and
  *    nothing can be judged by them;
- *  - the device it chose is not Bluetooth — an unnamed one counts as
- *    Bluetooth, as it does for the warm hold (./capture-warm);
- *  - the system default is not Bluetooth — the fallback of every failed
- *    open, and the device a default choice actually lands on.
+ *  - a choice of the system default ("" or an alias) lands on whatever the
+ *    OS names at the moment of the open — on a current list, the list's
+ *    default entry — so that entry must not be Bluetooth;
+ *  - a choice of a device is asked for ``exact`` (main.tsx
+ *    ``micCaptureConstraints``), so it lands on that device or fails: it
+ *    must be in the list (one that is not would only fail) and must not be
+ *    Bluetooth — an unnamed one counts as Bluetooth, as it does for the
+ *    warm hold (./capture-warm). The system default plays no part here:
+ *    the one way such an open reaches it is the last resort of a failed
+ *    open, and ``beginColdCapture`` holds that back until the fresh list
+ *    has confirmed the choice — where the sequential order takes it too.
+ *
+ * The graph branch opens only the output. An AudioContext playing to a
+ * headset in A2DP leaves it in A2DP — HFP is switched on by opening the
+ * headset's microphone — so the graph needs no condition of its own.
  *
  * Anything else takes the sequential order, which reads the list first
  * and opens only what it chooses.
@@ -147,10 +162,15 @@ export interface ColdCapturePlanInput {
 export function planColdCapture(input: ColdCapturePlanInput): ColdCapturePlan {
   if (!input.listCurrent) return { mode: "sequential", reason: "list-not-current" };
   if (!input.devices.some((d) => d.label.trim())) return { mode: "sequential", reason: "list-unnamed" };
-  if (isBluetoothInputLabel(input.choiceLabel)) return { mode: "sequential", reason: "bluetooth-choice" };
-  if (isBluetoothInputLabel(systemDefaultInput(input.devices)?.label ?? "")) {
-    return { mode: "sequential", reason: "bluetooth-default" };
+  if (opensSystemDefault(input.choiceDeviceId)) {
+    if (isBluetoothInputLabel(systemDefaultInput(input.devices)?.label ?? "")) {
+      return { mode: "sequential", reason: "bluetooth-default" };
+    }
+    return { mode: "parallel", reason: "known-list" };
   }
+  const chosen = input.devices.find((d) => d.deviceId === input.choiceDeviceId.trim());
+  if (!chosen) return { mode: "sequential", reason: "choice-not-listed" };
+  if (isBluetoothInputLabel(chosen.label)) return { mode: "sequential", reason: "bluetooth-choice" };
   return { mode: "parallel", reason: "known-list" };
 }
 
@@ -164,8 +184,13 @@ export interface ColdCaptureDeps<Stream, Graph, Choice extends MicChoiceLike> {
    * keeps the initial choice.
    */
   refreshChoice(): Promise<Choice>;
-  /** Open the microphone (bounded and retried by the caller). */
-  acquireMic(deviceId: string): Promise<Stream>;
+  /**
+   * Open the microphone (bounded and retried by the caller). The caller's
+   * last resort, once the asked device has failed, is the system default:
+   * it is tried only after ``fallbackToDefault`` resolves, and only if it
+   * resolves true.
+   */
+  acquireMic(deviceId: string, fallbackToDefault: Promise<boolean>): Promise<Stream>;
   releaseMic(stream: Stream): void;
   /** The AudioContext and the worklet module — nothing that needs the stream. */
   prepareGraph(mark: (label: string) => void): Promise<Graph>;
@@ -233,8 +258,8 @@ export function beginColdCapture<Stream, Graph, Choice extends MicChoiceLike>(
   };
   // A stream or graph that lands after the start was abandoned is
   // released on arrival, so a late open can never leave the device on.
-  const acquire = (deviceId: string): Promise<Stream> =>
-    deps.acquireMic(deviceId).then((s) => {
+  const acquire = (deviceId: string, fallbackToDefault: Promise<boolean>): Promise<Stream> =>
+    deps.acquireMic(deviceId, fallbackToDefault).then((s) => {
       if (abandoned) {
         try { deps.releaseMic(s); } catch { /* already released */ }
         throw new CaptureAbandonedError();
@@ -265,12 +290,14 @@ export function beginColdCapture<Stream, Graph, Choice extends MicChoiceLike>(
   const mic = parallel ? openAhead() : openInOrder();
   if (parallel) void settleGraph();
 
-  // The list first, then the one device it chooses.
+  // The list first, then the one device it chooses. That choice is made
+  // on the fresh list, so its open may fall back to the default as it
+  // always has.
   async function openInOrder(): Promise<{ stream: Stream; choice: Choice; reopened: boolean }> {
     const choice = await freshChoice();
     deps.mark("loadMics", "mic");
     if (abandoned) throw new CaptureAbandonedError();
-    const stream = await acquire(choice.deviceId);
+    const stream = await acquire(choice.deviceId, Promise.resolve(true));
     deps.mark("getUserMedia", "mic");
     return { stream, choice, reopened: false };
   }
@@ -282,10 +309,27 @@ export function beginColdCapture<Stream, Graph, Choice extends MicChoiceLike>(
   async function openAhead(): Promise<{ stream: Stream; choice: Choice; reopened: boolean }> {
     const initialId = deps.initialChoice.deviceId;
     let firstOpenAt: number | null = null;
-    const firstOpen = acquire(initialId);
+    // The plan vouched for the device the known list chose, not for the
+    // system default: should that device fail, the open falls back to the
+    // default only once the fresh list has confirmed the same choice — the
+    // moment the sequential order would have reached it.
+    let confirmChoice!: (same: boolean) => void;
+    const confirmed = new Promise<boolean>((resolve) => { confirmChoice = resolve; });
+    const firstOpen = acquire(initialId, confirmed);
     void firstOpen.then(() => { firstOpenAt = deps.now(); }, () => { /* reported below */ });
-    const choice = await freshChoice();
+    let choice: Choice;
+    try {
+      choice = await freshChoice();
+    } catch (e) {
+      // The gate has to settle whatever the list does: an early open that
+      // failed waiting on it would hang the start. ``freshChoice`` maps a
+      // rejection to the initial choice, so this is the backstop, not the
+      // contract.
+      confirmChoice(false);
+      throw e;
+    }
     const listAt = deps.now();
+    confirmChoice(!abandoned && choice.deviceId === initialId);
     if (choice.deviceId === initialId) {
       deps.mark("loadMics", "side", listAt);
       const stream = await firstOpen;
@@ -304,7 +348,7 @@ export function beginColdCapture<Stream, Graph, Choice extends MicChoiceLike>(
       releaseStream(s);
     }, () => { /* nothing to release */ });
     if (abandoned) throw new CaptureAbandonedError();
-    const stream = await acquire(choice.deviceId);
+    const stream = await acquire(choice.deviceId, Promise.resolve(true));
     deps.mark("micReopen", "mic");
     return { stream, choice, reopened: true };
   }

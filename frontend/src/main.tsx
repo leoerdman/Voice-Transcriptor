@@ -6011,19 +6011,28 @@ const MIC_ACQUIRE_ATTEMPTS = 3;
  * default device once the pinned one has failed. A stream that arrives
  * after its attempt timed out is stopped rather than leaked, so a late
  * resolution can never leave the microphone open behind our back.
+ *
+ * The fallback waits for ``fallbackToDefault`` and is skipped when it
+ * resolves false: an open made ahead of the fresh device list may reach
+ * the default only once that list has confirmed its choice
+ * (./live-start ``beginColdCapture``).
  */
-async function acquireMicStream(deviceId: string): Promise<MediaStream> {
-  const attempts: MediaStreamConstraints[] = [
-    micCaptureConstraints(deviceId),
-    micCaptureConstraints(deviceId),
-    micCaptureConstraints(""),
+async function acquireMicStream(deviceId: string, fallbackToDefault: Promise<boolean>): Promise<MediaStream> {
+  const attempts: Array<{ constraints: MediaStreamConstraints; fallback: boolean }> = [
+    { constraints: micCaptureConstraints(deviceId), fallback: false },
+    { constraints: micCaptureConstraints(deviceId), fallback: false },
+    { constraints: micCaptureConstraints(""), fallback: true },
   ].slice(0, MIC_ACQUIRE_ATTEMPTS);
 
   let lastError: unknown = null;
   for (let i = 0; i < attempts.length; i++) {
+    if (attempts[i].fallback && !(await fallbackToDefault)) {
+      console.warn("[trace startLive] microphone fallback to the system default not taken: the fresh device list did not confirm this microphone");
+      break;
+    }
     let timedOut = false;
     try {
-      const pending = navigator.mediaDevices.getUserMedia(attempts[i]);
+      const pending = navigator.mediaDevices.getUserMedia(attempts[i].constraints);
       // Stop a stream that lands after we stopped waiting for it.
       pending
         .then((late) => {
@@ -12180,7 +12189,7 @@ function beginColdLiveCapture(mic: LiveMicChoice, mark: StartMarker): LiveCaptur
   const plan = planColdCapture({
     listCurrent: knownAudioInputsCurrent(),
     devices: knownAudioInputs,
-    choiceLabel: mic.choice.label,
+    choiceDeviceId: mic.deviceId,
   });
   return {
     kind: "cold",
@@ -12197,8 +12206,8 @@ function beginColdLiveCapture(mic: LiveMicChoice, mark: StartMarker): LiveCaptur
       },
       // Bounded and retried — see acquireMicStream. A bare getUserMedia
       // hung the start outright on a busy input device.
-      acquireMic: (deviceId) => typeof navigator.mediaDevices?.getUserMedia === "function"
-        ? acquireMicStream(deviceId)
+      acquireMic: (deviceId, fallbackToDefault) => typeof navigator.mediaDevices?.getUserMedia === "function"
+        ? acquireMicStream(deviceId, fallbackToDefault)
         : Promise.reject(new Error("This browser does not support microphone capture.")),
       releaseMic: (s) => s.getTracks().forEach((t) => t.stop()),
       prepareGraph: prepareCaptureGraph,

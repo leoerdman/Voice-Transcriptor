@@ -622,7 +622,7 @@ describe("boot, update check and History bootstrap (FQ-13/FQ-14/FQ-15/FQ-22)", (
     expect(session).not.toContain("acquireMicStream(");
     // The capture branch opens the device and prepares the graph, and waits on none of them.
     const capture = mainTsxSlice("function beginLiveCapture(", "\n}\n") + mainTsxSlice("function beginColdLiveCapture(", "\n}\n");
-    expect(capture).toContain("acquireMicStream(deviceId)");
+    expect(capture).toContain("acquireMicStream(deviceId, fallbackToDefault)");
     expect(capture).toContain("prepareGraph: prepareCaptureGraph,");
     expect(capture).not.toMatch(/\bawait archiveReady|new WebSocket\(|DeferredPcmSink|readStaleLiveDraftOnce/);
     // Whether it may run ahead of a fresh device list is the one rule's

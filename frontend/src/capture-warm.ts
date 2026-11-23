@@ -171,6 +171,16 @@ export interface CaptureDeviceChoice extends CaptureDecision {
 const DEVICE_ALIAS_IDS = new Set(["default", "communications"]);
 
 /**
+ * Does asking ``getUserMedia`` for this id open the system default — the
+ * device the OS names at the moment of the open, not one the list named?
+ * True for "" and for the aliases.
+ */
+export function opensSystemDefault(deviceId: string): boolean {
+  const id = String(deviceId || "").trim();
+  return !id || DEVICE_ALIAS_IDS.has(id);
+}
+
+/**
  * Is this the Mac's own microphone? Chromium on macOS names devices with
  * their transport in parentheses — "MacBook Pro Microphone (Built-in)",
  * "Leo Liberty 5 BT (Bluetooth)" — which is the signal used first; the
@@ -225,7 +235,7 @@ export function chooseCaptureDevice(input: CaptureDeviceInput): CaptureDeviceCho
   const devices = input.devices || [];
   // The list's "Default - <name>" entry is the system default by another
   // name, not a device the user pinned.
-  if (requested && !DEVICE_ALIAS_IDS.has(requested)) {
+  if (!opensSystemDefault(requested)) {
     const picked = devices.find((d) => d.deviceId === requested);
     return { deviceId: requested, label: picked?.label || "", reason: "picked" };
   }
