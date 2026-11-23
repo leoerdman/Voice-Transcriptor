@@ -3,6 +3,23 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.40] - 2026-11-23
+
+### Removed
+
+- **Dead code and leftovers are gone.** Functions, exports, styles and compatibility wrappers that nothing called any more were removed from the engine, the window and the desktop shell; the fields and files they kept alive went with them (the old `preset` field of the upscale request — `preset_id` is the only one; the second Node version file — `.nvmrc` is the only one). Reading of your existing recordings, settings and logs from older versions is unchanged.
+- **The "backend didn't start" page** no longer shows a step from the old install scripts that is not followed by anything.
+
+## [1.6.39] - 2026-11-23
+
+### Fixed
+
+- **Files you send with `transcriptor <file> --save` land in Uploaded Media**, not in the root of the archive, and are cleaned up by the upload rule.
+- **Titles of other applications' windows no longer reach the log** — only the app's name stays.
+- **Paste on a non-QWERTY layout** works in the fallback path as well: it asks the keyboard layout where V is instead of pressing a fixed key.
+- **The player after a recording streams the file** instead of loading it whole — the same way History does.
+- **Screen mode fails honestly.** If an overlay window cannot load, the mode stops and tells you instead of staying half-alive; audio waiting for a slow connection is kept for up to 10 seconds instead of being dropped; the engine no longer freezes while it prepares the recovery copy.
+
 ## [1.6.38] - 2026-11-23
 
 ### Fixed
