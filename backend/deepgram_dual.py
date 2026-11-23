@@ -98,6 +98,7 @@ from backend.remote_deepgram_live import (
 from backend.word_case import (
     capital_is_lexical,
     cased_for_place,
+    lexical_names,
     ends_sentence,
     is_capitalised,
     starts_sentence,
@@ -1051,9 +1052,13 @@ def _settle_case(
     merged: list[dict],
     readings_of: dict[int, tuple[dict, ...]],
     context: dict[tuple, tuple[Optional[tuple], bool, bool]],
+    names: "frozenset[str]" = frozenset(),
 ) -> None:
     """Give a merged word whose case is in question the case of its
     place (``backend.word_case``); mutates ``merged`` in place.
+    ``names`` are the keyterms' names (``backend.word_case.
+    lexical_names``): a capital on one of them is the word's own even
+    where every reading had the word at a start.
 
     A word's case is in question when the readings it stands for
     disagree on it ("Же" against "же,") or when it no longer follows
@@ -1094,7 +1099,8 @@ def _settle_case(
                 or all(opens for _prev, _start, opens in own)
             ),
             lexical=capital_is_lexical(
-                (r["word"], at_start) for r, (_prev, at_start, _opens) in zip(records, own)
+                ((r["word"], at_start) for r, (_prev, at_start, _opens) in zip(records, own)),
+                names,
             ),
         )
 
@@ -1188,6 +1194,7 @@ def merge_readings(
     primary_language: str = "multi",
     secondary_language: str = DUAL_SECONDARY_LANGUAGE_DEFAULT,
     expected_languages: "Iterable[str]" = (),
+    keyterms: "Iterable[str]" = (),
 ) -> MergedReading:
     """Merge two readings of one recording into one transcript.
 
@@ -1201,6 +1208,10 @@ def merge_readings(
     also the ``source`` label each word carries — named for the first
     job so a caller cannot pass a free-form provenance string and
     silently change which stretches count as contested.
+
+    ``keyterms`` are the ones both readings were decoded with
+    (``DeepgramLiveConfig.keyterms``): the names among them keep their
+    capital wherever a merged word lands (``backend.word_case``).
     """
     primary_segments = list(primary_segments or [])
     # Read twice — flattened for the merge, and per segment for the case
@@ -1264,6 +1275,7 @@ def merge_readings(
             **_reading_context(primary_segments, primary_language),
             **_reading_context(secondary_segments, secondary_language),
         },
+        lexical_names(keyterms),
     )
     _label_speakers(merged, turns)
     return MergedReading(
@@ -1799,6 +1811,7 @@ class DualLiveSession:
             primary_language=self._primary_language,
             secondary_language=self._secondary_language,
             expected_languages=self._expected_languages,
+            keyterms=self.primary.keyterms,
         )
         self._last_merged = merged
         self.last_readings = (primary_result, secondary_result)

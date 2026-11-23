@@ -36,16 +36,23 @@ from typing import Any, Mapping
 def deepgram_word_text(word: Mapping[str, Any]) -> str:
     """Return the display spelling of a Deepgram word.
 
-    ``punctuated_word`` wins whenever it carries anything: it is the
-    same token with the formatting we asked for. ``word`` is the
-    fallback for responses that omit it (options disabled, or a
-    provider-side shape change), and an empty string is returned for
-    anything that is not a word object — callers skip falsy tokens.
+    ``punctuated_word`` wins whenever it is present: it is the same
+    token with the formatting we asked for. Present but EMPTY means the
+    formatter folded this token into a neighbour — measured 2026-11-23
+    (take ``20261123-145412``, ``ru``, ``smart_format``): "все-таки"
+    came back as ``word="все", punctuated_word=""`` followed by
+    ``word="-таки", punctuated_word="все-таки"``. Falling back to the
+    raw ``word`` there printed the folded token a second time ("все
+    все-таки"), so it yields an empty string and callers skip it.
+    ``word`` is the fallback only for responses that omit
+    ``punctuated_word`` (options disabled, or a provider-side shape
+    change), and an empty string is returned for anything that is not a
+    word object — callers skip falsy tokens.
     """
     if not isinstance(word, Mapping):
         return ""
     punctuated = word.get("punctuated_word")
-    if isinstance(punctuated, str) and punctuated.strip():
+    if isinstance(punctuated, str):
         return punctuated.strip()
     raw = word.get("word")
     if isinstance(raw, str):

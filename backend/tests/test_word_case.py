@@ -10,6 +10,7 @@ from backend.word_case import (
     cased_for_place,
     ends_sentence,
     has_own_casing,
+    lexical_names,
     starts_sentence,
     without_trailing_marks,
 )
@@ -67,6 +68,52 @@ class LexicalCapitalTests(unittest.TestCase):
         self.assertTrue(capital_is_lexical([("Deepgram", False)]))
         self.assertFalse(capital_is_lexical([("Потерял,", True)]))
         self.assertFalse(capital_is_lexical([]))
+
+
+class KeytermNameTests(unittest.TestCase):
+    """The names among the keyterms a reading was decoded with
+    (``lexical_names``). Keyterms are the owner's own list in Settings
+    and the self-filling vocabulary, as they stood on 2026-11-23."""
+
+    KEYTERMS = (
+        "Sonnet", "Opus", "Claude", "Windows", "субагент", "single source of truth",
+        "SSOT", "worktree", "коммит", "Транскриптор", "Claude Code", "Leo Erdman",
+        "Лео Эрдман", "M-Code", "Пронина",
+    )
+
+    def test_capitalised_keyterms_are_names(self):
+        names = lexical_names(self.KEYTERMS)
+        for word in ("Claude", "Opus,", "Windows.", "Code", "Erdman", "Эрдман", "Пронина"):
+            self.assertTrue(capital_is_lexical([(word, True)], names), word)
+
+    def test_lower_case_keyterms_say_nothing(self):
+        # "коммит", "worktree" and "single source of truth" were written
+        # in lower case: a capital on them at a start stays positional.
+        names = lexical_names(self.KEYTERMS)
+        for word in ("Коммит", "Worktree", "Single", "Source", "Субагент"):
+            self.assertFalse(capital_is_lexical([(word, True)], names), word)
+
+    def test_a_sentence_cased_phrase_does_not_make_its_first_word_a_name(self):
+        names = lexical_names(["Single source of truth", "заявка на Opus"])
+        self.assertFalse(capital_is_lexical([("Single", True)], names))
+        self.assertTrue(capital_is_lexical([("Opus", True)], names))
+        self.assertFalse(capital_is_lexical([("Заявка", True)], names))
+
+    def test_an_inflected_name_is_the_name(self):
+        names = lexical_names(self.KEYTERMS)
+        self.assertTrue(capital_is_lexical([("Транскриптора", True)], names))
+        self.assertTrue(capital_is_lexical([("Пронину,", True)], names))
+
+    def test_a_name_never_overrules_the_same_spelling_in_lower_case(self):
+        # Two decodes of one spelling that disagree on its case are not a
+        # name — whatever the vocabulary says ("Hub" / "hub").
+        names = lexical_names(["Hub"])
+        self.assertFalse(capital_is_lexical([("Hub", True), ("hub", False)], names))
+
+    def test_without_keyterms_a_capital_at_a_start_stays_positional(self):
+        # Negative control: the rule before the vocabulary joined it.
+        self.assertFalse(capital_is_lexical([("Claude", True)]))
+        self.assertFalse(capital_is_lexical([("Claude", True)], lexical_names(())))
 
 
 class TrailingMarksTests(unittest.TestCase):

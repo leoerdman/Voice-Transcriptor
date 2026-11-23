@@ -267,9 +267,11 @@ def _transliterate(latin: str) -> str:
     return "".join(_TRANSLIT.get(ch, ch) for ch in out)
 
 
-def _term_key(term: str) -> str:
+def term_key(term: str) -> str:
     """One key per term however it is inflected or spaced: a word's
-    grouping key, a phrase's compact key."""
+    grouping key, a phrase's compact key. Also how ``backend.word_case``
+    matches a transcript word ("Транскриптора") to a keyterm
+    ("Транскриптор")."""
     if " " in term.strip():
         return _compact_key(term)
     return _unigram_key(term.strip(), _script(term))
@@ -569,8 +571,8 @@ def rank_terms(
     seeded: list[AutoTerm] = []
     for text in builtin:
         text = text.strip()
-        key = _term_key(text)
-        if not text or any(_term_key(t.term) == key for t in seeded):
+        key = term_key(text)
+        if not text or any(term_key(t.term) == key for t in seeded):
             continue
         if " " in text:
             heard = [d.phrases[text.lower()].capitalised for d in documents
@@ -578,8 +580,8 @@ def rank_terms(
         else:
             heard = [d.unigrams[key].occurrences for d in documents if key in d.unigrams]
         seeded.append(AutoTerm(term=text, recordings=len(heard), occurrences=sum(heard)))
-    seeded_keys = {_term_key(t.term) for t in seeded}
-    mined = [term for _score, term in ranked if _term_key(term.term) not in seeded_keys]
+    seeded_keys = {term_key(t.term) for t in seeded}
+    mined = [term for _score, term in ranked if term_key(term.term) not in seeded_keys]
     return (seeded + mined)[:max_terms]
 
 

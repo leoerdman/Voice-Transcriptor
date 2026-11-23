@@ -616,6 +616,26 @@ class SpliceRecoveredWordsAlignmentTests(unittest.TestCase):
         self.assertEqual(spliced, 1)
         self.assertEqual(out[0]["text"], "сделай деплой на сервер")
 
+    def test_a_keyterm_name_opening_the_clip_keeps_its_capital(self):
+        # "Claude" opened the re-decoded clip, so its capital alone reads
+        # as positional; it is a keyterm the re-decode ran with, spelled
+        # as a name, so the capital is the word's own.
+        def run(keyterms):
+            transcript = [_segment(5.6, 7.2, [("спроси", 5.6, 6.0), ("про", 6.6, 6.8),
+                                              ("ключ", 6.8, 7.2)])]
+            return splice_recovered_words(
+                transcript,
+                [self._rec("Claude", 6.05, 6.5), self._rec("про", 6.6, 6.8)],
+                [(6.0, 6.8)],
+                keyterms=keyterms,
+            )
+        out, spliced = run(("Claude",))
+        self.assertEqual(spliced, 1)
+        self.assertEqual(out[0]["text"], "спроси Claude про ключ")
+        # Negative control: without the keyterm the capital is positional.
+        out, _spliced = run(())
+        self.assertEqual(out[0]["text"], "спроси claude про ключ")
+
     def test_a_capital_the_clip_gave_mid_sentence_is_kept(self):
         # Negative control: "Deepgram" did not open the clip; its capital
         # is the word's own.

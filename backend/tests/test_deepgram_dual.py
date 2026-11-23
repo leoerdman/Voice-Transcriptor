@@ -633,6 +633,9 @@ class _FakeLiveSession:
     is_closed: bool = False
     last_error: Optional[str] = None
     last_fatal: bool = False
+    # The keyterms the reading is decoded with; the merge reads the
+    # primary's (``DeepgramLiveSession.keyterms``).
+    keyterms: tuple = ()
     shutdown_called: bool = False
     close_called: bool = False
     discard_called: bool = False
@@ -1639,6 +1642,66 @@ class MergedCaseTests(unittest.TestCase):
         secondary = [_segment([_w("спроси", 1.0, 1.4), _w("клод", 1.5, 1.9), _w("сейчас", 1.9, 2.3)])]
         self.assertEqual(
             merge_readings(primary, secondary).text, "спроси Claude сейчас"
+        )
+
+    def test_a_keyterm_name_opening_a_final_keeps_its_capital(self):
+        # multi opened a final with "Claude" (on its own a positional
+        # capital) and ru wrote the transliteration "клод" mid-sentence:
+        # no reading capitalised it away from a start. Both readings were
+        # decoded with the keyterm "Claude" — the owner's statement that
+        # it is a name.
+        primary = [
+            _segment([_w("спроси", 1.0, 1.4)]),
+            _segment([_w("Claude", 1.5, 1.9), _w("сейчас", 1.9, 2.3)]),
+        ]
+        secondary = [_segment([
+            _w("спроси", 1.0, 1.4), _w("клод", 1.5, 1.9), _w("сейчас", 1.9, 2.3),
+        ])]
+        self.assertEqual(
+            merge_readings(primary, secondary, keyterms=("Claude", "коммит")).text,
+            "спроси Claude сейчас",
+        )
+        # Negative control: without the keyterm the capital is positional.
+        self.assertEqual(merge_readings(primary, secondary).text, "спроси claude сейчас")
+
+    def test_the_owners_claude_opening_a_multi_final_keeps_its_capital(self):
+        # Take 20261123-052024 (2026-11-23), "Я вставил свой Claude Code и
+        # Deepgram": multi opened a final with "Claude", ru read the same
+        # 4.01 s as "код". With 1.6.37's rule the merge wrote "свой
+        # claude". The readings were decoded with the owner's keyterms,
+        # among them "Claude".
+        primary = [
+            _segment([_w("агентом.", 2.64, 3.2), _w("Я", 3.2, 3.36),
+                      _w("вставил", 3.36, 3.68), _w("свой", 3.68, 3.92)]),
+            _segment([_w("Claude", 4.01, 4.57), _w("и", 4.73, 4.97),
+                      _w("Deepgram.", 4.97, 5.53), _w("Можешь", 5.53, 5.77)]),
+        ]
+        secondary = [
+            _segment([_w("агентом,", 2.64, 3.28), _w("я", 3.28, 3.36),
+                      _w("вставил", 3.36, 3.68), _w("свой", 3.68, 3.92)]),
+            _segment([_w("код", 4.01, 4.73), _w("Deepgram,", 4.73, 5.53),
+                      _w("можешь", 5.53, 5.85)]),
+        ]
+        self.assertEqual(
+            merge_readings(
+                primary, secondary, keyterms=("Sonnet", "Opus", "Claude", "коммит")
+            ).text,
+            "агентом. Я вставил свой Claude и Deepgram. Можешь",
+        )
+
+    def test_a_lower_case_keyterm_keeps_no_positional_capital(self):
+        # The same readings, the keyterm written in lower case: no
+        # statement that the word is a name.
+        primary = [
+            _segment([_w("спроси", 1.0, 1.4)]),
+            _segment([_w("Claude", 1.5, 1.9), _w("сейчас", 1.9, 2.3)]),
+        ]
+        secondary = [_segment([
+            _w("спроси", 1.0, 1.4), _w("клод", 1.5, 1.9), _w("сейчас", 1.9, 2.3),
+        ])]
+        self.assertEqual(
+            merge_readings(primary, secondary, keyterms=("claude",)).text,
+            "спроси claude сейчас",
         )
 
     def test_a_capital_owed_to_opening_a_final_is_lowered(self):

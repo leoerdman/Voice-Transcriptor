@@ -77,6 +77,7 @@ from backend.word_case import (
     capital_is_lexical,
     cased_for_place,
     ends_sentence,
+    lexical_names,
     place_in_reading,
     starts_sentence,
     without_read_place,
@@ -400,6 +401,33 @@ INTERIM_FALLBACK_SOURCE = "interim-fallback"
 # ``DeepgramLiveSession._standing_hypothesis_words`` and stripped there,
 # before any word reaches a transcript.
 _HYPOTHESIS_KEY = "_hypothesis"
+# The words either side of a retained word in the hypothesis it came
+# from, as ``(previous, next)`` bare ``word``/``start``/``end`` copies
+# (``None`` at an edge). Read by ``covering_word``: a later word that
+# IS one of these neighbours is not a spelling of this word. Stamped on arrival because the purge and
+# the evictions remove those neighbours from the pool long before the
+# word is judged. Internal like ``_HYPOTHESIS_KEY`` and stripped with it.
+_NEIGHBOURS_KEY = "_neighbours"
+_INTERNAL_WORD_KEYS = frozenset((_HYPOTHESIS_KEY, _NEIGHBOURS_KEY))
+
+
+def with_neighbours(words: list[dict]) -> list[dict]:
+    """Copies of one decode's words, each stamped with the words either
+    side of it in that decode (``_NEIGHBOURS_KEY``)."""
+    bare = [
+        {"word": w.get("word"), "start": w.get("start"), "end": w.get("end")}
+        for w in words
+    ]
+    return [
+        {
+            **w,
+            _NEIGHBOURS_KEY: (
+                bare[i - 1] if i > 0 else None,
+                bare[i + 1] if i + 1 < len(bare) else None,
+            ),
+        }
+        for i, w in enumerate(words)
+    ]
 
 
 def decoded_end_sec(segments: Iterable[dict]) -> float:
@@ -507,19 +535,81 @@ def covering_word(word: dict, later_words: Iterable[dict]) -> Optional[dict]:
     that audio and still owns it. A 0.1 s filler in the middle of a
     0.6 s word still does not amount to having transcribed it either
     way, so the fraction is checked both ways rather than dropped.
+
+    Overlap is evidence that two records touch, not that they are one
+    word, and it fails in one shape: the later decode stretched this
+    word's NEIGHBOUR over its time. That neighbour is a word the older
+    decode heard too, beside this one, so it is no rival spelling of
+    this word — the rule ``deepgram_dual._pairs`` measured on "он не
+    должен" (a word whose time is best explained by a word that has its
+    own counterpart is not that word's spelling) and the "трёх"/"в"
+    shape of session a9fd3fd9. Every retained interim word carries its
+    neighbours in its own hypothesis (``_NEIGHBOURS_KEY``), so:
+
+    * a later word that is the same spoken word as one of them is never
+      the rival;
+    * when such a word is also the later word overlapping this one MOST,
+      the answer is ORDER, as in ``deepgram_recovery``'s alignment: the
+      later decode's word on this word's side of that neighbour sits in
+      this word's slot and answers for it (a re-timed "в" beside a
+      stretched "песню", 2026-11-23 ``20261123-173438``); when there is
+      none, or it is this word's OTHER neighbour, the later decode left
+      the slot empty and nothing covers this word.
+
+    A later word's own neighbours are its stamp when it is a retained
+    interim word, and its place in ``later_words`` (one final's word
+    list, in order) otherwise. A word with no stamp — a caller that
+    built records by hand — has no neighbours and gets the overlap rule
+    alone.
     """
+    later = list(later_words)
+    own_neighbours = word.get(_NEIGHBOURS_KEY) or (None, None)
+
+    def _neighbour_side(other: dict) -> Optional[int]:
+        """0/1 when ``other`` is this word's previous/next neighbour."""
+        for side, neighbour in enumerate(own_neighbours):
+            if neighbour is not None and _same_spoken_word(neighbour, other):
+                return side
+        return None
+
     duration = word_duration(word)
-    for other in later_words:
+    rival: Optional[dict] = None
+    best_index = -1
+    best_overlap = 0.0
+    for index, other in enumerate(later):
         if _same_spoken_word(word, other):
             return other
         overlap = time_overlap(word, other)
         if overlap <= 0:
             continue
-        if overlap >= SPLICE_COVERAGE_OVERLAP_FRACTION * duration:
-            return other
-        if overlap >= SPLICE_COVERAGE_OVERLAP_FRACTION * word_duration(other):
-            return other
-    return None
+        if overlap > best_overlap:
+            best_index, best_overlap = index, overlap
+        if rival is None and _neighbour_side(other) is None and (
+            overlap >= SPLICE_COVERAGE_OVERLAP_FRACTION * duration
+            or overlap >= SPLICE_COVERAGE_OVERLAP_FRACTION * word_duration(other)
+        ):
+            rival = other
+    if best_index < 0:
+        return None
+    best = later[best_index]
+    side = _neighbour_side(best)
+    if side is None:
+        return rival
+    # The later decode put this word's NEIGHBOUR over its time. What the
+    # later decode says about the word itself is in ORDER: the word it
+    # carries on this word's side of that neighbour is in this word's
+    # slot, unless it is this word's OTHER neighbour.
+    best_neighbours = best.get(_NEIGHBOURS_KEY) or (
+        later[best_index - 1] if best_index > 0 else None,
+        later[best_index + 1] if best_index + 1 < len(later) else None,
+    )
+    in_slot = best_neighbours[1 - side]
+    if in_slot is None or _neighbour_side(in_slot) is not None:
+        return None
+    gap = max(as_float(word.get("start")), as_float(in_slot.get("start"))) - min(
+        as_float(word.get("end")), as_float(in_slot.get("end"))
+    )
+    return in_slot if gap <= INTERIM_WORD_GAP_SPLIT_SEC else None
 
 
 def final_words_cover(word: dict, final_words: Iterable[dict]) -> bool:
@@ -1079,7 +1169,11 @@ class SpliceOutcome:
 
 
 def splice_words_into_segments(
-    segments: "Iterable[dict]", words: "Iterable[dict]", *, source: str
+    segments: "Iterable[dict]",
+    words: "Iterable[dict]",
+    *,
+    source: str,
+    keyterms: "Iterable[str]" = (),
 ) -> SpliceOutcome:
     """Fold ``words`` into ``segments`` by time, guarded.
 
@@ -1100,12 +1194,15 @@ def splice_words_into_segments(
     This is the ONE place that happens for every inserted word — the
     live session's interim words and the recovery pass's re-decoded
     words alike — so callers hand in words as they were read
-    (``backend.word_case.as_read``) and nothing else.
+    (``backend.word_case.as_read``) and nothing else, plus the
+    ``keyterms`` they were decoded with (``DeepgramLiveConfig.keyterms``),
+    whose names keep their capital (``backend.word_case.lexical_names``).
 
     The returned list is a new list; the segments themselves are the
     caller's own dicts, mutated in place where a word was inserted.
     """
     out = list(segments)
+    names = lexical_names(keyterms)
     ordered = sorted(
         words, key=lambda w: (as_float(w.get("start")), as_float(w.get("end")))
     )
@@ -1132,7 +1229,7 @@ def splice_words_into_segments(
             placed[id(record)] = place_in_reading(word)
             inserted += 1
     if not outside:
-        _settle_placed_words(out, placed, own_starts)
+        _settle_placed_words(out, placed, own_starts, names)
         return SpliceOutcome(segments=out, inserted=inserted)
 
     groups: list[list[dict]] = [[outside[0]]]
@@ -1165,7 +1262,7 @@ def splice_words_into_segments(
         if group:
             trimmed_groups.append(group)
     if not trimmed_groups:
-        _settle_placed_words(out, placed, own_starts)
+        _settle_placed_words(out, placed, own_starts, names)
         return SpliceOutcome(segments=out, inserted=inserted)
 
     fallback_segments = []
@@ -1193,7 +1290,7 @@ def splice_words_into_segments(
         [*out, *fallback_segments],
         key=lambda s: (as_float(s.get("start")), as_float(s.get("end"))),
     )
-    _settle_placed_words(out, placed, own_starts)
+    _settle_placed_words(out, placed, own_starts, names)
     return SpliceOutcome(
         segments=out,
         inserted=inserted,
@@ -1221,6 +1318,7 @@ def _settle_placed_words(
     segments: "list[dict]",
     placed: "dict[int, ReadPlace]",
     own_starts: "dict[int, bool]",
+    names: "frozenset[str]" = frozenset(),
 ) -> None:
     """The case and punctuation of the places a splice changed
     (``backend.word_case``); mutates ``segments`` in place.
@@ -1232,7 +1330,9 @@ def _settle_placed_words(
     * a capital it had at a start of that text is positional: in the
       transcript it is capitalised at a sentence start and lowered
       elsewhere. A capital that text gave it mid-sentence is the word's
-      own ("Claude") and stays; casing like "API" is never touched;
+      own and stays, and so does one on a word ``names`` holds (the
+      keyterms' names, ``backend.word_case.lexical_names``): "Claude"
+      opening a hypothesis. Casing like "API" is never touched;
     * the trailing marks of that text's LAST word are where the text was
       cut, not where the speaker paused — they are dropped unless the
       word also ends the transcript. Marks between two words of one
@@ -1272,7 +1372,7 @@ def _settle_placed_words(
                 sentence_start=starts_sentence(
                     str(previous.get("word") or "") if previous is not None else None
                 ),
-                lexical=capital_is_lexical([(token, at_start)]),
+                lexical=capital_is_lexical([(token, at_start)], names),
             )
             if place is not None and place.last and position + 1 < len(walk):
                 settled = without_trailing_marks(settled)
@@ -2795,8 +2895,10 @@ class DeepgramLiveSession:
         gone) — 2026-09-03, session a9fd3fd9, where "трёх" lived only
         in an interim and never reached the user. Nothing in the log
         told the two shapes apart, so the rule could not be fixed from
-        evidence. This IS that evidence and only that: the rule is
-        unchanged.
+        evidence. This IS that evidence and only that. (The rule no
+        longer lets a stretched NEIGHBOUR overrule a word — see
+        ``covering_word`` — so what is recorded here is a word whose
+        time the later decode really spelled otherwise.)
 
         It has to be recorded at the moment of the drop, because that
         is the only moment both words exist together — the eviction
@@ -2855,7 +2957,9 @@ class DeepgramLiveSession:
     ) -> list[dict]:
         """The retained interim words (current and orphaned) that no
         NEWER hypothesis's standing word answers for, in time order and
-        without their hypothesis stamp.
+        without their hypothesis stamp. Each keeps its neighbours
+        (``_NEIGHBOURS_KEY``), because the finals still judge it after
+        this (``covering_word``); the splice strips them.
 
         Deepgram's interims are rolling re-decodes, and the pool keeps
         the words of every one of them that a newer one did not repeat
@@ -2961,7 +3065,9 @@ class DeepgramLiveSession:
                 continue
             if self._word_covered_by_spanless_final(word):
                 continue
-            survivors.append(word)
+            survivors.append(
+                {k: v for k, v in word.items() if k not in _INTERNAL_WORD_KEYS}
+            )
         if not survivors:
             return 0
 
@@ -2971,7 +3077,10 @@ class DeepgramLiveSession:
         # WHICH hypotheses deserve placing, which is what everything
         # above does.
         outcome = splice_words_into_segments(
-            self._finalized_segments, survivors, source=INTERIM_FALLBACK_SOURCE
+            self._finalized_segments,
+            survivors,
+            source=INTERIM_FALLBACK_SOURCE,
+            keyterms=self._cfg.keyterms,
         )
         self._finalized_segments = outcome.segments
         if outcome.appended:
@@ -2988,6 +3097,16 @@ class DeepgramLiveSession:
                 "deepgram-live: spliced %d uncovered interim word(s) back "
                 "into the finals that omitted them",
                 outcome.inserted,
+            )
+        if outcome.total != len(survivors):
+            # A word nothing covers can still find no room beside the
+            # finals (a final word stretched over its time) — the other
+            # way a heard word goes missing, counted as the recovery
+            # pass counts it (BL-02: never the dictated words).
+            self._log.info(
+                "deepgram-live: %d uncovered interim word(s) had no room "
+                "beside the finals",
+                len(survivors) - outcome.total,
             )
         return outcome.total
 
@@ -3531,6 +3650,12 @@ class DeepgramLiveSession:
         if self._fatal_at_bytes is None:
             return None
         return self._streamed_seconds(self._fatal_at_bytes)
+
+    @property
+    def keyterms(self) -> "tuple[str, ...]":
+        """The keyterms this reading is decoded with — the ones on the
+        wire (``DeepgramLiveConfig.keyterms``)."""
+        return self._cfg.keyterms
 
     @property
     def endpointing_sec(self) -> float:
@@ -4168,7 +4293,7 @@ class DeepgramLiveSession:
         # instead (measured 2026-11-23: "деплой Потерял, Посмотри").
         new_words = [
             {**w, _HYPOTHESIS_KEY: self.stats.segments_interim}
-            for w in as_read(message_words)
+            for w in with_neighbours(as_read(message_words))
         ]
         self._interim_ring.append((round(start, 3), round(end, 3), text))
         # Record where the service actually heard WORDS. The message span

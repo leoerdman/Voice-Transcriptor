@@ -515,7 +515,12 @@ async def recover_spans(
             )
             return readings[0]
         return _merge_recovery_readings(
-            readings[0], partner, language, languages[1], expected_languages=language_hints
+            readings[0],
+            partner,
+            language,
+            languages[1],
+            expected_languages=language_hints,
+            keyterms=keyterms,
         )
 
     tasks = [
@@ -571,6 +576,7 @@ def _merge_recovery_readings(
     secondary_language: str,
     *,
     expected_languages: "tuple[str, ...]" = (),
+    keyterms: "tuple[str, ...]" = (),
 ) -> list[dict]:
     """Two re-decodes of one span, merged by the live readings' own rules."""
     def _as_segment(words: list[dict]) -> list[dict]:
@@ -589,6 +595,7 @@ def _merge_recovery_readings(
         primary_language=primary_language,
         secondary_language=secondary_language,
         expected_languages=expected_languages,
+        keyterms=keyterms,
     )
     # Provenance on the wire is "recovery" whichever reading a word came
     # from — that is what the envelope's segment ``source`` promises.
@@ -599,6 +606,8 @@ def splice_recovered_words(
     segments: Sequence[dict],
     words: Sequence[dict],
     spans: Sequence[tuple[float, float]],
+    *,
+    keyterms: Sequence[str] = (),
 ) -> tuple[list[dict], int]:
     """Place recovered words into the assembled transcript.
 
@@ -607,6 +616,8 @@ def splice_recovered_words(
     span, and the transcript already has a sequence of words over the
     same ground, so which recovered words are new is decided by aligning
     the two sequences (``_fresh_recovered_words``) — not by time alone.
+    ``keyterms`` are the ones the re-decode ran with (``cfg.keyterms``):
+    the splice keeps the capital of the names among them.
 
     Time alone is what lost a spoken word (2026-11-23, take
     ``20261123-173222``): the span 7.93-8.86 s re-decoded as "Потерял,"
@@ -666,7 +677,7 @@ def splice_recovered_words(
     # are the splice's (``backend.word_case`` — one rule for every
     # inserted word, the live interim splice's too).
     outcome = splice_words_into_segments(
-        segments, fresh, source=RECOVERY_SOURCE
+        segments, fresh, source=RECOVERY_SOURCE, keyterms=keyterms
     )
     if outcome.total != len(fresh):
         logger.info(
@@ -958,7 +969,9 @@ async def run_recovery(
         transcribe=transcribe,
         secondary_language=secondary_language,
     )
-    segments, spliced = splice_recovered_words(segments, words, spans)
+    segments, spliced = splice_recovered_words(
+        segments, words, spans, keyterms=cfg.keyterms
+    )
     report = RecoveryReport(
         spans=list(spans),
         ms=(time.perf_counter() - started) * 1000.0,

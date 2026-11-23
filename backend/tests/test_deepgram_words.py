@@ -39,12 +39,18 @@ class DeepgramWordTextTests(unittest.TestCase):
         # smart_format/punctuate disabled, or a provider-side shape change.
         self.assertEqual(deepgram_word_text({"word": "четыре"}), "четыре")
 
-    def test_an_empty_punctuated_field_falls_back(self) -> None:
+    def test_an_empty_punctuated_field_is_a_token_the_formatter_folded(self) -> None:
+        # Real ``ru`` response, take 20261123-145412: smart_format folds
+        # "все" into the next token's "все-таки" and leaves it empty.
         self.assertEqual(
-            deepgram_word_text({"word": "четыре", "punctuated_word": ""}), "четыре"
+            deepgram_word_text({"word": "все", "punctuated_word": ""}), ""
         )
         self.assertEqual(
-            deepgram_word_text({"word": "четыре", "punctuated_word": "   "}), "четыре"
+            deepgram_word_text({"word": "-таки", "punctuated_word": "все-таки"}),
+            "все-таки",
+        )
+        self.assertEqual(
+            deepgram_word_text({"word": "четыре", "punctuated_word": "   "}), ""
         )
 
     def test_surrounding_whitespace_is_trimmed(self) -> None:

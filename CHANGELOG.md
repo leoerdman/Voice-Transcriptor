@@ -3,6 +3,14 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.38] - 2026-11-23
+
+### Fixed
+
+- **A word is no longer dropped as a "spelling" of its neighbour.** When a later reading stretched the next word over a short one ("text. lab", "песню в"), the short word was taken for another spelling of it and removed. Now a later word that is the word's own neighbour never replaces it, and word order decides where timing is ambiguous.
+- **No more "все все-таки".** Deepgram's formatter folds some tokens into the next one (hyphenated words, numbers) and leaves them empty; the empty token is now skipped instead of printed again.
+- **Names you dictate keep their capital at the start of a filled-in piece** ("свой Claude Code", not "свой claude Code") when the name is in your vocabulary (your keyterms or the automatic vocabulary — the same list that goes to Deepgram).
+
 ## [1.6.37] - 2026-11-23
 
 ### Fixed

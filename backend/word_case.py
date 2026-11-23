@@ -32,8 +32,9 @@ assembled text:
   sentence) it is capitalised;
 * elsewhere it is lower-cased — unless the capital is evidence about the
   WORD (``capital_is_lexical``): some reading capitalised it away from
-  a sentence start, and no reading wrote the same spelling in lower
-  case;
+  a sentence start, or capitalised a word the owner's vocabulary spells
+  as a name (``lexical_names``), and no reading wrote the same spelling
+  in lower case;
 * a token whose casing is not a plain leading capital ("API",
   "DeepGram", "iPhone") is never touched: that casing is the word's own.
 
@@ -56,11 +57,36 @@ paused. ``as_read`` records each word's place in the text it was read
 in, the splice reads it back (``place_in_reading``) once the word has a
 place in the transcript, and ``cased_for_place`` and
 ``without_trailing_marks`` decide the rest.
+
+Names the owner declared
+------------------------
+One reading alone cannot tell a name from a positional capital when the
+name OPENS the text it was read in: "Claude" first in an interim
+hypothesis or a re-decoded clip reads exactly like "Потерял" first in
+one. The product already holds the owner's statement of which words are
+names — the Deepgram keyterms (``backend.deepgram_keyterms.
+configured_keyterms``: the Settings list and the self-filling vocabulary
+of ``backend.auto_keyterms``, which offers a word as a name only when the
+archive capitalises it mid-sentence nearly every time). Those keyterms
+are what the reading was decoded WITH, and Deepgram writes them in their
+keyterm spelling: in the owner's archive since 2026-11-10, mid-sentence,
+"Claude" 207 times against "claude" 3, "Opus" 97 against 0, "Canvas" 64
+against 3. So a capital on a word that a keyterm spells with one is the
+capital the decoder gives that word anywhere, and the callers pass the
+very keyterms the request carried (``DeepgramLiveConfig.keyterms``) —
+no second list. ``lexical_names`` reads them conservatively: it only
+ever KEEPS a capital (a lower-case keyterm such as "коммит" or
+"worktree" says nothing, and nothing here capitalises a word), a phrase
+counts only when spelled as a name ("Claude Code", not "Single source of
+truth"), and a reading that wrote the same spelling in lower case still
+overrules it.
 """
 
 from __future__ import annotations
 
-from typing import Iterable, NamedTuple, Optional, Sequence
+from typing import AbstractSet, Iterable, NamedTuple, Optional, Sequence
+
+from backend.auto_keyterms import term_key
 
 # Marks that end a sentence, and the closing marks that may follow one
 # ("…сказал.»").
@@ -108,7 +134,51 @@ def _core(token: str) -> str:
     return "".join(ch for ch in token if ch.isalpha()).casefold()
 
 
-def capital_is_lexical(readings: Iterable[tuple[str, bool]]) -> bool:
+def _bare(token: str) -> str:
+    """The token without the marks around it ("«Claude»," → "Claude")."""
+    start, end = 0, len(token)
+    while start < end and not token[start].isalnum():
+        start += 1
+    while end > start and not token[end - 1].isalnum():
+        end -= 1
+    return token[start:end]
+
+
+def _name_key(token: str) -> str:
+    """The key a word is matched to a name by: case-blind, inflection-
+    blind (``backend.auto_keyterms.term_key`` — the key the vocabulary
+    itself groups a word's forms under)."""
+    return term_key(_bare(token))
+
+
+def lexical_names(keyterms: Iterable[str]) -> frozenset[str]:
+    """The words the owner's keyterms spell as names (see the module
+    docstring), as the keys ``capital_is_lexical`` matches.
+
+    A keyterm word counts when it is capitalised and that capital is not
+    merely a phrase's sentence-case opening: a one-word keyterm
+    ("Claude", "Транскриптор") and every word of a phrase spelled word
+    by word as a name ("Claude Code", "Leo Erdman") count; the first
+    word of "Single source of truth" does not, a capitalised later word
+    of a phrase ("заявка на Opus") does. Lower-case keyterms ("коммит")
+    contribute nothing.
+    """
+    names: set[str] = set()
+    for term in keyterms:
+        words = [w for w in (_bare(t) for t in str(term or "").split()) if w]
+        if not words:
+            continue
+        titled = all(is_capitalised(w) for w in words)
+        for index, word in enumerate(words):
+            if is_capitalised(word) and (index > 0 or titled):
+                names.add(_name_key(word))
+    return frozenset(names)
+
+
+def capital_is_lexical(
+    readings: Iterable[tuple[str, bool]],
+    names: AbstractSet[str] = frozenset(),
+) -> bool:
     """Is a capital evidence about the WORD rather than its position?
 
     ``readings`` holds, per reading that has the word, its token there
@@ -120,7 +190,10 @@ def capital_is_lexical(readings: Iterable[tuple[str, bool]]) -> bool:
     anywhere else is the word's own: one reading that capitalised it
     away from a start makes it a name — "Claude" in ``multi`` keeps its
     capital against ``ru``'s transliterated "клод", which is a different
-    spelling and says nothing about this one's case. The one thing that
+    spelling and says nothing about this one's case. At a start, a
+    capital is the word's own when the word is one of ``names``
+    (``lexical_names`` of the keyterms the reading was decoded with):
+    "Claude" opening an interim hypothesis. The one thing that
     overrules it is a reading that wrote the SAME word in lower case:
     two decodes of one spelling that disagree on its case are not a
     name. Measured 2026-11-23 (``20261123-173206``): ``multi`` wrote
@@ -129,7 +202,8 @@ def capital_is_lexical(readings: Iterable[tuple[str, bool]]) -> bool:
     readings = list(readings)
     named = {
         _core(token) for token, at_start in readings
-        if is_capitalised(token) and not at_start
+        if is_capitalised(token)
+        and (not at_start or (names and _name_key(token) in names))
     }
     if not named:
         return False

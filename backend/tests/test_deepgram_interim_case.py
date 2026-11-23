@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import unittest
 
-from backend.remote_deepgram_live import DeepgramLiveSession
+from backend.remote_deepgram_live import DeepgramLiveConfig, DeepgramLiveSession
 
 
 def _words(words: list[tuple[str, float, float]]) -> list[dict]:
@@ -42,8 +42,14 @@ def _results(words: list[tuple[str, float, float]], *, final: bool) -> dict:
 
 
 class InterimWordCaseTests(unittest.TestCase):
-    def _transcript(self, *messages: tuple[str, list[tuple[str, float, float]]]) -> str:
-        session = DeepgramLiveSession(api_key="k")
+    def _transcript(
+        self,
+        *messages: tuple[str, list[tuple[str, float, float]]],
+        keyterms: tuple[str, ...] = (),
+    ) -> str:
+        session = DeepgramLiveSession(
+            api_key="k", config=DeepgramLiveConfig(keyterms=keyterms)
+        )
         for kind, words in messages:
             session._process_deepgram_message(_results(words, final=kind == "final"))
         session._splice_uncovered_interim_words()
@@ -76,6 +82,31 @@ class InterimWordCaseTests(unittest.TestCase):
             ("final", [("ключ.", 4.0, 4.4)]),
         )
         self.assertEqual(text, "Я спросил Claude про Deepgram API ключ.")
+
+    def test_a_keyterm_name_opening_a_hypothesis_keeps_its_capital(self):
+        # "Claude" opened the hypothesis, so on its own its capital reads
+        # as positional. It is a keyterm the session was decoded with,
+        # spelled as a name: its capital is the word's own.
+        messages = (
+            ("final", [("Я", 0.0, 0.2), ("спросил", 0.3, 0.8)]),
+            ("interim", [("Claude", 1.2, 1.5)]),
+            ("final", [("про", 1.9, 2.1), ("ключ.", 2.2, 2.6)]),
+        )
+        self.assertEqual(
+            self._transcript(*messages, keyterms=("Claude", "коммит")),
+            "Я спросил Claude про ключ.",
+        )
+        # Negative control: without the keyterm the capital is positional.
+        self.assertEqual(self._transcript(*messages), "Я спросил claude про ключ.")
+
+    def test_a_lower_case_keyterm_does_not_keep_a_positional_capital(self):
+        text = self._transcript(
+            ("final", [("Сделай", 0.0, 0.4)]),
+            ("interim", [("Коммит", 0.8, 1.2)]),
+            ("final", [("и", 1.6, 1.7), ("пуш.", 1.8, 2.2)]),
+            keyterms=("Claude", "коммит"),
+        )
+        self.assertEqual(text, "Сделай коммит и пуш.")
 
     def test_an_interim_word_at_a_sentence_start_is_capitalised(self):
         # Read mid-hypothesis in lower case; in the transcript it follows
