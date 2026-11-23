@@ -458,14 +458,16 @@ class RecordingNameTests(_IsolatedMainCase):
         self.assertIn("updated", existing.read_text(encoding="utf-8"))
 
     def test_failed_text_save_does_not_register_archive_dir(self):
-        target = Path(self._tmp.name) / "custom-recordings"
-        target.mkdir()
+        target = (Path(self._tmp.name) / "custom-recordings"
+                  / self.main.RECORDING_COLLECTION_DIR_NAMES[self.main.RECORDING_COLLECTION_LIVE])
+        target.mkdir(parents=True)
 
         with mock.patch.object(self.main, "_atomic_write_text", side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
                 self.main.save_recording({
                     "recorded_at_ms": RECORDED_AT_MS,
                     "archive_dir": str(target),
+                    "recording_collection": self.main.RECORDING_COLLECTION_LIVE,
                     "title": "Will fail",
                     "source_text": "source",
                     "transcript_text": "transcript",
@@ -879,8 +881,9 @@ class RecordingNameTests(_IsolatedMainCase):
         self.assertIn("updated", existing.read_text(encoding="utf-8"))
 
     def test_failed_audio_save_does_not_register_archive_dir(self):
-        target = Path(self._tmp.name) / "custom-audio-recordings"
-        target.mkdir()
+        target = (Path(self._tmp.name) / "custom-audio-recordings"
+                  / self.main.RECORDING_COLLECTION_DIR_NAMES[self.main.RECORDING_COLLECTION_LIVE])
+        target.mkdir(parents=True)
 
         async def failing_writer(_tmp_audio: Path) -> None:
             raise OSError("disk full")
@@ -899,7 +902,7 @@ class RecordingNameTests(_IsolatedMainCase):
                 provider="local",
                 model="small",
                 language="ru",
-                recording_collection="",
+                recording_collection=self.main.RECORDING_COLLECTION_LIVE,
                 live_session_id="",
             ))
 
@@ -1213,8 +1216,9 @@ class RecordingNameTests(_IsolatedMainCase):
         # save) and every retry in the same second was pushed to a
         # suffixed name. The clock is held in one second throughout, so
         # every attempt below asks for the same name.
-        target = Path(self._tmp.name) / "recordings"
-        target.mkdir()
+        target = (Path(self._tmp.name) / "recordings"
+                  / self.main.RECORDING_COLLECTION_DIR_NAMES[self.main.RECORDING_COLLECTION_LIVE])
+        target.mkdir(parents=True)
 
         async def failing_writer(_tmp_audio: Path) -> None:
             raise OSError("upload larger than MAX_UPLOAD_BYTES")
@@ -1232,7 +1236,7 @@ class RecordingNameTests(_IsolatedMainCase):
                     provider="local",
                     model="small",
                     language="ru",
-                    recording_collection="",
+                    recording_collection=self.main.RECORDING_COLLECTION_LIVE,
                     live_session_id="",
                 ))
 
@@ -1258,7 +1262,7 @@ class RecordingNameTests(_IsolatedMainCase):
             provider="local",
             model="small",
             language="ru",
-            recording_collection="",
+            recording_collection=self.main.RECORDING_COLLECTION_LIVE,
             live_session_id="",
         ))
         saved = [p.name for p in target.glob("*.txt")]
@@ -1285,8 +1289,9 @@ class RecordingNameTests(_IsolatedMainCase):
         self.assertEqual(placeholder("", "готово", "deepgram"), "")
 
     def test_both_save_endpoints_write_the_same_placeholder(self):
-        target = Path(self._tmp.name) / "recordings"
-        target.mkdir()
+        target = (Path(self._tmp.name) / "recordings"
+                  / self.main.RECORDING_COLLECTION_DIR_NAMES[self.main.RECORDING_COLLECTION_LIVE])
+        target.mkdir(parents=True)
 
         self.main.save_recording({
             "recorded_at_ms": RECORDED_AT_MS,
@@ -1295,6 +1300,7 @@ class RecordingNameTests(_IsolatedMainCase):
             "transcript_text": "",
             "provider": "deepgram",
             "archive_dir": str(target),
+            "recording_collection": self.main.RECORDING_COLLECTION_LIVE,
         })
 
         async def writer(tmp_audio: Path) -> None:
@@ -1311,7 +1317,7 @@ class RecordingNameTests(_IsolatedMainCase):
             provider="deepgram",
             model="nova-3",
             language="ru",
-            recording_collection="",
+            recording_collection=self.main.RECORDING_COLLECTION_LIVE,
             live_session_id="",
         ))
 
@@ -1558,6 +1564,7 @@ class RecordingStartNameTests(_IsolatedMainCase):
         text = self.main.save_recording({
             "recorded_at_ms": began.timestamp() * 1000,
             "title": "t", "source_text": "s", "transcript_text": "x", "provider": "local",
+            "recording_collection": self.main.RECORDING_COLLECTION_LIVE,
         })
         self.assertEqual(text["name"], "20260307-235958.txt")
 
@@ -1567,6 +1574,7 @@ class RecordingStartNameTests(_IsolatedMainCase):
         with_audio = asyncio.run(self.main._save_recording_audio_source(
             orig_name="take.wav", write_tmp_audio=write_tmp, title="t",
             recorded_at_ms=datetime(2026, 3, 8, 0, 0, 1).timestamp() * 1000,
+            recording_collection=self.main.RECORDING_COLLECTION_LIVE,
         ))
         self.assertEqual(with_audio["name"], "20260308-000001.txt")
 
@@ -1576,6 +1584,7 @@ class RecordingStartNameTests(_IsolatedMainCase):
             self.main.save_recording({
                 "recorded_at_ms": began_ms + offset, "title": "t", "source_text": "s",
                 "transcript_text": f"x{offset}", "provider": "local",
+                "recording_collection": self.main.RECORDING_COLLECTION_LIVE,
             })["name"]
             for offset in (0, 700)
         ]
@@ -1589,6 +1598,7 @@ class RecordingStartNameTests(_IsolatedMainCase):
                     self.main.save_recording({
                         "recorded_at_ms": bad, "title": "t", "source_text": "s",
                         "transcript_text": "x", "provider": "local",
+                        "recording_collection": self.main.RECORDING_COLLECTION_LIVE,
                     })
                 self.assertEqual(raised.exception.status_code, 400)
                 self.assertIn("recorded_at_ms", raised.exception.detail)
@@ -1597,6 +1607,7 @@ class RecordingStartNameTests(_IsolatedMainCase):
         first = self.main.save_recording({
             "recorded_at_ms": RECORDED_AT_MS, "title": "t", "source_text": "s",
             "transcript_text": "x", "provider": "local",
+            "recording_collection": self.main.RECORDING_COLLECTION_LIVE,
         })
         again = self.main.save_recording({
             "name": first["name"], "archive_dir": first["archive_dir"], "require_existing": True,
@@ -1618,6 +1629,7 @@ class RecordingStartNameTests(_IsolatedMainCase):
             asyncio.run(self.main._save_recording_audio_source(
                 orig_name="take.wav", write_tmp_audio=write_tmp, title="t",
                 screen_session_id="screen-20261121-034611-000", recorded_at_ms=RECORDED_AT_MS,
+                recording_collection=self.main.RECORDING_COLLECTION_SCREEN,
             ))
         self.assertEqual(seen["audio_started_at"], RECORDED_AT_MS)
 
@@ -1728,3 +1740,244 @@ class SpokenWordsTests(_IsolatedMainCase):
         for item in items:
             payload = self.main._read_recording_payload(Path(item["archive_dir"]) / item["name"], Path(item["archive_dir"]))
             self.assertEqual(payload["display_name"], item["display_name"])
+
+
+class UploadSaveCollectionTests(_IsolatedMainCase):
+    """S-4: a file brought in from outside the app is filed in Uploaded Media.
+
+    The command-line client cannot name a collection — ``cli_access`` does
+    not allow the field for its token — so the route that files a job's
+    snapshot used to leave the collection to the caller, which named none:
+    the save resolved to the archive ROOT, the pre-collection layout, and
+    no Uploaded Media rule (20 newest, nothing older than 7 days) ever
+    looked at it. That is where an 83 MB ``F8rc-ULd4_4.m4a`` and a 32 MB
+    ``audio_2026-10-31_19-02-39_loud.mp3`` stayed.
+    """
+
+    def _cli_payload(self, source: Path) -> dict:
+        """Exactly what ``backend.cli.save_to_archive`` sends."""
+        return {
+            "source_path": str(source),
+            "title": "audio_2026-10-31_19-02-39_loud",
+            "transcript_text": "готово",
+            "provider": "deepgram",
+            "model": "nova-3",
+            "language": "ru",
+            "consume_source_path": True,
+            "recorded_at_ms": RECORDED_AT_MS,
+        }
+
+    def _root(self) -> Path:
+        return (Path(self._tmp.name) / "recordings").resolve()
+
+    def test_the_command_line_body_is_one_its_token_may_send(self):
+        from backend.cli_access import CLI_SAVE_FROM_PATH_FIELDS, cli_save_request_refusal
+
+        payload = self._cli_payload(Path("/tmp/x.mp3"))
+        self.assertTrue(set(payload) <= set(CLI_SAVE_FROM_PATH_FIELDS))
+        self.assertEqual(cli_save_request_refusal(payload), "")
+        # The point of the fix: the save cannot be told where to file.
+        self.assertNotIn("recording_collection", payload)
+
+    def test_a_file_saved_from_a_path_without_a_collection_lands_in_uploaded_media(self):
+        source = self.main.UPLOADS_DIR / (
+            "2f1c4a9e-1f0e-4d3a-9b7e-0b6f0d7a1c11.audio_2026-10-31_19-02-39_loud.mp3"
+        )
+        self.main.UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        payload_bytes = b"tiny mp3 payload"
+        source.write_bytes(payload_bytes)
+        cli_request = SimpleNamespace(state=SimpleNamespace(api_caller=self.main.API_CALLER_CLI))
+
+        result = asyncio.run(self.main.save_recording_from_path(
+            request=cli_request, payload=self._cli_payload(source)
+        ))
+
+        uploads = self._root() / self.main.RECORDING_COLLECTION_DIR_NAMES[
+            self.main.RECORDING_COLLECTION_UPLOADS
+        ]
+        target = Path(result["archive_dir"])
+        self.assertEqual(target, uploads)
+        self.assertTrue((target / result["name"]).is_file())
+        self.assertEqual((target / result["audio_name"]).read_bytes(), payload_bytes)
+        self.assertFalse(source.exists(), "the save that filed the snapshot consumes it")
+        # Nothing was written beside the collection folders.
+        self.assertEqual([p.name for p in self._root().iterdir()], [uploads.name])
+        # And the folder is the one the Uploaded Media policy governs.
+        self.assertIs(
+            self.main._audio_retention_policy_for_dir(target),
+            self.main.AUDIO_RETENTION_POLICIES[self.main.RECORDING_COLLECTION_UPLOADS],
+        )
+        raw = (target / result["name"]).read_text(encoding="utf-8")
+        self.assertIn("Source file: audio_2026-10-31_19-02-39_loud.mp3", raw)
+
+    def test_a_path_save_cannot_file_another_collection(self):
+        source = Path(self._tmp.name) / "take.mp3"
+        source.write_bytes(b"tiny mp3 payload")
+
+        with self.assertRaises(self.main.HTTPException) as raised:
+            asyncio.run(self.main.save_recording_from_path(request=_RENDERER_REQUEST, payload={
+                **self._cli_payload(source), "recording_collection": "live",
+            }))
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(list(self._root().glob("**/*.txt")), [])
+
+    def test_a_new_recording_that_names_no_collection_is_refused(self):
+        with self.assertRaises(self.main.HTTPException) as raised:
+            self.main.save_recording({
+                "recorded_at_ms": RECORDED_AT_MS,
+                "title": "t",
+                "source_text": "s",
+                "transcript_text": "x",
+                "provider": "local",
+            })
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("recording_collection", raised.exception.detail)
+        self.assertEqual(list(self._root().glob("*")), [])
+
+    def test_a_new_recording_with_audio_that_names_no_collection_is_refused(self):
+        upload = self.main.UploadFile(io.BytesIO(b"tiny wav payload"), filename="take.wav", size=16)
+
+        with self.assertRaises(self.main.HTTPException) as raised:
+            asyncio.run(self.main.save_recording_with_audio(
+                recorded_at_ms=RECORDED_AT_MS,
+                file=upload,
+                name="",
+                archive_dir="",
+                require_existing=False,
+                title="t",
+                source_text="s",
+                transcript_text="x",
+                provider="local",
+                model="small",
+                language="ru",
+                recording_collection="",
+                live_session_id="",
+            ))
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(list(self._root().glob("*")), [])
+
+    def test_an_existing_recording_in_the_old_root_layout_is_edited_where_it_lies(self):
+        root = self._root()
+        root.mkdir(parents=True, exist_ok=True)
+        legacy = root / "2026-10-31_19-02-39__loud.txt"
+        legacy.write_text("Title: loud\nSaved at: 2026-10-31 19:02:39\n\n", encoding="utf-8")
+
+        result = self.main.save_recording({
+            "name": legacy.name,
+            "archive_dir": str(root),
+            "require_existing": True,
+            "title": "loud again",
+            "source_text": "s",
+            "transcript_text": "y",
+        })
+
+        self.assertEqual(result["name"], legacy.name)
+        self.assertEqual(Path(result["archive_dir"]), root)
+        self.assertIn("loud again", legacy.read_text(encoding="utf-8"))
+        self.assertFalse((root / "Live Capsule").exists(), "an edit never moves a recording")
+
+
+class OneNamePerRecordingTests(_IsolatedMainCase):
+    """P2-3: a recording's file name and its ``Title:`` are not two answers.
+
+    A stop files its take TWICE: the audio save, beside the transcript wait,
+    carries the PROVISIONAL title (the live text so far); the final save
+    then writes what the transcription pass produced. Until 1.6.36 the first
+    save also built the file name out of that provisional title
+    (``<timestamp>__<live words>``) while ``Title:`` ended up from the final
+    transcript — one entry, two different texts, e.g. the 21:44 take whose
+    file said "Искать мне эта не нужна" and whose header said "2-ой режим
+    вот такой То есть я могу".
+
+    Now the stem is the recording's START TIME and nothing else
+    (``backend/recording_names.py``), and ``Title:`` has one rule (the final
+    transcript, else the live text, else the caller's default —
+    ``frontend/src/stop-epilogue.ts``). Renaming after the final would be the
+    other way to make the two equal; it is NOT done, because a name is the
+    key of the list index (``backend/recordings_index.py``: absolute path)
+    and the scope of every minted audio URL (``_media_token_scope``) —
+    renaming would orphan both for an entry the user already has on screen.
+    """
+
+    LIVE_TEXT = "Искать мне эта не нужна"
+    FINAL_TEXT = "2-ой режим вот такой То есть я могу нарисовать вот это"
+
+    def _root(self) -> Path:
+        return (Path(self._tmp.name) / "recordings").resolve()
+
+    def test_the_final_save_keeps_the_name_and_replaces_the_title(self):
+        async def writer(tmp_audio: Path) -> None:
+            tmp_audio.write_bytes(b"RIFF" + b"\x00" * 64)
+
+        # The audio save: what the take had at stop — the live text.
+        filed = asyncio.run(self.main._save_recording_audio_source(
+            orig_name="take.wav",
+            write_tmp_audio=writer,
+            recording_collection=self.main.RECORDING_COLLECTION_SCREEN,
+            title=self.LIVE_TEXT,
+            source_text=self.LIVE_TEXT,
+            transcript_text="",
+            provider="deepgram",
+            model="nova-3",
+            language="ru",
+            recorded_at_ms=RECORDED_AT_MS,
+        ))
+        stem = Path(filed["name"]).stem
+        self.assertEqual(stem, "20261121-034611")
+        self.assertTrue(self.main.recording_names.is_recording_stem(stem))
+        for words in (self.LIVE_TEXT, self.FINAL_TEXT):
+            for word in re.findall(r"\w{3,}", words):
+                self.assertNotIn(word, stem, "the file name came from dictated text")
+
+        # The final save: the transcript the pass produced, the same entry.
+        final = self.main.save_recording({
+            "name": filed["name"],
+            "archive_dir": filed["archive_dir"],
+            "require_existing": True,
+            "recording_collection": self.main.RECORDING_COLLECTION_SCREEN,
+            "title": self.FINAL_TEXT,
+            "source_text": self.LIVE_TEXT,
+            "transcript_text": self.FINAL_TEXT,
+            "provider": "deepgram",
+            "model": "nova-3",
+            "language": "ru",
+        })
+
+        self.assertEqual(final["name"], filed["name"], "the entry keeps the name it was filed under")
+        target = Path(final["archive_dir"])
+        content = (target / final["name"]).read_text(encoding="utf-8")
+        self.assertTrue(content.startswith(f"Title: {self.FINAL_TEXT}\n"), content[:200])
+        self.assertEqual(
+            [p.name for p in target.glob(f"{stem}.*")],
+            [f"{stem}.txt", f"{stem}.wav"],
+            "the audio and the transcript of one recording share its one stem",
+        )
+
+    def test_history_names_the_entry_from_the_transcript_not_from_its_stem(self):
+        saved = self.main.save_recording({
+            "recorded_at_ms": RECORDED_AT_MS,
+            "recording_collection": self.main.RECORDING_COLLECTION_LIVE,
+            "title": self.FINAL_TEXT,
+            "source_text": "",
+            "transcript_text": self.FINAL_TEXT,
+            "provider": "deepgram",
+            "model": "nova-3",
+            "language": "ru",
+        })
+        item = self.main._build_recordings_list_payload(self._root())["items"][0]
+
+        self.assertEqual(item["name"], saved["name"])
+        self.assertNotIn(Path(saved["name"]).stem, item["display_name"])
+        self.assertTrue(
+            self.FINAL_TEXT.startswith(item["display_name"].rstrip(".")),
+            item["display_name"],
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
