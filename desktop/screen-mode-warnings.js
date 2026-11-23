@@ -22,6 +22,10 @@ const SCREEN_MODE_WARNING_COPY = Object.freeze({
     title: "Screen mode didn't start",
     body: "The recording goes on as a voice recording. See the log for the reason, then try screen mode again.",
   },
+  [SCREEN_MODE_WARNING.OVERLAY]: {
+    title: "Screen mode couldn't show the screen",
+    body: "The screen overlay failed to load, so screen mode stopped safely. The recording continues as a voice recording; try screen mode again.",
+  },
   [SCREEN_MODE_WARNING.ACCESSIBILITY]: {
     title: "Screen mode can't draw",
     body: "Allow Transcriptor in System Settings → Privacy & Security → Accessibility, then start screen mode again.",

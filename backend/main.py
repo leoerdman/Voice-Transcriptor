@@ -4976,7 +4976,8 @@ async def ws_transcribe(websocket: WebSocket):
         live_cfg = await asyncio.to_thread(load_config)
         _bind_live_transcript_scripts(websocket, live_cfg, lang_opt)
         try:
-            recovery_ctx = _open_live_recovery(
+            recovery_ctx = await asyncio.to_thread(
+                _open_live_recovery,
                 session_id=session_id,
                 started_at=started_at,
                 provider=provider,

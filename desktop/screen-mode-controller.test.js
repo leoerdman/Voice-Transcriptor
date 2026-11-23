@@ -606,9 +606,30 @@ test("no overlay that can be shown fails the start", async () => {
   try {
     const started = await world.controller.start(ID);
     assert.equal(started.ok, false);
-    assert.deepEqual(world.warnings, ["start-failed"]);
+    assert.deepEqual(world.warnings, ["overlay"]);
     assert.equal(world.children[0].stdin.destroyed, true, "the helper is stopped");
     assert.deepEqual(world.active, []);
+  } finally {
+    world.cleanup();
+  }
+});
+
+test("a failed overlay aborts immediately without waiting on the palette or leaving a live session", async () => {
+  const world = createWorld({
+    failLoad: (w) => w.opts.title === "Transcriptor Screen Mode",
+    loadGate: (w) => (w.opts.title === "Transcriptor Screen Colors" ? new Promise(() => {}) : null),
+  });
+  try {
+    const started = await world.controller.start(ID);
+    assert.equal(started.outcome, SCREEN_START_OUTCOME.FAILED);
+    assert.match(started.error, /no overlay could be shown/);
+    assert.deepEqual(world.warnings, ["overlay"]);
+    assert.deepEqual(world.active, []);
+    assert.equal(world.controller.isActive(), false);
+    assert.equal(world.visibleOverlays(), 0);
+    assert.equal(world.palette(), null);
+    assert.ok(world.logs.some((line) => line.includes("overlay failed: loadURL failed")));
+    assert.ok(screenModeWarningCopy("overlay"));
   } finally {
     world.cleanup();
   }

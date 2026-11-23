@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from unittest import mock
@@ -848,6 +849,61 @@ class DeepgramLiveFinalizeDrainTests(IsolatedBackendMainImportMixin, unittest.Is
         self.assertGreaterEqual(
             elapsed, self.main._FINALIZE_DRAIN_CEILING_SEC - 0.01
         )
+
+
+class LiveRecoveryOpenOffloadTests(IsolatedBackendMainImportMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_slow_recovery_spool_open_does_not_block_websocket_event_loop(self):
+        main = self.main
+        open_started = threading.Event()
+        open_finished = threading.Event()
+        release_open = threading.Event()
+        loop_progressed_during_open = False
+
+        def slow_open(**_kwargs):
+            open_started.set()
+            release_open.wait(timeout=1.0)
+            open_finished.set()
+            return None
+
+        class FakeWebSocket:
+            headers = {"host": "localhost"}
+            query_params = {}
+            client = type("Client", (), {"host": "127.0.0.1"})()
+
+            async def accept(self, subprotocol=None):
+                return None
+
+            async def close(self, **_kwargs):
+                return None
+
+        ws = FakeWebSocket()
+
+        async def observe_loop():
+            nonlocal loop_progressed_during_open
+            await asyncio.sleep(0.02)
+            loop_progressed_during_open = open_started.is_set() and not open_finished.is_set()
+            release_open.set()
+
+        with (
+            mock.patch.object(main, "_cleanup_live_recovery_files", return_value=None),
+            mock.patch.object(main, "_host_header_allowed", return_value=True),
+            mock.patch.object(main, "_websocket_api_token", return_value=main.API_TOKEN),
+            mock.patch.object(main, "_websocket_accept_subprotocol", return_value=None),
+            mock.patch.object(main, "_touch_rate_limit", return_value=True),
+            mock.patch.object(main, "_register_live_session"),
+            mock.patch.object(main, "_end_live_session_ownership"),
+            mock.patch.object(main, "load_config", return_value={}),
+            mock.patch.object(main, "_bind_live_transcript_scripts"),
+            mock.patch.object(main, "_open_live_recovery", side_effect=slow_open),
+            mock.patch.object(main, "_run_local_live_session", new=mock.AsyncMock()),
+        ):
+            observer = asyncio.create_task(observe_loop())
+            await asyncio.wait_for(main.ws_transcribe(ws), timeout=2.0)
+            await observer
+
+        self.assertTrue(open_started.is_set())
+        self.assertTrue(loop_progressed_during_open)
+        self.assertTrue(open_finished.is_set())
 
 
 if __name__ == "__main__":

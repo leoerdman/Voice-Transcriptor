@@ -546,7 +546,8 @@ describe("live half: one rule per fact, no dead state (FL-05/06/09/14/15/16/17/1
   it("FL-06: the pre-open buffer cap is a duration at the live sample rate, not 64 000 samples", () => {
     expect(mainTsx).not.toContain("WS_PENDING_MAX_SAMPLES");
     expect(mainTsx).toContain("LIVE_SAMPLE_RATE_HZ * WS_PENDING_MAX_SEC");
-    expect(mainTsx).toContain("wsPendingFrameSamples + ds.length <= wsPendingMaxSamples()");
+    expect(mainTsx).toContain("wsPendingFrames.enqueue(pcm, ds.length)");
+    expect(mainTsx).toContain("const WS_PENDING_MAX_SEC = 10;");
   });
 
   it("FL-17: no PCM16 encode without a socket to send it to", () => {
