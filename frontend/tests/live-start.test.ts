@@ -2,10 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import {
   beginColdCapture,
+  planColdCapture,
   runLiveStart,
   type ColdCaptureDeps,
   type ColdCaptureHandle,
+  type ColdCaptureMode,
 } from "../src/live-start";
+import { chooseCaptureDevice } from "../src/capture-warm";
 import type { StartBranch } from "../src/start-trace";
 
 /** A promise the test settles by hand. */
@@ -27,10 +30,13 @@ interface Choice { deviceId: string; reason: string }
  * The resources of a start, each answered by the test: every microphone
  * open, the device list and the graph are pending until settled.
  */
-function fakeCapture(options: { initial?: string; graphAfterMic?: boolean } = {}) {
+function fakeCapture(options: { initial?: string; mode?: ColdCaptureMode } = {}) {
   const initial = options.initial ?? "built-in";
   const events: string[] = [];
   const marks: Array<[string, StartBranch]> = [];
+  // The marks' clock, advanced by the test; ``at`` is when a mark records.
+  const clock = { now: 0 };
+  const markedAt: number[] = [];
   const opens: Array<{ deviceId: string; answer: ReturnType<typeof deferred<FakeStream>> }> = [];
   const list = deferred<Choice>();
   const graphs: Array<ReturnType<typeof deferred<FakeGraph>>> = [];
@@ -53,8 +59,9 @@ function fakeCapture(options: { initial?: string; graphAfterMic?: boolean } = {}
       return answer.promise.then((g) => { mark("audioContext"); mark("workletModule"); return g; });
     },
     releaseGraph: (g) => { g.closed = true; closedGraphs.push(g); events.push(`close:graph${g.id}`); },
-    graphAfterMic: options.graphAfterMic ?? false,
-    mark: (label, branch) => { marks.push([label, branch]); },
+    mode: options.mode ?? "parallel",
+    now: () => clock.now,
+    mark: (label, branch, at) => { marks.push([label, branch]); markedAt.push(at ?? clock.now); },
   };
   const answerOpen = (i: number) => {
     const s: FakeStream = { id: `s${i}`, deviceId: opens[i].deviceId, stopped: false };
@@ -62,7 +69,12 @@ function fakeCapture(options: { initial?: string; graphAfterMic?: boolean } = {}
     opens[i].answer.resolve(s);
     return s;
   };
-  return { deps, events, marks, opens, list, graphs, streams, closedGraphs, answerOpen };
+  /** The marks in the order of the moments they record. */
+  const timeline = () => marks
+    .map(([label, branch], i) => ({ label, branch, at: markedAt[i] }))
+    .sort((a, b) => a.at - b.at)
+    .map((m) => `${m.label}/${m.branch}@${m.at}`);
+  return { deps, events, marks, opens, list, graphs, streams, closedGraphs, answerOpen, clock, timeline };
 }
 
 describe("runLiveStart — the microphone does not wait for the session", () => {
@@ -165,8 +177,10 @@ describe("beginColdCapture — choosing, verifying and preparing", () => {
   it("opens once when the fresh list confirms the choice, whichever answers first", async () => {
     const world = fakeCapture();
     const handle = beginColdCapture(world.deps);
+    world.clock.now = 10;
     world.answerOpen(0);
     await settle();
+    world.clock.now = 25;
     world.list.resolve({ deviceId: "built-in", reason: "fresh-list" });
     world.graphs[0].resolve({ id: 1, closed: false });
     const opened = await handle.ready;
@@ -175,8 +189,8 @@ describe("beginColdCapture — choosing, verifying and preparing", () => {
     expect(opened.choice.reason).toBe("fresh-list");
     expect(world.opens).toHaveLength(1);
     // The list answered after the device: that wait is on the chain.
-    expect(world.marks.filter(([, b]) => b !== "graph").map((m) => m.join("/"))).toEqual([
-      "getUserMedia/mic", "loadMics/side", "deviceCheck/mic",
+    expect(world.timeline().filter((m) => !m.includes("/graph@"))).toEqual([
+      "getUserMedia/mic@10", "loadMics/side@25", "deviceCheck/mic@25",
     ]);
   });
 
@@ -251,19 +265,46 @@ describe("beginColdCapture — choosing, verifying and preparing", () => {
     expect(opened.stream.stopped).toBe(false);
   });
 
-  it("Bluetooth input: the graph waits for the microphone and is reported on its chain", async () => {
-    const world = fakeCapture({ graphAfterMic: true });
+  it("a first open discarded by the fresh list is off the path, even when it answered first", async () => {
+    const world = fakeCapture({ initial: "" });
     const handle = beginColdCapture(world.deps);
-    world.list.resolve({ deviceId: "built-in", reason: "fresh-list" });
-    await settle();
-    expect(world.events).not.toContain("graph");
+    world.clock.now = 40;
     world.answerOpen(0);
     await settle();
-    expect(world.events).toContain("graph");
+    world.clock.now = 55;
+    world.list.resolve({ deviceId: "usb", reason: "picked" });
+    await settle();
+    world.clock.now = 300;
+    world.answerOpen(1);
+    world.graphs[0].resolve({ id: 1, closed: false });
+    await handle.ready;
+    await settle();
+    // The reopen began when the list answered: that, not the first open,
+    // is the chain. The first open is listed beside it at its own moment.
+    expect(world.timeline().filter((m) => !m.includes("/graph@"))).toEqual([
+      "getUserMedia.discarded/side@40", "loadMics/mic@55", "micReopen/mic@300",
+    ]);
+    expect(world.streams[0].stopped).toBe(true);
+  });
+
+  it("sequential: the list is read before any open, then the device it chose, then the graph — all on the mic chain", async () => {
+    const world = fakeCapture({ mode: "sequential" });
+    const handle = beginColdCapture(world.deps);
+    await settle();
+    expect(world.events).toEqual(["list"]);
+    world.list.resolve({ deviceId: "built-in-fresh", reason: "fresh-list" });
+    await settle();
+    expect(world.events).toEqual(["list", "open:built-in-fresh"]);
+    world.answerOpen(0);
+    await settle();
+    expect(world.events).toEqual(["list", "open:built-in-fresh", "graph"]);
     world.graphs[0].resolve({ id: 1, closed: false });
     const opened = await handle.ready;
-    expect(opened.graph).not.toBeNull();
-    expect(world.marks.filter(([l]) => l === "audioContext")).toEqual([["audioContext", "mic"]]);
+    expect(opened.reopened).toBe(false);
+    expect(world.opens).toHaveLength(1);
+    expect(world.marks.map((m) => m.join("/"))).toEqual([
+      "loadMics/mic", "getUserMedia/mic", "audioContext/mic", "workletModule/mic",
+    ]);
   });
 
   it("a microphone that cannot be opened rejects and releases the graph prepared beside it", async () => {
@@ -286,5 +327,73 @@ describe("beginColdCapture — choosing, verifying and preparing", () => {
     handle.abandon();
     expect(opened.stream.stopped).toBe(false);
     expect(world.closedGraphs).toHaveLength(0);
+  });
+});
+
+describe("planColdCapture — the one rule for running ahead of a fresh device list", () => {
+  const builtIn = { deviceId: "mac", label: "MacBook Pro Microphone (Built-in)" };
+  const usb = { deviceId: "usb", label: "Shure MV7 (USB)" };
+  const headset = { deviceId: "bt", label: "Leo Liberty 5 BT (Bluetooth)" };
+  const alias = (d: { label: string }) => ({ deviceId: "default", label: `Default - ${d.label}` });
+
+  it("runs ahead only on a current, named list where neither the choice nor the default is Bluetooth", () => {
+    expect(planColdCapture({ listCurrent: true, devices: [alias(builtIn), builtIn, usb], choiceLabel: builtIn.label }))
+      .toEqual({ mode: "parallel", reason: "known-list" });
+    expect(planColdCapture({ listCurrent: false, devices: [alias(builtIn), builtIn], choiceLabel: builtIn.label }).reason)
+      .toBe("list-not-current");
+    expect(planColdCapture({ listCurrent: true, devices: [{ deviceId: "", label: "" }], choiceLabel: "" }).reason)
+      .toBe("list-unnamed");
+    expect(planColdCapture({ listCurrent: true, devices: [alias(builtIn), builtIn, headset], choiceLabel: headset.label }).reason)
+      .toBe("bluetooth-choice");
+    // A device the list cannot name counts as Bluetooth.
+    expect(planColdCapture({ listCurrent: true, devices: [alias(builtIn), builtIn], choiceLabel: "" }).reason)
+      .toBe("bluetooth-choice");
+    // The built-in mic chosen over a Bluetooth default: the default is still
+    // what a failed or default open lands on.
+    expect(planColdCapture({ listCurrent: true, devices: [alias(headset), headset, builtIn], choiceLabel: builtIn.label }).reason)
+      .toBe("bluetooth-default");
+  });
+
+  // The two ways an open ahead of the list put a Bluetooth headset into
+  // its call profile: run each through the plan and the capture together.
+  async function runStart(plan: ReturnType<typeof planColdCapture>, initial: string, fresh: string) {
+    const world = fakeCapture({ initial, mode: plan.mode });
+    const handle = beginColdCapture(world.deps);
+    await settle();
+    const before = [...world.events];
+    world.list.resolve({ deviceId: fresh, reason: "fresh-list" });
+    await settle();
+    world.answerOpen(world.opens.length - 1);
+    await settle();
+    world.graphs[0]?.resolve({ id: 1, closed: false });
+    await handle.ready;
+    return { before, world };
+  }
+
+  it("a headset that has just connected (the list not yet refreshed): no open and no graph before the fresh list, and the graph after the microphone", async () => {
+    // The known list still says built-in; the devicechange has arrived but
+    // its enumeration has not finished.
+    const plan = planColdCapture({ listCurrent: false, devices: [alias(builtIn), builtIn], choiceLabel: builtIn.label });
+    const { before, world } = await runStart(plan, "", "");
+    expect(before).toEqual(["list"]);
+    expect(world.opens.map((o) => o.deviceId)).toEqual([""]);
+    expect(world.events.indexOf("graph")).toBeGreaterThan(world.events.indexOf("open:"));
+  });
+
+  it("'Bluetooth → built-in' with a Bluetooth default: the headset's microphone is never opened", async () => {
+    const devices = [alias(headset), headset, builtIn];
+    const choice = chooseCaptureDevice({ requestedDeviceId: "", preferBuiltInOverBluetooth: true, devices });
+    expect(choice.deviceId).toBe("mac");
+    // Even on a current list: a failed open would fall back to the default.
+    const plan = planColdCapture({ listCurrent: true, devices, choiceLabel: choice.label });
+    const { before, world } = await runStart(plan, choice.deviceId, choice.deviceId);
+    expect(before).toEqual(["list"]);
+    expect(world.opens.map((o) => o.deviceId)).toEqual(["mac"]);
+    // A stale list that still names the built-in mic as the default: the
+    // default-alias open would land on the headset — not attempted either.
+    const stale = planColdCapture({ listCurrent: false, devices: [alias(builtIn), builtIn], choiceLabel: alias(builtIn).label });
+    const second = await runStart(stale, "", "mac");
+    expect(second.before).toEqual(["list"]);
+    expect(second.world.opens.map((o) => o.deviceId)).toEqual(["mac"]);
   });
 });

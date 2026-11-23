@@ -621,10 +621,18 @@ describe("boot, update check and History bootstrap (FQ-13/FQ-14/FQ-15/FQ-22)", (
     expect(session).not.toMatch(/await Promise\.race\(\[readStaleLiveDraftOnce\(\)/);
     expect(session).not.toContain("acquireMicStream(");
     // The capture branch opens the device and prepares the graph, and waits on none of them.
-    const capture = mainTsxSlice("function beginLiveCapture(", "\n}\n");
+    const capture = mainTsxSlice("function beginLiveCapture(", "\n}\n") + mainTsxSlice("function beginColdLiveCapture(", "\n}\n");
     expect(capture).toContain("acquireMicStream(deviceId)");
     expect(capture).toContain("prepareGraph: prepareCaptureGraph,");
     expect(capture).not.toMatch(/\bawait archiveReady|new WebSocket\(|DeferredPcmSink|readStaleLiveDraftOnce/);
+    // Whether it may run ahead of a fresh device list is the one rule's
+    // (./live-start planColdCapture), asked of the list's currency.
+    expect(capture).toContain("listCurrent: knownAudioInputsCurrent(),");
+    expect(capture).toContain("mode: plan.mode,");
+    expect(mainTsxSlice("async function loadMics(", "\n}\n")).toMatch(
+      /const changesBefore = audioInputChanges;\s*const devs = await navigator\.mediaDevices\.enumerateDevices\(\);\s*knownAudioInputsAfterChanges = changesBefore;/,
+    );
+    expect(mainTsx).toMatch(/"devicechange", \(\) => \{\s*releaseWarmCaptureOnLifecycle\("devicechange"\);\s*noteAudioInputsChanged\(\);/);
     // The phases stay visible in the start line, each on its branch (./start-trace).
     for (const [phase, branch] of [
       ["archiveReady", "session"], ["wsRequested", "session"], ["sessionReady", "session"],
@@ -642,17 +650,25 @@ describe("boot, update check and History bootstrap (FQ-13/FQ-14/FQ-15/FQ-22)", (
     expect(mainTsx).toContain('($("bluetoothBuiltinMicToggle") as HTMLInputElement).checked = ui.bluetooth_builtin_mic === true;');
     // A take the built-in mic barely heard says so, once per launch.
     expect(mainTsxSlice("async function stopLive(", "\nasync function ")).toContain("warnBuiltInMicBarelyHeard(captureLevel, recordedMs)");
-    const capture = mainTsxSlice("function beginLiveCapture(", "\n}\n");
+    const begin = mainTsxSlice("function beginLiveCapture(", "\n}\n");
+    const cold = mainTsxSlice("function beginColdLiveCapture(", "\n}\n");
+    const connect = mainTsxSlice("async function connectLiveCapture(", "\nasync function ");
     // One chooser, asked on both lists: the warm path reuses the hold only
     // for the device the choice names; the cold path opens that device and
     // chooses again on the freshly enumerated list (./live-start reopens
     // when the answers differ).
-    expect(capture.match(/chooseCaptureDevice\(\{/g) || []).toHaveLength(1);
-    expect(capture).toContain("const mic = chooseMic();");
-    expect(capture).toContain("const warm = takeWarmCapture(mic.deviceId);");
-    expect(capture).toContain("initialChoice: mic,");
-    expect(capture).toMatch(/refreshChoice: async \(\) => \{\s*await loadMics\(false\);\s*return chooseMic\(\);/);
-    expect(mainTsxSlice("async function connectLiveCapture(", "\nasync function ")).toContain("choice=${micChoice.reason}");
+    expect(mainTsxSlice("function chooseLiveMic(", "\n}\n").match(/chooseCaptureDevice\(\{/g) || []).toHaveLength(1);
+    expect(mainTsx.match(/chooseCaptureDevice\(\{/g) || []).toHaveLength(1);
+    expect(begin).toContain("const mic = chooseLiveMic();");
+    expect(cold).toContain("initialChoice: mic,");
+    expect(cold).toMatch(/refreshChoice: async \(\) => \{\s*await loadMics\(false\);\s*return chooseLiveMic\(\);/);
+    // The held graph is only checked at the press and taken at the connect,
+    // so a start that fails before it leaves the hold — its one owner — intact.
+    expect(begin).toContain("if (warmCaptureReusable(mic.deviceId)) {");
+    expect(begin).not.toContain("takeWarmCapture(");
+    expect(connect).toContain('const warm = capture.kind === "warm" ? takeWarmCapture(capture.mic.deviceId) : null;');
+    expect(mainTsxSlice("function abandonLiveCapture(", "\n}\n")).not.toMatch(/releaseWarmCapture|\.close\(|getTracks/);
+    expect(connect).toContain("choice=${micChoice.reason}");
     // A hot-plugged headset refreshes the list the next choice uses.
     expect(mainTsx).toMatch(/"devicechange", \(\) => \{\s*releaseWarmCaptureOnLifecycle\("devicechange"\);[\s\S]{0,200}void loadMics\(false\);/);
   });
@@ -668,11 +684,10 @@ describe("boot, update check and History bootstrap (FQ-13/FQ-14/FQ-15/FQ-22)", (
     expect(mainTsx).toContain("const next = micPreferenceFromPick(sel.value, knownAudioInputs, micPreference);");
     // Both start paths resolve the pick on the list they choose against:
     // the one chooser resolves it afresh every time it is asked.
-    const capture = mainTsxSlice("function beginLiveCapture(", "\n}\n");
-    const chooser = capture.slice(capture.indexOf("const chooseMic = (): LiveMicChoice => {"));
+    const chooser = mainTsxSlice("function chooseLiveMic(", "\n}\n");
     expect(chooser.indexOf("const micResolution = resolveRequestedMic();")).toBeGreaterThan(0);
     expect(chooser.indexOf("requestedDeviceId: micResolution.deviceId,")).toBeGreaterThan(chooser.indexOf("const micResolution = resolveRequestedMic();"));
-    expect(capture.match(/chooseMic\(\)/g) || []).toHaveLength(2);
+    expect(mainTsx.match(/resolveRequestedMic\(\)/g) || []).toHaveLength(2); // its definition and the one chooser
     expect(mainTsxSlice("async function startLive(", "\nasync function stopLive(")).not.toContain("micSelect");
     expect(mainTsxSlice("async function connectLiveCapture(", "\nasync function ")).toContain("pick=${micResolution.kind}");
     // The list is rendered from the pick, not from its previous value.

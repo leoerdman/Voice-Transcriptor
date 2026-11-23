@@ -185,6 +185,15 @@ export function isBuiltInInputLabel(label: string): boolean {
 }
 
 /**
+ * The system default input as the list names it: Chromium lists it first
+ * as the "default" alias ("Default - <name>"); without the alias, the
+ * first entry is it.
+ */
+export function systemDefaultInput<D extends InputDeviceInfo>(devices: readonly D[]): D | undefined {
+  return devices.find((d) => d.deviceId === "default") || devices[0];
+}
+
+/**
  * Which microphone a cold start records from.
  *
  * Bluetooth headphones cannot be warm-held (``decideWarmHold``: an open
@@ -220,10 +229,7 @@ export function chooseCaptureDevice(input: CaptureDeviceInput): CaptureDeviceCho
     const picked = devices.find((d) => d.deviceId === requested);
     return { deviceId: requested, label: picked?.label || "", reason: "picked" };
   }
-  // The system default: Chromium lists it first as the "default" alias
-  // ("Default - <name>"); without the alias, the first entry is it.
-  const systemDefault = devices.find((d) => d.deviceId === "default") || devices[0];
-  const defaultLabel = systemDefault?.label || "";
+  const defaultLabel = systemDefaultInput(devices)?.label || "";
   // Every "default" verdict passes the request through unchanged ("" or
   // the alias), so the device asked for is exactly what it always was.
   if (!input.preferBuiltInOverBluetooth) {

@@ -14,8 +14,13 @@
  *             and re-enumerate beside it; if the fresh list chooses
  *             another device, open that one instead;
  *   graph   — the AudioContext and the worklet module, which need no
- *             stream; for a Bluetooth input they wait for the microphone
- *             (``graphAfterMic``, see ``beginColdCapture``);
+ *             stream.
+ *
+ * Both run ahead of a fresh device list only when ``planColdCapture``
+ * says nothing Bluetooth can be on the path; otherwise the list is read
+ * first, then the device opened, then the graph built — the old order.
+ * The third branch always runs beside them:
+ *
  *   session — everything the frames need a home for: the archive folder,
  *             the socket, the capture storage, the session state.
  *
@@ -29,9 +34,14 @@
  * (tests/live-start.test.ts).
  */
 
+import { isBluetoothInputLabel, systemDefaultInput, type InputDeviceInfo } from "./capture-warm";
 import type { StartBranch } from "./start-trace";
 
-export type StartMarker = (label: string, branch: StartBranch) => void;
+/**
+ * Record a start phase. ``at`` (on the caller's clock, see
+ * ``ColdCaptureDeps.now``) is for a mark set after the moment it records.
+ */
+export type StartMarker = (label: string, branch: StartBranch, at?: number) => void;
 
 export interface LiveStartSteps<Capture, Session> {
   /**
@@ -71,13 +81,87 @@ export interface MicChoiceLike {
   deviceId: string;
 }
 
+/**
+ * How a cold start opens the microphone.
+ *
+ *   parallel   — open the device the known list chose at once, read the
+ *                list again beside the open, and build the graph beside
+ *                both;
+ *   sequential — read the list first, open the device it chooses, then
+ *                build the graph: the order every start had before the
+ *                branches.
+ */
+export type ColdCaptureMode = "parallel" | "sequential";
+
+export type ColdCapturePlanReason =
+  | "known-list"
+  | "list-not-current"
+  | "list-unnamed"
+  | "bluetooth-choice"
+  | "bluetooth-default";
+
+export interface ColdCapturePlan {
+  mode: ColdCaptureMode;
+  /** Support-log reason code: printed on the start's ``mic=`` line. */
+  reason: ColdCapturePlanReason;
+}
+
+export interface ColdCapturePlanInput {
+  /** No ``devicechange`` has arrived since the known list was enumerated. */
+  listCurrent: boolean;
+  /** The known ``audioinput`` list. */
+  devices: readonly InputDeviceInfo[];
+  /** Label of the device the known list chose ("" when it does not name it). */
+  choiceLabel: string;
+}
+
+/**
+ * The one rule that decides whether a cold start may run ahead of a
+ * fresh device list.
+ *
+ * Opening before the list is read means opening by the list known at the
+ * press, and the device that open lands on is only as right as that list:
+ * a picked id is asked for ``exact`` (main.tsx ``micCaptureConstraints``),
+ * so a stale one fails and ``acquireMicStream`` falls back to the system
+ * default; the default itself ("" — the alias) is whatever the OS names at
+ * the moment of the open, not what the list said. For a built-in or USB
+ * input a wrong first open costs a second open. For a Bluetooth headset
+ * it costs the headset: opening its microphone switches it from
+ * high-quality playback (A2DP) to the call profile (HFP) — the very thing
+ * "Bluetooth → built-in mic" exists to avoid — and an AudioContext opened
+ * before it starts its output in the profile that is about to be torn
+ * away. So the branches run ahead only when nothing Bluetooth can be on
+ * the path:
+ *
+ *  - the list is current — enumerated after the last ``devicechange``;
+ *  - it is named — before microphone permission the labels are empty and
+ *    nothing can be judged by them;
+ *  - the device it chose is not Bluetooth — an unnamed one counts as
+ *    Bluetooth, as it does for the warm hold (./capture-warm);
+ *  - the system default is not Bluetooth — the fallback of every failed
+ *    open, and the device a default choice actually lands on.
+ *
+ * Anything else takes the sequential order, which reads the list first
+ * and opens only what it chooses.
+ */
+export function planColdCapture(input: ColdCapturePlanInput): ColdCapturePlan {
+  if (!input.listCurrent) return { mode: "sequential", reason: "list-not-current" };
+  if (!input.devices.some((d) => d.label.trim())) return { mode: "sequential", reason: "list-unnamed" };
+  if (isBluetoothInputLabel(input.choiceLabel)) return { mode: "sequential", reason: "bluetooth-choice" };
+  if (isBluetoothInputLabel(systemDefaultInput(input.devices)?.label ?? "")) {
+    return { mode: "sequential", reason: "bluetooth-default" };
+  }
+  return { mode: "parallel", reason: "known-list" };
+}
+
 export interface ColdCaptureDeps<Stream, Graph, Choice extends MicChoiceLike> {
   /** The choice made against the device list known at the press. */
   initialChoice: Choice;
+  /** ``planColdCapture``'s verdict for this start. */
+  mode: ColdCaptureMode;
   /**
-   * Enumerate the inputs again and choose on the fresh list: the known
-   * one can be stale (a device that left or came back under a new id).
-   * A rejection keeps the initial choice.
+   * Enumerate the inputs again and choose on the fresh list. A rejection
+   * keeps the initial choice.
    */
   refreshChoice(): Promise<Choice>;
   /** Open the microphone (bounded and retried by the caller). */
@@ -86,15 +170,8 @@ export interface ColdCaptureDeps<Stream, Graph, Choice extends MicChoiceLike> {
   /** The AudioContext and the worklet module — nothing that needs the stream. */
   prepareGraph(mark: (label: string) => void): Promise<Graph>;
   releaseGraph(graph: Graph): void;
-  /**
-   * Build the graph only once the microphone is open. For a Bluetooth
-   * input: an AudioContext opened first would start its output in the
-   * headset's playback profile, and the microphone opening a moment
-   * later switches the headset to the call profile underneath it. Built
-   * after, the context opens on the profile the take records in — the
-   * order every start had before the branches.
-   */
-  graphAfterMic: boolean;
+  /** The clock the marks are on, for a mark set after the moment it records. */
+  now(): number;
   mark: StartMarker;
 }
 
@@ -130,10 +207,7 @@ export class CaptureAbandonedError extends Error {
   }
 }
 
-/**
- * Open the microphone and prepare the graph beside each other, from the
- * moment of the call.
- */
+/** Open the microphone and prepare the graph in the order ``deps.mode`` names. */
 export function beginColdCapture<Stream, Graph, Choice extends MicChoiceLike>(
   deps: ColdCaptureDeps<Stream, Graph, Choice>,
 ): ColdCaptureHandle<Stream, Graph, Choice> {
@@ -168,65 +242,72 @@ export function beginColdCapture<Stream, Graph, Choice extends MicChoiceLike>(
       heldStreams.add(s);
       return s;
     });
-  const graphBranch: StartBranch = deps.graphAfterMic ? "mic" : "graph";
-  const startGraph = (): Promise<Graph | null> =>
-    deps.prepareGraph((label) => deps.mark(label, graphBranch)).then((g) => {
+  const parallel = deps.mode === "parallel";
+  // In the sequential order the graph is a step of the microphone's chain.
+  const graphBranch: StartBranch = parallel ? "graph" : "mic";
+  let graphOutcome: Promise<{ graph: Graph | null; error: unknown }> | null = null;
+  const settleGraph = (): Promise<{ graph: Graph | null; error: unknown }> => {
+    graphOutcome ??= deps.prepareGraph((label) => deps.mark(label, graphBranch)).then((g) => {
       if (abandoned) {
         try { deps.releaseGraph(g); } catch { /* already released */ }
         throw new CaptureAbandonedError();
       }
       heldGraph = g;
       return g;
-    });
-
-  // Both start now: the device open is the one physical wait, and the
-  // list that verifies its choice is read beside it.
-  const initialId = deps.initialChoice.deviceId;
-  let listedChoice: Choice | null = null;
-  let firstOpenDone = false;
-  const firstOpen = acquire(initialId);
-  const listed = deps.refreshChoice().then(
-    (c) => c,
-    () => deps.initialChoice,
-  ).then((c) => {
-    listedChoice = c;
-    // The list is on the path only when it decided a second open.
-    deps.mark("loadMics", c.deviceId !== initialId ? "mic" : "side");
-    return c;
-  });
-  void firstOpen.then(() => {
-    firstOpenDone = true;
-    const discarded = listedChoice !== null && listedChoice.deviceId !== initialId;
-    deps.mark(discarded ? "getUserMedia.discarded" : "getUserMedia", discarded ? "side" : "mic");
-  }, () => { /* reported through the mic branch */ });
-
-  let graphOutcome: Promise<{ graph: Graph | null; error: unknown }> | null = null;
-  const settleGraph = (): Promise<{ graph: Graph | null; error: unknown }> => {
-    graphOutcome ??= startGraph().then(
+    }).then(
       (graph) => ({ graph, error: null }),
       (error) => ({ graph: null, error }),
     );
     return graphOutcome;
   };
-  if (!deps.graphAfterMic) void settleGraph();
+  const freshChoice = (): Promise<Choice> => deps.refreshChoice().then((c) => c, () => deps.initialChoice);
 
-  const mic = (async (): Promise<{ stream: Stream; choice: Choice; reopened: boolean }> => {
-    const choice = await listed;
+  const mic = parallel ? openAhead() : openInOrder();
+  if (parallel) void settleGraph();
+
+  // The list first, then the one device it chooses.
+  async function openInOrder(): Promise<{ stream: Stream; choice: Choice; reopened: boolean }> {
+    const choice = await freshChoice();
+    deps.mark("loadMics", "mic");
+    if (abandoned) throw new CaptureAbandonedError();
+    const stream = await acquire(choice.deviceId);
+    deps.mark("getUserMedia", "mic");
+    return { stream, choice, reopened: false };
+  }
+
+  // The device the known list chose, opened at once; the fresh list,
+  // read beside it, confirms it or names the one to open instead. Which
+  // of the two was on the path is known only once both have answered, so
+  // their marks are set then, at the moments they record.
+  async function openAhead(): Promise<{ stream: Stream; choice: Choice; reopened: boolean }> {
+    const initialId = deps.initialChoice.deviceId;
+    let firstOpenAt: number | null = null;
+    const firstOpen = acquire(initialId);
+    void firstOpen.then(() => { firstOpenAt = deps.now(); }, () => { /* reported below */ });
+    const choice = await freshChoice();
+    const listAt = deps.now();
     if (choice.deviceId === initialId) {
-      const listWasLast = firstOpenDone;
+      deps.mark("loadMics", "side", listAt);
       const stream = await firstOpen;
-      // Waited on the list after the device was already open.
-      if (listWasLast) deps.mark("deviceCheck", "mic");
+      const openedAt = firstOpenAt ?? deps.now();
+      deps.mark("getUserMedia", "mic", openedAt);
+      // The device was open before the list confirmed it: that wait was on the path.
+      if (listAt > openedAt) deps.mark("deviceCheck", "mic", listAt);
       return { stream, choice, reopened: false };
     }
     // The fresh list names another device: the first open is not this
-    // take's microphone, whether it has answered yet or not.
-    void firstOpen.then(releaseStream, () => { /* nothing to release */ });
+    // take's microphone, whether it has answered yet or not, and the
+    // second open began when the list answered.
+    deps.mark("loadMics", "mic", listAt);
+    void firstOpen.then((s) => {
+      deps.mark("getUserMedia.discarded", "side", firstOpenAt ?? deps.now());
+      releaseStream(s);
+    }, () => { /* nothing to release */ });
     if (abandoned) throw new CaptureAbandonedError();
     const stream = await acquire(choice.deviceId);
     deps.mark("micReopen", "mic");
     return { stream, choice, reopened: true };
-  })();
+  }
 
   const ready = (async (): Promise<ColdCaptureOpen<Stream, Graph, Choice>> => {
     let opened: { stream: Stream; choice: Choice; reopened: boolean };

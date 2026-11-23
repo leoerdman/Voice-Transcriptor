@@ -73,7 +73,6 @@ import { classifyBootError, type BootFailure } from "./boot-error";
 import {
   captureElapsedMs,
   chooseCaptureDevice,
-  isBluetoothInputLabel,
   builtInMicBarelyHeard,
   decidePreRoll,
   decideWarmHold,
@@ -194,7 +193,14 @@ import {
 } from "./recording-save";
 import { skippedAudioPersistence, startAudioPersistence, type AudioPersistence } from "./audio-persistence";
 import { DeferredPcmSink } from "./deferred-pcm-sink";
-import { beginColdCapture, runLiveStart, type ColdCaptureHandle } from "./live-start";
+import {
+  beginColdCapture,
+  planColdCapture,
+  runLiveStart,
+  type ColdCaptureHandle,
+  type ColdCapturePlan,
+  type StartMarker,
+} from "./live-start";
 import { summarizeStartTrace, type StartBranch, type StartMark } from "./start-trace";
 import { PendingWsFrames } from "./pending-ws-frames";
 import {
@@ -5814,6 +5820,22 @@ document.querySelectorAll(".sb-item").forEach((e) => {
  * a warm start; the cold path re-enumerates first.
  */
 let knownAudioInputs: AudioInputDevice[] = [];
+/**
+ * ``devicechange`` events seen, and how many of them ``knownAudioInputs``
+ * was enumerated after (-1: never enumerated). Equal means the list is
+ * current — the one input ./live-start ``planColdCapture`` takes on trust.
+ */
+let audioInputChanges = 0;
+let knownAudioInputsAfterChanges = -1;
+
+function knownAudioInputsCurrent(): boolean {
+  return knownAudioInputsAfterChanges === audioInputChanges;
+}
+
+/** Called first thing on ``devicechange``: the known list is stale from here. */
+function noteAudioInputsChanged(): void {
+  audioInputChanges += 1;
+}
 
 /** Show the picked microphone in the Mic list, as resolved against ``knownAudioInputs``. */
 function renderMicPicker(): void {
@@ -5845,7 +5867,9 @@ async function loadMics(forceReload = false): Promise<void> {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       stream.getTracks().forEach((t) => t.stop());
     }
+    const changesBefore = audioInputChanges;
     const devs = await navigator.mediaDevices.enumerateDevices();
+    knownAudioInputsAfterChanges = changesBefore;
     knownAudioInputs = devs
       .filter((d) => d.kind === "audioinput")
       .map((d) => ({ deviceId: d.deviceId, label: d.label, groupId: d.groupId }));
@@ -10224,9 +10248,9 @@ let startFirstFrameSeen = false;
 // Whether this take's microphone has woken yet (./mic-wake). Reset at the
 // press; fed by every captured frame.
 let micWake = createMicWakeTracker();
-function markStartPhase(label: string, branch: StartBranch): void {
+function markStartPhase(label: string, branch: StartBranch, at = performance.now()): void {
   if (startT0 <= 0 || startFirstFrameSeen) return;
-  startMarks.push({ label, branch, atMs: performance.now() - startT0 });
+  startMarks.push({ label, branch, atMs: at - startT0 });
 }
 let flushRequestSeq = 0;
 const pendingWorkletFlushes = new Map<string, () => void>();
@@ -10518,11 +10542,6 @@ function releaseWarmCapture(reason: string): void {
   const held = warmCapture;
   if (!held) return;
   warmCapture = null;
-  releaseHeldGraph(held, reason);
-}
-
-/** Stop and close a graph that has left the hold (the hold's own release, or a start that took it and ended). */
-function releaseHeldGraph(held: WarmCapture, reason: string): void {
   if (held.expiryTimer !== null) window.clearTimeout(held.expiryTimer);
   const heldMs = Date.now() - held.heldSince;
   try { held.workletNode.port.onmessage = null; } catch { /* port already dead */ }
@@ -10714,14 +10733,24 @@ function warmReuseDecision(held: WarmCapture, requestedDeviceId: string) {
   });
 }
 
-function takeWarmCapture(requestedDeviceId: string): WarmCapture | null {
+/**
+ * Will the held graph do for this device? A "no" releases it (see above);
+ * a "yes" leaves it in the hold.
+ */
+function warmCaptureReusable(requestedDeviceId: string): boolean {
   const held = warmCapture;
-  if (!held) return null;
+  if (!held) return false;
   const decision = warmReuseDecision(held, requestedDeviceId);
   if (!decision.reuse) {
     releaseWarmCapture(decision.reason);
-    return null;
+    return false;
   }
+  return true;
+}
+
+function takeWarmCapture(requestedDeviceId: string): WarmCapture | null {
+  const held = warmCapture;
+  if (!held || !warmCaptureReusable(requestedDeviceId)) return null;
   warmCapture = null;
   if (held.expiryTimer !== null) window.clearTimeout(held.expiryTimer);
   return held;
@@ -10748,6 +10777,7 @@ function releaseWarmCaptureOnLifecycle(reason: WarmHoldLifecycleRelease): void {
 try {
   navigator.mediaDevices?.addEventListener?.("devicechange", () => {
     releaseWarmCaptureOnLifecycle("devicechange");
+    noteAudioInputsChanged();
     // A device came or went: refresh the list the next start resolves
     // the pick against, and the Mic list that shows it.
     void loadMics(false);
@@ -12088,57 +12118,82 @@ interface PreparedCaptureGraph {
   workletModuleLoaded: boolean;
 }
 
+/**
+ * What the capture branches of a start were set going with. A warm start
+ * carries only the choice: the held graph stays in the hold — its one
+ * owner — until the connect takes it, so a start that fails before then
+ * leaves the next one warm.
+ */
 type LiveCapture =
-  | { kind: "warm"; warm: WarmCapture; mic: LiveMicChoice }
-  | { kind: "cold"; handle: ColdCaptureHandle<MediaStream, PreparedCaptureGraph, LiveMicChoice> };
+  | { kind: "warm"; mic: LiveMicChoice }
+  | { kind: "cold"; plan: ColdCapturePlan; handle: ColdCaptureHandle<MediaStream, PreparedCaptureGraph, LiveMicChoice> };
 
 const PCM_WORKLET_URL = new URL("./pcm-worklet.js", import.meta.url).href;
 
 /**
+ * The microphone a take records from, chosen on the known device list.
+ * Asked again on the fresh list by a cold start (``beginColdLiveCapture``).
+ */
+function chooseLiveMic(): LiveMicChoice {
+  const micResolution = resolveRequestedMic();
+  const micChoice = chooseCaptureDevice({
+    requestedDeviceId: micResolution.deviceId,
+    preferBuiltInOverBluetooth: readBluetoothBuiltinMicEnabled(),
+    devices: knownAudioInputs,
+  });
+  return { deviceId: micChoice.deviceId, resolution: micResolution, choice: micChoice };
+}
+
+/**
+ * The start-phase marker of one start. A branch of a start that has since
+ * been superseded does not write into the next start's trace line.
+ */
+function startPhaseMarker(startAttemptSeq: number): StartMarker {
+  return (label, branch, at) => {
+    if (startAttemptSeq === liveStartAttemptSeq) markStartPhase(label, branch, at);
+  };
+}
+
+/**
  * The capture branches of a start, set going at the press.
  *
- * The choice is made on the device list known at the press, which every
- * ``devicechange`` refreshes. The warm path adopts the held graph by it
- * and touches no device API at all; the cold path opens the device by it
- * at once, re-enumerates beside the open and opens again only if the
- * fresh list chooses another device (./live-start ``beginColdCapture``).
+ * The choice is made on the device list known at the press. The warm
+ * path touches no device API at all — it only checks that the held graph
+ * will do; the connect takes it. The cold path opens in the order
+ * ./live-start ``planColdCapture`` allows.
  */
 function beginLiveCapture(startAttemptSeq: number): LiveCapture {
-  // A branch of a start that has since been superseded does not write
-  // into the next start's trace line.
-  const mark = (label: string, branch: StartBranch): void => {
-    if (startAttemptSeq === liveStartAttemptSeq) markStartPhase(label, branch);
-  };
-  const preferBuiltInOverBluetooth = readBluetoothBuiltinMicEnabled();
-  const chooseMic = (): LiveMicChoice => {
-    const micResolution = resolveRequestedMic();
-    const micChoice = chooseCaptureDevice({
-      requestedDeviceId: micResolution.deviceId,
-      preferBuiltInOverBluetooth,
-      devices: knownAudioInputs,
-    });
-    return { deviceId: micChoice.deviceId, resolution: micResolution, choice: micChoice };
-  };
-  const mic = chooseMic();
+  const mark = startPhaseMarker(startAttemptSeq);
+  const mic = chooseLiveMic();
   // The graph the previous recording left running, if it is still the
   // right one (§4.7). Adopting it skips getUserMedia, the AudioContext
   // and the worklet module — the whole ~310 ms — and its ring has been
   // holding the last half-second of audio the entire time.
-  const warm = takeWarmCapture(mic.deviceId);
-  if (warm) {
+  if (warmCaptureReusable(mic.deviceId)) {
     mark("warmCapture", "mic");
-    return { kind: "warm", warm, mic };
+    return { kind: "warm", mic };
   }
+  return beginColdLiveCapture(mic, mark);
+}
+
+function beginColdLiveCapture(mic: LiveMicChoice, mark: StartMarker): LiveCapture {
+  const plan = planColdCapture({
+    listCurrent: knownAudioInputsCurrent(),
+    devices: knownAudioInputs,
+    choiceLabel: mic.choice.label,
+  });
   return {
     kind: "cold",
+    plan,
     handle: beginColdCapture<MediaStream, PreparedCaptureGraph, LiveMicChoice>({
       initialChoice: mic,
+      mode: plan.mode,
       // Do not force a preflight getUserMedia here: a second throwaway
       // stream before the recording one causes duplicate macOS media
       // permission / activation events.
       refreshChoice: async () => {
         await loadMics(false);
-        return chooseMic();
+        return chooseLiveMic();
       },
       // Bounded and retried — see acquireMicStream. A bare getUserMedia
       // hung the start outright on a busy input device.
@@ -12148,8 +12203,7 @@ function beginLiveCapture(startAttemptSeq: number): LiveCapture {
       releaseMic: (s) => s.getTracks().forEach((t) => t.stop()),
       prepareGraph: prepareCaptureGraph,
       releaseGraph: (g) => { void g.ac.close().catch(() => { /* already closed */ }); },
-      // An unnamed device counts as Bluetooth, as it does for the hold.
-      graphAfterMic: isBluetoothInputLabel(mic.choice.label),
+      now: () => performance.now(),
       mark,
     }),
   };
@@ -12184,40 +12238,52 @@ async function prepareCaptureGraph(mark: (label: string) => void): Promise<Prepa
   return { ac: context, workletModuleLoaded };
 }
 
-/** No session will connect this capture: release what it opened. */
+/**
+ * No session will connect this capture: release what it opened. A warm
+ * start has opened nothing — the graph is still in the hold.
+ */
 function abandonLiveCapture(capture: LiveCapture): void {
-  if (capture.kind === "cold") {
-    capture.handle.abandon();
-    return;
-  }
-  // The held graph left the hold at the press; with no session to adopt
-  // it, it goes the way every hold ends.
-  releaseHeldGraph(capture.warm, "start-abandoned");
+  if (capture.kind === "cold") capture.handle.abandon();
 }
 
 /** Join the branches and connect the capture (./live-start). */
 async function connectLiveCapture(session: LiveStartSession, capture: LiveCapture): Promise<void> {
   const { sessionUiToken, startAttemptSeq, throwIfStartCancelled } = session;
   try {
-    const warm = capture.kind === "warm" ? capture.warm : null;
+    // The hold is taken here, not at the press: until the session is
+    // ready it stays with its one owner. Gone since the press (TTL,
+    // devicechange, hidden window) — the take starts cold from here.
+    const warm = capture.kind === "warm" ? takeWarmCapture(capture.mic.deviceId) : null;
+    const cold = capture.kind === "cold"
+      ? capture
+      : warm ? null : beginColdLiveCapture(capture.mic, startPhaseMarker(startAttemptSeq));
     sessionStartedWarm = !!warm;
     sessionPreRollMs = 0;
     let mic: LiveMicChoice;
+    let coldPlan = "";
     let preparedWorklet = false;
-    if (capture.kind === "warm") {
+    if (warm && capture.kind === "warm") {
       mic = capture.mic;
-      ac = capture.warm.ac;
-      stream = capture.warm.stream;
-      src = capture.warm.src;
-      workletNode = capture.warm.workletNode;
+      ac = warm.ac;
+      stream = warm.stream;
+      src = warm.src;
+      workletNode = warm.workletNode;
     } else {
+      if (!cold || cold.kind !== "cold") throw new Error("Capture start lost its microphone branch.");
+      coldPlan = cold.plan.reason;
       // Close whatever still occupies the slot before the session's
       // context takes it. Every teardown path is supposed to have emptied
       // it already; this is the structural guarantee that a path which
       // did not cannot strand a running AudioContext with no reference
-      // left to close it.
-      await releaseOrphanedAudioContext("starting a new capture session");
-      const opened = await capture.handle.ready;
+      // left to close it. Should it ever throw, what the branches opened
+      // is released rather than stranded.
+      try {
+        await releaseOrphanedAudioContext("starting a new capture session");
+      } catch (e) {
+        cold.handle.abandon();
+        throw e;
+      }
+      const opened = await cold.handle.ready;
       // Both into the module slots at once, before anything can throw:
       // from here the cancelled-start cleanup releases them.
       mic = opened.choice;
@@ -12253,7 +12319,8 @@ async function connectLiveCapture(session: LiveStartSession, capture: LiveCaptur
     // The one line that says which microphone this take records from and why.
     console.log(
       `[trace startLive] mic="${initialTracks[0]?.label || micChoice.label}" ` +
-      `pick=${micResolution.kind} choice=${micChoice.reason} warm=${warm ? 1 : 0}`,
+      `pick=${micResolution.kind} choice=${micChoice.reason} warm=${warm ? 1 : 0}` +
+      (coldPlan ? ` open=${coldPlan}` : ""),
     );
     micHealth.observe({ kind: "session-start", deviceId: initialDeviceId });
     if (initialTracks.some((t) => t.muted)) {
