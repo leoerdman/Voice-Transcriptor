@@ -131,7 +131,7 @@ export function mayClearRecoveredDraft(ownerSessionId: string, slotWrittenThisRu
  * and are not content: the recovery reads neither the timer nor a
  * fresher `updated_at` than the last change of the text.
  */
-export function liveDraftContentKey(payload: PersistedLiveDraft): string {
+function liveDraftContentKey(payload: PersistedLiveDraft): string {
   const { updated_at: _updatedAt, timer: _timer, ...content } = payload;
   void _updatedAt;
   void _timer;

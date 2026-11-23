@@ -29,7 +29,7 @@ export const RECORDINGS_WINDOW_MINIMUM = 200;
 /** Rows added each time the user reaches the growth threshold. */
 export const RECORDINGS_WINDOW_CHUNK = 200;
 /** Distance from the bottom, in px, at which the window grows. */
-export const RECORDINGS_WINDOW_GROW_THRESHOLD_PX = 400;
+const RECORDINGS_WINDOW_GROW_THRESHOLD_PX = 400;
 
 export interface WindowRequest {
   /** Size of the full filtered set. */

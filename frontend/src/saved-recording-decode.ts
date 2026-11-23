@@ -153,7 +153,7 @@ export async function runSavedRecordingDecode<A>(
 }
 
 /** "Deepgram nova-3", "local Whisper large-v3" — the names Re-transcribe reports. */
-export function savedDecodeAttemptLabel(a: SavedDecodeAttempt): string {
+function savedDecodeAttemptLabel(a: SavedDecodeAttempt): string {
   return a.provider === "deepgram" ? `Deepgram ${a.model}` : `local Whisper ${a.model}`;
 }
 

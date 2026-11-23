@@ -29,7 +29,7 @@ export function keyAction(state: KeyFieldState): KeyAction {
   return "none";
 }
 
-export function deleteKeyConfirmation(providerName: string): string {
+function deleteKeyConfirmation(providerName: string): string {
   return `Delete the saved ${providerName} API key?\n\nThis cannot be undone — you will need the key again to use ${providerName}.`;
 }
 
