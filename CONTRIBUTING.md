@@ -22,7 +22,7 @@
 
 ### Предварительные требования
 
-- **Node.js** `>=22.12.0` (`.node-version` / `.nvmrc` — SSOT)
+- **Node.js** `>=22.12.0` (`.nvmrc` — SSOT)
 - **npm** `>=10`
 - **Python** версии из `.python-version` (SSOT — её же ставит CI и из неё собирается bundled runtime) + `pip`
 - **macOS**: Xcode Command Line Tools, `codesign`, `bash`
