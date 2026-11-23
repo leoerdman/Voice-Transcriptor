@@ -3065,14 +3065,6 @@ async function renderLatestSavedAudio(): Promise<void> {
     return;
   }
 
-  // Source preference order:
-  //   1. Backend refetch when savedName is known — DURABLE: the backend
-  //      wrote the file to disk via atomic_write_bytes, and the renderer
-  //      fetches it with header auth before attaching a blob URL.
-  //   2. In-memory blob URL when the file is fresh from MediaRecorder /
-  //      PcmSink and not yet uploaded to backend (the recording-just-
-  //      stopped window before save completes — typically <500 ms).
-  //
   // ROOT CAUSE for "audio doesn't play on Windows" (user report):
   //   OpfsPcmSink.finalize() returns a ``File`` whose Blob references
   //   the OPFS-backed spool lazily — ``new Blob([header, spool])``.
@@ -3084,20 +3076,21 @@ async function renderLatestSavedAudio(): Promise<void> {
   //   bytes lazily on play, hits the deleted OPFS handle, and the
   //   media element fires a silent error code=4 (src-not-supported).
   //
-  //   Switching to a backend-authenticated blob once savedName is set
-  //   bypasses the OPFS lifecycle entirely — same bytes, durable.
-  //   The blob URL stays as the first-render fallback for the brief
-  //   pre-save window.
   let playbackUrl = "";
   let playbackSourceKey = "";
   if (latestSavedAudioState.savedName) {
     try {
-      const audioFile = await fetchSavedAudioFromBackend(
+      const minted = await mintRecordingStreamUrl(
         latestSavedAudioState.savedName,
         latestSavedAudioState.archiveDir || "",
       );
       if (renderSeq !== currentRecordingAudioRenderSeq) return;
-      playbackUrl = URL.createObjectURL(audioFile);
+      recordingViewerStream = {
+        name: latestSavedAudioState.savedName,
+        archiveDir: latestSavedAudioState.archiveDir || "",
+        minted,
+      };
+      playbackUrl = minted.url;
       playbackSourceKey = desiredBackendKey;
     } catch (e) {
       // The staleness guard has to be repeated here. It sat only on the
@@ -3135,7 +3128,7 @@ async function renderLatestSavedAudio(): Promise<void> {
   // Track ObjectURL ownership so revokeCurrentRecordingAudioUrl can
   // free it later. Media never receives the persistent API token in URL.
   setPlayerEnabled(true);
-  currentRecordingAudioObjectUrl = playbackUrl;
+  currentRecordingAudioObjectUrl = playbackUrl.startsWith("blob:") ? playbackUrl : "";
   currentRecordingAudioSourceKey = playbackSourceKey;
   audioEl.src = playbackUrl;
   audioEl.load();
@@ -3284,6 +3277,9 @@ function setCurrentRecordingAudio(file: File | null, savedName = "", archiveDir 
 // The History player streams from a URL that expires (S-15); an error
 // after the expiry re-mints and resumes (recoverRecordingViewerStream).
 ($("recordingAudio") as HTMLAudioElement).addEventListener("error", (ev) => {
+  void recoverRecordingViewerStream(ev.currentTarget as HTMLAudioElement);
+});
+$("currentRecordingAudio").addEventListener("error", (ev) => {
   void recoverRecordingViewerStream(ev.currentTarget as HTMLAudioElement);
 });
 
@@ -11795,6 +11791,11 @@ async function startLive(
       markStartPhase("pcmSink");
       if (heldFrames > 0) console.log(`[trace startLive] capture storage ready; ${heldFrames} early frame(s) written into it`);
     },
+    () => {
+      showRecordSessionNotice("Recording storage did not become ready in time. This take was discarded to prevent audio loss.", "error", UI_TOKENS.notice.longMs);
+      void stopLive(false, { discard: true });
+    },
+    LIVE_SAMPLE_RATE_HZ * 2,
   );
   workletLastFrameAt = 0;
   captureLevel = createCaptureLevel();

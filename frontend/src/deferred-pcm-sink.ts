@@ -11,7 +11,7 @@
  * This sink is handed to the capture path at once. Frames that arrive
  * before the storage is ready are copied into memory, in order, and
  * written into it the moment it exists; after that every frame goes
- * straight through. Nothing captured is dropped, and nothing waits:
+ * straight through, and nothing waits:
  *
  *  - ``finalize`` waits for the storage (a take shorter than the open
  *    still finalizes everything it captured);
@@ -28,11 +28,14 @@ export interface PcmSinkLike {
   readonly totalSamples: number;
 }
 
+export const DEFERRED_PCM_SINK_MAX_SAMPLES = 32_000;
+
 export class DeferredPcmSink implements PcmSinkLike {
   private target: PcmSinkLike | null = null;
   private held: Float32Array[] = [];
   private heldSamples = 0;
   private destroyed = false;
+  private overflowed = false;
   /** Resolves with the storage once the held frames are in it. */
   readonly ready: Promise<PcmSinkLike>;
 
@@ -40,6 +43,8 @@ export class DeferredPcmSink implements PcmSinkLike {
     storage: Promise<PcmSinkLike>,
     fallback: () => PcmSinkLike,
     onReady?: (sink: PcmSinkLike, heldFrames: number) => void,
+    private readonly onOverflow?: () => void,
+    private readonly maxHeldSamples = DEFERRED_PCM_SINK_MAX_SAMPLES,
   ) {
     this.ready = storage
       .catch((e) => {
@@ -72,12 +77,22 @@ export class DeferredPcmSink implements PcmSinkLike {
   }
 
   append(samples: Float32Array): void {
-    if (this.destroyed) return;
+    if (this.destroyed || this.overflowed) return;
     if (this.target) {
       this.target.append(samples);
       return;
     }
     // A copy: the capture path may reuse the buffer it hands over.
+    if (this.heldSamples + samples.length > this.maxHeldSamples) {
+      if (!this.overflowed) {
+        this.overflowed = true;
+        this.held = [];
+        this.heldSamples = 0;
+        if (this.onOverflow) this.onOverflow();
+        else throw new Error("Deferred PCM buffer exceeded its configured limit");
+      }
+      return;
+    }
     this.held.push(samples.slice());
     this.heldSamples += samples.length;
   }
