@@ -3,6 +3,13 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.36] - 2026-11-23
+
+### Fixed
+
+- **The recordings list opens in a fraction of a second after the first launch.** Every launch used to read all ~10 600 transcripts again (2–5 s, up to 16 s under load). Their details are now kept in an index next to the settings; only new or changed recordings are read, and any change to how recordings are read rebuilds it automatically.
+- **Words filled in from the live preview get the case and punctuation of their place**, in single-language mode too — the same rule the two-reading merge and the recovery pass already use.
+
 ## [1.6.35] - 2026-11-23
 
 ### Fixed
