@@ -3,6 +3,19 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.42] - 2026-11-24
+
+### Changed
+
+- **The microphone stays ready after dictation — 15 minutes by default.** A start inside that window is instant (about 10 ms) instead of waiting for the system to open the microphone again. Settings let you choose Off, 30 seconds, 5 minutes or 15 minutes. While the microphone is ready the macOS microphone indicator stays on and the audio system keeps running. Bluetooth microphones are still let go right after a take, so a headset is never kept in call mode.
+- **Only the microphone is held, not the speakers.** Keeping the microphone ready no longer keeps an output device (such as a headset) busy; if the system cannot confirm that, the microphone is held for 30 seconds at most.
+- **The hold is let go** when the screen locks, the Mac sleeps, devices change, you pick another microphone or hold time, or the microphone stops delivering sound. Hiding the main window no longer drops it — dictation from the capsule keeps it.
+- **A chosen built-in microphone starts the fast way even when a Bluetooth headset is the macOS default input.**
+
+### Fixed
+
+- **The upscale request refuses the removed `preset` field and an unknown `preset_id`** with a clear error instead of quietly using the default preset.
+
 ## [1.6.41] - 2026-11-24
 
 ### Changed
