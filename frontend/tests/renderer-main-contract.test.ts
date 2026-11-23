@@ -158,7 +158,14 @@ describe("segmentEpsilonSec vs. live.py's emit_epsilon_sec (S-06, deliberately n
  * mean two different code paths can both decide "the stop is done, here
  * is the text" — which is exactly the three-source-of-truth bug the
  * B-038/889c91a work fixed. This test makes that a standing check
- * instead of a manual one-time verification.
+ * instead of a manual one-time verification. These are explicit source
+ * pins, not behavior tests: stopLive is nested in the side-effectful
+ * renderer entry point and depends on its DOM and preload bridge. The
+ * extracted epilogue and metadata-save behavior is exercised in
+ * stop-epilogue.test.ts; the one-delivery invariant is not. Replacing the
+ * pins requires extracting the stop coordinator behind injectable effects,
+ * then asserting one transcript publication and one release per stop via
+ * those effects. That production refactor is outside this test-only lane.
  */
 describe("stopLive has exactly one transcript delivery site (F/7 / U-022)", () => {
   const stopLiveStart = mainTsx.indexOf("async function stopLive(");
