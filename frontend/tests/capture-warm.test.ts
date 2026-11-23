@@ -19,6 +19,10 @@ import {
   isBluetoothInputLabel,
   systemDefaultInput,
   decideHeldStreamAlive,
+  decideHeldStream,
+  classifyCaptureSink,
+  warmHoldReleasedTrace,
+  warmHoldCappedTrace,
   WARM_HOLD_RELEASE,
   WARM_HOLD_OUTPUT_OPEN_CAP_MS,
   type WarmHoldInput,
@@ -32,7 +36,7 @@ const holdInput: WarmHoldInput = {
   trackLive: true,
   contextState: "running",
   workletCapture: true,
-  outputSilent: true,
+  sink: { kind: "silent" } as const,
 };
 
 const reuseInput: WarmReuseInput = {
@@ -147,7 +151,7 @@ describe("decideWarmHold", () => {
     // ordinary context, whose destination is the default output — and a
     // fifteen-minute hold would keep the owner's headset streaming
     // silence for fifteen minutes. Degrade to what 1.6.41 did instead.
-    expect(decideWarmHold({ ...holdInput, warmHoldMs: 900_000, outputSilent: false })).toEqual({
+    expect(decideWarmHold({ ...holdInput, warmHoldMs: 900_000, sink: { kind: "open" } })).toEqual({
       hold: true,
       reason: "held",
       ttlMs: WARM_HOLD_OUTPUT_OPEN_CAP_MS,
@@ -161,11 +165,96 @@ describe("decideWarmHold", () => {
       reason: "held",
       ttlMs: 900_000,
     });
-    expect(decideWarmHold({ ...holdInput, warmHoldMs: 30_000, outputSilent: false })).toEqual({
+    expect(decideWarmHold({ ...holdInput, warmHoldMs: 30_000, sink: { kind: "open" } })).toEqual({
       hold: true,
       reason: "held",
       ttlMs: 30_000,
     });
+  });
+
+  it("a sink it cannot read caps the hold too — and says so, with the shape", () => {
+    // "Not silent" has two causes and the log must not name the one it did
+    // not verify: an unfamiliar ``sinkId`` is not "the output is open".
+    expect(
+      decideWarmHold({ ...holdInput, warmHoldMs: 900_000, sink: { kind: "unreadable", shape: "undefined" } }),
+    ).toEqual({
+      hold: true,
+      reason: "held",
+      ttlMs: WARM_HOLD_OUTPUT_OPEN_CAP_MS,
+      capReason: "sink-unreadable",
+      sinkShape: "undefined",
+    });
+  });
+});
+
+describe("classifyCaptureSink — what the context is rendering into", () => {
+  it("names the silent sink", () => {
+    expect(classifyCaptureSink({ type: "none" })).toEqual({ kind: "silent" });
+  });
+
+  it("names the system default's empty id as an open output", () => {
+    expect(classifyCaptureSink("")).toEqual({ kind: "open" });
+  });
+
+  it("does not call an unfamiliar shape 'open': it reports the shape", () => {
+    // An older runtime without the property, a newer one with a shape this
+    // code was not taught — both cap the hold, neither is a verified
+    // "output-device-open".
+    expect(classifyCaptureSink(undefined)).toEqual({ kind: "unreadable", shape: "undefined" });
+    expect(classifyCaptureSink(null)).toEqual({ kind: "unreadable", shape: "null" });
+    expect(classifyCaptureSink({ type: "speaker" })).toEqual({
+      kind: "unreadable",
+      shape: '{"type":"speaker"}',
+    });
+    expect(classifyCaptureSink(7)).toEqual({ kind: "unreadable", shape: "number" });
+  });
+});
+
+describe("decideHeldStream — one answer for the whole held stream", () => {
+  const live = { readyState: "live", muted: false };
+  const ended = { readyState: "ended", muted: false };
+
+  it("is alive only when every audio track is", () => {
+    expect(decideHeldStream([live])).toEqual({ alive: true });
+    expect(decideHeldStream([live, live])).toEqual({ alive: true });
+    // The case the two old readers disagreed on: ``some`` said usable, the
+    // watcher's first-track check said alive, and neither was the answer.
+    expect(decideHeldStream([live, ended])).toEqual({ alive: false, reason: "track-ended" });
+    expect(decideHeldStream([ended, live])).toEqual({ alive: false, reason: "track-ended" });
+    expect(decideHeldStream([live, { readyState: "live", muted: true }]))
+      .toEqual({ alive: false, reason: "track-muted" });
+    expect(decideHeldStream([])).toEqual({ alive: false, reason: "track-ended" });
+  });
+
+  it("the release side and the reuse side answer the same question the same way", () => {
+    const tracks = [live, ended];
+    const verdict = decideHeldStream(tracks);
+    // The watcher releases with this reason...
+    expect(verdict).toEqual({ alive: false, reason: "track-ended" });
+    // ...and the press, asking the reuse rule with the same predicate,
+    // refuses the graph instead of adopting what the watcher would kill.
+    const reuse = decideWarmReuse({ ...reuseInput, trackLive: verdict.alive });
+    expect(reuse).toEqual({ reuse: false, reason: "track-ended" });
+  });
+});
+
+describe("the warm-hold trace lines — the format the support log reads", () => {
+  it("prints the release line with the hold's summary, and detail only when there is one", () => {
+    expect(warmHoldReleasedTrace({ reason: "ttl", heldMs: 900_012, signalChanges: 0, silentMs: 0 }))
+      .toBe("[trace warmCapture] released reason=ttl heldMs=900012 signalChanges=0 silentMs=0");
+    expect(warmHoldReleasedTrace({
+      reason: "refused", heldMs: 1_200, signalChanges: 2, silentMs: 3_000, detail: "expired",
+    })).toBe("[trace warmCapture] released reason=refused heldMs=1200 signalChanges=2 silentMs=3000 detail=expired");
+  });
+
+  it("prints the cap line, and the shape only for an unreadable sink", () => {
+    expect(warmHoldCappedTrace({ reason: "output-device-open", ttlMs: 30_000 }))
+      .toBe("[trace warmCapture] hold capped reason=output-device-open ttlMs=30000");
+    expect(warmHoldCappedTrace({ reason: "sink-unreadable", ttlMs: 30_000, sinkShape: "undefined" }))
+      .toBe("[trace warmCapture] hold capped reason=sink-unreadable sink=undefined ttlMs=30000");
+    // The shape belongs to that reason only — an open output has none to show.
+    expect(warmHoldCappedTrace({ reason: "output-device-open", ttlMs: 30_000, sinkShape: "x" }))
+      .toBe("[trace warmCapture] hold capped reason=output-device-open ttlMs=30000");
   });
 });
 
@@ -518,12 +607,12 @@ describe("the stop-sequence ordering (F-001)", () => {
     // second case was the ONLY reachable one.
     const live = decideWarmHold({ ...holdInput, trackLive: true });
     expect(freezeCaptureForStop({ planHold: () => live, stopTracks: () => { /* unused */ } }))
-      .toMatchObject({ hold: true, reason: "held" });
+      .toEqual({ hold: true, reason: "held", ttlMs: 30_000 });
 
     const ended = decideWarmHold({ ...holdInput, trackLive: false });
     let stopped = 0;
     expect(freezeCaptureForStop({ planHold: () => ended, stopTracks: () => { stopped += 1; } }))
-      .toMatchObject({ hold: false, reason: "track-ended" });
+      .toEqual({ hold: false, reason: "track-ended", ttlMs: 30_000 });
     expect(stopped).toBe(1);
   });
 });
@@ -544,7 +633,7 @@ describe("chooseCaptureDevice — Bluetooth default → the Mac's built-in micro
   it("the built-in mic it picks is then warm-holdable (the point of the setting)", () => {
     const choice = chooseCaptureDevice({ requestedDeviceId: "", preferBuiltInOverBluetooth: true, devices: macWithHeadset });
     expect(decideWarmHold({ ...holdInput, deviceLabel: choice.label }))
-      .toMatchObject({ hold: true, reason: "held" });
+      .toEqual({ hold: true, reason: "held", ttlMs: 30_000 });
   });
 
   it("the list's \"Default - …\" entry is the system default too, not a pinned device", () => {

@@ -83,7 +83,12 @@ import {
   warmHoldOptionFor,
   WARM_HOLD_OPTIONS,
   WARM_HOLD_DEFAULT_ID,
-  decideHeldStreamAlive,
+  decideHeldStream,
+  classifyCaptureSink,
+  warmHoldCappedTrace,
+  warmHoldReleasedTrace,
+  type CaptureSinkReading,
+  type WarmHoldCapReason,
   type WarmHoldLifecycleRelease,
   type WarmHoldReleaseReason,
 } from "./capture-warm";
@@ -10567,14 +10572,31 @@ let sessionMicChoiceReason = "";
 let builtInMicWarningShown = false;
 let sessionPreRollMs = 0;
 
-function streamHasLiveAudio(s: MediaStream | null): boolean {
-  if (!s) return false;
+/**
+ * The audio tracks of a stream, as ./capture-warm reads them.
+ *
+ * A stream whose tracks cannot be read answers "no tracks", which both
+ * rules below treat as dead: nothing there can be recorded.
+ */
+function audioTrackStates(s: MediaStream | null): Array<{ readyState: string; muted: boolean }> {
+  if (!s) return [];
   try {
-    return s.getAudioTracks().some((t) => t.readyState === "live");
+    return s.getAudioTracks().map((t) => ({ readyState: t.readyState, muted: !!t.muted }));
   } catch {
-    // A stream whose tracks cannot be read is not one we can record from.
-    return false;
+    return [];
   }
+}
+
+/**
+ * Is this stream still one we could record from?
+ *
+ * One predicate (./capture-warm ``decideHeldStream``), every audio track:
+ * the reuse check and the watcher that releases a dead hold used to ask
+ * differently — ``some`` here, the first track there — so a stream whose
+ * second track had ended was usable to one and dead to the other.
+ */
+function streamHasLiveAudio(s: MediaStream | null): boolean {
+  return decideHeldStream(audioTrackStates(s)).alive;
 }
 
 function micTrackLabel(s: MediaStream | null): string {
@@ -10640,11 +10662,13 @@ function releaseWarmCapture(reason: WarmHoldReleaseReason, detail = ""): void {
   // console.info, not console.log: the support log's mirror keeps INFO
   // only for the prefixes it names (./desktop/renderer-console), and this
   // line is the one that says why the microphone was let go.
-  console.info(
-    `[trace warmCapture] released reason=${reason} heldMs=${heldMs} ` +
-    `signalChanges=${held.signalChanges} silentMs=${silentMs}` +
-    (detail ? ` detail=${detail}` : ""),
-  );
+  console.info(warmHoldReleasedTrace({
+    reason,
+    heldMs,
+    signalChanges: held.signalChanges,
+    silentMs,
+    ...(detail ? { detail } : {}),
+  }));
 }
 
 /**
@@ -10682,7 +10706,9 @@ interface WarmHoldPlan {
   /** The TTL this plan holds for — the decision's, cap included. */
   ttlMs: number;
   /** Set when the decision shortened the TTL: named in the trace. */
-  capReason?: "output-device-open";
+  capReason?: WarmHoldCapReason;
+  /** The raw sink shape, when the cap was "we could not vouch for it". */
+  sinkShape?: string;
   deviceLabel: string;
   /** The graph this plan promised to keep. Null unless ``hold``. */
   ac: AudioContext | null;
@@ -10723,7 +10749,9 @@ function planWarmCaptureHold(): WarmHoldPlan {
     // microphone staying open.
     workletCapture: !!workletNode && scriptFallbackState !== "committed",
     // Asked of the live context, not assumed from the option we passed.
-    outputSilent: ac ? audioContextRendersSilently(ac) : false,
+    // No context at all cannot happen here (it is refused above for its
+    // state), but "unreadable" is the honest reading if it ever does.
+    sink: ac ? readCaptureSink(ac) : { kind: "unreadable", shape: "no-context" },
   });
   if (!decision.hold) return refusedWarmHold(decision.reason, deviceLabel, decision.ttlMs);
   const heldAc = ac;
@@ -10746,6 +10774,7 @@ function planWarmCaptureHold(): WarmHoldPlan {
     reason: decision.reason,
     ttlMs: decision.ttlMs,
     capReason: decision.capReason,
+    sinkShape: decision.sinkShape,
     deviceLabel,
     ac: heldAc,
     stream: heldStream,
@@ -10816,7 +10845,11 @@ function commitWarmCaptureHold(plan: WarmHoldPlan): boolean {
     // The hold is shorter than the user asked for: the support log has to
     // say why, and it is the one line that can (Settings still reads 15
     // minutes, because that is still the setting).
-    console.info(`[trace warmCapture] hold capped reason=${plan.capReason} ttlMs=${plan.ttlMs}`);
+    console.info(warmHoldCappedTrace({
+      reason: plan.capReason,
+      ttlMs: plan.ttlMs,
+      ...(plan.sinkShape ? { sinkShape: plan.sinkShape } : {}),
+    }));
   }
   // Ownership has moved. Everything below in the teardown chain now
   // finds empty slots, which is precisely the intent.
@@ -11008,16 +11041,13 @@ function attachMicTrackWatchers(target: MediaStream): void {
   // could never use: ``decideWarmReuse`` would refuse it at the press,
   // but the microphone would stay open — and lit — until that press.
   // What counts as dead is a rule of its own (./capture-warm
-  // ``decideHeldStreamAlive``), asked of the track's state rather than of
-  // the event that fired, and released through the device door.
+  // ``decideHeldStream``, over EVERY audio track), asked of the stream's
+  // state rather than of the event that fired, and released through the
+  // device door.
   const releaseIfHeldDead = (): void => {
     if (!warmCapture || warmCapture.stream !== target) return;
-    const track = target.getAudioTracks()[0];
-    const verdict = decideHeldStreamAlive({
-      readyState: track?.readyState ?? "ended",
-      muted: !!track?.muted,
-    });
-    if (!verdict.hold) releaseWarmCaptureForTrack(verdict.reason);
+    const verdict = decideHeldStream(audioTrackStates(target));
+    if (!verdict.alive) releaseWarmCaptureForTrack(verdict.reason);
   };
   for (const track of target.getAudioTracks()) {
     track.addEventListener("ended", () => {
@@ -12419,26 +12449,26 @@ type SilentSinkContextOptions = AudioContextOptions & { sinkId: { type: "none" }
  * stays open.
  */
 /**
- * Did the context we built actually get Chromium's silent sink?
+ * What the context we built is actually rendering into.
  *
  * Asked of the context AFTER it exists, because the option is a request:
  * a runtime that ignores ``sinkId`` accepts ``new AudioContext({sinkId})``
  * and builds an ordinary context whose destination is the default output.
  * Reading it back is the only way to tell, and the answer decides the
- * hold's length (``decideWarmHold``, the ``outputSilent`` input).
+ * hold's length (``decideWarmHold``, the ``sink`` input) — with three
+ * outcomes, so an unfamiliar shape is reported as such instead of being
+ * called "the output is open" (:./capture-warm classifyCaptureSink).
  *
  * ``AudioContext.sinkId`` is ``""`` for the system default and
  * ``{type: "none"}`` for the silent sink; the bundled DOM typings declare
  * it only on ``HTMLMediaElement``, hence the cast.
  */
-function audioContextRendersSilently(context: AudioContext): boolean {
+function readCaptureSink(context: AudioContext): CaptureSinkReading {
   try {
-    const sink = (context as AudioContext & { sinkId?: unknown }).sinkId;
-    return typeof sink === "object" && sink !== null
-      && String((sink as { type?: unknown }).type || "") === "none";
-  } catch {
-    // Unreadable is not silent: the cap is the safe answer.
-    return false;
+    return classifyCaptureSink((context as AudioContext & { sinkId?: unknown }).sinkId);
+  } catch (e) {
+    // A property that cannot even be read is a shape we were not taught.
+    return { kind: "unreadable", shape: `throws:${String((e as Error)?.name || "error")}` };
   }
 }
 

@@ -1021,18 +1021,22 @@ describe("the warm hold: its length, its output, and its releases", () => {
   it("reads the sink back, and a graph that kept the output open is held for the old 30 s", () => {
     // The option is a request. A runtime that ignores it builds an
     // ordinary context, and holding that for fifteen minutes keeps the
-    // owner's output streaming silence.
-    const probe = mainTsxSlice("function audioContextRendersSilently(", "\n}\n");
+    // owner's output streaming silence. The reading has three answers
+    // (silent / open / unreadable), so the log never calls an unfamiliar
+    // shape "the output is open".
+    const probe = mainTsxSlice("function readCaptureSink(", "\n}\n");
+    expect(probe).toContain("classifyCaptureSink(");
     expect(probe).toContain('.sinkId');
-    expect(probe).toContain('=== "none"');
     // Asked of the live context, and answered into the ONE policy.
     expect(mainTsxSlice("function planWarmCaptureHold(", "\nfunction commitWarmCaptureHold("))
-      .toContain("outputSilent: ac ? audioContextRendersSilently(ac) : false,");
+      .toContain('sink: ac ? readCaptureSink(ac) : { kind: "unreadable", shape: "no-context" },')
     // The hold and its timer run on the decision's TTL, not the setting.
     const commit = mainTsxSlice("function commitWarmCaptureHold(", "\nfunction ");
     expect(commit).toContain("ttlMs: plan.ttlMs,");
     expect(commit).toContain("plan.ttlMs,");
-    expect(commit).toContain("hold capped reason=${plan.capReason} ttlMs=${plan.ttlMs}");
+    expect(commit).toContain("warmHoldCappedTrace({");
+    expect(commit).toContain("reason: plan.capReason,");
+    expect(mainTsx).not.toContain("[trace warmCapture] hold capped reason=${plan.capReason}");
     expect(mainTsxSlice("function warmReuseDecision(", "\n}\n")).toContain("warmHoldMs: held.ttlMs,");
   });
 
@@ -1040,9 +1044,10 @@ describe("the warm hold: its length, its output, and its releases", () => {
     // The rule is a pure function of the track's state (./capture-warm);
     // the listener only asks it and releases through the device door.
     const watchers = mainTsxSlice("function attachMicTrackWatchers(", "\n}\n");
-    expect(watchers).toContain("decideHeldStreamAlive({");
-    expect(watchers).toContain("readyState: track?.readyState ?? \"ended\"");
+    expect(watchers).toContain("decideHeldStream(audioTrackStates(target))");
     expect(watchers).toContain("releaseWarmCaptureForTrack(verdict.reason)");
+    // The same predicate answers the press: one rule, not two.
+    expect(mainTsxSlice("function streamHasLiveAudio(", "\n}\n")).toContain("decideHeldStream(audioTrackStates(s)).alive");
     expect(watchers).toContain('track.addEventListener("ended"');
     expect(watchers).toContain('track.addEventListener("mute"');
   });
@@ -1096,11 +1101,15 @@ describe("the warm hold: its length, its output, and its releases", () => {
     expect(mainTsxSlice("function commitWarmCaptureHold(", "\nfunction ")).toContain("silent: false,");
     // One summary line per hold, not one per transition: the release trace
     // carries how often the device changed state and how long it was quiet.
+    // The TEXT comes from the formatter whose exact output the frontend
+    // test pins (capture-warm.test.ts), and ./desktop/renderer-console.test
+    // mirrors those same strings — so a renamed field breaks a test on one
+    // side or the other, never silently.
     const release = mainTsxSlice("function releaseWarmCapture(", "\n}\n");
-    expect(release).toContain("console.info(");
-    expect(release).toContain("signalChanges=${held.signalChanges}");
-    expect(release).toContain("silentMs=${silentMs}");
-    expect(release).toContain("[trace warmCapture] released reason=${reason} heldMs=${heldMs}");
+    expect(release).toContain("warmHoldReleasedTrace({");
+    expect(release).toContain("signalChanges: held.signalChanges,");
+    expect(release).toContain("silentMs,");
+    expect(mainTsx).not.toContain("[trace warmCapture] released reason=${reason}");
     // ...and the transition itself writes nothing.
     const signalHandler = mainTsxSlice("function handleWorkletMessage(", "\nfunction ");
     expect(signalHandler).toContain("held.signalChanges += 1;");

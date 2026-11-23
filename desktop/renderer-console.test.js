@@ -142,16 +142,23 @@ test("the recording tones are always mirrored, flag or no flag", () => {
   assert.equal(shouldMirrorConsoleMessage("INFO", "[cue] stop resuming", false), true);
 });
 
-test("the warm hold's release and device signal are always mirrored, flag or no flag", () => {
+test("the warm hold's release, cap and sink-refusal lines are always mirrored, flag or no flag", () => {
   // The hold is what keeps the OS microphone indicator lit between takes.
   // "The light stays on and I can't tell why" is answered by the release
-  // reason or by nothing at all — and a release happens a handful of
-  // times per session, not per take.
+  // reason, by the cap reason, or by nothing at all — and each happens a
+  // handful of times per session, not per take.
+  //
+  // These are the strings the renderer PRINTS, taken from its formatters
+  // (frontend/src/capture-warm.ts warmHoldReleasedTrace / warmHoldCappedTrace
+  // and createSilentCaptureContext). The frontend's own test pins those
+  // exact strings, so a field renamed on one side shows up there.
   for (const line of [
-    "[trace warmCapture] released reason=ttl heldMs=900012",
-    "[trace warmCapture] released reason=lock-screen heldMs=95000",
-    "[trace warmCapture] released reason=mic-hold-changed heldMs=12000",
-    "[trace warmCapture] device signal silent=1 heldMs=60000",
+    "[trace warmCapture] released reason=ttl heldMs=900012 signalChanges=0 silentMs=0",
+    "[trace warmCapture] released reason=lock-screen heldMs=95000 signalChanges=1 silentMs=4000",
+    "[trace warmCapture] released reason=mic-hold-changed heldMs=12000 signalChanges=0 silentMs=0",
+    "[trace warmCapture] released reason=refused heldMs=1200 signalChanges=0 silentMs=0 detail=expired",
+    "[trace warmCapture] hold capped reason=output-device-open ttlMs=30000",
+    "[trace warmCapture] hold capped reason=sink-unreadable sink=undefined ttlMs=30000",
     "[trace warmCapture] the silent output sink was refused; the capture context keeps the default output",
   ]) {
     assert.equal(shouldMirrorConsoleMessage("INFO", line, false), true, line);

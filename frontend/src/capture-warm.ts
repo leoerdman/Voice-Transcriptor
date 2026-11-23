@@ -38,6 +38,25 @@ export interface CaptureDecision {
   reason: string;
 }
 
+/**
+ * What the capture context's sink turned out to be.
+ *
+ * Not a boolean, because "not silent" has two very different meanings:
+ * the runtime accepted the option's absence and gave us an ordinary
+ * context with a real output device behind it, or it reported something
+ * this code does not recognise. Both cap the hold, and a support log
+ * that said ``output-device-open`` for an unrecognised shape would be
+ * naming a cause it did not verify.
+ */
+export type CaptureSinkReading =
+  | { kind: "silent" }
+  | { kind: "open" }
+  | { kind: "unreadable"; shape: string };
+
+/** The reasons a hold may be cut short. A support-log contract. */
+export const WARM_HOLD_CAP_REASONS = ["output-device-open", "sink-unreadable"] as const;
+export type WarmHoldCapReason = (typeof WARM_HOLD_CAP_REASONS)[number];
+
 export interface WarmHoldDecision extends CaptureDecision {
   hold: boolean;
   /**
@@ -48,7 +67,9 @@ export interface WarmHoldDecision extends CaptureDecision {
    */
   ttlMs: number;
   /** Set when ``ttlMs`` is shorter than the setting, naming why. */
-  capReason?: "output-device-open";
+  capReason?: WarmHoldCapReason;
+  /** The raw sink value, when ``capReason`` is ``sink-unreadable``. */
+  sinkShape?: string;
 }
 
 export interface WarmReuseDecision extends CaptureDecision {
@@ -172,6 +193,39 @@ export function warmHoldMsForOption(id: string | null | undefined): number {
 }
 
 /**
+ * A short, log-safe description of a value the sink reader did not
+ * recognise — enough to tell "undefined property" from "a shape we were
+ * not taught", which is the whole point of reporting it.
+ */
+export function sinkShape(raw: unknown): string {
+  if (raw === undefined) return "undefined";
+  if (raw === null) return "null";
+  if (typeof raw === "string") return raw === "" ? "empty-string" : raw.slice(0, 60);
+  if (typeof raw === "object") {
+    try {
+      return JSON.stringify(raw).slice(0, 80);
+    } catch {
+      return "object";
+    }
+  }
+  return typeof raw;
+}
+
+/**
+ * Read Chromium's ``AudioContext.sinkId``: ``""`` is the system default
+ * output, ``{type:"none"}`` is the silent sink, and anything else is a
+ * runtime this code was not taught. Pure, so all three answers are a unit
+ * test instead of a claim about one Electron build.
+ */
+export function classifyCaptureSink(raw: unknown): CaptureSinkReading {
+  if (typeof raw === "string" && raw === "") return { kind: "open" };
+  if (typeof raw === "object" && raw !== null && String((raw as { type?: unknown }).type || "") === "none") {
+    return { kind: "silent" };
+  }
+  return { kind: "unreadable", shape: sinkShape(raw) };
+}
+
+/**
  * The longest a graph may be held when its AudioContext kept an OUTPUT
  * device open — the 30 s the app held for before it learned to render
  * the capture context into Chromium's silent sink (1.6.42).
@@ -211,15 +265,16 @@ export interface WarmHoldInput {
    */
   workletCapture: boolean;
   /**
-   * Is the graph's AudioContext rendering into Chromium's silent sink —
-   * no output device behind it (``main.tsx`` ``createSilentCaptureContext``)?
+   * What the graph's AudioContext is actually rendering into
+   * (``classifyCaptureSink`` over ``context.sinkId``).
    *
    * Asked of the context itself after it was created, not assumed from
    * the option that was passed: a runtime that ignores ``sinkId`` builds
    * an ordinary context, and the difference is exactly "the output is
-   * open for the whole hold".
+   * open for the whole hold" — or, if it answers in a shape this code
+   * does not know, "we cannot vouch for it".
    */
-  outputSilent: boolean;
+  sink: CaptureSinkReading;
 }
 
 /**
@@ -241,12 +296,13 @@ export function decideWarmHold(input: WarmHoldInput): WarmHoldDecision {
     return { hold: false, reason: "bluetooth", ttlMs };
   }
   // The one place the output device's price is charged (see the constant).
-  if (!input.outputSilent && ttlMs > WARM_HOLD_OUTPUT_OPEN_CAP_MS) {
+  if (input.sink.kind !== "silent" && ttlMs > WARM_HOLD_OUTPUT_OPEN_CAP_MS) {
     return {
       hold: true,
       reason: "held",
       ttlMs: WARM_HOLD_OUTPUT_OPEN_CAP_MS,
-      capReason: "output-device-open",
+      capReason: input.sink.kind === "open" ? "output-device-open" : "sink-unreadable",
+      ...(input.sink.kind === "unreadable" ? { sinkShape: input.sink.shape } : {}),
     };
   }
   return { hold: true, reason: "held", ttlMs };
@@ -473,6 +529,45 @@ export const WARM_HOLD_LIFECYCLE_RELEASES: readonly WarmHoldLifecycleRelease[] =
   ),
 );
 
+/**
+ * The release line's exact text — the support-log format, in one place.
+ *
+ * ``main.tsx`` prints this and nothing of its own, and
+ * ``tests/capture-warm.test.ts`` pins the full string, so the format
+ * cannot drift from what the log analysis and ./desktop/renderer-console
+ * look for. Fields: the reason, how long the hold lasted, how often the
+ * device changed state over the hold and how long it was silent (one
+ * line per hold — transitions are not logged), and, for a refusal, the
+ * verdict that caused it.
+ */
+export function warmHoldReleasedTrace(input: {
+  reason: WarmHoldReleaseReason;
+  heldMs: number;
+  signalChanges: number;
+  silentMs: number;
+  detail?: string;
+}): string {
+  return `[trace warmCapture] released reason=${input.reason}`
+    + ` heldMs=${Math.max(0, Math.round(input.heldMs))}`
+    + ` signalChanges=${Math.max(0, Math.round(input.signalChanges))}`
+    + ` silentMs=${Math.max(0, Math.round(input.silentMs))}`
+    + (input.detail ? ` detail=${input.detail}` : "");
+}
+
+/**
+ * The capped-hold line: the user's setting was cut short, and this is the
+ * one place that can say why (Settings still shows the setting).
+ */
+export function warmHoldCappedTrace(input: {
+  reason: WarmHoldCapReason;
+  ttlMs: number;
+  sinkShape?: string;
+}): string {
+  return `[trace warmCapture] hold capped reason=${input.reason}`
+    + (input.reason === "sink-unreadable" && input.sinkShape ? ` sink=${input.sinkShape}` : "")
+    + ` ttlMs=${Math.max(0, Math.round(input.ttlMs))}`;
+}
+
 /** What a held track's own state says about keeping the microphone open. */
 export type HeldStreamVerdict =
   | { hold: true }
@@ -492,6 +587,41 @@ export function decideHeldStreamAlive(input: { readyState: string; muted: boolea
   if (String(input.readyState || "") !== "live") return { hold: false, reason: "track-ended" };
   if (input.muted) return { hold: false, reason: "track-muted" };
   return { hold: true };
+}
+
+/** The states of a stream's audio tracks, as the two rules below read them. */
+export interface AudioTrackStates {
+  readyState: string;
+  muted: boolean;
+}
+
+/** Is the WHOLE held stream still one this app could record from? */
+export type HeldStreamReading =
+  | { alive: true }
+  | { alive: false; reason: "track-ended" | "track-muted" };
+
+/**
+ * The one predicate for "the held stream is alive", over EVERY audio
+ * track.
+ *
+ * It exists because there were two answers: the reuse check asked "is
+ * there at least one live track" (``some``) while the watcher that
+ * releases a hold asked only the FIRST track. A stream whose second
+ * track had ended was therefore still "usable" to one reader and dead to
+ * the other — two rules for one question, and the press would adopt a
+ * graph the watcher had already decided was worthless.
+ *
+ * A stream with no audio tracks at all is dead: there is nothing to
+ * record. Otherwise every track must pass ``decideHeldStreamAlive``, and
+ * the first that does not names the reason.
+ */
+export function decideHeldStream(tracks: readonly AudioTrackStates[]): HeldStreamReading {
+  if (tracks.length === 0) return { alive: false, reason: "track-ended" };
+  for (const track of tracks) {
+    const verdict = decideHeldStreamAlive(track);
+    if (!verdict.hold) return { alive: false, reason: verdict.reason };
+  }
+  return { alive: true };
 }
 
 export interface WarmReuseInput {
