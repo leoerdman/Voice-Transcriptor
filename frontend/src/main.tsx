@@ -73,6 +73,7 @@ import { classifyBootError, type BootFailure } from "./boot-error";
 import {
   captureElapsedMs,
   chooseCaptureDevice,
+  isBluetoothInputLabel,
   builtInMicBarelyHeard,
   decidePreRoll,
   decideWarmHold,
@@ -193,6 +194,8 @@ import {
 } from "./recording-save";
 import { skippedAudioPersistence, startAudioPersistence, type AudioPersistence } from "./audio-persistence";
 import { DeferredPcmSink } from "./deferred-pcm-sink";
+import { beginColdCapture, runLiveStart, type ColdCaptureHandle } from "./live-start";
+import { summarizeStartTrace, type StartBranch, type StartMark } from "./start-trace";
 import { PendingWsFrames } from "./pending-ws-frames";
 import {
   RECORDING_COLLECTIONS,
@@ -10215,15 +10218,15 @@ let liveStartAttemptSeq = 0;
 // arrives after startLive has resolved, so the clock and the phase
 // list live at module scope. One summary line per recording, emitted
 // from pushCapturedFrame.
-let startTimings: Array<[string, number]> = [];
+let startMarks: StartMark[] = [];
 let startT0 = 0;
 let startFirstFrameSeen = false;
 // Whether this take's microphone has woken yet (./mic-wake). Reset at the
 // press; fed by every captured frame.
 let micWake = createMicWakeTracker();
-function markStartPhase(label: string): void {
+function markStartPhase(label: string, branch: StartBranch): void {
   if (startT0 <= 0 || startFirstFrameSeen) return;
-  startTimings.push([label, performance.now() - startT0]);
+  startMarks.push({ label, branch, atMs: performance.now() - startT0 });
 }
 let flushRequestSeq = 0;
 const pendingWorkletFlushes = new Map<string, () => void>();
@@ -10515,6 +10518,11 @@ function releaseWarmCapture(reason: string): void {
   const held = warmCapture;
   if (!held) return;
   warmCapture = null;
+  releaseHeldGraph(held, reason);
+}
+
+/** Stop and close a graph that has left the hold (the hold's own release, or a start that took it and ended). */
+function releaseHeldGraph(held: WarmCapture, reason: string): void {
   if (held.expiryTimer !== null) window.clearTimeout(held.expiryTimer);
   const heldMs = Date.now() - held.heldSince;
   try { held.workletNode.port.onmessage = null; } catch { /* port already dead */ }
@@ -11480,22 +11488,20 @@ function pushCapturedFrame(input: Float32Array, preRollMs = 0): void {
   if (!startFirstFrameSeen && startT0 > 0) {
     // First audio of the session. Everything before this is start-up
     // cost the user experiences as the capsule not doing anything yet.
-    markStartPhase("first-frame");
-    startFirstFrameSeen = true;
     const totalMs = performance.now() - startT0;
-    const labels = startTimings
-      .map(([label, t], i) => {
-        const prev = i > 0 ? startTimings[i - 1][1] : 0;
-        return `${label}: ${(t - prev).toFixed(0)}ms`;
-      })
-      .join(" → ");
+    startMarks.push({ label: "first-frame", branch: "capture", atMs: totalMs });
+    startFirstFrameSeen = true;
+    // The chain that set the total, then the branches beside it (./start-trace).
+    const summary = summarizeStartTrace(startMarks, totalMs);
     console.log(
       `[trace startLive] total=${totalMs.toFixed(0)}ms to first audio frame ` +
-      `warm=${sessionStartedWarm ? 1 : 0} preRollMs=${sessionPreRollMs.toFixed(0)} | ${labels}`,
+      `warm=${sessionStartedWarm ? 1 : 0} preRollMs=${sessionPreRollMs.toFixed(0)} | ${summary.detail}`,
     );
     (window as unknown as { __transcriptorStartTimings?: unknown }).__transcriptorStartTimings = {
       totalMs,
-      phases: startTimings,
+      critical: summary.critical,
+      chain: summary.chain,
+      marks: startMarks,
     };
   }
   window.__transcriptorLastFrameAt = workletLastFrameAt;
@@ -11691,7 +11697,7 @@ async function startLive(
   // microphone answered.
   startRequestedAt = Date.now();
   startT0 = performance.now();
-  startTimings = [];
+  startMarks = [];
   startFirstFrameSeen = false;
   micWake = createMicWakeTracker();
   window.__transcriptorMicWaking = false;
@@ -11699,9 +11705,37 @@ async function startLive(
   // not at the first frame).
   console.log(`[cue] start ${playRecordingCue("start")}`);
   const startAttemptSeq = ++liveStartAttemptSeq;
+  // The microphone is asked for first, at the press, and everything else
+  // runs beside it (./live-start): the session's set-up does not hold
+  // the device open, and the device does not wait for the set-up.
+  try {
+    await runLiveStart<LiveCapture, LiveStartSession>({
+      beginCapture: () => beginLiveCapture(startAttemptSeq),
+      prepareSession: () => prepareLiveSession(startAttemptSeq),
+      connect: connectLiveCapture,
+      abandonCapture: abandonLiveCapture,
+    });
+  } finally {
+    startLiveInFlight = false;
+  }
+}
+
+/** What the capture connect needs from the session branch. */
+interface LiveStartSession {
+  sessionUiToken: string;
+  startAttemptSeq: number;
+  throwIfStartCancelled: () => void;
+}
+
+/**
+ * The session branch of a start: everything the frames need a home for.
+ * Runs while the microphone opens (./live-start); returns ``null`` when
+ * the start ends here.
+ */
+async function prepareLiveSession(startAttemptSeq: number): Promise<LiveStartSession | null> {
   // What the start needs from disk and the backend is asked for at once,
   // not one after another (OPTIMIZATION.md §3.4). The archive folder is
-  // the one answer the start waits for — the socket's query names it —
+  // the one answer the session waits for — the socket's query names it —
   // and it is memoized after the first start. The previous run's draft
   // (FG-08) gates only this session's first autosave, never the
   // microphone; the capture storage is opened beside the socket and the
@@ -11711,12 +11745,11 @@ async function startLive(
   const staleDraftRead = Promise.race([
     readStaleLiveDraftOnce(),
     sleepUnlessAborted(UI_TOKENS.draft.staleReadWaitMs, undefined),
-  ]).then(() => { markStartPhase("staleDraftRead"); }, () => {});
-  try {
+  ]).then(() => { markStartPhase("staleDraftRead", "side"); }, () => {});
   let sessionArchiveDir = "";
   try {
     sessionArchiveDir = await archiveReady;
-    markStartPhase("archiveReady");
+    markStartPhase("archiveReady", "session");
   } catch (e) {
     const message = (e as Error).message || "Recordings archive is not ready yet.";
     publishRecordingOutput({
@@ -11726,7 +11759,7 @@ async function startLive(
       kind: "error",
     });
     patchCurrentRecordingSummary({ status: message, tone: "error" });
-    return;
+    return null;
   }
   liveStartAbortReason = "";
   const throwIfStartCancelled = (): void => {
@@ -11780,7 +11813,7 @@ async function startLive(
     createPcmSink(sessionUiToken),
     () => new MemoryPcmSink(),
     (_sink, heldFrames) => {
-      markStartPhase("pcmSink");
+      markStartPhase("pcmSink", "side");
       if (heldFrames > 0) console.log(`[trace startLive] capture storage ready; ${heldFrames} early frame(s) written into it`);
     },
     () => {
@@ -11871,7 +11904,7 @@ async function startLive(
   // crash-time promotion adopts the staged screenshots (S-01 / H-01).
   if (liveScreenSessionId) wsQuery.set("screen_session_id", liveScreenSessionId);
   const sessionSocket = new WebSocket(wsBase() + "/ws/transcribe?" + wsQuery.toString(), websocketAuthProtocols());
-  markStartPhase("wsRequested");
+  markStartPhase("wsRequested", "session");
   ws = sessionSocket;
   ws.binaryType = "arraybuffer";
   ws.onopen = () => {
@@ -12032,62 +12065,176 @@ async function startLive(
       }
     }
   };
+  markStartPhase("sessionReady", "session");
+  return { sessionUiToken, startAttemptSeq, throwIfStartCancelled };
+}
 
-  try {
-    if (!navigator.mediaDevices?.getUserMedia) {
-      throw new Error("This browser does not support microphone capture.");
-    }
-    const preferBuiltInOverBluetooth = readBluetoothBuiltinMicEnabled();
-    // Which microphone this take records from: the picked one under the
-    // id it has now (./mic-preference — the system default only while it
-    // is not connected), then ./capture-warm ``chooseCaptureDevice``,
-    // which — while the system default is a Bluetooth headset and the
-    // setting is on — swaps the default for the Mac's built-in mic.
-    // Resolved against the last known device list, so the warm path below
-    // touches no device API.
-    let micResolution = resolveRequestedMic();
-    let micChoice = chooseCaptureDevice({
+/**
+ * The microphone choice of a take: the picked one under the id it has
+ * now (./mic-preference — the system default only while it is not
+ * connected), then ./capture-warm ``chooseCaptureDevice``, which — while
+ * the system default is a Bluetooth headset and the setting is on —
+ * swaps the default for the Mac's built-in mic.
+ */
+interface LiveMicChoice {
+  deviceId: string;
+  resolution: ReturnType<typeof resolveRequestedMic>;
+  choice: ReturnType<typeof chooseCaptureDevice>;
+}
+
+/** The AudioContext and worklet module prepared beside the microphone. */
+interface PreparedCaptureGraph {
+  ac: AudioContext;
+  workletModuleLoaded: boolean;
+}
+
+type LiveCapture =
+  | { kind: "warm"; warm: WarmCapture; mic: LiveMicChoice }
+  | { kind: "cold"; handle: ColdCaptureHandle<MediaStream, PreparedCaptureGraph, LiveMicChoice> };
+
+const PCM_WORKLET_URL = new URL("./pcm-worklet.js", import.meta.url).href;
+
+/**
+ * The capture branches of a start, set going at the press.
+ *
+ * The choice is made on the device list known at the press, which every
+ * ``devicechange`` refreshes. The warm path adopts the held graph by it
+ * and touches no device API at all; the cold path opens the device by it
+ * at once, re-enumerates beside the open and opens again only if the
+ * fresh list chooses another device (./live-start ``beginColdCapture``).
+ */
+function beginLiveCapture(startAttemptSeq: number): LiveCapture {
+  // A branch of a start that has since been superseded does not write
+  // into the next start's trace line.
+  const mark = (label: string, branch: StartBranch): void => {
+    if (startAttemptSeq === liveStartAttemptSeq) markStartPhase(label, branch);
+  };
+  const preferBuiltInOverBluetooth = readBluetoothBuiltinMicEnabled();
+  const chooseMic = (): LiveMicChoice => {
+    const micResolution = resolveRequestedMic();
+    const micChoice = chooseCaptureDevice({
       requestedDeviceId: micResolution.deviceId,
       preferBuiltInOverBluetooth,
       devices: knownAudioInputs,
     });
-    // The graph the previous recording left running, if it is still the
-    // right one (§4.7). Adopting it skips getUserMedia, the AudioContext
-    // and the worklet module — the whole ~310 ms — and its ring has been
-    // holding the last half-second of audio the entire time.
-    const warm = takeWarmCapture(micChoice.deviceId);
+    return { deviceId: micChoice.deviceId, resolution: micResolution, choice: micChoice };
+  };
+  const mic = chooseMic();
+  // The graph the previous recording left running, if it is still the
+  // right one (§4.7). Adopting it skips getUserMedia, the AudioContext
+  // and the worklet module — the whole ~310 ms — and its ring has been
+  // holding the last half-second of audio the entire time.
+  const warm = takeWarmCapture(mic.deviceId);
+  if (warm) {
+    mark("warmCapture", "mic");
+    return { kind: "warm", warm, mic };
+  }
+  return {
+    kind: "cold",
+    handle: beginColdCapture<MediaStream, PreparedCaptureGraph, LiveMicChoice>({
+      initialChoice: mic,
+      // Do not force a preflight getUserMedia here: a second throwaway
+      // stream before the recording one causes duplicate macOS media
+      // permission / activation events.
+      refreshChoice: async () => {
+        await loadMics(false);
+        return chooseMic();
+      },
+      // Bounded and retried — see acquireMicStream. A bare getUserMedia
+      // hung the start outright on a busy input device.
+      acquireMic: (deviceId) => typeof navigator.mediaDevices?.getUserMedia === "function"
+        ? acquireMicStream(deviceId)
+        : Promise.reject(new Error("This browser does not support microphone capture.")),
+      releaseMic: (s) => s.getTracks().forEach((t) => t.stop()),
+      prepareGraph: prepareCaptureGraph,
+      releaseGraph: (g) => { void g.ac.close().catch(() => { /* already closed */ }); },
+      // An unnamed device counts as Bluetooth, as it does for the hold.
+      graphAfterMic: isBluetoothInputLabel(mic.choice.label),
+      mark,
+    }),
+  };
+}
+
+/**
+ * The graph branch: a running AudioContext with the capture worklet
+ * module loaded — nothing that needs the stream. A module that fails to
+ * load here is loaded again by the connect, which falls back to the
+ * ScriptProcessor from there exactly as before.
+ */
+async function prepareCaptureGraph(mark: (label: string) => void): Promise<PreparedCaptureGraph> {
+  const context = new AudioContext();
+  if (context.state !== "running") {
+    try {
+      await context.resume();
+    } catch (e) {
+      console.debug("AudioContext resume rejected (non-fatal)", e);
+    }
+  }
+  mark("audioContext");
+  let workletModuleLoaded = false;
+  if (context.audioWorklet && typeof AudioWorkletNode === "function") {
+    try {
+      await context.audioWorklet.addModule(PCM_WORKLET_URL);
+      workletModuleLoaded = true;
+      mark("workletModule");
+    } catch (e) {
+      console.warn("AudioWorklet module did not load beside the microphone; the capture loads it again", e);
+    }
+  }
+  return { ac: context, workletModuleLoaded };
+}
+
+/** No session will connect this capture: release what it opened. */
+function abandonLiveCapture(capture: LiveCapture): void {
+  if (capture.kind === "cold") {
+    capture.handle.abandon();
+    return;
+  }
+  // The held graph left the hold at the press; with no session to adopt
+  // it, it goes the way every hold ends.
+  releaseHeldGraph(capture.warm, "start-abandoned");
+}
+
+/** Join the branches and connect the capture (./live-start). */
+async function connectLiveCapture(session: LiveStartSession, capture: LiveCapture): Promise<void> {
+  const { sessionUiToken, startAttemptSeq, throwIfStartCancelled } = session;
+  try {
+    const warm = capture.kind === "warm" ? capture.warm : null;
     sessionStartedWarm = !!warm;
     sessionPreRollMs = 0;
-    if (warm) {
-      ac = warm.ac;
-      stream = warm.stream;
-      src = warm.src;
-      workletNode = warm.workletNode;
-      markStartPhase("warmCapture");
+    let mic: LiveMicChoice;
+    let preparedWorklet = false;
+    if (capture.kind === "warm") {
+      mic = capture.mic;
+      ac = capture.warm.ac;
+      stream = capture.warm.stream;
+      src = capture.warm.src;
+      workletNode = capture.warm.workletNode;
     } else {
-      // Do not force a preflight getUserMedia here. startLive is about
-      // to request the actual recording stream below; opening a second
-      // throwaway stream first causes duplicate macOS media permission /
-      // activation events and can make every recording look like it is
-      // asking for access twice.
-      await loadMics(false);
-      markStartPhase("loadMics");
-      throwIfStartCancelled();
-      // Resolved again on the list ``loadMics`` just enumerated: a device
-      // that came back, left, or reappeared under a new id since the warm
-      // check above changes the answer.
-      micResolution = resolveRequestedMic();
-      micChoice = chooseCaptureDevice({
-        requestedDeviceId: micResolution.deviceId,
-        preferBuiltInOverBluetooth,
-        devices: knownAudioInputs,
-      });
-      // Bounded and retried — see acquireMicStream. The old code awaited a
-      // bare getUserMedia, so a busy input device hung the start outright.
-      stream = await acquireMicStream(micChoice.deviceId);
-      markStartPhase("getUserMedia");
+      // Close whatever still occupies the slot before the session's
+      // context takes it. Every teardown path is supposed to have emptied
+      // it already; this is the structural guarantee that a path which
+      // did not cannot strand a running AudioContext with no reference
+      // left to close it.
+      await releaseOrphanedAudioContext("starting a new capture session");
+      const opened = await capture.handle.ready;
+      // Both into the module slots at once, before anything can throw:
+      // from here the cancelled-start cleanup releases them.
+      mic = opened.choice;
+      stream = opened.stream;
+      if (opened.graph) {
+        ac = opened.graph.ac;
+        preparedWorklet = opened.graph.workletModuleLoaded;
+      } else {
+        console.warn("Capture graph could not be prepared beside the microphone; building it now", opened.graphError);
+      }
+      if (opened.reopened) {
+        console.log(`[trace startLive] the fresh device list chose another microphone; opened again choice=${opened.choice.choice.reason}`);
+      }
       throwIfStartCancelled();
     }
+    const micResolution = mic.resolution;
+    const micChoice = mic.choice;
     if (!stream || !stream.getAudioTracks().some((t) => t.readyState === "live")) {
       throw new Error("Microphone stream is not live");
     }
@@ -12115,13 +12262,15 @@ async function startLive(
     // Device watchers — see ``attachMicTrackWatchers``. A warm start
     // finds them already installed on this stream and adds nothing.
     attachMicTrackWatchers(stream);
-    if (!warm) {
-      // Close whatever still occupies the slot before overwriting it.
-      // Every teardown path is supposed to have emptied it already; this
-      // is the structural guarantee that a path which did not cannot
-      // strand a running AudioContext with no reference left to close it.
-      await releaseOrphanedAudioContext("starting a new capture session");
+    // The graph branch failed: the context is built here, after the
+    // stream, as every start used to build it.
+    // Waited for here only when the graph branch did not deliver a
+    // running context: it failed (built now, after the stream, as every
+    // start used to), or the prepared one has been suspended since.
+    let contextWaited = false;
+    if (!ac) {
       ac = new AudioContext();
+      contextWaited = true;
     }
     // One non-null reference for the rest of the start path. The module
     // slot is reassigned by the teardown helpers, so narrowing it once
@@ -12135,8 +12284,9 @@ async function startLive(
       } catch (e) {
         console.debug("AudioContext resume rejected (non-fatal)", e);
       }
+      contextWaited = true;
     }
-    markStartPhase("audioContext");
+    if (contextWaited) markStartPhase("audioContext", "capture");
     throwIfStartCancelled();
     recordedWebmChunks = [];
     try {
@@ -12173,7 +12323,7 @@ async function startLive(
         }
       };
       mediaRecorder.start(1000);
-      markStartPhase("mediaRecorder");
+      markStartPhase("mediaRecorder", "capture");
     } catch (e) {
       console.warn("MediaRecorder failed, falling back to WAV encoder", e);
       // If ``.start(1000)`` threw AFTER the constructor succeeded we
@@ -12260,13 +12410,15 @@ async function startLive(
       // frame, MessagePort order) and switches delivery back on.
       workletNode.port.onmessage = handleWorkletMessage;
       workletNode.port.postMessage({ type: "start" });
-      markStartPhase("warmWorkletStart");
+      markStartPhase("warmWorkletStart", "capture");
       workletCaptureStarted = true;
     } else if (sessionAc.audioWorklet && typeof AudioWorkletNode === "function") {
       try {
-        await sessionAc.audioWorklet.addModule(new URL("./pcm-worklet.js", import.meta.url).href);
-        markStartPhase("workletModule");
-        throwIfStartCancelled();
+        if (!preparedWorklet) {
+          await sessionAc.audioWorklet.addModule(PCM_WORKLET_URL);
+          markStartPhase("workletModule", "capture");
+          throwIfStartCancelled();
+        }
         workletNode = new AudioWorkletNode(sessionAc, "pcm-capture-processor", {
           numberOfInputs: 1,
           numberOfOutputs: 0,
@@ -12277,7 +12429,7 @@ async function startLive(
         // pre-roll message, a warm one sends exactly one.
         workletNode.port.onmessage = handleWorkletMessage;
         sessionSrc.connect(workletNode);
-        markStartPhase("captureConnected");
+        markStartPhase("captureConnected", "capture");
         workletCaptureStarted = true;
       } catch (e) {
         console.warn("AudioWorklet capture init failed; falling back to ScriptProcessor", e);
@@ -12292,7 +12444,7 @@ async function startLive(
         sessionAc.audioWorklet ? "AudioWorklet init failed" : "AudioWorklet API unavailable",
         false,
       );
-      markStartPhase("scriptProcessorCapture");
+      markStartPhase("scriptProcessorCapture", "capture");
       if (!fallbackStarted) {
         throw new Error("Microphone capture is unavailable in this browser runtime.");
       }
@@ -12323,9 +12475,6 @@ async function startLive(
       tone: "error",
     }, sessionUiToken);
     await stopLive(false);
-  }
-  } finally {
-    startLiveInFlight = false;
   }
 }
 
