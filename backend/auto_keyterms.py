@@ -115,7 +115,12 @@ PHRASE_ABSORBS_SHARE = 0.8
 #: queue) is one recompute.
 RECOMPUTE_DEBOUNCE_SEC = 30.0
 
-#: Delay of the boot recompute, so it never competes with start-up.
+#: Delay of the boot recompute after start-up's own archive read is
+#: done (``start(boot_after=...)``). The recompute is pure-Python work
+#: over up to ``MAX_CORPUS_RECORDINGS`` transcripts; run beside the
+#: History list's first build it holds the GIL against it, and a fixed
+#: delay from process start alone did not keep them apart: on a large
+#: archive the list build was still running when the delay ran out.
 BOOT_RECOMPUTE_DELAY_SEC = 5.0
 
 #: Debounce after a keyterm-related settings change.
@@ -676,6 +681,8 @@ class AutoKeytermStore:
         # by a recompute's longer debounce, nor the reverse.
         self._timers: dict[bool, asyncio.TimerHandle] = {}
         self._task: Optional[asyncio.Task] = None
+        # Waits for ``start``'s *boot_after*, then arms the boot recompute.
+        self._boot_gate: Optional[asyncio.Task] = None
         # None: nothing queued behind the running task; otherwise whether
         # the queued run recomputes.
         self._again: Optional[bool] = None
@@ -798,18 +805,56 @@ class AutoKeytermStore:
         on_refresh: Callable[[], Awaitable[None]],
         *,
         boot_delay_sec: float = BOOT_RECOMPUTE_DELAY_SEC,
+        boot_after: Optional[Awaitable[object]] = None,
     ) -> None:
         """Bind to the running loop (call from it): load the persisted
         ranking now, recompute after *boot_delay_sec*. *on_refresh* runs
         after every recompute and settings refresh — the caller re-points
-        whatever holds the old keyterm list (the warm socket pool)."""
+        whatever holds the old keyterm list (the warm socket pool).
+
+        *boot_after* is start-up work the boot recompute must not compete
+        with (the History list's first build reads the same archive):
+        the *boot_delay_sec* countdown starts only once it has finished,
+        whether it succeeded or not. Recomputes asked for meanwhile
+        (``schedule_recompute``) are not held back by it."""
         self._loop = asyncio.get_running_loop()
         self._on_refresh = on_refresh
         self.load_cached()
-        self._arm(boot_delay_sec, recompute=True)
+        if boot_after is None:
+            self._arm(boot_delay_sec, recompute=True)
+        else:
+            self._boot_gate = self._loop.create_task(
+                self._arm_after(boot_after, boot_delay_sec),
+                name="auto-keyterms-boot-gate",
+            )
+
+    async def _arm_after(self, gate: Awaitable[object], delay: float) -> None:
+        try:
+            # Shielded: ``stop`` cancelling this wait must not cancel the
+            # caller's start-up work along with it.
+            await asyncio.shield(gate)
+        except asyncio.CancelledError:
+            if self._loop is None:  # ``stop`` — nothing to arm
+                raise
+            # The gate itself was cancelled, not this task: start-up
+            # work is over either way.
+        except Exception as e:
+            logger.warning(
+                "auto-keyterms: start-up work failed (%s); boot recompute armed anyway",
+                type(e).__name__,
+            )
+        self._boot_gate = None
+        self._arm(delay, recompute=True)
 
     async def stop(self) -> None:
         loop, self._loop = self._loop, None
+        gate, self._boot_gate = self._boot_gate, None
+        if gate is not None and not gate.done():
+            gate.cancel()
+            try:
+                await gate
+            except (asyncio.CancelledError, Exception):
+                pass
         for timer in self._timers.values():
             timer.cancel()
         self._timers.clear()

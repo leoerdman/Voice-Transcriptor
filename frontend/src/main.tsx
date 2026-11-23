@@ -1198,7 +1198,7 @@ const UI_TOKENS = {
      * for a multi-MB recording.
      */
     downloadRevokeDelayMs: 30_000,
-    /** Cap on the first archive read, after which the view opens empty. */
+    /** How long the boot waits for the first archive read; the list still fills in when it answers. */
     bootstrapTimeoutMs: 15_000,
     /** Coalescing window after a save, before the archive is re-read. */
     deferredRefreshMs: 160,
@@ -14337,11 +14337,24 @@ window.addEventListener("pagehide", stopGatedPolls, { once: true });
 // Race bootstrap against a 15-second wall-clock timeout so a stalled
 // network mount or slow FS does not hang the boot overlay forever — the
 // promise must settle for any caller that `await recordingsBootstrapPromise`
-// to resume. On timeout the recordings list stays empty; the user can still
-// record and the list reloads on the next manual refresh.
+// to resume. Losing the race does not cancel the load: it carries on, and
+// the list fills in the moment the archive answers — so the warning says
+// that, and is retired then if nothing has replaced it since.
 let recordingsBootstrapTimeoutHandle = 0;
+const RECORDINGS_BOOTSTRAP_SLOW_STATUS =
+  "History is taking unusually long to load. Recording still works; the list appears as soon as it is read.";
+const recordingsBootstrapRun = initRecordingsBootstrap();
+const retireRecordingsBootstrapSlowStatus = (): void => {
+  if (liveStatusText === abbreviateForStatusPill(RECORDINGS_BOOTSTRAP_SLOW_STATUS)) {
+    setStatus("Ready", "info");
+  }
+};
+void recordingsBootstrapRun.then(
+  retireRecordingsBootstrapSlowStatus,
+  retireRecordingsBootstrapSlowStatus,
+);
 const bootRecordingsBootstrap: Promise<void> = Promise.race([
-  initRecordingsBootstrap(),
+  recordingsBootstrapRun,
   new Promise<void>((_, rej) => {
     recordingsBootstrapTimeoutHandle = window.setTimeout(
       () => rej(new Error(`recordings bootstrap timeout (${UI_TOKENS.recordings.bootstrapTimeoutMs} ms)`)),
@@ -14351,7 +14364,7 @@ const bootRecordingsBootstrap: Promise<void> = Promise.race([
 ])
   .catch((e) => {
     console.warn("[bootstrap]", e?.message ?? e);
-    setStatus("History is taking unusually long to load. Recording still works; the list reloads on the next refresh.", "warning");
+    setStatus(RECORDINGS_BOOTSTRAP_SLOW_STATUS, "warning");
   })
   .finally(() => {
     // The loser of a race is not cancelled by winning it. Without this

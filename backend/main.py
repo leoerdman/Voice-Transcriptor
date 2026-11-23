@@ -43,7 +43,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from backend.async_tasks import (
@@ -500,7 +500,15 @@ async def _app_lifespan(_app: "FastAPI") -> AsyncIterator[None]:
     # Before the boot pre-warm: ``start`` adopts the persisted keyterm
     # ranking synchronously, so the first warm socket is opened with the
     # list the first recording will ask for.
-    AUTO_KEYTERMS.start(_retarget_warm_keyterms)
+    #
+    # The History list's first build is started here, not by the window's
+    # first request, and the keyterm boot recompute — a second full read
+    # of the same archive — waits for it rather than racing it for the
+    # GIL (see ``_warm_recordings_list_at_boot``).
+    recordings_warm = asyncio.get_running_loop().create_task(
+        _warm_recordings_list_at_boot(), name="recordings-list-warm"
+    )
+    AUTO_KEYTERMS.start(_retarget_warm_keyterms, boot_after=recordings_warm)
     warm_boot = asyncio.get_running_loop().create_task(
         _prewarm_deepgram_at_boot(), name="deepgram-warm-boot"
     )
@@ -514,6 +522,7 @@ async def _app_lifespan(_app: "FastAPI") -> AsyncIterator[None]:
 
     await cancel_and_await(stall_watch, what="loop stall watch", log=logger)
     await AUTO_KEYTERMS.stop()
+    await cancel_and_await(recordings_warm, what="recordings list boot warm-up", log=logger)
     await cancel_and_await(warm_boot, what="deepgram boot pre-warm", log=logger)
     # Shutdown: drain in-flight transcription jobs before the process
     # exits so Electron's SIGTERM (killBackendHard, 1500 ms hard deadline)
@@ -8670,7 +8679,12 @@ async def open_recordings_folder(payload: dict = Body(default_factory=dict), _au
         )
 
 
-_list_cache: Optional[dict] = None
+# The rendered JSON body of the last list, not the dict: the History list
+# of a large archive is ~10k items (~6 MB), and FastAPI encoding a returned
+# dict runs on the event loop — ~0.25 s of loop-thread CPU on every request,
+# cache hit or not (a ``backend.loop_stall`` beside each boot list load).
+# Rendering once, in the rebuild's worker thread, takes that off the loop.
+_list_cache: Optional[bytes] = None
 _list_cache_at = 0.0
 _list_cache_key: Optional[tuple] = None
 _LIST_CACHE_TTL = 5.0
@@ -8855,16 +8869,22 @@ def _build_recordings_list_payload(d: "Path") -> dict:
     return {"items": items, "directory": str(d)}
 
 
-@app.get("/api/recordings")
-async def list_recordings(_auth: None = Depends(_require_api_auth)):
-    """Return the current recordings list, cached with mtime+count key.
+def _render_recordings_list(d: "Path") -> bytes:
+    """``_build_recordings_list_payload`` rendered to the response body.
+    Blocking: run it in a worker thread."""
+    return JSONResponse(content=_build_recordings_list_payload(d)).body
 
-    Now ``async`` so FastAPI does NOT silently dispatch the route to
-    a thread pool worker. On cache hit the response returns within
-    microseconds (lock + dict lookup, no I/O). On miss the scan runs
-    via ``asyncio.to_thread`` so the event loop stays responsive for
-    other requests; concurrent misses all await the same rebuild via
-    ``_list_cache_rebuild_lock`` (double-checked).
+
+async def _recordings_list_body() -> bytes:
+    """The current recordings list as a JSON body, cached with an
+    mtime+count key.
+
+    Cache hit: no scan, no encoding — the body is the bytes the last
+    rebuild rendered. Miss: the scan and the encoding run via
+    ``asyncio.to_thread`` so the event loop stays responsive for other
+    requests; concurrent misses all await the same rebuild via
+    ``_list_cache_rebuild_lock`` (double-checked). Shared by the route
+    and the boot warm-up (``_warm_recordings_list_at_boot``).
     """
     global _list_cache, _list_cache_at, _list_cache_key, _list_cache_rebuild_lock
     d = _resolve_recordings_dir()
@@ -8872,10 +8892,8 @@ async def list_recordings(_auth: None = Depends(_require_api_auth)):
 
     # Cache key probe (BUG-51): the key is an O(N) stat over every tracked
     # file of every active storage dir — NOT cheap for a library of
-    # thousands of recordings, and this route runs on the event loop, so
-    # computing it inline stalled WS transcription frames on every poll.
-    # Same worker-thread hop as the rebuild below; the fast path still
-    # avoids the full scan.
+    # thousands of recordings, so it runs on a worker thread too; the
+    # fast path still avoids the full scan.
     cache_key = await asyncio.to_thread(_recordings_scan_cache_key, d)
 
     # Fast path: cache hit.
@@ -8904,15 +8922,48 @@ async def list_recordings(_auth: None = Depends(_require_api_auth)):
                 and (now - _list_cache_at) < _LIST_CACHE_TTL
             ):
                 return _list_cache
-        # Genuine miss — run the scan in a worker thread so other
-        # awaitables (WS transcription frames, /api/health, etc.) keep
-        # making progress during the ~300 ms scan.
-        result = await asyncio.to_thread(_build_recordings_list_payload, d)
+        body = await asyncio.to_thread(_render_recordings_list, d)
         with _recordings_caches_lock:
-            _list_cache = result
+            _list_cache = body
             _list_cache_at = time.monotonic()
             _list_cache_key = cache_key
-        return result
+        return body
+
+
+@app.get("/api/recordings")
+async def list_recordings(_auth: None = Depends(_require_api_auth)):
+    """Return the current recordings list (see ``_recordings_list_body``).
+
+    ``async`` so FastAPI does NOT silently dispatch the route to a
+    thread pool worker; the body is returned pre-rendered, so FastAPI
+    has nothing left to encode on the loop.
+    """
+    return Response(content=await _recordings_list_body(), media_type="application/json")
+
+
+async def _warm_recordings_list_at_boot() -> None:
+    """Build the History list once at start-up, before the window asks.
+
+    The first build after a launch reads and parses every transcript
+    (the per-file metadata cache is in memory only) — seconds on an
+    archive of thousands. Started from the lifespan, it runs while the
+    renderer is still loading, and the renderer's first
+    ``GET /api/recordings`` joins it through the rebuild lock instead of
+    starting it. The auto-keyterm boot recompute reads the same archive
+    and waits for this (``AutoKeytermStore.start(boot_after=...)``).
+    """
+    started = time.monotonic()
+    try:
+        await _recordings_list_body()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("recordings list: boot warm-up failed")
+        return
+    logger.info(
+        "recordings list: warmed at boot in %.0f ms",
+        (time.monotonic() - started) * 1000.0,
+    )
 
 
 # Graph is intentionally dormant. The frontend sidebar/view markup and TS/CSS

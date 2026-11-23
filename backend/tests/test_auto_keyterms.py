@@ -398,6 +398,53 @@ class SchedulingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.corpus.reads, [], "a refresh alone reads nothing")
         await store.stop()
 
+    async def test_the_boot_recompute_waits_for_start_up_work(self):
+        # The History list's first build reads the same archive; the boot
+        # recompute racing it for the GIL is what pushed the list past the
+        # renderer's bootstrap timeout.
+        gate = asyncio.get_running_loop().create_future()
+        store = self._store()
+        store.start(self._on_refresh, boot_delay_sec=0.0, boot_after=gate)
+        await asyncio.sleep(0.1)
+        self.assertEqual(self.corpus.reads, [], "nothing read while start-up work runs")
+        gate.set_result(None)
+        await self._settle(store, 0.05)
+        self.assertEqual(sorted(self.corpus.reads), ["r0", "r1", "r2"])
+        self.assertEqual(self.refreshes, 1)
+        await store.stop()
+
+    async def test_failed_start_up_work_still_arms_the_boot_recompute(self):
+        gate = asyncio.get_running_loop().create_future()
+        store = self._store()
+        store.start(self._on_refresh, boot_delay_sec=0.0, boot_after=gate)
+        with self.assertLogs("backend.auto_keyterms", level="WARNING"):
+            gate.set_exception(OSError("disk"))
+            await self._settle(store, 0.05)
+        self.assertEqual(sorted(self.corpus.reads), ["r0", "r1", "r2"])
+        await store.stop()
+
+    async def test_a_save_during_start_up_is_not_held_by_the_gate(self):
+        gate = asyncio.get_running_loop().create_future()
+        store = self._store()
+        store.start(self._on_refresh, boot_delay_sec=0.0, boot_after=gate)
+        store.schedule_recompute()
+        await self._settle(store)
+        self.assertEqual(sorted(self.corpus.reads), ["r0", "r1", "r2"])
+        gate.set_result(None)
+        await store.stop()
+
+    async def test_stop_during_start_up_leaves_the_start_up_work_alone(self):
+        gate = asyncio.get_running_loop().create_future()
+        store = self._store()
+        store.start(self._on_refresh, boot_delay_sec=0.0, boot_after=gate)
+        await asyncio.sleep(0.01)
+        await store.stop()
+        self.assertFalse(gate.cancelled(), "stopping the store cancelled the caller's work")
+        gate.set_result(None)
+        await asyncio.sleep(0.05)
+        self.assertEqual(self.corpus.reads, [])
+        self.assertEqual(self.refreshes, 0)
+
     async def test_stop_cancels_what_is_pending(self):
         store = self._store()
         store.start(self._on_refresh, boot_delay_sec=0.05)
