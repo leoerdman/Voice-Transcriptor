@@ -4,6 +4,11 @@
 // the window's own error page (stderr tail, recovery poll), not a bare
 // modal with no window — so whenReady must not await the backend before
 // it raises the startup event; createWindow owns the boot.
+// This remains a source pin, not a behavior test: the ordering lives in
+// Electron's app.whenReady/createWindow lifecycle and cannot be executed
+// by this Node test without starting the desktop app. Replacing it
+// requires extracting startup orchestration from main.js into an
+// independently executable module; main.js is out of scope for this lane.
 
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
@@ -26,7 +31,13 @@ test("createWindow starts the backend itself and owns the failure page", () => {
 // FQ-22(5) / FQ-14: an empty boot status means "boot finished
 // successfully" to the renderer, so only the health-OK path sends it;
 // every failure records a code and retires the status without signalling
-// success, and the error reaches the renderer as { code, raw }.
+// success, and the error reaches the renderer as { code, raw }. This is
+// also a source pin: the producer and consumer are wired through Electron
+// IPC in main.js. A behavior replacement requires an injected backend and
+// fake BrowserWindow/preload bridge, exercising success and each failure
+// through the real startup coordinator; the coordinator is not extracted
+// and main.js is out of scope here. boot-error.test.ts behavior-tests the
+// renderer's classification, not this producer's IPC ordering.
 test("only the success path sends an empty boot status; failures carry a code", () => {
   const empties = mainSource.match(/setBackendBootStatus\(""\)/g) || [];
   assert.equal(empties.length, 1, "exactly one success signal");
