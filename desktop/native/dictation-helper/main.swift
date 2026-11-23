@@ -21,6 +21,8 @@
 // Every request carries an "id" that its answer repeats.
 //   stdin : {"cmd":"permissions","id":n}
 //           {"cmd":"front-app","id":n}
+//           {"cmd":"paste-key","id":n}                the key the current
+//                                                    layout's ⌘ table calls V
 //           {"cmd":"clipboard-prepare","id":n}       snapshot the clipboard now
 //                                                    (the recording's start)
 //           {"cmd":"paste","id":n,"text":"..","pid":n,"verify":bool,
@@ -35,6 +37,9 @@
 //   stdout: {"t":"ready","pid":n,"accessibility":b,"postEvents":b,"listenEvents":b}
 //           {"t":"permissions","id":n,"accessibility":b,"postEvents":b,"listenEvents":b}
 //           {"t":"front-app","id":n,"pid":n,"bundleId":"..","name":".."}   no pid: none
+//           {"t":"paste-key","id":n,"code":n,"layout":".."}   KeyLayout.swift's
+//                                                    answer, so the AppleScript
+//                                                    fallback presses the same key
 //           {"t":"clipboard-prepare","id":n,"changeCount":n,"ms":x}
 //           {"t":"paste","id":n,"ok":b,"sent":b,"reason":"..","reverted":b,"changeCount":n,
 //            "source":"prepared|carried|fresh","front":{..},"modifiers":{"cleared":b,"flags":n,"waitedMs":n},
@@ -199,6 +204,9 @@ func handle(_ obj: [String: Any], cmd: String) {
     var answer: [String: Any] = ["t": "front-app", "id": id]
     if let front = FrontApp.current() { answer.merge(front.json) { $1 } }
     emit(answer)
+  case "paste-key":
+    let key = PasteKey.current
+    emit(["t": "paste-key", "id": id, "code": Int(key.code), "layout": key.layout])
   case "clipboard-prepare":
     let started = DispatchTime.now().uptimeNanoseconds
     let snapshot = systemPasteboard.snapshot()

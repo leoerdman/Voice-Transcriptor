@@ -45,6 +45,7 @@ const {
   pasteAttemptDelayMs,
   pasteMethodTimeoutMs,
   pasteBudgetWorstCaseMs,
+  pasteKeyAnswerTimeoutMs,
   NS_EVENT_MODIFIER_FLAGS,
   planModifierRelease,
   modifierReleaseScript,
@@ -531,12 +532,15 @@ test("the table owns EVERY wall-clock bound the ladder spends, activation includ
   // On Windows that made the real worst case ~2x the computed one.
   for (const platform of Object.keys(PASTE_BUDGET)) {
     const b = pasteBudgetFor(platform);
-    for (const key of ["activationTimeoutMs", "activationLadderSteps", "autoSendTimeoutMs"]) {
+    for (const key of ["activationTimeoutMs", "activationLadderSteps", "pasteKeyAnswerMs", "autoSendTimeoutMs"]) {
       assert.equal(typeof b[key], "number", `${platform}.${key}`);
     }
     assert.ok(b.activationTimeoutMs > 0, platform);
     assert.equal(pasteActivationTimeoutMs(platform), b.activationTimeoutMs);
     assert.equal(pasteAutoSendTimeoutMs(platform), b.autoSendTimeoutMs);
+    assert.equal(pasteKeyAnswerTimeoutMs(platform), b.pasteKeyAnswerMs);
+    // Only macOS reads a keyboard layout for the AppleScript fallback.
+    assert.equal(b.pasteKeyAnswerMs > 0, platform === "darwin", `${platform}: paste-key query is macOS only`);
     assert.ok(
       pasteBudgetWorstCaseMs(platform) >=
       b.maxAttempts * b.activationLadderSteps * b.activationTimeoutMs,
@@ -820,7 +824,7 @@ test("the activation settles live in PASTE_BUDGET and are counted in the worst c
     // Removing the settles must leave exactly the old sum, i.e. they are counted once per attempt.
     assert.equal(
       withoutSettle,
-      b.preflightMs + b.preflightSettleMs
+      b.preflightMs + b.preflightSettleMs + b.pasteKeyAnswerMs
         + b.attemptDelaysMs.slice(0, b.maxAttempts).reduce((a, x) => a + x, 0)
         + b.maxAttempts * (b.methodTimeoutsMs.reduce((a, x) => a + x, 0) + b.verificationAllowanceMs
           + b.activationLadderSteps * b.activationTimeoutMs + b.activationSettleMs)

@@ -31,7 +31,9 @@ const {
   AX_VERIFY_POLL_INTERVAL_SEC,
   AX_TRACE_PREFIX,
   PASTE_SENT_PREFIX,
+  QWERTY_V_KEY_CODE,
   escapeAppleScriptString,
+  pasteKeyFromAnswer,
   robustPasteScript,
   menuPasteFallbackScript,
 } = require("./paste-script");
@@ -188,6 +190,55 @@ test("the pasted length is interpolated as a number, never as text", () => {
   assert.match(robustPasteScript({ ...TARGET, pid: -5 }), /set targetPid to 0\n/);
 });
 
+test("the pressed key code is the caller's, not a fixed QWERTY position", () => {
+  // A virtual key code names a POSITION: code 9 is V on QWERTY and K on
+  // Dvorak, whose ⌘V is code 47. KeyLayout.swift is the one place that
+  // reads the layout; the AppleScript receives its answer as a parameter.
+  const pressed = (source) => {
+    const m = /key code (\d+) using \{command down\}/.exec(source);
+    return m ? Number(m[1]) : null;
+  };
+  assert.equal(pressed(robustPasteScript({ ...TARGET, vKeyCode: 47, verify: false })), 47);
+  assert.equal(pressed(robustPasteScript({ ...TARGET, vKeyCode: 47, verify: true })), 47);
+  // Nothing answered: the QWERTY last resort, the same one the native
+  // path uses when a layout gives no "v".
+  assert.equal(pressed(robustPasteScript({ ...TARGET })), QWERTY_V_KEY_CODE);
+  // A value that is not a key position never reaches the script.
+  for (const bad of ["not-a-number", 128, -1, 9.5]) {
+    assert.equal(pressed(robustPasteScript({ ...TARGET, vKeyCode: bad })), QWERTY_V_KEY_CODE, String(bad));
+  }
+});
+
+test("the paste key is KeyLayout.swift's answer, with one documented last resort", () => {
+  assert.deepEqual(
+    pasteKeyFromAnswer({ t: "paste-key", code: 47, layout: "com.apple.keylayout.Dvorak" }),
+    { code: 47, layout: "com.apple.keylayout.Dvorak", source: "helper" },
+  );
+  for (const answer of [null, undefined, { t: "lost" }, { t: "paste-key" }, { t: "paste-key", code: "47" }, { t: "paste-key", code: 128 }]) {
+    assert.deepEqual(
+      pasteKeyFromAnswer(answer),
+      { code: QWERTY_V_KEY_CODE, layout: "", source: "fallback" },
+      JSON.stringify(answer),
+    );
+  }
+  // The number is written twice — once for each language — because the
+  // Swift binary cannot read this file. This is what keeps them equal.
+  const swift = fs.readFileSync(path.join(__dirname, "native", "dictation-helper", "KeyLayout.swift"), "utf8");
+  const declared = /let qwertyVKeyCode: CGKeyCode = (\d+)/.exec(swift);
+  assert.ok(declared, "KeyLayout.swift declares qwertyVKeyCode");
+  assert.equal(Number(declared[1]), QWERTY_V_KEY_CODE, "qwertyVKeyCode and QWERTY_V_KEY_CODE drifted");
+});
+
+test("main.js takes the key from the helper, not from a literal", () => {
+  const { mainSource, topLevelFunctionSource } = require("./main-source");
+  assert.match(mainSource, /dictationHelper\.request\("paste-key"/, "the helper owns the layout read");
+  assert.match(
+    topLevelFunctionSource("pasteFromClipboard"),
+    /vKeyCode: pasteKey\.code/,
+    "the AppleScript receives that answer instead of a fixed position",
+  );
+});
+
 test("target text cannot break out of its AppleScript string literal", () => {
   const script = robustPasteScript({
     appName: 'Ev"il\nApp',
@@ -206,16 +257,18 @@ test("every shape the product runs compiles", { skip: process.platform !== "darw
   if (probe.error) return; // osacompile ships with macOS; nothing to do without it.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "transcriptor-paste-script-"));
   try {
-    for (const verify of [false, true]) {
-      const out = path.join(dir, `paste-verify-${verify}.scpt`);
+    // Both verification shapes on the QWERTY position, and both on a
+    // Dvorak key code the helper really answers with.
+    for (const [verify, vKeyCode] of [[false, QWERTY_V_KEY_CODE], [true, QWERTY_V_KEY_CODE], [false, 47], [true, 47]]) {
+      const out = path.join(dir, `paste-verify-${verify}-key-${vKeyCode}.scpt`);
       const res = spawnSync("osacompile", ["-o", out], {
-        input: robustPasteScript({ ...TARGET, verify }),
+        input: robustPasteScript({ ...TARGET, verify, vKeyCode }),
         encoding: "utf8",
       });
       assert.equal(
         res.status,
         0,
-        `robustPasteScript({verify:${verify}}) does not compile:\n${(res.stderr || "").trim()}`,
+        `robustPasteScript({verify:${verify}, vKeyCode:${vKeyCode}}) does not compile:\n${(res.stderr || "").trim()}`,
       );
     }
     // The secondary fallback too. It used to be a hand-written template in

@@ -177,7 +177,11 @@ test("the scanner finds the AppleScript sources it is meant to guard", () => {
   );
   const joined = scripts.map((s) => s.value).join("\n");
   assert.match(joined, /menu item "Paste"/, "the paste script must be among them");
-  assert.match(joined, /key code 9/, "the Cmd+V fallback must be among them");
+  // The key code is a parameter now (KeyLayout.swift reads the layout);
+  // the anchor is the statement, not a position, so this still proves the
+  // Cmd+V fallback was found without restating a number the script no
+  // longer owns.
+  assert.match(joined, /key code \$\{safeKey\} using \{command down\}/, "the Cmd+V fallback must be among them");
 });
 
 test("no AppleScript template is cut short by a stray backtick", () => {
