@@ -1,6 +1,6 @@
 {
   "name": "transcriptor",
-  "version": "1.6.31",
+  "version": "1.6.32",
   "description": "Voice-to-text transcription with auto-paste",
   "author": "Leo Erdman",
   "license": "MIT",
@@ -95,6 +95,7 @@
       "backend-runtime-check.js",
       "python-version.js",
       "window-lifecycle.js",
+      "floating-window.js",
       "user-data-dir.js",
       "preload.js",
       "capsule-preload.js",

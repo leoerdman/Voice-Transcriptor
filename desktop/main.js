@@ -40,6 +40,7 @@ const {
   decideMainWindowBounds,
   normalizeStoredWindowState,
 } = require("./window-lifecycle");
+const { floatingWindowOptions, spanAllWorkspaces } = require("./floating-window");
 // SSOT for "did this paste attempt actually succeed, and is it verified
 // enough to trust restoring the clipboard afterward" (BUGS_AUDIT
 // 2026-09-03 §6.1/§6.4/§6.6) — unit-tested by desktop/paste-result.test.js.
@@ -2307,6 +2308,9 @@ async function ensureRecordingStatusCapsuleWindow() {
   const createStartedAt = Date.now();
   recordingStatusWindow = new BrowserWindow({
     ...recordingStatusCapsuleBounds(),
+    // An NSPanel on macOS: floats over full-screen apps without turning the
+    // process into a Dock-less UIElement app (./floating-window).
+    ...floatingWindowOptions(),
     frame: false,
     transparent: true,
     resizable: false,
@@ -2353,7 +2357,11 @@ async function ensureRecordingStatusCapsuleWindow() {
   recordingStatusWindow.setMenuBarVisibility(false);
   try { recordingStatusWindow.setAlwaysOnTop(true, "floating"); } catch { }
   if (recordingStatusCapsuleState.screen) applyCapsuleScreenModeLayer(true);
-  try { recordingStatusWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }); } catch { }
+  try {
+    spanAllWorkspaces(recordingStatusWindow);
+  } catch (e) {
+    appendMainLog(`[recording-capsule] span workspaces failed: ${e?.message || e}`);
+  }
   recordingStatusWindow.on("closed", () => {
     recordingStatusWindow = null;
     recordingStatusWindowReady = false;

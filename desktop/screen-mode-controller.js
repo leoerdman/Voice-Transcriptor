@@ -92,6 +92,7 @@ const {
   unshotStrokes,
 } = require("./screen-mode");
 const { PRESENTER_STATE, SCREEN_SURFACE, createSurfacePresenter } = require("./screen-surfaces");
+const { floatingWindowOptions, spanAllWorkspaces } = require("./floating-window");
 
 const OVERLAY_PARTITION = "screen-mode-overlay";
 const PALETTE = Object.freeze({ dot: 18, tool: 22, divider: 1, gap: 8, padX: 10, height: 30, marginAboveCapsule: 8 });
@@ -589,6 +590,7 @@ function createScreenModeController(deps) {
       fullscreenable: false,
       focusable: false,
       skipTaskbar: true,
+      ...floatingWindowOptions(),
       hasShadow: false,
       show: false,
       enableLargerThanScreen: true,
@@ -621,7 +623,7 @@ function createScreenModeController(deps) {
       required("setIgnoreMouseEvents", () => w.setIgnoreMouseEvents(true));
       required("setContentProtection", () => w.setContentProtection(true));
       optional("overlay setAlwaysOnTop", () => w.setAlwaysOnTop(true, SCREEN_MODE_LAYERS.level, SCREEN_MODE_LAYERS.overlay));
-      optional("overlay setVisibleOnAllWorkspaces", () => w.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }));
+      optional("overlay spanAllWorkspaces", () => spanAllWorkspaces(w));
       await w.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(overlayHtml())}`);
       if (w.isDestroyed()) throw new Error("overlay window was destroyed while loading");
       // The display bounds again: macOS may have nudged the window off the
@@ -801,6 +803,7 @@ function createScreenModeController(deps) {
       fullscreenable: false,
       focusable: false,
       skipTaskbar: true,
+      ...floatingWindowOptions(),
       hasShadow: false,
       show: false,
       alwaysOnTop: true,
@@ -828,7 +831,7 @@ function createScreenModeController(deps) {
       recreate: () => replacePalette(w),
     });
     optional("palette setAlwaysOnTop", () => w.setAlwaysOnTop(true, SCREEN_MODE_LAYERS.level, SCREEN_MODE_LAYERS.palette));
-    optional("palette setVisibleOnAllWorkspaces", () => w.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true }));
+    optional("palette spanAllWorkspaces", () => spanAllWorkspaces(w));
     const html = paletteHtml(
       SCREEN_MODE.colors,
       session ? session.color : SCREEN_MODE.colors[0],

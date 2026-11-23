@@ -230,7 +230,11 @@ test("nothing hides the app or the main window", () => {
 });
 
 test("only the recording capsule spans workspaces, and it never activates the app", () => {
-  const spans = MAIN_JS.match(/^.*setVisibleOnAllWorkspaces.*$/gm) || [];
+  // Every span goes through ./floating-window, which never transforms the
+  // process: a bare setVisibleOnAllWorkspaces(…visibleOnFullScreen…) turns
+  // the app into a Dock-less UIElement (the missing running indicator).
+  assert.ok(!/setVisibleOnAllWorkspaces\(/.test(MAIN_JS), "span windows only through spanAllWorkspaces()");
+  const spans = MAIN_JS.match(/^.*spanAllWorkspaces\(.*$/gm) || [];
   assert.equal(spans.length, 1, "exactly one window may span workspaces");
   assert.match(spans[0], /recordingStatusWindow/, "only the capsule, never the main window");
   // The capsule is a panel: not focusable, shown without activating.

@@ -165,6 +165,7 @@ desktop/
 ├── linux-wm-class.js               # WM_CLASS split from `wmctrl -lpGx` for Linux window activation (pure, node --test)
 ├── user-data-dir.js                # one spelling for the app's data directory, shared with backend/data_dir.py (pure, node --test)
 ├── window-lifecycle.js             # main-window lifecycle SSOT: activate/close/minimise/quit/second-instance/capsule decisions and where the window opens (pure, node --test)
+├── floating-window.js              # capsule/screen-mode windows float over full-screen apps as NSPanels without taking the app out of the Dock (node --test)
 ├── transcript-signal.js            # what a renderer hand-off signal means for the post-stop task: paste, keep waiting, or terminal (pure, node --test)
 ├── clipboard-lease.js              # one owner of the user's real-clipboard snapshot during a paste; released exactly once (pure, node --test)
 ├── dictation-helper.js            # the persistent native helper's client: spawn/restart, request/answer by id, native paste request and verdict (pure, node --test)

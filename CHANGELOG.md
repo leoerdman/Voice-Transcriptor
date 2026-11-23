@@ -3,6 +3,12 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.32] - 2026-11-23
+
+### Fixed
+
+- **Transcriptor stays in the Dock with its running dot.** The recording capsule (and screen mode's overlay and palette) asked Electron to float over full-screen apps, and Electron does that by quietly turning the whole app into a background agent — the same thing as hiding its Dock icon. The capsule is built about a second after launch, so from then on the Dock showed no dot under Transcriptor, and the main window got hidden right after start (the log's `event=hide reason=os-initiated`). These windows are now macOS panels, which float over full-screen apps on their own, and the app is never switched out of the Dock.
+
 ## [1.6.31] - 2026-11-23
 
 ### Fixed
