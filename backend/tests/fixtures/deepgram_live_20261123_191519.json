@@ -1,0 +1,1757 @@
+[
+{
+"reading": "multi",
+"is_final": false,
+"speech_final": false,
+"start": 0.0,
+"duration": 1.0,
+"transcript": "",
+"words": []
+},
+{
+"reading": "ru",
+"is_final": false,
+"speech_final": false,
+"start": 0.0,
+"duration": 1.0,
+"transcript": "",
+"words": []
+},
+{
+"reading": "ru",
+"is_final": false,
+"speech_final": false,
+"start": 0.0,
+"duration": 2.0,
+"transcript": "Так, это тестовая",
+"words": [
+{
+"word": "так",
+"punctuated_word": "Так,",
+"start": 0.96,
+"end": 1.28,
+"confidence": 0.97998047
+},
+{
+"word": "это",
+"punctuated_word": "это",
+"start": 1.28,
+"end": 1.52,
+"confidence": 0.9951172
+},
+{
+"word": "тестовая",
+"punctuated_word": "тестовая",
+"start": 1.52,
+"end": 1.92,
+"confidence": 0.75561523
+}
+]
+},
+{
+"reading": "multi",
+"is_final": false,
+"speech_final": false,
+"start": 0.0,
+"duration": 2.0,
+"transcript": "Таката тестова",
+"words": [
+{
+"word": "таката",
+"punctuated_word": "Таката",
+"start": 0.96,
+"end": 1.52,
+"confidence": 0.76953125,
+"language": "ru"
+},
+{
+"word": "тестова",
+"punctuated_word": "тестова",
+"start": 1.52,
+"end": 1.92,
+"confidence": 0.7342529,
+"language": "ru"
+}
+]
+},
+{
+"reading": "ru",
+"is_final": false,
+"speech_final": false,
+"start": 0.0,
+"duration": 3.0,
+"transcript": "Так, это тестовая речь. Я сейчас говорю",
+"words": [
+{
+"word": "так",
+"punctuated_word": "Так,",
+"start": 0.96,
+"end": 1.28,
+"confidence": 0.98535156
+},
+{
+"word": "это",
+"punctuated_word": "это",
+"start": 1.28,
+"end": 1.52,
+"confidence": 0.9863281
+},
+{
+"word": "тестовая",
+"punctuated_word": "тестовая",
+"start": 1.52,
+"end": 2.0,
+"confidence": 0.9995117
+},
+{
+"word": "речь",
+"punctuated_word": "речь.",
+"start": 2.0,
+"end": 2.32,
+"confidence": 0.7993164
+},
+{
+"word": "я",
+"punctuated_word": "Я",
+"start": 2.32,
+"end": 2.3999999,
+"confidence": 0.99902344
+},
+{
+"word": "сейчас",
+"punctuated_word": "сейчас",
+"start": 2.3999999,
+"end": 2.56,
+"confidence": 0.9941406
+},
+{
+"word": "говорю",
+"punctuated_word": "говорю",
+"start": 2.56,
+"end": 2.8799999,
+"confidence": 0.7578125
+}
+]
+},
+{
+"reading": "multi",
+"is_final": false,
+"speech_final": false,
+"start": 0.0,
+"duration": 3.0,
+"transcript": "Tak atatestomoje riečiai aš atdavariu",
+"words": [
+{
+"word": "tak",
+"punctuated_word": "Tak",
+"start": 0.96,
+"end": 1.1999999,
+"confidence": 0.40966797,
+"language": "lt"
+},
+{
+"word": "atatestomoje",
+"punctuated_word": "atatestomoje",
+"start": 1.1999999,
+"end": 2.0,
+"confidence": 0.6378174,
+"language": "lt"
+},
+{
+"word": "riečiai",
+"punctuated_word": "riečiai",
+"start": 2.0,
+"end": 2.32,
+"confidence": 0.77563477,
+"language": "lt"
+},
+{
+"word": "aš",
+"punctuated_word": "aš",
+"start": 2.32,
+"end": 2.48,
+"confidence": 0.51904297,
+"language": "lt"
+},
+{
+"word": "atdavariu",
+"punctuated_word": "atdavariu",
+"start": 2.48,
+"end": 2.8799999,
+"confidence": 0.61291504,
+"language": "lt"
+}
+]
+},
+{
+"reading": "multi",
+"is_final": false,
+"speech_final": false,
+"start": 0.0,
+"duration": 4.0,
+"transcript": "Так это тестовой речки я сейчас говорю говорю очень",
+"words": [
+{
+"word": "так",
+"punctuated_word": "Так",
+"start": 0.96,
+"end": 1.1999999,
+"confidence": 0.51171875,
+"language": "ru"
+},
+{
+"word": "это",
+"punctuated_word": "это",
+"start": 1.1999999,
+"end": 1.52,
+"confidence": 0.9819336,
+"language": "ru"
+},
+{
+"word": "тестовой",
+"punctuated_word": "тестовой",
+"start": 1.52,
+"end": 2.0,
+"confidence": 0.8076172,
+"language": "ru"
+},
+{
+"word": "речки",
+"punctuated_word": "речки",
+"start": 2.0,
+"end": 2.32,
+"confidence": 0.7512207,
+"language": "ru"
+},
+{
+"word": "я",
+"punctuated_word": "я",
+"start": 2.32,
+"end": 2.3999999,
+"confidence": 0.94921875,
+"language": "ru"
+},
+{
+"word": "сейчас",
+"punctuated_word": "сейчас",
+"start": 2.3999999,
+"end": 2.56,
+"confidence": 0.97021484,
+"language": "ru"
+},
+{
+"word": "говорю",
+"punctuated_word": "говорю",
+"start": 2.56,
+"end": 2.8799999,
+"confidence": 0.9951172,
+"language": "ru"
+},
+{
+"word": "говорю",
+"punctuated_word": "говорю",
+"start": 2.8799999,
+"end": 3.36,
+"confidence": 0.94140625,
+"language": "ru"
+},
+{
+"word": "очень",
+"punctuated_word": "очень",
+"start": 3.36,
+"end": 3.6799998,
+"confidence": 0.9316406,
+"language": "ru"
+}
+]
+},
+{
+"reading": "ru",
+"is_final": false,
+"speech_final": false,
+"start": 0.0,
+"duration": 4.0,
+"transcript": "Так, это тестовая речь. Я сейчас говорю, говорю очень",
+"words": [
+{
+"word": "так",
+"punctuated_word": "Так,",
+"start": 0.96,
+"end": 1.28,
+"confidence": 0.98535156
+},
+{
+"word": "это",
+"punctuated_word": "это",
+"start": 1.28,
+"end": 1.52,
+"confidence": 0.9863281
+},
+{
+"word": "тестовая",
+"punctuated_word": "тестовая",
+"start": 1.52,
+"end": 2.0,
+"confidence": 0.99853516
+},
+{
+"word": "речь",
+"punctuated_word": "речь.",
+"start": 2.0,
+"end": 2.32,
+"confidence": 0.8964844
+},
+{
+"word": "я",
+"punctuated_word": "Я",
+"start": 2.32,
+"end": 2.3999999,
+"confidence": 0.99902344
+},
+{
+"word": "сейчас",
+"punctuated_word": "сейчас",
+"start": 2.3999999,
+"end": 2.6399999,
+"confidence": 0.9980469
+},
+{
+"word": "говорю",
+"punctuated_word": "говорю,",
+"start": 2.6399999,
+"end": 2.96,
+"confidence": 0.8457031
+},
+{
+"word": "говорю",
+"punctuated_word": "говорю",
+"start": 2.96,
+"end": 3.36,
+"confidence": 0.9140625
+},
+{
+"word": "очень",
+"punctuated_word": "очень",
+"start": 3.36,
+"end": 3.76,
+"confidence": 0.9902344
+}
+]
+},
+{
+"reading": "multi",
+"is_final": true,
+"speech_final": false,
+"start": 0.0,
+"duration": 4.16,
+"transcript": "",
+"words": []
+},
+{
+"reading": "ru",
+"is_final": true,
+"speech_final": false,
+"start": 0.0,
+"duration": 4.16,
+"transcript": "Так, это тестовая речь. Я сейчас говорю, говорю очень быстро.",
+"words": [
+{
+"word": "так",
+"punctuated_word": "Так,",
+"start": 0.96,
+"end": 1.28,
+"confidence": 0.9838867
+},
+{
+"word": "это",
+"punctuated_word": "это",
+"start": 1.28,
+"end": 1.52,
+"confidence": 0.98535156
+},
+{
+"word": "тестовая",
+"punctuated_word": "тестовая",
+"start": 1.52,
+"end": 2.0,
+"confidence": 0.9980469
+},
+{
+"word": "речь",
+"punctuated_word": "речь.",
+"start": 2.0,
+"end": 2.32,
+"confidence": 0.89404297
+},
+{
+"word": "я",
+"punctuated_word": "Я",
+"start": 2.32,
+"end": 2.3999999,
+"confidence": 0.99902344
+},
+{
+"word": "сейчас",
+"punctuated_word": "сейчас",
+"start": 2.3999999,
+"end": 2.6399999,
+"confidence": 0.9980469
+},
+{
+"word": "говорю",
+"punctuated_word": "говорю,",
+"start": 2.6399999,
+"end": 2.96,
+"confidence": 0.85253906
+},
+{
+"word": "говорю",
+"punctuated_word": "говорю",
+"start": 2.96,
+"end": 3.36,
+"confidence": 0.9316406
+},
+{
+"word": "очень",
+"punctuated_word": "очень",
+"start": 3.36,
+"end": 3.76,
+"confidence": 0.9770508
+},
+{
+"word": "быстро",
+"punctuated_word": "быстро.",
+"start": 3.76,
+"end": 4.08,
+"confidence": 0.64819336
+}
+]
+},
+{
+"reading": "multi",
+"is_final": false,
+"speech_final": false,
+"start": 4.16,
+"duration": 1.04,
+"transcript": "",
+"words": []
+},
+{
+"reading": "ru",
+"is_final": false,
+"speech_final": false,
+"start": 4.16,
+"duration": 1.04,
+"transcript": "Быстро разные",
+"words": [
+{
+"word": "быстро",
+"punctuated_word": "Быстро",
+"start": 4.16,
+"end": 4.3199997,
+"confidence": 0.5830078
+},
+{
+"word": "разные",
+"punctuated_word": "разные",
+"start": 4.3199997,
+"end": 4.8799996,
+"confidence": 0.79541016
+}
+]
+},
+{
+"reading": "multi",
+"is_final": false,
+"speech_final": false,
+"start": 4.16,
+"duration": 1.44,
+"transcript": "",
+"words": []
+},
+{
+"reading": "ru",
+"is_final": false,
+"speech_final": false,
+"start": 4.16,
+"duration": 1.44,
+"transcript": "Быстро разные... Я",
+"words": [
+{
+"word": "быстро",
+"punctuated_word": "Быстро",
+"start": 4.16,
+"end": 4.3199997,
+"confidence": 0.50390625
+},
+{
+"word": "разные",
+"punctuated_word": "разные...",
+"start": 4.3199997,
+"end": 5.4399996,
+"confidence": 0.69036865
+},
+{
+"word": "я",
+"punctuated_word": "Я",
+"start": 5.4399996,
+"end": 5.52,
+"confidence": 0.26464844
+}
+]
+},
+{
+"reading": "multi",
+"is_final": false,
+"speech_final": false,
+"start": 4.16,
+"duration": 2.44,
+"transcript": "",
+"words": []
+},
+{
+"reading": "ru",
+"is_final": false,
+"speech_final": false,
+"start": 4.16,
+"duration": 2.44,
+"transcript": "Быстро разные неописуемые",
+"words": [
+{
+"word": "быстро",
+"punctuated_word": "Быстро",
+"start": 4.16,
+"end": 4.56,
+"confidence": 0.38330078
+},
+{
+"word": "разные",
+"punctuated_word": "разные",
+"start": 4.56,
+"end": 5.28,
+"confidence": 0.8828125
+},
+{
+"word": "неописуемые",
+"punctuated_word": "неописуемые",
+"start": 5.4399996,
+"end": 6.16,
+"confidence": 0.7985026
+}
+]
+},
+{
+"reading": "multi",
+"is_final": false,
+"speech_final": false,
+"start": 4.16,
+"duration": 3.44,
+"transcript": "",
+"words": []
+},
+{
+"reading": "ru",
+"is_final": false,
+"speech_final": false,
+"start": 4.16,
+"duration": 3.44,
+"transcript": "",
+"words": []
+},
+{
+"reading": "multi",
+"is_final": false,
+"speech_final": false,
+"start": 4.16,
+"duration": 4.4400005,
+"transcript": "",
+"words": []
+},
+{
+"reading": "ru",
+"is_final": false,
+"speech_final": false,
+"start": 4.16,
+"duration": 4.4400005,
+"transcript": "Разные неописуемые. Если вдвоем говорить,",
+"words": [
+{
+"word": "разные",
+"punctuated_word": "Разные",
+"start": 4.56,
+"end": 5.28,
+"confidence": 0.41381836
+},
+{
+"word": "неописуемые",
+"punctuated_word": "неописуемые.",
+"start": 5.4399996,
+"end": 6.56,
+"confidence": 0.7824707
+},
+{
+"word": "если",
+"punctuated_word": "Если",
+"start": 6.96,
+"end": 7.2799997,
+"confidence": 0.4741211
+},
+{
+"word": "вдвоем",
+"punctuated_word": "вдвоем",
+"start": 7.2799997,
+"end": 7.7599998,
+"confidence": 0.9812012
+},
+{
+"word": "говорить",
+"punctuated_word": "говорить,",
+"start": 7.7599998,
+"end": 8.0,
+"confidence": 0.72509766
+}
+]
+},
+{
+"reading": "multi",
+"is_final": true,
+"speech_final": false,
+"start": 4.16,
+"duration": 4.7300005,
+"transcript": "",
+"words": []
+},
+{
+"reading": "ru",
+"is_final": true,
+"speech_final": false,
+"start": 4.16,
+"duration": 4.7300005,
+"transcript": "Разные неописуемые. Если вдвоем говорить,",
+"words": [
+{
+"word": "разные",
+"punctuated_word": "Разные",
+"start": 4.56,
+"end": 5.28,
+"confidence": 0.47021484
+},
+{
+"word": "неописуемые",
+"punctuated_word": "неописуемые.",
+"start": 5.4399996,
+"end": 6.56,
+"confidence": 0.7885742
+},
+{
+"word": "если",
+"punctuated_word": "Если",
+"start": 6.96,
+"end": 7.2799997,
+"confidence": 0.4970703
+},
+{
+"word": "вдвоем",
+"punctuated_word": "вдвоем",
+"start": 7.2799997,
+"end": 7.7599998,
+"confidence": 0.9802246
+},
+{
+"word": "говорить",
+"punctuated_word": "говорить,",
+"start": 7.7599998,
+"end": 8.0,
+"confidence": 0.5722656
+}
+]
+},
+{
+"reading": "ru",
+"is_final": true,
+"speech_final": true,
+"start": 8.89,
+"duration": 0.7199993,
+"transcript": "",
+"words": []
+},
+{
+"reading": "multi",
+"is_final": true,
+"speech_final": true,
+"start": 8.89,
+"duration": 0.7199993,
+"transcript": "",
+"words": []
+},
+{
+"reading": "ru",
+"is_final": false,
+"speech_final": false,
+"start": 9.61,
+"duration": 1.0900002,
+"transcript": "",
+"words": []
+},
+{
+"reading": "multi",
+"is_final": false,
+"speech_final": false,
+"start": 9.61,
+"duration": 1.0900002,
+"transcript": "יסודו היום גבריתי",
+"words": [
+{
+"word": "יסודו",
+"punctuated_word": "יסודו",
+"start": 9.7699995,
+"end": 10.25,
+"confidence": 0.8305664,
+"language": "en"
+},
+{
+"word": "היום",
+"punctuated_word": "היום",
+"start": 10.25,
+"end": 10.41,
+"confidence": 0.62060547,
+"language": "en"
+},
+{
+"word": "גבריתי",
+"punctuated_word": "גבריתי",
+"start": 10.41,
+"end": 10.73,
+"confidence": 0.8669922,
+"language": "en"
+}
+]
+},
+{
+"reading": "multi",
+"is_final": false,
+"speech_final": false,
+"start": 9.61,
+"duration": 2.1900005,
+"transcript": "שוליום גבריתי שהז'ור הפיל",
+"words": [
+{
+"word": "שוליום",
+"punctuated_word": "שוליום",
+"start": 9.69,
+"end": 10.009999,
+"confidence": 0.50146484,
+"language": "en"
+},
+{
+"word": "גבריתי",
+"punctuated_word": "גבריתי",
+"start": 10.49,
+"end": 10.969999,
+"confidence": 0.86923826,
+"language": "en"
+},
+{
+"word": "שהז'ור",
+"punctuated_word": "שהז'ור",
+"start": 10.969999,
+"end": 11.45,
+"confidence": 0.85,
+"language": "en"
+},
+{
+"word": "הפיל",
+"punctuated_word": "הפיל",
+"start": 11.45,
+"end": 11.69,
+"confidence": 0.37353516,
+"language": "en"
+}
+]
+},
+{
+"reading": "ru",
+"is_final": false,
+"speech_final": false,
+"start": 9.61,
+"duration": 2.1900005,
+"transcript": "вдвоем говорить, сейчас Жора пилит",
+"words": [
+{
+"word": "вдвоем",
+"punctuated_word": "вдвоем",
+"start": 10.089999,
+"end": 10.57,
+"confidence": 0.967041
+},
+{
+"word": "говорить",
+"punctuated_word": "говорить,",
+"start": 10.57,
+"end": 10.889999,
+"confidence": 0.6665039
+},
+{
+"word": "сейчас",
+"punctuated_word": "сейчас",
+"start": 10.889999,
+"end": 11.209999,
+"confidence": 0.8095703
+},
+{
+"word": "жора",
+"punctuated_word": "Жора",
+"start": 11.209999,
+"end": 11.53,
+"confidence": 0.6845703
+},
+{
+"word": "пилит",
+"punctuated_word": "пилит",
+"start": 11.53,
+"end": 11.7699995,
+"confidence": 0.94222003
+}
+]
+},
+{
+"reading": "multi",
+"is_final": false,
+"speech_final": false,
+"start": 9.61,
+"duration": 3.1900005,
+"transcript": "שזור הפעיל את модул שאתה בנו",
+"words": [
+{
+"word": "שזור",
+"punctuated_word": "שזור",
+"start": 10.889999,
+"end": 11.37,
+"confidence": 0.4614502,
+"language": "en"
+},
+{
+"word": "הפעיל",
+"punctuated_word": "הפעיל",
+"start": 11.37,
+"end": 11.69,
+"confidence": 0.56722003,
+"language": "en"
+},
+{
+"word": "את",
+"punctuated_word": "את",
+"start": 11.69,
+"end": 11.849999,
+"confidence": 0.78808594,
+"language": "en"
+},
+{
+"word": "модул",
+"punctuated_word": "модул",
+"start": 11.849999,
+"end": 12.09,
+"confidence": 0.21875,
+"language": "en"
+},
+{
+"word": "שאתה",
+"punctuated_word": "שאתה",
+"start": 12.09,
+"end": 12.33,
+"confidence": 0.13366699,
+"language": "en"
+},
+{
+"word": "בנו",
+"punctuated_word": "בנו",
+"start": 12.33,
+"end": 12.65,
+"confidence": 0.751709,
+"language": "en"
+}
+]
+},
+{
+"reading": "ru",
+"is_final": false,
+"speech_final": false,
+"start": 9.61,
+"duration": 3.1900005,
+"transcript": "вдвоем говорить, сейчас Jarvis middle, чтобы оно",
+"words": [
+{
+"word": "вдвоем",
+"punctuated_word": "вдвоем",
+"start": 10.089999,
+"end": 10.57,
+"confidence": 0.9597168
+},
+{
+"word": "говорить",
+"punctuated_word": "говорить,",
+"start": 10.57,
+"end": 10.889999,
+"confidence": 0.6948242
+},
+{
+"word": "сейчас",
+"punctuated_word": "сейчас",
+"start": 10.889999,
+"end": 11.209999,
+"confidence": 0.94189453
+},
+{
+"word": "jarvis",
+"punctuated_word": "Jarvis",
+"start": 11.209999,
+"end": 11.61,
+"confidence": 0.9136963
+},
+{
+"word": "middle",
+"punctuated_word": "middle,",
+"start": 11.61,
+"end": 12.09,
+"confidence": 0.5275472
+},
+{
+"word": "чтобы",
+"punctuated_word": "чтобы",
+"start": 12.09,
+"end": 12.41,
+"confidence": 0.9873047
+},
+{
+"word": "оно",
+"punctuated_word": "оно",
+"start": 12.41,
+"end": 12.65,
+"confidence": 0.7680664
+}
+]
+},
+{
+"reading": "multi",
+"is_final": false,
+"speech_final": false,
+"start": 9.61,
+"duration": 3.8900003,
+"transcript": "",
+"words": []
+},
+{
+"reading": "ru",
+"is_final": false,
+"speech_final": false,
+"start": 9.61,
+"duration": 3.8900003,
+"transcript": "вдвоем говорить, сейчас Jarvis Pilit Model, чтобы оно разделялось",
+"words": [
+{
+"word": "вдвоем",
+"punctuated_word": "вдвоем",
+"start": 10.089999,
+"end": 10.57,
+"confidence": 0.94921875
+},
+{
+"word": "говорить",
+"punctuated_word": "говорить,",
+"start": 10.57,
+"end": 10.889999,
+"confidence": 0.7348633
+},
+{
+"word": "сейчас",
+"punctuated_word": "сейчас",
+"start": 10.889999,
+"end": 11.209999,
+"confidence": 0.921875
+},
+{
+"word": "jarvis",
+"punctuated_word": "Jarvis",
+"start": 11.209999,
+"end": 11.53,
+"confidence": 0.9053955
+},
+{
+"word": "pilit",
+"punctuated_word": "Pilit",
+"start": 11.53,
+"end": 11.849999,
+"confidence": 0.54833984
+},
+{
+"word": "model",
+"punctuated_word": "Model,",
+"start": 11.849999,
+"end": 12.25,
+"confidence": 0.7310791
+},
+{
+"word": "чтобы",
+"punctuated_word": "чтобы",
+"start": 12.25,
+"end": 12.49,
+"confidence": 0.97802734
+},
+{
+"word": "оно",
+"punctuated_word": "оно",
+"start": 12.49,
+"end": 12.969999,
+"confidence": 0.4013672
+},
+{
+"word": "разделялось",
+"punctuated_word": "разделялось",
+"start": 12.969999,
+"end": 13.53,
+"confidence": 0.69710284
+}
+]
+},
+{
+"reading": "multi",
+"is_final": false,
+"speech_final": false,
+"start": 9.61,
+"duration": 4.9900007,
+"transcript": "",
+"words": []
+},
+{
+"reading": "ru",
+"is_final": false,
+"speech_final": false,
+"start": 9.61,
+"duration": 4.9900007,
+"transcript": "вдвоем говорить, сейчас Jarvis map map map map map",
+"words": [
+{
+"word": "вдвоем",
+"punctuated_word": "вдвоем",
+"start": 10.089999,
+"end": 10.57,
+"confidence": 0.9567871
+},
+{
+"word": "говорить",
+"punctuated_word": "говорить,",
+"start": 10.57,
+"end": 10.889999,
+"confidence": 0.7451172
+},
+{
+"word": "сейчас",
+"punctuated_word": "сейчас",
+"start": 10.889999,
+"end": 11.209999,
+"confidence": 0.94970703
+},
+{
+"word": "jarvis",
+"punctuated_word": "Jarvis",
+"start": 11.209999,
+"end": 11.53,
+"confidence": 0.8892822
+},
+{
+"word": "map",
+"punctuated_word": "map",
+"start": 11.53,
+"end": 11.61,
+"confidence": 0.2130127
+},
+{
+"word": "map",
+"punctuated_word": "map",
+"start": 11.61,
+"end": 12.09,
+"confidence": 0.4276123
+},
+{
+"word": "map",
+"punctuated_word": "map",
+"start": 12.09,
+"end": 12.57,
+"confidence": 0.7883301
+},
+{
+"word": "map",
+"punctuated_word": "map",
+"start": 12.73,
+"end": 13.049999,
+"confidence": 0.74560547
+},
+{
+"word": "map",
+"punctuated_word": "map",
+"start": 13.049999,
+"end": 13.69,
+"confidence": 0.73494464
+}
+]
+},
+{
+"reading": "multi",
+"is_final": true,
+"speech_final": false,
+"start": 9.61,
+"duration": 3.6800003,
+"transcript": "",
+"words": []
+},
+{
+"reading": "ru",
+"is_final": true,
+"speech_final": false,
+"start": 9.61,
+"duration": 3.6800003,
+"transcript": "вдвоем говорить, сейчас Jarvis Pilit Model, чтобы оно",
+"words": [
+{
+"word": "вдвоем",
+"punctuated_word": "вдвоем",
+"start": 10.089999,
+"end": 10.57,
+"confidence": 0.9506836
+},
+{
+"word": "говорить",
+"punctuated_word": "говорить,",
+"start": 10.57,
+"end": 10.889999,
+"confidence": 0.70654297
+},
+{
+"word": "сейчас",
+"punctuated_word": "сейчас",
+"start": 10.889999,
+"end": 11.209999,
+"confidence": 0.9248047
+},
+{
+"word": "jarvis",
+"punctuated_word": "Jarvis",
+"start": 11.209999,
+"end": 11.53,
+"confidence": 0.9141846
+},
+{
+"word": "pilit",
+"punctuated_word": "Pilit",
+"start": 11.53,
+"end": 11.849999,
+"confidence": 0.54386395
+},
+{
+"word": "model",
+"punctuated_word": "Model,",
+"start": 11.849999,
+"end": 12.25,
+"confidence": 0.72998047
+},
+{
+"word": "чтобы",
+"punctuated_word": "чтобы",
+"start": 12.25,
+"end": 12.49,
+"confidence": 0.98291016
+},
+{
+"word": "оно",
+"punctuated_word": "оно",
+"start": 12.49,
+"end": 12.73,
+"confidence": 0.60791016
+}
+]
+},
+{
+"reading": "multi",
+"is_final": false,
+"speech_final": false,
+"start": 13.29,
+"duration": 1.5100002,
+"transcript": "",
+"words": []
+},
+{
+"reading": "ru",
+"is_final": false,
+"speech_final": false,
+"start": 13.29,
+"duration": 1.5100002,
+"transcript": "",
+"words": []
+},
+{
+"reading": "multi",
+"is_final": false,
+"speech_final": false,
+"start": 13.29,
+"duration": 2.5100002,
+"transcript": "",
+"words": []
+},
+{
+"reading": "ru",
+"is_final": false,
+"speech_final": false,
+"start": 13.29,
+"duration": 2.5100002,
+"transcript": "А если наоборот,",
+"words": [
+{
+"word": "а",
+"punctuated_word": "А",
+"start": 14.65,
+"end": 14.889999,
+"confidence": 0.4494629
+},
+{
+"word": "если",
+"punctuated_word": "если",
+"start": 14.889999,
+"end": 15.13,
+"confidence": 0.98095703
+},
+{
+"word": "наоборот",
+"punctuated_word": "наоборот,",
+"start": 15.13,
+"end": 15.69,
+"confidence": 0.64697266
+}
+]
+},
+{
+"reading": "multi",
+"is_final": false,
+"speech_final": false,
+"start": 13.29,
+"duration": 3.5099993,
+"transcript": "",
+"words": []
+},
+{
+"reading": "ru",
+"is_final": false,
+"speech_final": false,
+"start": 13.29,
+"duration": 3.5099993,
+"transcript": "А если наоборот, надо, чтобы свило все в 1",
+"words": [
+{
+"word": "а",
+"punctuated_word": "А",
+"start": 14.73,
+"end": 14.889999,
+"confidence": 0.8310547
+},
+{
+"word": "если",
+"punctuated_word": "если",
+"start": 14.889999,
+"end": 15.13,
+"confidence": 0.98828125
+},
+{
+"word": "наоборот",
+"punctuated_word": "наоборот,",
+"start": 15.13,
+"end": 15.77,
+"confidence": 0.7844238
+},
+{
+"word": "надо",
+"punctuated_word": "надо,",
+"start": 15.77,
+"end": 15.85,
+"confidence": 0.7541504
+},
+{
+"word": "чтобы",
+"punctuated_word": "чтобы",
+"start": 15.85,
+"end": 16.01,
+"confidence": 0.9863281
+},
+{
+"word": "свило",
+"punctuated_word": "свило",
+"start": 16.01,
+"end": 16.33,
+"confidence": 0.65686035
+},
+{
+"word": "все",
+"punctuated_word": "все",
+"start": 16.33,
+"end": 16.49,
+"confidence": 0.96972656
+},
+{
+"word": "в",
+"punctuated_word": "в",
+"start": 16.49,
+"end": 16.57,
+"confidence": 0.9902344
+},
+{
+"word": "1",
+"punctuated_word": "1",
+"start": 16.57,
+"end": 16.73,
+"confidence": 0.68652344
+}
+]
+},
+{
+"reading": "multi",
+"is_final": false,
+"speech_final": false,
+"start": 13.29,
+"duration": 4.5099993,
+"transcript": "",
+"words": []
+},
+{
+"reading": "ru",
+"is_final": false,
+"speech_final": false,
+"start": 13.29,
+"duration": 4.5099993,
+"transcript": "А если наоборот, надо, чтобы свило все в 1 вход? Ну,",
+"words": [
+{
+"word": "а",
+"punctuated_word": "А",
+"start": 14.73,
+"end": 14.889999,
+"confidence": 0.82128906
+},
+{
+"word": "если",
+"punctuated_word": "если",
+"start": 14.889999,
+"end": 15.13,
+"confidence": 0.98095703
+},
+{
+"word": "наоборот",
+"punctuated_word": "наоборот,",
+"start": 15.13,
+"end": 15.77,
+"confidence": 0.7348633
+},
+{
+"word": "надо",
+"punctuated_word": "надо,",
+"start": 15.77,
+"end": 15.85,
+"confidence": 0.7751465
+},
+{
+"word": "чтобы",
+"punctuated_word": "чтобы",
+"start": 15.85,
+"end": 16.01,
+"confidence": 0.98535156
+},
+{
+"word": "свило",
+"punctuated_word": "свило",
+"start": 16.01,
+"end": 16.41,
+"confidence": 0.7074382
+},
+{
+"word": "все",
+"punctuated_word": "все",
+"start": 16.41,
+"end": 16.49,
+"confidence": 0.96533203
+},
+{
+"word": "в",
+"punctuated_word": "в",
+"start": 16.49,
+"end": 16.65,
+"confidence": 0.9980469
+},
+{
+"word": "1",
+"punctuated_word": "1",
+"start": 16.65,
+"end": 16.81,
+"confidence": 0.9921875
+},
+{
+"word": "вход",
+"punctuated_word": "вход?",
+"start": 16.81,
+"end": 17.29,
+"confidence": 0.6608887
+},
+{
+"word": "ну",
+"punctuated_word": "Ну,",
+"start": 17.29,
+"end": 17.45,
+"confidence": 0.6088867
+}
+]
+},
+{
+"reading": "multi",
+"is_final": true,
+"speech_final": false,
+"start": 13.29,
+"duration": 3.6500006,
+"transcript": "",
+"words": []
+},
+{
+"reading": "multi",
+"is_final": false,
+"speech_final": false,
+"start": 16.94,
+"duration": 1.3599987,
+"transcript": "",
+"words": []
+},
+{
+"reading": "ru",
+"is_final": false,
+"speech_final": false,
+"start": 13.29,
+"duration": 5.0099993,
+"transcript": "А если наоборот, надо, чтобы свило все в 1 ход? Она и так",
+"words": [
+{
+"word": "а",
+"punctuated_word": "А",
+"start": 14.73,
+"end": 14.889999,
+"confidence": 0.4909668
+},
+{
+"word": "если",
+"punctuated_word": "если",
+"start": 14.889999,
+"end": 15.13,
+"confidence": 0.98828125
+},
+{
+"word": "наоборот",
+"punctuated_word": "наоборот,",
+"start": 15.13,
+"end": 15.77,
+"confidence": 0.77075195
+},
+{
+"word": "надо",
+"punctuated_word": "надо,",
+"start": 15.77,
+"end": 15.85,
+"confidence": 0.7597656
+},
+{
+"word": "чтобы",
+"punctuated_word": "чтобы",
+"start": 15.85,
+"end": 16.01,
+"confidence": 0.9819336
+},
+{
+"word": "свило",
+"punctuated_word": "свило",
+"start": 16.01,
+"end": 16.33,
+"confidence": 0.5772095
+},
+{
+"word": "все",
+"punctuated_word": "все",
+"start": 16.33,
+"end": 16.49,
+"confidence": 0.9658203
+},
+{
+"word": "в",
+"punctuated_word": "в",
+"start": 16.49,
+"end": 16.57,
+"confidence": 0.984375
+},
+{
+"word": "1",
+"punctuated_word": "1",
+"start": 16.57,
+"end": 16.73,
+"confidence": 0.88427734
+},
+{
+"word": "ход",
+"punctuated_word": "ход?",
+"start": 16.94,
+"end": 17.26,
+"confidence": 0.7648926
+},
+{
+"word": "она",
+"punctuated_word": "Она",
+"start": 17.26,
+"end": 17.9,
+"confidence": 0.453125
+},
+{
+"word": "и",
+"punctuated_word": "и",
+"start": 17.9,
+"end": 18.060001,
+"confidence": 0.97753906
+},
+{
+"word": "так",
+"punctuated_word": "так",
+"start": 18.060001,
+"end": 18.140001,
+"confidence": 0.9316406
+}
+]
+},
+{
+"reading": "multi",
+"is_final": false,
+"speech_final": false,
+"start": 16.94,
+"duration": 2.0599995,
+"transcript": "",
+"words": []
+},
+{
+"reading": "ru",
+"is_final": false,
+"speech_final": false,
+"start": 13.29,
+"duration": 5.71,
+"transcript": "А если наоборот, надо, чтобы свило все в 1 Она и так солела.",
+"words": [
+{
+"word": "а",
+"punctuated_word": "А",
+"start": 14.73,
+"end": 14.889999,
+"confidence": 0.4909668
+},
+{
+"word": "если",
+"punctuated_word": "если",
+"start": 14.889999,
+"end": 15.13,
+"confidence": 0.98828125
+},
+{
+"word": "наоборот",
+"punctuated_word": "наоборот,",
+"start": 15.13,
+"end": 15.77,
+"confidence": 0.77075195
+},
+{
+"word": "надо",
+"punctuated_word": "надо,",
+"start": 15.77,
+"end": 15.85,
+"confidence": 0.7597656
+},
+{
+"word": "чтобы",
+"punctuated_word": "чтобы",
+"start": 15.85,
+"end": 16.01,
+"confidence": 0.9819336
+},
+{
+"word": "свило",
+"punctuated_word": "свило",
+"start": 16.01,
+"end": 16.33,
+"confidence": 0.5772095
+},
+{
+"word": "все",
+"punctuated_word": "все",
+"start": 16.33,
+"end": 16.49,
+"confidence": 0.9658203
+},
+{
+"word": "в",
+"punctuated_word": "в",
+"start": 16.49,
+"end": 16.57,
+"confidence": 0.984375
+},
+{
+"word": "1",
+"punctuated_word": "1",
+"start": 16.57,
+"end": 16.73,
+"confidence": 0.88427734
+},
+{
+"word": "она",
+"punctuated_word": "Она",
+"start": 17.66,
+"end": 17.9,
+"confidence": 0.51904297
+},
+{
+"word": "и",
+"punctuated_word": "и",
+"start": 17.9,
+"end": 18.060001,
+"confidence": 0.9970703
+},
+{
+"word": "так",
+"punctuated_word": "так",
+"start": 18.060001,
+"end": 18.220001,
+"confidence": 0.9951172
+},
+{
+"word": "солела",
+"punctuated_word": "солела.",
+"start": 18.220001,
+"end": 18.7,
+"confidence": 0.70996094
+}
+]
+},
+{
+"reading": "multi",
+"is_final": true,
+"speech_final": true,
+"start": 16.94,
+"duration": 2.602436,
+"transcript": "",
+"words": []
+},
+{
+"reading": "ru",
+"is_final": true,
+"speech_final": true,
+"start": 13.29,
+"duration": 6.2524366,
+"transcript": "А если наоборот, надо, чтобы свило все в 1 Она и так солеет.",
+"words": [
+{
+"word": "а",
+"punctuated_word": "А",
+"start": 14.73,
+"end": 14.889999,
+"confidence": 0.4909668
+},
+{
+"word": "если",
+"punctuated_word": "если",
+"start": 14.889999,
+"end": 15.13,
+"confidence": 0.98828125
+},
+{
+"word": "наоборот",
+"punctuated_word": "наоборот,",
+"start": 15.13,
+"end": 15.77,
+"confidence": 0.77075195
+},
+{
+"word": "надо",
+"punctuated_word": "надо,",
+"start": 15.77,
+"end": 15.85,
+"confidence": 0.7597656
+},
+{
+"word": "чтобы",
+"punctuated_word": "чтобы",
+"start": 15.85,
+"end": 16.01,
+"confidence": 0.9819336
+},
+{
+"word": "свило",
+"punctuated_word": "свило",
+"start": 16.01,
+"end": 16.33,
+"confidence": 0.5772095
+},
+{
+"word": "все",
+"punctuated_word": "все",
+"start": 16.33,
+"end": 16.49,
+"confidence": 0.9658203
+},
+{
+"word": "в",
+"punctuated_word": "в",
+"start": 16.49,
+"end": 16.57,
+"confidence": 0.984375
+},
+{
+"word": "1",
+"punctuated_word": "1",
+"start": 16.57,
+"end": 16.73,
+"confidence": 0.88427734
+},
+{
+"word": "она",
+"punctuated_word": "Она",
+"start": 17.66,
+"end": 17.9,
+"confidence": 0.43945312
+},
+{
+"word": "и",
+"punctuated_word": "и",
+"start": 17.9,
+"end": 18.060001,
+"confidence": 0.9970703
+},
+{
+"word": "так",
+"punctuated_word": "так",
+"start": 18.060001,
+"end": 18.220001,
+"confidence": 0.9951172
+},
+{
+"word": "солеет",
+"punctuated_word": "солеет.",
+"start": 18.220001,
+"end": 18.7,
+"confidence": 0.75891113
+}
+]
+},
+{
+"reading": "multi",
+"is_final": true,
+"speech_final": true,
+"start": 19.542437,
+"duration": 0.0,
+"transcript": "",
+"words": []
+}
+]

@@ -110,6 +110,130 @@ class OrphanPoolTests(unittest.TestCase):
             "the same word re-decoded by the newest hypothesis must evict its orphan",
         )
 
+    def test_an_older_spelling_of_the_same_audio_is_not_spliced(self):
+        """Real timings, ``multi`` on 2026-11-23 ``20261123-191519``.
+
+        Three rolling hypotheses of 0.96-3.68 s, the final there empty:
+        under the identity-only purge every older spelling survived as
+        an orphan and the splice shipped "Так tak таката это
+        atatestomoje тестова тестовой речки riečiai я aš …". The newest
+        hypothesis owns the time its words occupy, as a final would.
+        """
+        s = self._session()
+        s._process_deepgram_message(_msg(0.0, 2.0, "Таката тестова", [
+            _w("Таката", 0.96, 1.52), _w("тестова", 1.52, 1.92),
+        ]))
+        s._process_deepgram_message(_msg(0.0, 3.0, "Tak atatestomoje riečiai aš atdavariu", [
+            _w("Tak", 0.96, 1.20), _w("atatestomoje", 1.20, 2.00),
+            _w("riečiai", 2.00, 2.32), _w("aš", 2.32, 2.48),
+            _w("atdavariu", 2.48, 2.88),
+        ]))
+        newest = [
+            _w("Так", 0.96, 1.20), _w("это", 1.20, 1.52),
+            _w("тестовой", 1.52, 2.00), _w("речки", 2.00, 2.32),
+            _w("я", 2.32, 2.40), _w("сейчас", 2.40, 2.56),
+            _w("говорю", 2.56, 2.88), _w("говорю", 2.88, 3.36),
+            _w("очень", 3.36, 3.68),
+        ]
+        s._process_deepgram_message(_msg(0.0, 4.0, "Так это тестовой речки я сейчас говорю говорю очень", newest))
+        s._process_deepgram_message(_final_msg(0.0, 4.16, "", []))
+        s._splice_uncovered_interim_words()
+        spliced = [
+            w["word"].strip(",.?").lower()
+            for seg in s._finalized_segments
+            for w in seg.get("words") or []
+        ]
+        self.assertEqual(
+            spliced,
+            ["так", "это", "тестовой", "речки", "я", "сейчас", "говорю", "говорю", "очень"],
+        )
+
+    def test_a_respelled_word_in_a_final_gap_is_spliced_once(self):
+        """Real timings, ``ru`` on 2026-11-23 ``20261123-191519``: the
+        hypothesis "вход?" 16.81-17.29 was re-decoded as "ход?"
+        16.94-17.26, then the final left 16.73-17.66 empty. Both
+        spellings reached the splice and the user got "в 1 вход? Ход?"."""
+        s = self._session()
+        s._process_deepgram_message(_msg(13.29, 17.80, "в 1 вход? Ну,", [
+            _w("в", 16.49, 16.65), _w("1", 16.65, 16.81),
+            _w("вход?", 16.81, 17.29), _w("Ну,", 17.29, 17.45),
+        ]))
+        s._process_deepgram_message(_msg(13.29, 18.30, "в 1 ход? Она и так", [
+            _w("в", 16.49, 16.57), _w("1", 16.57, 16.73),
+            _w("ход?", 16.94, 17.26), _w("Она", 17.26, 17.90),
+            _w("и", 17.90, 18.06), _w("так", 18.06, 18.14),
+        ]))
+        s._process_deepgram_message(_msg(13.29, 19.00, "в 1 Она и так солела.", [
+            _w("в", 16.49, 16.57), _w("1", 16.57, 16.73),
+            _w("Она", 17.66, 17.90), _w("и", 17.90, 18.06),
+            _w("так", 18.06, 18.22), _w("солела.", 18.22, 18.70),
+        ]))
+        s._process_deepgram_message(_final_msg(13.29, 19.54, "в 1 Она и так солеет.", [
+            _w("в", 16.49, 16.57), _w("1", 16.57, 16.73),
+            _w("Она", 17.66, 17.90), _w("и", 17.90, 18.06),
+            _w("так", 18.06, 18.22), _w("солеет.", 18.22, 18.70),
+        ]))
+        s._splice_uncovered_interim_words()
+        words = [
+            w["word"].strip(",.?").lower()
+            for seg in s._finalized_segments
+            for w in seg.get("words") or []
+        ]
+        # "Ну," lay under the second hypothesis's stretched "Она" — a
+        # claim the third hypothesis withdrew — so it stands.
+        self.assertEqual(words, ["в", "1", "ход", "ну", "она", "и", "так", "солеет"])
+
+    def test_a_reread_tail_is_not_spliced_across_a_final_boundary(self):
+        """Real timings, ``ru`` on 2026-11-23 ``20261123-191519``: final 1
+        ended "очень быстро." 3.76-4.08; the next window re-read that
+        tail as "Быстро" 4.16-4.56, and the final 4.16-8.89 began at
+        "Разные" 4.56. The word landed first in final 2, where the
+        per-final neighbour check saw nothing before it, and the user got
+        "очень быстро. Быстро разные". The full REST pass and a REST
+        clip of 2.3-4.7 s both hear one "быстро"."""
+        s = self._session()
+        head = [
+            _w("Так,", 0.96, 1.28), _w("это", 1.28, 1.52),
+            _w("тестовая", 1.52, 2.00), _w("речь.", 2.00, 2.32),
+            _w("Я", 2.32, 2.40), _w("сейчас", 2.40, 2.64),
+            _w("говорю,", 2.64, 2.96), _w("говорю", 2.96, 3.36),
+            _w("очень", 3.36, 3.76),
+        ]
+        s._process_deepgram_message(_msg(
+            0.0, 4.0, " ".join(w["word"] for w in head), head,
+        ))
+        final_1 = head + [_w("быстро.", 3.76, 4.08)]
+        s._process_deepgram_message(_final_msg(
+            0.0, 4.16, " ".join(w["word"] for w in final_1), final_1,
+        ))
+        s._process_deepgram_message(_msg(4.16, 5.20, "Быстро разные", [
+            _w("Быстро", 4.16, 4.32), _w("разные", 4.32, 4.88),
+        ]))
+        s._process_deepgram_message(_msg(4.16, 6.60, "Быстро разные неописуемые", [
+            _w("Быстро", 4.16, 4.56), _w("разные", 4.56, 5.28),
+            _w("неописуемые", 5.44, 6.16),
+        ]))
+        final_2 = [
+            _w("Разные", 4.56, 5.28), _w("неописуемые.", 5.44, 6.56),
+            _w("Если", 6.96, 7.28), _w("вдвоем", 7.28, 7.76),
+            _w("говорить,", 7.76, 8.00),
+        ]
+        s._process_deepgram_message(_final_msg(
+            4.16, 8.89, " ".join(w["word"] for w in final_2), final_2,
+        ))
+        s._splice_uncovered_interim_words()
+        words = [
+            w["word"].strip(",.?").lower()
+            for seg in s._finalized_segments
+            for w in seg.get("words") or []
+        ]
+        self.assertEqual(words.count("быстро"), 1, words)
+        self.assertEqual(
+            words,
+            ["так", "это", "тестовая", "речь", "я", "сейчас", "говорю", "говорю",
+             "очень", "быстро", "разные", "неописуемые", "если", "вдвоем", "говорить"],
+        )
+
     def test_a_final_only_clears_the_words_it_actually_contains(self):
         """Inverted from the old ``test_final_confirming_region_clears_orphans``.
 

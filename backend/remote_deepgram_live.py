@@ -48,8 +48,10 @@ import hashlib
 import json
 import logging
 import time
+from bisect import bisect_left, bisect_right
 from collections import deque
 from dataclasses import dataclass
+from itertools import groupby
 from typing import AsyncIterator, Callable, Iterable, Optional
 from urllib.parse import parse_qsl, urlencode
 
@@ -357,9 +359,8 @@ def _same_spoken_word(a: dict, b: dict) -> bool:
     re-decode moves word boundaries by a few tens of milliseconds, so
     requiring identical times would treat every shift as a new word,
     while requiring only *some* overlap would let any neighbouring word
-    stand in for this one. The rule was written once for the splice's
-    orphan dedupe and is now the single definition used everywhere
-    (audit §3.1/§3.2).
+    stand in for this one. The single definition of identity; the
+    first clause of ``covering_word`` (audit §3.1/§3.2).
     """
     core = word_core(a)
     if not core or core != word_core(b):
@@ -369,18 +370,14 @@ def _same_spoken_word(a: dict, b: dict) -> bool:
 
 
 def word_accounted_for(word: dict, others: Iterable[dict]) -> bool:
-    """Does any record in ``others`` account for ``word``?
+    """Does any record in ``others`` carry the same spoken word?
 
-    One predicate, three callers, because they are all asking the same
-    question:
-
-    * a final's own words vs a retained interim word — "did this final
-      actually contain that word?" (the eviction, audit §3.1);
-    * the newest interim's words vs an orphan — "does the newer
-      hypothesis already account for this?" (the purge, audit §3.2);
-    * the current interim words vs an orphan at splice time — the same
-      question one last time, so a shifted re-decode is not spliced
-      twice (BUG-78).
+    The identity half of ``covering_word``, asked on its own where a
+    newer interim purges the orphan pool on arrival: the newer copy of a
+    word carries that word's claim forward, so dropping the older copy
+    loses nothing, whatever later happens to the newer one. A
+    DIFFERENT word over the same time is no such copy — see
+    ``DeepgramLiveSession._standing_hypothesis_words``.
 
     Answering it by TIME WINDOW instead — "the final's span contains the
     word's centre" — is what deleted the word "субагента" from a
@@ -390,11 +387,19 @@ def word_accounted_for(word: dict, others: Iterable[dict]) -> bool:
     return any(_same_spoken_word(word, other) for other in others)
 
 
+
+
 # What a segment created by the interim splice is stamped with. Read
 # back by ``decoded_end_sec``: a spliced hypothesis extends the
 # transcript but is not a decode, so it must never raise
 # ``coveredEndSec``.
 INTERIM_FALLBACK_SOURCE = "interim-fallback"
+
+# Which interim hypothesis a retained word came from (the session's
+# interim count when it arrived). Internal to the live session: read by
+# ``DeepgramLiveSession._standing_hypothesis_words`` and stripped there,
+# before any word reaches a transcript.
+_HYPOTHESIS_KEY = "_hypothesis"
 
 
 def decoded_end_sec(segments: Iterable[dict]) -> float:
@@ -452,8 +457,16 @@ def word_inside_spanless_final(word: dict, segments: Iterable[dict]) -> bool:
     )
 
 
-def covering_final_word(word: dict, final_words: Iterable[dict]) -> Optional[dict]:
-    """Which final word answers for ``word`` — or ``None`` if none does.
+def covering_word(word: dict, later_words: Iterable[dict]) -> Optional[dict]:
+    """Which word of a LATER decode answers for ``word`` — or ``None``.
+
+    One rule for every "the audio was re-decoded; is this older word
+    still owed a place?" question: a final against the interim words
+    it settles, and a newer interim hypothesis against the orphans it
+    displaced (the purge and the splice dedupe). A final is only the
+    last of Deepgram's rolling re-decodes, so the two relations are the
+    same relation, and the text below speaks of "the final" for the
+    case the rule was measured on.
 
     The implementation behind ``final_words_cover``: the predicate is
     "did anything cover it", this is "what covered it", and they must
@@ -472,7 +485,7 @@ def covering_final_word(word: dict, final_words: Iterable[dict]) -> Optional[dic
     Two ways, and both are needed:
 
     * the final carries the SAME word, its boundaries shifted by the
-      re-decode (``word_accounted_for``); or
+      re-decode (``_same_spoken_word``); or
     * the final's own WORDS occupy a substantial share of this word's
       time — the final heard that audio and wrote something else for
       it, whatever it spelled.
@@ -496,7 +509,7 @@ def covering_final_word(word: dict, final_words: Iterable[dict]) -> Optional[dic
     way, so the fraction is checked both ways rather than dropped.
     """
     duration = word_duration(word)
-    for other in final_words:
+    for other in later_words:
         if _same_spoken_word(word, other):
             return other
         overlap = time_overlap(word, other)
@@ -512,10 +525,10 @@ def covering_final_word(word: dict, final_words: Iterable[dict]) -> Optional[dic
 def final_words_cover(word: dict, final_words: Iterable[dict]) -> bool:
     """Is this interim word's ground already transcribed by a final?
 
-    See ``covering_final_word`` for the rule; this is that answer read
+    See ``covering_word`` for the rule; this is that answer read
     as a yes/no.
     """
-    return covering_final_word(word, final_words) is not None
+    return covering_word(word, final_words) is not None
 
 
 def segment_words(segment: dict) -> list[dict]:
@@ -914,6 +927,17 @@ def nearest_segment_word(
     return best
 
 
+def _shares_stem(word: dict, neighbour: Optional[dict]) -> bool:
+    """The splice guard's stem test: would ``word`` beside ``neighbour``
+    read as one spoken word twice (``_word_stem``)? The one
+    implementation behind ``fits_beside`` and the in-segment check of
+    ``insert_word_into_segment``."""
+    if neighbour is None:
+        return False
+    stem = _word_stem(word)
+    return bool(stem) and stem == _word_stem(neighbour)
+
+
 def fits_beside(
     word: dict, neighbour: Optional[dict], *, neighbour_before: bool
 ) -> bool:
@@ -924,8 +948,7 @@ def fits_beside(
     """
     if neighbour is None:
         return True
-    stem = _word_stem(word)
-    if stem and stem == _word_stem(neighbour):
+    if _shares_stem(word, neighbour):
         return False
     gap = (
         as_float(word.get("start")) - as_float(neighbour.get("end"))
@@ -935,7 +958,9 @@ def fits_beside(
     return gap >= word_duration(word) - SPLICE_GAP_SLACK_SEC
 
 
-def insert_word_into_segment(segment: dict, word: dict) -> Optional[dict]:
+def insert_word_into_segment(
+    segment: dict, word: dict, assembled: "Iterable[dict]"
+) -> Optional[dict]:
     """Put ``word`` into ``segment`` at its time position.
 
     The segment's own word list gives the position: the index is how
@@ -955,7 +980,19 @@ def insert_word_into_segment(segment: dict, word: dict) -> Optional[dict]:
       re-decode moved, or that the two decodes spelled differently —
       "тебе тебе нужно", "посмотреть в в WAV" and "слушаю"/"слушай" are
       all this same failure. A recovery that reads as a stutter is not a
-      recovery;
+      recovery.
+
+      "Beside" means beside in the ASSEMBLED text, not in the host's
+      own word list: a word that lands first (or last) in its host sits
+      at a seam, and its neighbour is the nearest word of the other
+      segments in ``assembled`` (``nearest_segment_word``), asked the
+      same stem question (``_shares_stem``). A final boundary is
+      where Deepgram's endpointing happened to cut, not a pause the
+      reader hears, so it must not hide the neighbour (2026-11-23,
+      ``20261123-191519``, ``ru``: final 1 ended "очень быстро."
+      3.76-4.08, final 2 started "Разные" 4.56; the next window re-read
+      the same tail as "Быстро" 4.16-4.56, which became word 0 of final
+      2 and shipped "быстро. Быстро разные");
     * there is not enough room: the gap between this segment's own
       neighbouring words (or the segment's own start/end, at an edge) is
       shorter than the word's duration less ``SPLICE_GAP_SLACK_SEC``. A
@@ -970,12 +1007,27 @@ def insert_word_into_segment(segment: dict, word: dict) -> Optional[dict]:
     index = sum(
         1 for w in seg_words if as_float(w.get("start")) <= as_float(word.get("start"))
     )
-    stem = _word_stem(word)
-    neighbours = seg_words[max(0, index - 1):index + 1]
-    if stem and any(_word_stem(n) == stem for n in neighbours):
-        return None
     prev_word = seg_words[index - 1] if index > 0 else None
     next_word = seg_words[index] if index < len(seg_words) else None
+    if _shares_stem(word, prev_word) or _shares_stem(word, next_word):
+        return None
+    if prev_word is None or next_word is None:
+        # At an edge of the host the neighbour is across the seam. Only
+        # its stem is asked about: room is the host's own business (its
+        # span bounds the slot below), and a re-decoded word may overlap
+        # the previous final's last word by design — a REST clip
+        # stretches its first word back to the clip start.
+        others = [seg for seg in assembled if seg is not segment]
+        if prev_word is None and _shares_stem(
+            word,
+            nearest_segment_word(others, as_float(word.get("start")), before=True),
+        ):
+            return None
+        if next_word is None and _shares_stem(
+            word,
+            nearest_segment_word(others, as_float(word.get("end")), before=False),
+        ):
+            return None
     before_bound = (
         as_float(prev_word.get("end")) if prev_word else as_float(segment.get("start"))
     )
@@ -1075,7 +1127,7 @@ def splice_words_into_segments(
         if host is None:
             outside.append(word)
             continue
-        record = insert_word_into_segment(host, word)
+        record = insert_word_into_segment(host, word, out)
         if record is not None:
             placed[id(record)] = place_in_reading(word)
             inserted += 1
@@ -1827,7 +1879,7 @@ class DeepgramLiveSession:
         self._interim_ring: "deque[tuple[float, float, str]]" = deque(
             maxlen=INTERIM_HYPOTHESIS_RING_SIZE
         )
-        # Ring of ``(interim_word, covering_final_word)`` pairs where the
+        # Ring of ``(interim_word, covering final word)`` pairs where the
         # two are spelled differently — the drop that leaves no hole
         # behind it (see ``_note_overruled_word``). Bounded like the
         # hypothesis ring; ``_overruled_total`` keeps the count honest
@@ -2715,7 +2767,7 @@ class DeepgramLiveSession:
             seg_words = segment_words(seg)
             if not seg_words:
                 continue
-            owner = covering_final_word(word, seg_words)
+            owner = covering_word(word, seg_words)
             if owner is not None:
                 return owner
         return None
@@ -2766,13 +2818,13 @@ class DeepgramLiveSession:
     ) -> list[dict]:
         """Drop the retained words this final answers for, and say which.
 
-        The eviction itself is unchanged (``covering_final_word`` is the
+        The eviction itself is unchanged (``covering_word`` is the
         same rule ``final_words_cover`` asks); it now names the covering
         word on its way past so a displacement leaves a trace.
         """
         kept: list[dict] = []
         for word in words:
-            owner = covering_final_word(word, final_words)
+            owner = covering_word(word, final_words)
             if owner is None:
                 kept.append(word)
             else:
@@ -2798,6 +2850,83 @@ class DeepgramLiveSession:
         """This session's finals asked ``nearest_segment_word``."""
         return nearest_segment_word(self._finalized_segments, time, before=before)
 
+    def _standing_hypothesis_words(
+        self, *, note_overruled: bool = False
+    ) -> list[dict]:
+        """The retained interim words (current and orphaned) that no
+        NEWER hypothesis's standing word answers for, in time order and
+        without their hypothesis stamp.
+
+        Deepgram's interims are rolling re-decodes, and the pool keeps
+        the words of every one of them that a newer one did not repeat
+        (BUG-24: "Displaced ≠ wrong"). So one stretch of audio can sit
+        in the pool in several spellings at once. Measured 2026-11-23
+        ``20261123-191519``: ``multi`` re-decoded 0.96-3.68 s as
+        "Таката тестова", then "Tak atatestomoje riečiai aš atdavariu",
+        then "Так это тестовой речки я сейчас говорю говорю очень"; its
+        final there came back empty, every spelling was spliced, and
+        the reading became "Так tak таката это atatestomoje тестова
+        тестовой речки riečiai я aš …" (``ru``'s "вход?" re-decoded as
+        "ход?" gave "вход? Ход?" the same way). Neither the dual merge
+        nor the recovery pass can undo that: both take a reading's
+        words as words it heard.
+
+        The rule is the one a final applies to interim words
+        (``covering_word``) — a later decode owns the time its words
+        occupy, and nothing else — applied in hypothesis order: the
+        newest hypothesis's words stand; an older word stands only if
+        no STANDING word of a newer hypothesis covers it. "Standing" is
+        what keeps a withdrawn claim from deleting a word: a word the
+        newer hypothesis stretched over a neighbour and the next one
+        pulled back was purged by identity when it was re-decoded, so
+        it covers nothing here ("Ну" under the stretched "Она", see the
+        purge). A word in a gap between newer words — the word the
+        newer hypothesis really dropped — stands. Legit repeats ("да,
+        да") have disjoint times and stand.
+        """
+        pool = sorted(
+            (*self._interim_words, *self._orphan_interim_words),
+            key=lambda w: -int(w.get(_HYPOTHESIS_KEY, 0)),
+        )
+        # Standing words by start time, for a bounded look-up: only a
+        # word that overlaps ``w`` can cover it, and one starting more
+        # than the longest standing word's length before ``w`` cannot
+        # reach it. Keeps this linear-ish on a long take whose finals
+        # never covered the pool (B-002: this runs between Stop and text).
+        standing: list[dict] = []
+        starts: list[float] = []
+        longest = 0.0
+        for _seq, group in groupby(
+            pool, key=lambda w: int(w.get(_HYPOTHESIS_KEY, 0))
+        ):
+            kept = []
+            for w in group:
+                start, end = as_float(w.get("start")), as_float(w.get("end"))
+                lo = bisect_left(starts, start - longest)
+                hi = bisect_left(starts, end)
+                owner = covering_word(w, standing[lo:hi])
+                if owner is None:
+                    kept.append(w)
+                elif note_overruled:
+                    # A drop like a final's, so the same trace
+                    # (``_note_overruled_word``) — only from the splice,
+                    # which consumes the pool; the hole measurement
+                    # asks too and must not count a drop twice.
+                    self._note_overruled_word(w, owner)
+            for w in kept:
+                start = as_float(w.get("start"))
+                at = bisect_right(starts, start)
+                starts.insert(at, start)
+                standing.insert(at, w)
+                longest = max(longest, word_duration(w))
+        return [
+            {k: v for k, v in w.items() if k != _HYPOTHESIS_KEY}
+            for w in sorted(
+                standing,
+                key=lambda w: (as_float(w.get("start")), as_float(w.get("end"))),
+            )
+        ]
+
     def _splice_uncovered_interim_words(self) -> int:
         """Fold interim-recognised words no final ever covered into the
         committed transcript, in time order.
@@ -2807,19 +2936,7 @@ class DeepgramLiveSession:
         never hypothesised — the honest residual, not the recoverable
         loss it used to be.
         """
-        # Orphan-vs-interim dedupe (BUG-78): a word displaced to the
-        # orphan pool can be re-emitted by a LATER interim at shifted
-        # times — the rolling re-decode moves word boundaries. Both
-        # copies would survive the coverage test and the splice would
-        # emit the same spoken word twice. ``word_accounted_for`` is the
-        # same predicate the interim purge uses; the interim copy wins
-        # (newer hypothesis). Legit repeats ("да, да") have disjoint
-        # times and survive.
-        candidates_deduped = [
-            w for w in self._orphan_interim_words
-            if not word_accounted_for(w, self._interim_words)
-        ]
-        candidates = self._interim_words + candidates_deduped
+        candidates = self._standing_hypothesis_words(note_overruled=True)
         if not candidates:
             self._orphan_interim_words = []
             return 0
@@ -2835,7 +2952,7 @@ class DeepgramLiveSession:
                 orphan_count,
             )
         survivors: list[dict] = []
-        for word in sorted(candidates, key=lambda w: (w["start"], w["end"])):
+        for word in candidates:
             owner = self._covering_final_word_for(word)
             if owner is not None:
                 # The second place a hypothesis is discarded for being
@@ -2931,7 +3048,7 @@ class DeepgramLiveSession:
         if overruled:
             lines.append(
                 "  overruled interim words — judged covered by a "
-                f"DIFFERENT final word ({self._overruled_total}):"
+                f"DIFFERENT later word ({self._overruled_total}):"
             )
             for word, owner in overruled[:_HOLE_REPORT_MAX_OVERRULED]:
                 lines.append(
@@ -3199,7 +3316,7 @@ class DeepgramLiveSession:
         """
         return union_spans(
             (as_float(w.get("start")), as_float(w.get("end")))
-            for w in (*self._interim_words, *self._orphan_interim_words)
+            for w in self._standing_hypothesis_words()
             if not self._word_covered_by_finals(w)
         )
 
@@ -4049,7 +4166,10 @@ class DeepgramLiveSession:
         # closed by position, and if the word is ever spliced into a final
         # the splice gives it the case and marks of its place there
         # instead (measured 2026-11-23: "деплой Потерял, Посмотри").
-        new_words = as_read(message_words)
+        new_words = [
+            {**w, _HYPOTHESIS_KEY: self.stats.segments_interim}
+            for w in as_read(message_words)
+        ]
         self._interim_ring.append((round(start, 3), round(end, 3), text))
         # Record where the service actually heard WORDS. The message span
         # is the re-decode window, not the speech in it: a rolling interim
@@ -4086,13 +4206,17 @@ class DeepgramLiveSession:
                 if key not in seen:
                     seen.add(key)
                     self._orphan_interim_words.append(dict(w))
-            # Purge by IDENTITY, not by any temporal overlap (audit
-            # §3.2). A rolling re-decode nearly always puts *something*
-            # on the same ground, so overlap-based purging emptied the
-            # pool unless the newer hypothesis happened to leave a hole
-            # in exactly that place. An orphan dies only when the newest
-            # words contain the same spoken word — the same question
-            # ``word_accounted_for`` answers at splice time.
+            # Purge by IDENTITY on arrival (audit §3.2): an orphan the
+            # newest words re-decode as the same word is carried forward
+            # by that copy. A DIFFERENT word over its time does not end
+            # it here, because the newer hypothesis may itself be
+            # withdrawn by the next one — measured 2026-11-23
+            # ``20261123-191519``: ``ru``'s "Ну," 17.29-17.45 lay under a
+            # stretched "Она" 17.26-17.90 for one hypothesis, and the
+            # next one put "Она" back at 17.66 and left "Ну" its gap.
+            # Which spelling of a stretch stands is decided once, at the
+            # splice, by the newest hypothesis that still stands there
+            # (``_standing_hypothesis_words``).
             self._orphan_interim_words = [
                 o
                 for o in self._orphan_interim_words
@@ -4157,7 +4281,7 @@ __all__ = [
     # what a word record is, when two of them are the same spoken word,
     # and when a final already accounts for one.
     "as_float",
-    "covering_final_word",
+    "covering_word",
     "decoded_end_sec",
     "drop_repeated_seam_ngrams",
     "final_words_cover",

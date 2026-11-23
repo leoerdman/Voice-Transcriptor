@@ -614,7 +614,7 @@ def splice_recovered_words(
     "деплой" 7.68-8.08 and "Посмотри," 8.56-9.04. A REST decode of a
     short clip stretches its first word back to the clip start, so
     "Потерял," overlapped 37 % of "деплой", and the time-only coverage
-    rule (``covering_final_word``, 25 % of either word) judged its ground
+    rule (``covering_word``, 25 % of either word) judged its ground
     owned and dropped it. In order, though, the re-decode says "<X>
     посмотрю" where the transcript says "деплой Посмотри": "посмотрю" is
     the transcript's "Посмотри", and nothing of the transcript lies

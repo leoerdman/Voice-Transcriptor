@@ -3,6 +3,13 @@
 All notable changes to Transcriptor are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.37] - 2026-11-23
+
+### Fixed
+
+- **No more two spellings of one word side by side** ("Так таката это тестова тестовой речь. Речки … в 1 вход? Ход?"). While you speak, Deepgram re-reads the last seconds several times, and every earlier reading of a stretch it never confirmed was kept in reserve; where the final result for that stretch came back empty, all of them were put into the text. Now the newest reading of a moment decides it, and a word an older reading heard is used only where no newer one put a word of its own — a word the newer reading really skipped still comes back.
+- **A word re-read across the boundary of two finished phrases is not added twice** ("очень быстро. Быстро разные", "песню в в интернете").
+
 ## [1.6.36] - 2026-11-23
 
 ### Fixed
