@@ -77,7 +77,8 @@ class OrphanPoolTests(unittest.TestCase):
         # finalize() is async; exercise the sync splice path directly:
         spliced = s._splice_uncovered_interim_words()
         texts = [str(seg.get("text") or "") for seg in s._finalized_segments]
-        self.assertIn("что", " ".join(texts))
+        # Case-blind: the word opens the transcript, so it is capitalised.
+        self.assertIn("что", " ".join(texts).lower())
         self.assertGreaterEqual(spliced, 1)
 
     def test_newest_hypothesis_still_wins_no_duplicates(self):
@@ -260,7 +261,8 @@ class OrphanPoolTests(unittest.TestCase):
         spliced = s._splice_uncovered_interim_words()
         texts = [str(seg.get("text") or "") for seg in s._finalized_segments]
         joined = " ".join(texts)
-        self.assertEqual(joined.count("привет"), 1, f"word duplicated in splice: {joined!r}")
+        # Case-blind: the word opens the transcript, so it is capitalised.
+        self.assertEqual(joined.lower().count("привет"), 1, f"word duplicated in splice: {joined!r}")
         # Legit repeat with DISJOINT times is not deduped away.
         self.assertIn("мир", joined)
         self.assertGreaterEqual(spliced, 2)
@@ -399,7 +401,8 @@ class OrphanPoolTests(unittest.TestCase):
         joined = " ".join(
             str(seg.get("text") or "") for seg in s._finalized_segments
         )
-        self.assertEqual(joined.count("да"), 2, "a genuinely repeated word was wrongly deduped")
+        # Case-blind: the first "да" opens the transcript ("Да да").
+        self.assertEqual(joined.lower().count("да"), 2, "a genuinely repeated word was wrongly deduped")
 
 
 if __name__ == "__main__":

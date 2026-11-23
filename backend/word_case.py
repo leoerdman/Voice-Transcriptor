@@ -39,13 +39,28 @@ assembled text:
 
 Which words are "in question" is each caller's knowledge — the merge
 knows which readings a word came from and what preceded it there, the
-recovery pass knows which words it inserted — so the callers decide
-that, and this module owns what the answer is.
+splice (``backend.remote_deepgram_live.splice_words_into_segments``)
+knows which words it inserted — so the callers decide that, and this
+module owns what the answer is.
+
+Words inserted into a transcript
+--------------------------------
+Every path that inserts words into the finals goes through one splice:
+the live session's interim words no final carried, and the recovery
+pass's re-decoded words. Both kinds were read as part of a text of their
+own (an interim hypothesis, a re-decoded clip), and two of their marks
+describe THAT text: the positional capital above, and the trailing
+punctuation of its last word — the decoder closes every text it is
+given, so that mark is where the text was cut, not where the speaker
+paused. ``as_read`` records each word's place in the text it was read
+in, the splice reads it back (``place_in_reading``) once the word has a
+place in the transcript, and ``cased_for_place`` and
+``without_trailing_marks`` decide the rest.
 """
 
 from __future__ import annotations
 
-from typing import Iterable, Optional
+from typing import Iterable, NamedTuple, Optional, Sequence
 
 # Marks that end a sentence, and the closing marks that may follow one
 # ("…сказал.»").
@@ -143,3 +158,52 @@ def without_trailing_marks(token: str) -> str:
     "посмотрю"); a token that is nothing but marks is returned as is."""
     stripped = token.rstrip(_TRAILING_MARKS)
     return stripped if stripped else token
+
+
+class ReadPlace(NamedTuple):
+    """Where a word stood in the text it was read in."""
+
+    # First word of that text, or after a word that ends a sentence in
+    # it: a capital there may be positional.
+    at_start: bool
+    # The text's last word: its trailing marks are where the text was
+    # cut.
+    last: bool
+
+
+# A word whose reading is not known: its capital is taken as its own and
+# its marks as the speaker's.
+UNKNOWN_PLACE = ReadPlace(at_start=False, last=False)
+
+# The key ``as_read`` stores a word's ``ReadPlace`` under. Internal to the
+# splice: it never leaves ``splice_words_into_segments``.
+_READ_PLACE_KEY = "_readPlace"
+
+
+def as_read(words: Sequence[dict]) -> list[dict]:
+    """Copies of ONE text's words, in its order (an interim hypothesis, a
+    re-decoded clip), each remembering its ``ReadPlace`` in that text."""
+    out: list[dict] = []
+    previous: Optional[str] = None
+    for index, word in enumerate(words):
+        token = str(word.get("word") or "")
+        place = ReadPlace(
+            at_start=starts_sentence(previous),
+            last=index == len(words) - 1,
+        )
+        out.append({**word, _READ_PLACE_KEY: place})
+        previous = token
+    return out
+
+
+def place_in_reading(word: dict) -> ReadPlace:
+    """The ``ReadPlace`` ``as_read`` recorded on ``word`` (``UNKNOWN_PLACE``
+    when it was not read through ``as_read``)."""
+    place = word.get(_READ_PLACE_KEY)
+    return place if isinstance(place, ReadPlace) else UNKNOWN_PLACE
+
+
+def without_read_place(word: dict) -> dict:
+    """``word`` without the ``as_read`` record — what goes into a
+    transcript."""
+    return {k: v for k, v in word.items() if k != _READ_PLACE_KEY}

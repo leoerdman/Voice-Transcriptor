@@ -69,6 +69,17 @@ from backend.deepgram_keyterms import keyterm_query_pairs
 from backend.deepgram_language import language_hint_pairs, resolve_live_language
 from backend.deepgram_words import deepgram_word_text
 from backend.model_catalog import DEFAULT_DEEPGRAM_AUDIO_MODEL
+from backend.word_case import (
+    ReadPlace,
+    as_read,
+    capital_is_lexical,
+    cased_for_place,
+    ends_sentence,
+    place_in_reading,
+    starts_sentence,
+    without_read_place,
+    without_trailing_marks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -924,7 +935,7 @@ def fits_beside(
     return gap >= word_duration(word) - SPLICE_GAP_SLACK_SEC
 
 
-def insert_word_into_segment(segment: dict, word: dict) -> bool:
+def insert_word_into_segment(segment: dict, word: dict) -> Optional[dict]:
     """Put ``word`` into ``segment`` at its time position.
 
     The segment's own word list gives the position: the index is how
@@ -934,7 +945,8 @@ def insert_word_into_segment(segment: dict, word: dict) -> bool:
     transcript is not always a plain join of its words) the index is
     clamped rather than guessed at.
 
-    Returns False, changing nothing, in two cases (audit A/B on the
+    Returns the word record it put into the segment, or ``None``,
+    changing nothing, in two cases (audit A/B on the
     trilingual evidence recording, rules 2 and 3 of the splice guard):
 
     * the word would land immediately beside a word sharing its stem
@@ -961,7 +973,7 @@ def insert_word_into_segment(segment: dict, word: dict) -> bool:
     stem = _word_stem(word)
     neighbours = seg_words[max(0, index - 1):index + 1]
     if stem and any(_word_stem(n) == stem for n in neighbours):
-        return False
+        return None
     prev_word = seg_words[index - 1] if index > 0 else None
     next_word = seg_words[index] if index < len(seg_words) else None
     before_bound = (
@@ -971,7 +983,7 @@ def insert_word_into_segment(segment: dict, word: dict) -> bool:
         as_float(next_word.get("start")) if next_word else as_float(segment.get("end"))
     )
     if after_bound - before_bound < word_duration(word) - SPLICE_GAP_SLACK_SEC:
-        return False
+        return None
     tokens = str(segment.get("text") or "").split()
     tokens.insert(min(index, len(tokens)), str(word.get("word") or ""))
     segment["text"] = " ".join(tokens)
@@ -994,7 +1006,7 @@ def insert_word_into_segment(segment: dict, word: dict) -> bool:
     # Diagnostic only (like ``source`` on the fallback segments): says
     # this segment was repaired, and by how much.
     segment["splicedWords"] = int(segment.get("splicedWords") or 0) + 1
-    return True
+    return placed
 
 
 @dataclass
@@ -1031,6 +1043,13 @@ def splice_words_into_segments(
     fallback-segment seam; only a group's interior is exempt, because by
     construction it is the inside of one recovered run of speech.
 
+    Once placed, the inserted words and the words right after them take
+    the case and punctuation of their places (``_settle_placed_words``).
+    This is the ONE place that happens for every inserted word — the
+    live session's interim words and the recovery pass's re-decoded
+    words alike — so callers hand in words as they were read
+    (``backend.word_case.as_read``) and nothing else.
+
     The returned list is a new list; the segments themselves are the
     caller's own dicts, mutated in place where a word was inserted.
     """
@@ -1041,6 +1060,14 @@ def splice_words_into_segments(
     if not ordered:
         return SpliceOutcome(segments=out)
 
+    # Where each transcript word stood in its own final, taken BEFORE
+    # anything is inserted: what a word's capital is judged against once
+    # an inserted word lands in front of it.
+    own_starts = _own_sentence_starts(out)
+    # Each record this call put into the transcript, by identity, with
+    # its place in the text it was read in.
+    placed: dict[int, ReadPlace] = {}
+
     inserted = 0
     outside: list[dict] = []
     for word in ordered:
@@ -1048,9 +1075,12 @@ def splice_words_into_segments(
         if host is None:
             outside.append(word)
             continue
-        if insert_word_into_segment(host, word):
+        record = insert_word_into_segment(host, word)
+        if record is not None:
+            placed[id(record)] = place_in_reading(word)
             inserted += 1
     if not outside:
+        _settle_placed_words(out, placed, own_starts)
         return SpliceOutcome(segments=out, inserted=inserted)
 
     groups: list[list[dict]] = [[outside[0]]]
@@ -1083,10 +1113,15 @@ def splice_words_into_segments(
         if group:
             trimmed_groups.append(group)
     if not trimmed_groups:
+        _settle_placed_words(out, placed, own_starts)
         return SpliceOutcome(segments=out, inserted=inserted)
 
-    fallback_segments = [
-        {
+    fallback_segments = []
+    for group in trimmed_groups:
+        records = [without_read_place(w) for w in group]
+        for word, record in zip(group, records):
+            placed[id(record)] = place_in_reading(word)
+        fallback_segments.append({
             "start": round(as_float(group[0].get("start")), 3),
             "end": round(max(as_float(w.get("end")) for w in group), 3),
             "text": " ".join(str(w.get("word") or "") for w in group),
@@ -1096,24 +1131,118 @@ def splice_words_into_segments(
             # The recovered words travel with the segment they became,
             # exactly like a native final's — so seam repair and coverage
             # read one shape, not two.
-            "words": [dict(w) for w in group],
+            "words": records,
             # Distinguishes recovered content from native finals; the
             # frontend merges by time like any other segment, so this is
             # diagnostic metadata only.
             "source": source,
-        }
-        for group in trimmed_groups
-    ]
+        })
     out = sorted(
         [*out, *fallback_segments],
         key=lambda s: (as_float(s.get("start")), as_float(s.get("end"))),
     )
+    _settle_placed_words(out, placed, own_starts)
     return SpliceOutcome(
         segments=out,
         inserted=inserted,
         appended=sum(len(group) for group in trimmed_groups),
         groups=len(fallback_segments),
     )
+
+
+def _own_sentence_starts(segments: "Iterable[dict]") -> dict[int, bool]:
+    """Per transcript word (by identity): did it stand at a sentence
+    start in the segment it came in — first of it, or after a word that
+    ends a sentence (``backend.word_case``)?"""
+    starts: dict[int, bool] = {}
+    for seg in segments:
+        previous: Optional[dict] = None
+        for word in segment_words(seg):
+            starts[id(word)] = previous is None or ends_sentence(
+                str(previous.get("word") or "")
+            )
+            previous = word
+    return starts
+
+
+def _settle_placed_words(
+    segments: "list[dict]",
+    placed: "dict[int, ReadPlace]",
+    own_starts: "dict[int, bool]",
+) -> None:
+    """The case and punctuation of the places a splice changed
+    (``backend.word_case``); mutates ``segments`` in place.
+
+    An inserted word was read in a text of its own — an interim
+    hypothesis, a re-decoded clip — and arrives with two marks of THAT
+    text (``placed`` holds its ``ReadPlace`` there):
+
+    * a capital it had at a start of that text is positional: in the
+      transcript it is capitalised at a sentence start and lowered
+      elsewhere. A capital that text gave it mid-sentence is the word's
+      own ("Claude") and stays; casing like "API" is never touched;
+    * the trailing marks of that text's LAST word are where the text was
+      cut, not where the speaker paused — they are dropped unless the
+      word also ends the transcript. Marks between two words of one
+      reading are that reading's account of a real boundary and stay.
+
+    A transcript word right after an inserted one has a new neighbour, so
+    its case is decided by its place again: "Посмотри," opened its final,
+    and after the inserted "потерял" it is "посмотри,". Words the splice
+    did not insert, and did not put a word in front of, are left exactly
+    as read. A final that carried no word list reads as its one clause
+    (``segment_word_records``): it says whether a sentence ends before
+    the next word and that the transcript goes on, and is never respelt.
+    """
+    if not placed:
+        return
+    walk = [
+        (seg, words, index)
+        for seg in segments
+        for words in (segment_word_records(seg),)
+        for index in range(len(words))
+    ]
+    previous: Optional[dict] = None
+    for position, (seg, words, index) in enumerate(walk):
+        word = words[index]
+        place = placed.get(id(word))
+        in_question = place is not None or (
+            previous is not None and id(previous) in placed
+        )
+        if in_question and not word.get(SPANLESS_WORD_FLAG):
+            token = str(word.get("word") or "")
+            at_start = (
+                place.at_start if place is not None
+                else own_starts.get(id(word), True)
+            )
+            settled = cased_for_place(
+                token,
+                sentence_start=starts_sentence(
+                    str(previous.get("word") or "") if previous is not None else None
+                ),
+                lexical=capital_is_lexical([(token, at_start)]),
+            )
+            if place is not None and place.last and position + 1 < len(walk):
+                settled = without_trailing_marks(settled)
+            if settled != token:
+                _retoken(seg, words, index, settled)
+        previous = word
+
+
+def _retoken(seg: dict, words: "list[dict]", index: int, token: str) -> None:
+    """Respell one word of a segment, in its word list and its text.
+
+    ``text`` is edited at the same index, as ``insert_word_into_segment``
+    does, when it is the plain join of the words (always, for a fallback
+    segment and for a final whose text its words spell); a provider
+    transcript that does not tokenise like its word list is left as the
+    provider wrote it rather than guessed at."""
+    old = str(words[index].get("word") or "")
+    words[index]["word"] = token
+    tokens = str(seg.get("text") or "").split()
+    if len(tokens) == len(words) and tokens[index] == old:
+        tokens[index] = token
+        seg["text"] = " ".join(tokens)
 
 
 def join_segment_texts(segments: "Iterable[dict]") -> str:
@@ -3913,7 +4042,14 @@ class DeepgramLiveSession:
         # one supersedes every stored word that overlaps its range —
         # without that, the same spoken word would pile up once per
         # interim message and the splice would duplicate it.
-        new_words = message_words
+        #
+        # Each word remembers its place in THIS hypothesis
+        # (``backend.word_case.as_read``): a hypothesis is formatted as a
+        # text of its own, so its first word is capitalised and its last
+        # closed by position, and if the word is ever spliced into a final
+        # the splice gives it the case and marks of its place there
+        # instead (measured 2026-11-23: "деплой Потерял, Посмотри").
+        new_words = as_read(message_words)
         self._interim_ring.append((round(start, 3), round(end, 3), text))
         # Record where the service actually heard WORDS. The message span
         # is the re-decode window, not the speech in it: a rolling interim
