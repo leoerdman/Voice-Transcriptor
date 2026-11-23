@@ -102,8 +102,61 @@ export function isBluetoothInputLabel(label: string): boolean {
   return BLUETOOTH_LABEL_TOKENS.some((token) => normalized.includes(token));
 }
 
+/**
+ * How long the built-in input stays ready after a Stop — the durations
+ * Settings offers, in the one place that decides what each means.
+ *
+ * The measurement that chose them (2026-11-24): every warm reuse in the
+ * production log happened within 29 s of the take before it, and the
+ * 30 s budget covered 13 % of cold starts; five minutes covers 43 %,
+ * fifteen minutes 63 %. What a hold costs its owner is the lit macOS
+ * microphone indicator and a running input device — the output is not
+ * opened (``main.tsx`` ``createSilentCaptureContext``), and a Bluetooth
+ * input is never held at all (``decideWarmHold``). That price is the
+ * owner's decision, taken once, in Settings; this table is what the
+ * setting's value means and nothing else is allowed to restate it.
+ */
+export const WARM_HOLD_OPTIONS = Object.freeze([
+  { id: "30s", ms: 30_000 },
+  { id: "5m", ms: 300_000 },
+  { id: "15m", ms: 900_000 },
+] as const);
+
+export type WarmHoldOptionId = (typeof WARM_HOLD_OPTIONS)[number]["id"];
+
+/**
+ * The shipped default: long enough that a working session's takes are
+ * warm, short enough that a walked-away machine releases the microphone
+ * on its own even if nothing else did.
+ */
+export const WARM_HOLD_DEFAULT_ID: WarmHoldOptionId = "15m";
+
+/**
+ * The option a stored setting value names.
+ *
+ * An unknown or missing value is the default, never "no hold": a setting
+ * that cannot be read (an older config, a markup change) must not quietly
+ * turn the feature off. Settings restores the control to this answer, so
+ * what the user sees and what the hold does cannot disagree.
+ */
+export function warmHoldOptionFor(id: string | null | undefined): WarmHoldOptionId {
+  const key = String(id ?? "").trim();
+  const found = WARM_HOLD_OPTIONS.find((o) => o.id === key);
+  return found ? found.id : WARM_HOLD_DEFAULT_ID;
+}
+
+/**
+ * The hold's TTL for a stored setting value — ``warmHoldOptionFor``'s
+ * option, in milliseconds. Zero only if the table itself is empty, which
+ * would mean the hold has no duration to honour.
+ */
+export function warmHoldMsForOption(id: string | null | undefined): number {
+  const option = WARM_HOLD_OPTIONS.find((o) => o.id === warmHoldOptionFor(id));
+  return option ? option.ms : 0;
+}
+
 export interface WarmHoldInput {
-  /** `UI_TOKENS.capture.warmHoldMs`. Zero or less disables the hold. */
+  /** The hold's TTL — ``warmHoldMsForOption`` of the user's setting. Zero or less disables the hold. */
   warmHoldMs: number;
   /** `MediaStreamTrack.label` of the capture track (or the picker's text). */
   deviceLabel: string;
@@ -261,36 +314,51 @@ export function chooseCaptureDevice(input: CaptureDeviceInput): CaptureDeviceCho
  * The lifecycle events that end a warm hold, and why each one does.
  *
  * These strings are a support-log contract — they are what
- * ``[trace warmCapture] released reason=…`` prints — so they live here,
- * with the rest of the warm-capture policy, rather than as four string
- * literals spread across the renderer's event listeners.
+ * ``[trace warmCapture] released reason=…`` prints, mirrored into
+ * main.log by ./desktop/renderer-console — so they live here, with the
+ * rest of the warm-capture policy, rather than as string literals spread
+ * across the renderer's event listeners.
  *
- *   ttl            — the hold's own timer expired: 30 s of holding the
- *                    microphone open is the whole budget.
- *   window-hidden  — the app left the screen. A microphone held open by
- *                    an app that is not visible is the one case where
- *                    the OS indicator has nothing at all to show for
- *                    itself. (The TRANSITION is what releases; a hold
- *                    taken while already hidden is the ordinary case of
- *                    dictating by global hotkey.)
- *   pagehide       — the renderer itself is going away.
- *   devicechange   — the device list changed underneath us, so the "same
- *                    microphone" premise the hold rests on is gone.
- *   system-suspend — the machine is sleeping or the screen is locking.
- *                    This one cannot be inferred from inside the
- *                    renderer: ``setTimeout`` does not run while asleep,
- *                    so the TTL timer above cannot fire, and the OS may
- *                    hand the input device to something else in the
- *                    meantime. ``decideWarmReuse`` still re-checks the
- *                    wall clock at the next press — that is the backstop
- *                    for a shell too old to send the event.
+ *   ttl             — the hold's own timer expired. Its length is the
+ *                     user's setting (``warmHoldMsForOption``); nothing
+ *                     else in the app decides it.
+ *   pagehide        — the renderer itself is going away.
+ *   devicechange    — the device list changed underneath us, so the "same
+ *                     microphone" premise the hold rests on is gone.
+ *   system-suspend  — the machine is sleeping. This one cannot be inferred
+ *                     from inside the renderer: ``setTimeout`` does not run
+ *                     while asleep, so the TTL timer above cannot fire, and
+ *                     the OS may hand the input device to something else in
+ *                     the meantime. ``decideWarmReuse`` still re-checks the
+ *                     wall clock at the next press — that is the backstop
+ *                     for a shell too old to send the event.
+ *   lock-screen     — the screen locked: the machine is unattended by
+ *                     definition, and the indicator the hold costs the
+ *                     owner can no longer be seen. Electron reports it as
+ *                     its own ``powerMonitor`` event (./desktop/power-events)
+ *                     and the shell forwards the reason verbatim.
+ *   mic-changed     — the user picked another microphone in Settings; the
+ *                     held stream is no longer the one this app would open.
+ *   mic-hold-changed— the hold's own duration changed. The timer in force
+ *                     was the old one, so it is dropped and the next take
+ *                     holds under the new setting.
+ *
+ * Deliberately NOT here: the window becoming hidden. Dictation by global
+ * hotkey runs with the main window hidden or closed — the capsule is a
+ * window of its own — so a hold released on ``visibilitychange`` would be
+ * released in exactly the case it exists for, and a 15-minute budget
+ * would never survive the first window close. The indicator is the
+ * honest signal that the microphone is open; "the user is away" is what
+ * ``lock-screen`` and ``system-suspend`` say, and they are subscribed.
  */
 export const WARM_HOLD_LIFECYCLE_RELEASES = [
   "ttl",
-  "window-hidden",
   "pagehide",
   "devicechange",
   "system-suspend",
+  "lock-screen",
+  "mic-changed",
+  "mic-hold-changed",
 ] as const;
 
 export type WarmHoldLifecycleRelease = typeof WARM_HOLD_LIFECYCLE_RELEASES[number];
@@ -306,6 +374,19 @@ export interface WarmReuseInput {
   requestedDeviceId: string;
   trackLive: boolean;
   contextState: string;
+  /**
+   * The worklet has seen the device deliver nothing but digital zeros for
+   * longer than a device wake-up takes (./pcm-worklet ``SILENT_HOLD_MS``
+   * reports it as ``{type:"signal", silent:true}``).
+   *
+   * A live track is not the same as a working device: macOS can leave the
+   * track ``"live"`` while the input has stopped delivering (another app
+   * took it, the device was reset). A held graph like that would record
+   * silence from the first word, so the next press opens the device afresh
+   * instead — a cold start costs ~300–900 ms, a take of silence costs the
+   * take.
+   */
+  audioSilent: boolean;
 }
 
 /**
@@ -316,8 +397,8 @@ export interface WarmReuseInput {
  * while the machine is asleep, so a lid closed for two hours would
  * otherwise hand a two-hour-old MediaStream to the next press. The clock
  * comparison catches the sleep case even when the timer has not fired
- * yet, and the track/context checks catch the device that went away
- * while we were not looking.
+ * yet, and the track/context/signal checks catch the device that went
+ * away while we were not looking.
  */
 export function decideWarmReuse(input: WarmReuseInput): WarmReuseDecision {
   if (!(input.warmHoldMs > 0)) return { reuse: false, reason: "disabled" };
@@ -327,6 +408,7 @@ export function decideWarmReuse(input: WarmReuseInput): WarmReuseDecision {
   if (input.contextState !== "running") {
     return { reuse: false, reason: `context-${input.contextState || "unknown"}` };
   }
+  if (input.audioSilent) return { reuse: false, reason: "silent" };
   // An empty request means "whatever the system default is", which the
   // held stream already is — the user has not pinned a device, so there
   // is nothing to disagree with. A pinned device must match exactly.

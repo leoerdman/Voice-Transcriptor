@@ -142,6 +142,23 @@ test("the recording tones are always mirrored, flag or no flag", () => {
   assert.equal(shouldMirrorConsoleMessage("INFO", "[cue] stop resuming", false), true);
 });
 
+test("the warm hold's release and device signal are always mirrored, flag or no flag", () => {
+  // The hold is what keeps the OS microphone indicator lit between takes.
+  // "The light stays on and I can't tell why" is answered by the release
+  // reason or by nothing at all — and a release happens a handful of
+  // times per session, not per take.
+  for (const line of [
+    "[trace warmCapture] released reason=ttl heldMs=900012",
+    "[trace warmCapture] released reason=lock-screen heldMs=95000",
+    "[trace warmCapture] released reason=mic-hold-changed heldMs=12000",
+    "[trace warmCapture] device signal silent=1 heldMs=60000",
+    "[trace warmCapture] the silent output sink was refused; the capture context keeps the default output",
+  ]) {
+    assert.equal(shouldMirrorConsoleMessage("INFO", line, false), true, line);
+    assert.equal(shouldMirrorConsoleMessage("INFO", line, true), true, line);
+  }
+});
+
 test("the high-volume trace stream stays behind the flag", () => {
   // Thousands of lines per session — the reason the flag exists.
   const line = '[trace] {"id":"paste-1","scope":"paste","step":1}';

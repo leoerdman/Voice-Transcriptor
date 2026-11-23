@@ -26,6 +26,8 @@ interface PostedMessage {
   samples?: Float32Array;
   sampleRate?: number;
   lastWriteTime?: number;
+  /** ``{type:"signal"}``: the held device stopped, or resumed, delivering. */
+  silent?: boolean;
 }
 
 interface FakePort {
@@ -266,5 +268,85 @@ describe("pcm-worklet capture processor", () => {
     expect(() => h.send(null)).not.toThrow();
     expect(() => h.send("start")).not.toThrow();
     expect(h.posted.length).toBe(0);
+  });
+});
+
+/**
+ * A held device that stops delivering — the case a "live" MediaStreamTrack
+ * cannot report and a held graph must not carry into a recording.
+ */
+describe("the armed ring's device watch", () => {
+  let h: Harness;
+  beforeEach(() => {
+    h = createHarness();
+  });
+
+  const QUANTA_PER_SECOND = SAMPLE_RATE / QUANTUM;
+
+  function signals(h: Harness): PostedMessage[] {
+    return messages(h).filter((m) => m.type === "signal");
+  }
+
+  function renderSilence(h: Harness, seconds: number): void {
+    const quanta = Math.round(seconds * QUANTA_PER_SECOND);
+    for (let i = 0; i < quanta; i++) {
+      h.render(new Float32Array(QUANTUM));
+      h.advance(QUANTUM / SAMPLE_RATE);
+    }
+  }
+
+  it("says nothing while the device keeps delivering, however quiet the room", () => {
+    h.send({ type: "arm", preRollMs: 500 });
+    // A real input carries its own noise floor; a ramp stands for it.
+    renderRamp(h, 0.001, 50);
+    expect(signals(h)).toEqual([]);
+  });
+
+  it("reports silence once, after a second of digital zeros, and never twice", () => {
+    h.send({ type: "arm", preRollMs: 500 });
+    renderRamp(h, 0, 4);
+    renderSilence(h, 0.9);
+    // A device wake-up is ~100 ms of the same zeros (see the cold-start
+    // log line "microphone woke"), so the window must be longer than that.
+    expect(signals(h)).toEqual([]);
+    renderSilence(h, 0.3);
+    expect(signals(h)).toEqual([{ type: "signal", silent: true }]);
+    renderSilence(h, 2);
+    expect(signals(h)).toEqual([{ type: "signal", silent: true }]);
+  });
+
+  it("clears the report when audio comes back, and can report the next gap", () => {
+    h.send({ type: "arm", preRollMs: 500 });
+    renderSilence(h, 1.2);
+    renderRamp(h, 0.5, 2);
+    expect(signals(h).map((m) => m.silent)).toEqual([true, false]);
+    renderSilence(h, 1.2);
+    expect(signals(h).map((m) => m.silent)).toEqual([true, false, true]);
+  });
+
+  it("counts a quantum with no channel at all as silence", () => {
+    h.send({ type: "arm", preRollMs: 500 });
+    for (let i = 0; i < QUANTA_PER_SECOND * 1.2; i++) {
+      h.processor.process([]);
+      h.advance(QUANTUM / SAMPLE_RATE);
+    }
+    expect(signals(h)).toEqual([{ type: "signal", silent: true }]);
+  });
+
+  it("starts a new hold unjudged", () => {
+    h.send({ type: "arm", preRollMs: 500 });
+    renderSilence(h, 1.2);
+    h.send({ type: "start" });
+    h.send({ type: "arm", preRollMs: 500 });
+    renderSilence(h, 0.5);
+    // Nothing new: the second hold has been silent for half a second only.
+    expect(signals(h)).toEqual([{ type: "signal", silent: true }]);
+  });
+
+  it("stays quiet during a recording: those zeros are the user's own", () => {
+    // Not armed: the processor is delivering, and silence is a fact for
+    // the mic-health path, not for a hold that does not exist.
+    renderSilence(h, 3);
+    expect(signals(h)).toEqual([]);
   });
 });

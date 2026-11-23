@@ -955,3 +955,76 @@ describe("the microphone's wake state (./mic-wake)", () => {
     expect(mainTsxSlice("if (wake.justWoke) {", "const frameIsSpeech")).toContain('playRecordingCue("ready")');
   });
 });
+
+/**
+ * P2-4 (2026-11-24): the warm hold's length is the user's, the graph it
+ * keeps opens no output device, and every reason it must be let go is
+ * wired to the one release path. The policy itself is behaviour-tested in
+ * capture-warm.test.ts and the worklet in pcm-worklet.test.ts; these pins
+ * say main.tsx uses exactly those.
+ */
+describe("the warm hold: its length, its output, and its releases", () => {
+  it("takes its length from the setting, and no other place restates it", () => {
+    expect(mainTsx).not.toContain("UI_TOKENS.capture.warmHoldMs");
+    expect(mainTsx).not.toMatch(/warmHoldMs:\s*\d/);
+    expect(mainTsxSlice("function planWarmCaptureHold(", "\nfunction commitWarmCaptureHold(")).toContain("warmHoldMs: warmHoldMs(),");
+    expect(mainTsxSlice("function commitWarmCaptureHold(", "\nfunction ")).toContain("warmHoldMs(),");
+    // One reader, one resolver: the control names an option id and the
+    // table in ./capture-warm says what it means.
+    expect(mainTsxSlice("function readMicHoldSetting(", "\n}\n")).toContain('getElementById("micHoldSelect")');
+    expect(mainTsxSlice("function warmHoldMs(", "\n}\n")).toContain("warmHoldMsForOption(readMicHoldSetting())");
+    // The control offers exactly the table's ids, and says what it costs.
+    const select = html.slice(html.indexOf('<select id="micHoldSelect">'), html.indexOf("</select>", html.indexOf('<select id="micHoldSelect">')));
+    expect(select).toContain('<option value="30s">');
+    expect(select).toContain('<option value="5m">');
+    expect(select).toContain('<option value="15m">');
+    expect(html).toContain("the macOS microphone indicator stays on");
+  });
+
+  it("stores the setting and restores the control from it", () => {
+    expect(mainTsxSlice("function collectUiPreferences(", "\n}\n")).toContain("mic_hold: readMicHoldSetting(),");
+    expect(mainTsx).toContain('($("micHoldSelect") as HTMLSelectElement).value = warmHoldOptionFor(ui.mic_hold);');
+    expect(mainTsxSlice('($("micHoldSelect") as HTMLSelectElement).addEventListener("change", () => {', "\n});"))
+      .toContain('releaseWarmCapture("mic-hold-changed")');
+  });
+
+  it("keeps the input and opens no output device, on both the branch and the fallback", () => {
+    const make = mainTsxSlice("function createSilentCaptureContext(", "\n}\n");
+    expect(make).toContain('sinkId: { type: "none" }');
+    expect(mainTsxSlice("async function prepareCaptureGraph(", "\n}\n")).toContain("createSilentCaptureContext()");
+    expect(mainTsxSlice("async function connectLiveCapture(", "\nasync function ")).toContain("ac = createSilentCaptureContext();");
+  });
+
+  it("is released by the ttl, a locked screen, sleep, a device change, a new pick, a new length and an exit", () => {
+    const lifecycle = mainTsxSlice("function releaseWarmCaptureOnLifecycle(", "\n}\n");
+    expect(lifecycle).toContain("releaseWarmCapture(reason)");
+    expect(mainTsx).toContain('releaseWarmCaptureOnLifecycle("ttl")');
+    expect(mainTsx).toContain('releaseWarmCaptureOnLifecycle("pagehide")');
+    expect(mainTsx).toContain('releaseWarmCaptureOnLifecycle("devicechange")');
+    // The shell forwards the powerMonitor event name; a locked screen is
+    // its own reason in the log, not folded into "suspend".
+    expect(mainTsx).toContain('kind === "lock-screen" ? "lock-screen" : "system-suspend"');
+    expect(mainTsxSlice("function subscribeToSystemSuspend(", "\n}\n")).toContain("releaseWarmCaptureOnLifecycle(why)");
+    expect(mainTsxSlice('($("micSelect") as HTMLSelectElement).addEventListener("change", () => {', "\n});"))
+      .toContain('releaseWarmCapture("mic-changed")');
+  });
+
+  it("is NOT released by the window becoming hidden", () => {
+    // Dictation by hotkey runs with the main window hidden or closed; a
+    // release on that transition died in exactly the case it exists for.
+    expect(mainTsx).not.toContain('releaseWarmCaptureOnLifecycle("window-hidden")');
+    const hidden = mainTsxSlice('document.addEventListener("visibilitychange", () => {', "\n});");
+    expect(hidden).not.toContain("releaseWarmCapture");
+  });
+
+  it("refuses a held device that stopped delivering, and says why in the log", () => {
+    const handler = mainTsxSlice("function handleWorkletMessage(", "\nfunction ");
+    expect(handler).toContain('data.type === "signal"');
+    expect(handler).toContain("held.silent = data.silent === true;");
+    expect(mainTsxSlice("function warmReuseDecision(", "\n}\n")).toContain("audioSilent: held.silent,");
+    expect(mainTsxSlice("function commitWarmCaptureHold(", "\nfunction ")).toContain("silent: false,");
+    // The release trace reaches main.log: INFO + a mirrored prefix.
+    expect(mainTsx).toContain("console.info(`[trace warmCapture] released reason=${reason} heldMs=${heldMs}`);");
+    expect(mainTsxSlice("function releaseWarmCapture(", "\n}\n")).toContain("console.info(");
+  });
+});

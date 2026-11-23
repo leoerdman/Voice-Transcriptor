@@ -79,6 +79,9 @@ import {
   decideWarmReuse,
   freezeCaptureForStop,
   handOverHeldCapture,
+  warmHoldMsForOption,
+  warmHoldOptionFor,
+  WARM_HOLD_DEFAULT_ID,
   type WarmHoldLifecycleRelease,
 } from "./capture-warm";
 import {
@@ -412,6 +415,12 @@ interface AppConfig {
        * turns it off.
        */
       bluetooth_builtin_mic?: boolean;
+      /**
+       * How long the built-in input stays ready after a Stop — an id from
+       * ./capture-warm ``WARM_HOLD_OPTIONS`` ("30s" | "5m" | "15m").
+       * Absent means the shipped default (15 minutes).
+       */
+      mic_hold?: string;
       /**
        * Live-tab speaker diarization. Its two neighbours in the same
        * popover (``auto_transcribe``, ``live_preview``) have always been
@@ -1258,34 +1267,10 @@ const UI_TOKENS = {
      * "ещё в 2 раза увеличим высоту" after trying 10).
      */
     vuAmplify: 20,
-    /**
-     * How long the capture graph — MediaStream, AudioContext, capture
-     * worklet — stays alive after Stop, waiting for the next press.
-     *
-     * A cold start costs `getUserMedia: 82 ms → audioContext: 33 ms →
-     * first-frame: 172 ms` (measured 2026-09-03, §4.7), and seconds when
-     * the input device is busy. None of it is paid again inside this
-     * window: the next start adopts the graph that is already running,
-     * and the worklet has been keeping `preRollMs` of audio in a ring the
-     * whole time, so the recording begins before the press instead of
-     * ~310 ms after it.
-     *
-     * THE VISIBLE COST: the operating system's microphone indicator — the
-     * orange dot on macOS, the tray icon on Windows — stays lit for these
-     * 30 s after every recording, and other applications see the input as
-     * in use. That is the honest price of not clipping the first word,
-     * and it is bounded exactly by this number. 0 disables the hold
-     * entirely and restores the pre-§4.7 behaviour (release at Stop);
-     * there is deliberately no UI for it yet.
-     *
-     * 30 s matches Handy's "lazy stream close" option. It is long enough
-     * to cover a dictate-paste-dictate cycle (the case where the clipping
-     * is most noticeable, because the user is already mid-thought) and
-     * short enough that a walk away from the machine ends with the
-     * microphone released. Bluetooth inputs never take the hold at all —
-     * see ./capture-warm.
-     */
-    warmHoldMs: 30_000,
+    // The warm hold's length has no token: it is the user's setting, and
+    // what each value means lives in ./capture-warm ``WARM_HOLD_OPTIONS``
+    // (read here by ``readMicHoldSetting``). A second constant here would
+    // be a second answer to "how long".
     /**
      * How much audio from BEFORE the hotkey the recording starts with.
      *
@@ -6483,6 +6468,7 @@ function collectUiPreferences(): NonNullable<NonNullable<AppConfig["preferences"
     shortcut_screen_shot: currentShortcuts.screenShot,
     screen_clicks: readScreenClicksEnabled(),
     bluetooth_builtin_mic: readBluetoothBuiltinMicEnabled(),
+    mic_hold: readMicHoldSetting(),
     // Upload tab — mirrors current DOM values. Optional-chained because
     // setupUploadView may not have run yet on a page that loaded
     // without the Upload section (defensive against future view splits).
@@ -6767,6 +6753,24 @@ function warnBuiltInMicBarelyHeard(level: CaptureLevel, recordedMs: number): voi
  *  (on by default in 1.6.22-1.6.24; config schema v3 cleared that). */
 function readBluetoothBuiltinMicEnabled(): boolean {
   return (document.getElementById("bluetoothBuiltinMicToggle") as HTMLInputElement | null)?.checked === true;
+}
+
+/**
+ * preferences.ui.mic_hold — how long the built-in input stays ready after
+ * a Stop: one of ./capture-warm ``WARM_HOLD_OPTIONS``.
+ *
+ * The value is the option's id, and the duration it means lives only in
+ * that table; this reader hands the id over rather than any number, so a
+ * duration cannot be restated here.
+ */
+function readMicHoldSetting(): string {
+  const el = document.getElementById("micHoldSelect") as HTMLSelectElement | null;
+  return (el?.value || "").trim() || WARM_HOLD_DEFAULT_ID;
+}
+
+/** The hold's TTL: the user's setting, resolved once, in one place. */
+function warmHoldMs(): number {
+  return warmHoldMsForOption(readMicHoldSetting());
 }
 
 function readScreenClicksEnabled(): boolean {
@@ -7452,6 +7456,7 @@ async function loadCfg(): Promise<void> {
     autoStopEnabledEl.checked = ui.auto_stop_silence_enabled === true;
     ($("screenClicksToggle") as HTMLInputElement).checked = ui.screen_clicks === true;
     ($("bluetoothBuiltinMicToggle") as HTMLInputElement).checked = ui.bluetooth_builtin_mic === true;
+    ($("micHoldSelect") as HTMLSelectElement).value = warmHoldOptionFor(ui.mic_hold);
     autoStopSecondsEl.value = String(clampAutoStopSeconds(Number(ui.auto_stop_silence_seconds)));
     autoStopDbEl.value = String(clampAutoStopThresholdDb(Number(ui.auto_stop_silence_db)));
     const upscaleToggle = $("upscaleToggle") as HTMLInputElement;
@@ -7761,6 +7766,12 @@ async function handleKeyAction(provider: RemoteProvider): Promise<void> {
   });
 });
 ($("screenClicksToggle") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
+($("micHoldSelect") as HTMLSelectElement).addEventListener("change", () => {
+  // The timer in force was the old duration: drop the hold and let the
+  // next take hold under the new one (./capture-warm WARM_HOLD_OPTIONS).
+  releaseWarmCapture("mic-hold-changed");
+  queueUiPreferencesSave();
+});
 ($("bluetoothBuiltinMicToggle") as HTMLInputElement).addEventListener("change", () => {
   // A held microphone was chosen under the old setting: let the next
   // start choose again instead of reusing it.
@@ -9893,6 +9904,10 @@ dualSecondaryLanguageSelect()?.addEventListener("change", () => {
   if (!next) return;
   micPreference = next;
   console.log(`[trace mic] picked "${next.label || (next.deviceId ? next.deviceId : "system default")}"`);
+  // A hold taken under the previous pick is the wrong device for the next
+  // take; ``decideWarmReuse`` would refuse it a press later, but a lit
+  // indicator nobody will use is not worth waiting for.
+  releaseWarmCapture("mic-changed");
   queueUiPreferencesSave();
 });
 
@@ -10476,6 +10491,13 @@ interface WarmCapture {
   deviceLabel: string;
   heldSince: number;
   expiryTimer: number | null;
+  /**
+   * The worklet has seen the held device deliver nothing but digital
+   * zeros for longer than a wake-up takes (./pcm-worklet ``SILENT_HOLD_MS``).
+   * Set from its ``{type:"signal"}`` message, read by ``decideWarmReuse``:
+   * a silent hold is released instead of adopted.
+   */
+  silent: boolean;
 }
 
 let warmCapture: WarmCapture | null = null;
@@ -10559,7 +10581,10 @@ function releaseWarmCapture(reason: string): void {
   try { held.stream.getTracks().forEach((t) => t.stop()); } catch { /* already stopped */ }
   if (micTrackWatchersStream === held.stream) micTrackWatchersStream = null;
   void held.ac.close().catch(() => { /* already closing — nothing to release */ });
-  console.log(`[trace warmCapture] released reason=${reason} heldMs=${heldMs}`);
+  // console.info, not console.log: the support log's mirror keeps INFO
+  // only for the prefixes it names (./desktop/renderer-console), and this
+  // line is the one that says why the microphone was let go.
+  console.info(`[trace warmCapture] released reason=${reason} heldMs=${heldMs}`);
 }
 
 /**
@@ -10625,7 +10650,7 @@ function refusedWarmHold(reason: string, deviceLabel: string): WarmHoldPlan {
 function planWarmCaptureHold(): WarmHoldPlan {
   const deviceLabel = micTrackLabel(stream);
   const decision = decideWarmHold({
-    warmHoldMs: UI_TOKENS.capture.warmHoldMs,
+    warmHoldMs: warmHoldMs(),
     deviceLabel,
     trackLive: streamHasLiveAudio(stream),
     contextState: ac?.state || "closed",
@@ -10705,9 +10730,12 @@ function commitWarmCaptureHold(plan: WarmHoldPlan): boolean {
     deviceId: micTrackDeviceId(heldStream),
     deviceLabel: plan.deviceLabel,
     heldSince: Date.now(),
+    // A fresh hold has not been judged silent yet; the worklet reports it
+    // if the device stops delivering while it is held.
+    silent: false,
     expiryTimer: window.setTimeout(
       () => releaseWarmCaptureOnLifecycle("ttl"),
-      UI_TOKENS.capture.warmHoldMs,
+      warmHoldMs(),
     ),
   };
   // Ownership has moved. Everything below in the teardown chain now
@@ -10734,11 +10762,12 @@ function warmReuseDecision(held: WarmCapture, requestedDeviceId: string) {
   return decideWarmReuse({
     now: Date.now(),
     heldSince: held.heldSince,
-    warmHoldMs: UI_TOKENS.capture.warmHoldMs,
+    warmHoldMs: warmHoldMs(),
     heldDeviceId: held.deviceId,
     requestedDeviceId,
     trackLive: streamHasLiveAudio(held.stream),
     contextState: held.ac.state,
+    audioSilent: held.silent,
   });
 }
 
@@ -10796,9 +10825,14 @@ try {
   // TTL still bounds the hold.
   console.debug("warm capture: devicechange listener unavailable", e);
 }
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "hidden") releaseWarmCaptureOnLifecycle("window-hidden");
-});
+// Note what is NOT here: "hidden" is no longer a release. Dictation by
+// global hotkey runs with the main window hidden or closed — the capsule
+// is a window of its own — so a hold released on the transition to hidden
+// died in exactly the case it exists for, and a 15-minute budget would
+// never survive the first window close. The microphone indicator is the
+// honest signal that the input is open; "the user is away" is what
+// lock-screen and system-suspend say (see ./capture-warm, where each
+// release reason and its rationale live).
 window.addEventListener("pagehide", () => releaseWarmCaptureOnLifecycle("pagehide"));
 // Holds the unsubscribe ``onSystemSuspend`` returns, so
 // ``subscribeToSystemSuspend`` (see its own doc comment, D-053) can
@@ -10834,8 +10868,12 @@ function subscribeToSystemSuspend(): void {
   try {
     systemSuspendUnsubscribe?.();
     systemSuspendUnsubscribe = window.transcriptor?.onSystemSuspend?.(({ reason }) => {
-      console.log(`[trace warmCapture] system suspend (${reason || "unknown"}) — releasing the hold`);
-      releaseWarmCaptureOnLifecycle("system-suspend");
+      // The shell forwards the powerMonitor event name verbatim
+      // (./desktop/power-events): "suspend" and "lock-screen" are the two,
+      // and a locked screen is its own reason in the support log.
+      const kind = String(reason || "").trim();
+      const why: WarmHoldLifecycleRelease = kind === "lock-screen" ? "lock-screen" : "system-suspend";
+      releaseWarmCaptureOnLifecycle(why);
     }) ?? null;
   } catch (e) {
     console.debug("warm capture: system-suspend bridge unavailable", e);
@@ -10872,9 +10910,18 @@ let micTrackWatchersStream: MediaStream | null = null;
 function attachMicTrackWatchers(target: MediaStream): void {
   if (micTrackWatchersStream === target) return;
   micTrackWatchersStream = target;
+  // A track that dies while it is HELD is a held graph the next take
+  // could never use: ``decideWarmReuse`` would refuse it at the press,
+  // but the microphone would stay open — and lit — until that press.
+  // The two reasons are the device's, not a lifecycle event's, so they
+  // are not in WARM_HOLD_LIFECYCLE_RELEASES; the release path is the
+  // same one.
+  const releaseIfHeld = (reason: "track-ended" | "track-muted"): void => {
+    if (warmCapture && warmCapture.stream === target) releaseWarmCapture(reason);
+  };
   for (const track of target.getAudioTracks()) {
     track.addEventListener("ended", () => {
-      if (!isRecording) return;
+      if (!isRecording) { releaseIfHeld("track-ended"); return; }
       console.warn("Audio track ended (device disconnect) — auto-stopping");
       micHealth.observe({ kind: "track-ended" });
       patchCurrentRecordingSummary(
@@ -10884,7 +10931,7 @@ function attachMicTrackWatchers(target: MediaStream): void {
       void stopLive(shouldAutoTranscribe());
     }, { once: true });
     track.addEventListener("mute", () => {
-      if (!isRecording) return;
+      if (!isRecording) { releaseIfHeld("track-muted"); return; }
       micHealth.observe({ kind: "track-muted", muted: true });
     });
     track.addEventListener("unmute", () => {
@@ -10912,7 +10959,20 @@ function handleWorkletMessage(ev: MessageEvent): void {
     return;
   }
   if (!msg || typeof msg !== "object") return;
-  const data = msg as { type?: unknown; token?: unknown; samples?: unknown; lastWriteTime?: unknown };
+  const data = msg as { type?: unknown; token?: unknown; samples?: unknown; lastWriteTime?: unknown; silent?: unknown };
+  if (data.type === "signal") {
+    // Only meaningful while held: during a recording, silence is the
+    // user's own and the mic-health path owns what to say about it.
+    const held = warmCapture;
+    if (held) {
+      held.silent = data.silent === true;
+      console.info(
+        `[trace warmCapture] device signal silent=${held.silent ? 1 : 0} ` +
+        `heldMs=${Date.now() - held.heldSince}`,
+      );
+    }
+    return;
+  }
   if (data.type === "flush-ack") {
     const token = String(data.token || "");
     const resolve = pendingWorkletFlushes.get(token);
@@ -12219,13 +12279,52 @@ function beginColdLiveCapture(mic: LiveMicChoice, mark: StartMarker): LiveCaptur
 }
 
 /**
+ * Chromium's silent-sink context option. The bundled DOM typings declare
+ * ``AudioContextOptions`` without ``sinkId``; the implementation has it.
+ */
+type SilentSinkContextOptions = AudioContextOptions & { sinkId: { type: "none" } };
+
+/**
+ * The capture graph's AudioContext — one that renders to NO output device.
+ *
+ * A capture context plays nothing: the worklet has no outputs at all and
+ * the analyser is a pass-through nobody listens to. Its destination was
+ * still a real device — Chromium opens the default output for a running
+ * context — so while the graph was held warm, the output was held too.
+ * On this machine the default output is a Bluetooth headset: a held
+ * microphone also held the headset streaming silence for the whole hold.
+ * At 30 s that was tolerable; at 15 minutes it is not.
+ *
+ * ``sinkId: {type: "none"}`` asks Chromium for its silent sink: the
+ * context renders on its own clock with no device behind it. Measured on
+ * Electron 42 / macOS 26 (2026-11-24, ``/tmp/cold-start-probe/electron-sink``):
+ * the worklet received every quantum — 400 quanta, 51 200 samples, 51 199
+ * of them non-zero from a test oscillator — the context clock advanced
+ * 1.22 s, and CoreAudio reported the default output device as not running
+ * for the whole context, including a graph connected to the destination.
+ * The same probe with a default sink opened it.
+ *
+ * A context that refuses the option is built the old way and says so:
+ * a recording that cannot start is worse than an output device that
+ * stays open.
+ */
+function createSilentCaptureContext(): AudioContext {
+  try {
+    return new AudioContext({ sinkId: { type: "none" } } as SilentSinkContextOptions);
+  } catch (e) {
+    console.warn("[trace warmCapture] the silent output sink was refused; the capture context keeps the default output", e);
+    return new AudioContext();
+  }
+}
+
+/**
  * The graph branch: a running AudioContext with the capture worklet
  * module loaded — nothing that needs the stream. A module that fails to
  * load here is loaded again by the connect, which falls back to the
  * ScriptProcessor from there exactly as before.
  */
 async function prepareCaptureGraph(mark: (label: string) => void): Promise<PreparedCaptureGraph> {
-  const context = new AudioContext();
+  const context = createSilentCaptureContext();
   if (context.state !== "running") {
     try {
       await context.resume();
@@ -12345,7 +12444,9 @@ async function connectLiveCapture(session: LiveStartSession, capture: LiveCaptur
     // start used to), or the prepared one has been suspended since.
     let contextWaited = false;
     if (!ac) {
-      ac = new AudioContext();
+      // Same context as the graph branch builds: no output device (see
+      // ``createSilentCaptureContext``).
+      ac = createSilentCaptureContext();
       contextWaited = true;
     }
     // One non-null reference for the rest of the start path. The module
@@ -12979,7 +13080,7 @@ async function stopLive(
   });
   console.log(
     `[trace stopLive] warm hold=${warmHoldPlan.hold ? 1 : 0} reason=${warmHoldPlan.reason} ` +
-    `ttlMs=${UI_TOKENS.capture.warmHoldMs} device="${warmHoldPlan.deviceLabel}"`,
+    `ttlMs=${warmHoldMs()} device="${warmHoldPlan.deviceLabel}"`,
   );
   mark("captureFreeze");
   // The WebM container is an INDEPENDENT sink fed by the MediaStream,

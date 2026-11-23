@@ -763,6 +763,23 @@
                   built-in mic. Only if you sit close to the Mac: it hears you worse than the
                   headset</span><input type="checkbox"
                   id="bluetoothBuiltinMicToggle" /></label>
+              <!--
+                How long the built-in input stays ready after a take: the
+                durations and their milliseconds live in
+                src/capture-warm.ts WARM_HOLD_OPTIONS, and this control only
+                names them. preferences.ui.mic_hold stores the id; absent
+                means 15 minutes. While the input is held, macOS keeps its
+                microphone indicator lit — that is the whole price, the
+                output is never opened.
+              -->
+              <label class="field"><span class="lbl">Keep the microphone ready</span>
+                <select id="micHoldSelect">
+                  <option value="30s">30 seconds</option>
+                  <option value="5m">5 minutes</option>
+                  <option value="15m">15 minutes</option>
+                </select>
+                <span class="hint">While it is ready, the macOS microphone indicator stays on</span>
+              </label>
               <label class="toggle-inline settings-toggle"><span>Auto stop on silence</span><input type="checkbox"
                   id="autoStopSilenceEnabled" /></label>
               <!--

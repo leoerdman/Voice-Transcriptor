@@ -77,6 +77,13 @@ const MAX_MESSAGE_CHARS = 600;
  * "I don't hear the sound" (2026-11-20) was undiagnosable without it —
  * two lines per recording.
  *
+ * `[trace warmCapture]` says why the microphone was let go — `ttl`,
+ * `lock-screen`, `system-suspend`, `devicechange`, `mic-changed`, … — and
+ * whether the held device stopped delivering (`device signal silent=1`).
+ * The hold is what keeps the OS microphone indicator lit between takes,
+ * so "the light stays on and I don't know why" is answered by these lines
+ * or by nothing. A handful per hold, not per take.
+ *
  * A handful of lines per recording. Anything added here must stay that
  * cheap.
  */
@@ -85,6 +92,7 @@ const ALWAYS_MIRRORED_PREFIXES = Object.freeze([
   "[trace startLive]",
   "[trace tail-gap]",
   "[cue]",
+  "[trace warmCapture]",
 ]);
 
 const LEVEL_ERROR = "ERROR";

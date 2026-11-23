@@ -6,6 +6,10 @@ import {
   chooseCaptureDevice,
   isBuiltInInputLabel,
   WARM_HOLD_LIFECYCLE_RELEASES,
+  WARM_HOLD_OPTIONS,
+  WARM_HOLD_DEFAULT_ID,
+  warmHoldMsForOption,
+  warmHoldOptionFor,
   type WarmHoldLifecycleRelease,
   decidePreRoll,
   decideWarmHold,
@@ -33,6 +37,7 @@ const reuseInput: WarmReuseInput = {
   requestedDeviceId: "mic-a",
   trackLive: true,
   contextState: "running",
+  audioSilent: false,
 };
 
 describe("isBluetoothInputLabel", () => {
@@ -148,6 +153,16 @@ describe("decideWarmReuse", () => {
     });
   });
 
+  it("refuses a live track that has stopped delivering audio", () => {
+    // The track stayed "live" but the device went away: adopting this
+    // graph would record silence from the first word, which costs the
+    // take, where a cold start costs ~300-900 ms.
+    expect(decideWarmReuse({ ...reuseInput, audioSilent: true })).toEqual({
+      reuse: false,
+      reason: "silent",
+    });
+  });
+
   it("reuses nothing when the hold is switched off", () => {
     expect(decideWarmReuse({ ...reuseInput, warmHoldMs: 0 })).toEqual({
       reuse: false,
@@ -225,6 +240,26 @@ describe("captureElapsedMs — one clock for 'is this a recording yet?'", () => 
   });
 });
 
+describe("WARM_HOLD_OPTIONS — the durations Settings offers, and what each means", () => {
+  it("offers exactly three, and the default is the fifteen-minute one", () => {
+    expect(WARM_HOLD_OPTIONS.map((o) => o.id)).toEqual(["30s", "5m", "15m"]);
+    expect(WARM_HOLD_OPTIONS.map((o) => o.ms)).toEqual([30_000, 300_000, 900_000]);
+    expect(WARM_HOLD_DEFAULT_ID).toBe("15m");
+    expect(warmHoldMsForOption(WARM_HOLD_DEFAULT_ID)).toBe(900_000);
+  });
+
+  it("resolves every id, and turns an unknown or missing one into the default", () => {
+    expect(warmHoldMsForOption("30s")).toBe(30_000);
+    expect(warmHoldMsForOption("5m")).toBe(300_000);
+    expect(warmHoldMsForOption("15m")).toBe(900_000);
+    // An unreadable setting must not quietly turn the hold off.
+    for (const stored of ["", "  ", undefined, null, "60m", "0", "15"]) {
+      expect(warmHoldMsForOption(stored as string)).toBe(900_000);
+      expect(warmHoldOptionFor(stored as string)).toBe("15m");
+    }
+  });
+});
+
 describe("WARM_HOLD_LIFECYCLE_RELEASES", () => {
   it("names every event that ends a hold, and nothing else", () => {
     // A support-log contract: these are the strings
@@ -232,10 +267,12 @@ describe("WARM_HOLD_LIFECYCLE_RELEASES", () => {
     // has one listener per entry.
     expect([...WARM_HOLD_LIFECYCLE_RELEASES]).toEqual([
       "ttl",
-      "window-hidden",
       "pagehide",
       "devicechange",
       "system-suspend",
+      "lock-screen",
+      "mic-changed",
+      "mic-hold-changed",
     ]);
   });
 
@@ -245,6 +282,20 @@ describe("WARM_HOLD_LIFECYCLE_RELEASES", () => {
     // powerMonitor event is.
     const sleep: WarmHoldLifecycleRelease = "system-suspend";
     expect(WARM_HOLD_LIFECYCLE_RELEASES).toContain(sleep);
+  });
+
+  it("includes the locked screen as its own reason: the machine is unattended", () => {
+    // Electron reports lock-screen separately from suspend (neither always
+    // implies the other) and the shell forwards the name verbatim.
+    const locked: WarmHoldLifecycleRelease = "lock-screen";
+    expect(WARM_HOLD_LIFECYCLE_RELEASES).toContain(locked);
+  });
+
+  it("does not release on the window becoming hidden", () => {
+    // Dictation by global hotkey runs with the main window hidden or
+    // closed — the capsule is a window of its own. Releasing on that
+    // transition killed the hold in exactly the case it exists for.
+    expect(WARM_HOLD_LIFECYCLE_RELEASES).not.toContain("window-hidden" as never);
   });
 });
 

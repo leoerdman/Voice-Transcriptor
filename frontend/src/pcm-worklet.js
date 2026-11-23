@@ -48,6 +48,24 @@
 const MAX_PENDING_SAMPLES = 512;
 
 /**
+ * How long an armed ring must see nothing but digital zeros before the
+ * device is reported as not delivering.
+ *
+ * A live input always carries its own noise floor — measured on the
+ * owner's built-in microphone at peak ~0.008 with the room silent — so
+ * exact zeros mean no data, which is what an input that was taken away,
+ * reset or asleep produces. The window is a second rather than a quantum
+ * because the same digital silence is normal for ~100 ms while a device
+ * wakes (``microphone woke: 104 ms of digital silence``); anything
+ * shorter would call a healthy device dead at every cold start.
+ *
+ * Nothing is posted while the device is healthy: a transition is one
+ * ~40-byte message, into silence and back out of it, so a 15-minute hold
+ * costs one message if nothing goes wrong.
+ */
+const SILENT_HOLD_MS = 1000;
+
+/**
  * Ring buffer holding the most recent `capacity` samples.
  *
  * Pure and self-contained on purpose: it is the one piece of the worklet
@@ -111,6 +129,10 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
     // renderer subtracts it from its own `currentTime` to learn whether
     // the ring kept filling or the context stopped rendering.
     this.lastRingWriteTime = 0;
+    // Context clock at the first zero-only quantum since the last real
+    // sample; -1 means "the device is delivering". See ``watchDevice``.
+    this.quietSince = -1;
+    this.silent = false;
     this.port.onmessage = (event) => {
       const msg = event?.data;
       if (!msg || typeof msg !== "object") return;
@@ -145,6 +167,9 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
     const capacity = Math.max(0, Math.round((Number.isFinite(ms) ? ms : 0) * sampleRate / 1000));
     this.ring = capacity > 0 ? new PreRollRing(capacity) : null;
     this.lastRingWriteTime = currentTime;
+    // A new hold starts unjudged, whatever the previous one looked like.
+    this.quietSince = -1;
+    this.silent = false;
     this.armed = true;
   }
 
@@ -196,16 +221,48 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
     this.pendingSamples = 0;
   }
 
+  /**
+   * Report a held device that has stopped (or resumed) delivering.
+   *
+   * Called for every armed quantum. A quantum with no channel at all is
+   * silence like any other: the device owes us 128 samples every 128
+   * samples of the context clock, and a context that keeps rendering
+   * without them is exactly the "live track, dead device" the renderer
+   * must not hand to a recording.
+   */
+  watchDevice(channel) {
+    let sound = false;
+    if (channel) {
+      for (let i = 0; i < channel.length; i++) {
+        if (channel[i] !== 0) { sound = true; break; }
+      }
+    }
+    if (sound) {
+      this.quietSince = -1;
+      if (this.silent) {
+        this.silent = false;
+        this.port.postMessage({ type: "signal", silent: false });
+      }
+      return;
+    }
+    if (this.quietSince < 0) this.quietSince = currentTime;
+    if (!this.silent && (currentTime - this.quietSince) * 1000 >= SILENT_HOLD_MS) {
+      this.silent = true;
+      this.port.postMessage({ type: "signal", silent: true });
+    }
+  }
+
   process(inputs) {
     const channel = inputs?.[0]?.[0];
-    if (channel && channel.length) {
-      if (this.armed) {
-        if (this.ring) {
-          this.ring.push(channel);
-          this.lastRingWriteTime = currentTime;
-        }
-        return true;
+    if (this.armed) {
+      this.watchDevice(channel);
+      if (channel && channel.length && this.ring) {
+        this.ring.push(channel);
+        this.lastRingWriteTime = currentTime;
       }
+      return true;
+    }
+    if (channel && channel.length) {
       const copy = channel.slice(0);
       this.pending.push(copy);
       this.pendingSamples += copy.length;
