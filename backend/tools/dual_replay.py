@@ -21,7 +21,6 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -30,18 +29,24 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from backend.deepgram_dual import merge_readings  # noqa: E402
+from backend.tools.dual_dump import load_dump  # noqa: E402
 
 
-def replay(path: Path, *, words: bool, expected_languages: "list[str] | None" = None) -> str:
-    data = json.loads(path.read_text(encoding="utf-8"))
+def merge_dump(data: dict, *, expected_languages: "list[str] | None" = None):
     expected = expected_languages if expected_languages is not None else data.get("expected_languages") or []
-    merged = merge_readings(
+    return merge_readings(
         data.get("primary_segments") or [],
         data.get("secondary_segments") or [],
         primary_language=str(data.get("primary_language") or "multi"),
         secondary_language=str(data.get("secondary_language") or "ru"),
         expected_languages=expected,
+        keyterms=data.get("keyterms") or [],
     )
+
+
+def replay(path: Path, *, words: bool, expected_languages: "list[str] | None" = None) -> str:
+    data = load_dump(path)
+    merged = merge_dump(data, expected_languages=expected_languages)
     lines = [
         f"{data.get('file', path.name)}: merged={len(merged.words)} words "
         f"filled_from_secondary={merged.filled_from_secondary} "
