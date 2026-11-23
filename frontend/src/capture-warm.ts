@@ -40,6 +40,15 @@ export interface CaptureDecision {
 
 export interface WarmHoldDecision extends CaptureDecision {
   hold: boolean;
+  /**
+   * The TTL this verdict applies, in milliseconds — the user's setting,
+   * or the shorter cap below when the graph kept the output device open.
+   * The caller holds for THIS, never for the setting: two numbers that
+   * could disagree would be two answers to "how long".
+   */
+  ttlMs: number;
+  /** Set when ``ttlMs`` is shorter than the setting, naming why. */
+  capReason?: "output-device-open";
 }
 
 export interface WarmReuseDecision extends CaptureDecision {
@@ -118,10 +127,10 @@ export function isBluetoothInputLabel(label: string): boolean {
  */
 export const WARM_HOLD_OPTIONS = Object.freeze([
   /** Off: the input is released at Stop, as it was before the hold existed. */
-  { id: "off", ms: 0 },
-  { id: "30s", ms: 30_000 },
-  { id: "5m", ms: 300_000 },
-  { id: "15m", ms: 900_000 },
+  { id: "off", ms: 0, label: "Off — release it after each recording" },
+  { id: "30s", ms: 30_000, label: "30 seconds" },
+  { id: "5m", ms: 300_000, label: "5 minutes" },
+  { id: "15m", ms: 900_000, label: "15 minutes" },
 ] as const);
 
 export type WarmHoldOptionId = (typeof WARM_HOLD_OPTIONS)[number]["id"];
@@ -162,6 +171,26 @@ export function warmHoldMsForOption(id: string | null | undefined): number {
   return WARM_HOLD_MS_BY_ID[warmHoldOptionFor(id)];
 }
 
+/**
+ * The longest a graph may be held when its AudioContext kept an OUTPUT
+ * device open — the 30 s the app held for before it learned to render
+ * the capture context into Chromium's silent sink (1.6.42).
+ *
+ * Why a cap and not "refuse the hold": the graph is otherwise exactly
+ * what the hold wants — a live input, a running worklet, a filled
+ * pre-roll ring — so the next press is still warm. What changes is the
+ * price: an open output means the owner's headset (or speakers) stays
+ * streaming silence for as long as we hold it, and fifteen minutes of
+ * that is not something a fallback may decide on its own. Thirty
+ * seconds is the price the owner already accepted, so a runtime that
+ * ignores ``sinkId`` degrades to the old behaviour instead of quietly
+ * holding something else open for half an hour.
+ *
+ * It is the table's own ``30s``, not a second 30 000: the number has one
+ * home.
+ */
+export const WARM_HOLD_OUTPUT_OPEN_CAP_MS: number = WARM_HOLD_MS_BY_ID["30s"];
+
 export interface WarmHoldInput {
   /** The hold's TTL — ``warmHoldMsForOption`` of the user's setting. Zero or less disables the hold. */
   warmHoldMs: number;
@@ -181,6 +210,16 @@ export interface WarmHoldInput {
    * next start goes through the ordinary cold path.
    */
   workletCapture: boolean;
+  /**
+   * Is the graph's AudioContext rendering into Chromium's silent sink —
+   * no output device behind it (``main.tsx`` ``createSilentCaptureContext``)?
+   *
+   * Asked of the context itself after it was created, not assumed from
+   * the option that was passed: a runtime that ignores ``sinkId`` builds
+   * an ordinary context, and the difference is exactly "the output is
+   * open for the whole hold".
+   */
+  outputSilent: boolean;
 }
 
 /**
@@ -190,16 +229,27 @@ export interface WarmHoldInput {
  * answers "why did this machine never warm-hold?" without a repro.
  */
 export function decideWarmHold(input: WarmHoldInput): WarmHoldDecision {
-  if (!(input.warmHoldMs > 0)) return { hold: false, reason: "disabled" };
-  if (!input.workletCapture) return { hold: false, reason: "script-fallback" };
-  if (!input.trackLive) return { hold: false, reason: "track-ended" };
+  const settingMs = Number(input.warmHoldMs);
+  const ttlMs = Number.isFinite(settingMs) && settingMs > 0 ? settingMs : 0;
+  if (!(ttlMs > 0)) return { hold: false, reason: "disabled", ttlMs: 0 };
+  if (!input.workletCapture) return { hold: false, reason: "script-fallback", ttlMs };
+  if (!input.trackLive) return { hold: false, reason: "track-ended", ttlMs };
   if (input.contextState !== "running") {
-    return { hold: false, reason: `context-${input.contextState || "unknown"}` };
+    return { hold: false, reason: `context-${input.contextState || "unknown"}`, ttlMs };
   }
   if (isBluetoothInputLabel(input.deviceLabel)) {
-    return { hold: false, reason: "bluetooth" };
+    return { hold: false, reason: "bluetooth", ttlMs };
   }
-  return { hold: true, reason: "held" };
+  // The one place the output device's price is charged (see the constant).
+  if (!input.outputSilent && ttlMs > WARM_HOLD_OUTPUT_OPEN_CAP_MS) {
+    return {
+      hold: true,
+      reason: "held",
+      ttlMs: WARM_HOLD_OUTPUT_OPEN_CAP_MS,
+      capReason: "output-device-open",
+    };
+  }
+  return { hold: true, reason: "held", ttlMs };
 }
 
 /** One `audioinput` entry of `enumerateDevices()`. */
@@ -341,57 +391,108 @@ export function chooseCaptureDevice(input: CaptureDeviceInput): CaptureDeviceCho
 }
 
 /**
- * The lifecycle events that end a warm hold, and why each one does.
+ * Every reason the app may let a warm hold go, and who may say it.
  *
- * These strings are a support-log contract — they are what
- * ``[trace warmCapture] released reason=…`` prints, mirrored into
- * main.log by ./desktop/renderer-console — so they live here, with the
- * rest of the warm-capture policy, rather than as string literals spread
- * across the renderer's event listeners.
+ * One closed table, because the alternative is what was here before:
+ * a list of lifecycle strings beside untyped ``releaseWarmCapture("…")``
+ * calls, and a reason (``mic-setting-changed``) that reached the log
+ * while existing in no table at all. The type below is DERIVED from this
+ * table, so a reason that is not here cannot be passed to the release
+ * path — the compiler says so, not a review.
  *
- *   ttl             — the hold's own timer expired. Its length is the
- *                     user's setting (``warmHoldMsForOption``); nothing
- *                     else in the app decides it.
- *   pagehide        — the renderer itself is going away.
- *   devicechange    — the device list changed underneath us, so the "same
- *                     microphone" premise the hold rests on is gone.
- *   system-suspend  — the machine is sleeping. This one cannot be inferred
- *                     from inside the renderer: ``setTimeout`` does not run
- *                     while asleep, so the TTL timer above cannot fire, and
- *                     the OS may hand the input device to something else in
- *                     the meantime. ``decideWarmReuse`` still re-checks the
- *                     wall clock at the next press — that is the backstop
- *                     for a shell too old to send the event.
- *   lock-screen     — the screen locked: the machine is unattended by
- *                     definition, and the indicator the hold costs the
- *                     owner can no longer be seen. Electron reports it as
- *                     its own ``powerMonitor`` event (./desktop/power-events)
- *                     and the shell forwards the reason verbatim.
- *   mic-changed     — the user picked another microphone in Settings; the
- *                     held stream is no longer the one this app would open.
- *   mic-hold-changed— the hold's own duration changed. The timer in force
- *                     was the old one, so it is dropped and the next take
- *                     holds under the new setting.
+ * The column is what makes the vocabulary honest: a ``listener`` reason
+ * is an outside event a subscription reports; ``device`` is a fact about
+ * the held track; ``start`` is the hold being refused when a press asked
+ * for it. Only ``listener`` reasons may travel through
+ * ``releaseWarmCaptureOnLifecycle`` in ``main.tsx``.
  *
- * Deliberately NOT here: the window becoming hidden. Dictation by global
- * hotkey runs with the main window hidden or closed — the capsule is a
- * window of its own — so a hold released on ``visibilitychange`` would be
- * released in exactly the case it exists for, and a 15-minute budget
- * would never survive the first window close. The indicator is the
- * honest signal that the microphone is open; "the user is away" is what
- * ``lock-screen`` and ``system-suspend`` say, and they are subscribed.
+ * These strings are a support-log contract — ``[trace warmCapture]
+ * released reason=…`` prints them, mirrored into main.log by
+ * ./desktop/renderer-console.
+ *
+ *   ttl              — the hold's own timer expired. Its length is the
+ *                      decision's (``decideWarmHold``), not the raw
+ *                      setting: an open output caps it.
+ *   pagehide         — the renderer itself is going away.
+ *   devicechange     — the device list changed underneath us, so "same
+ *                      microphone" no longer holds.
+ *   system-suspend   — the machine is sleeping. Nothing inside the
+ *                      renderer can infer this: ``setTimeout`` does not
+ *                      run while asleep, so the TTL timer cannot fire,
+ *                      and the OS may hand the input to something else.
+ *                      ``decideWarmReuse`` re-checks the wall clock at
+ *                      the next press as the backstop.
+ *   lock-screen      — the screen locked: the machine is unattended by
+ *                      definition and the indicator the hold costs can no
+ *                      longer be seen. Electron reports it as its own
+ *                      ``powerMonitor`` event (./desktop/power-events) and
+ *                      the shell forwards the name verbatim.
+ *   mic-changed      — the microphone this app would open changed: the
+ *                      user picked another one, or changed the rule that
+ *                      resolves the pick (the Bluetooth setting). One
+ *                      reason, because the hold's premise — "the device I
+ *                      hold is the device I would open" — is what broke.
+ *   mic-hold-changed — the hold's own duration changed; the timer in
+ *                      force was the old one.
+ *   mic-hold-off     — the hold was switched off. A distinct fact from a
+ *                      retimed hold: the next take holds nothing.
+ *   track-ended      — the held track is no longer live.
+ *   track-muted      — the held input is muted at the OS level; nothing
+ *                      it records would be worth holding for.
+ *   refused          — a press asked for the hold and it could not be
+ *                      used. ``detail`` carries ``decideWarmReuse``'s own
+ *                      answer (``expired``, ``silent``, ``device-changed``,
+ *                      …), which is data about a refusal, not a release
+ *                      reason of its own.
  */
-export const WARM_HOLD_LIFECYCLE_RELEASES = [
-  "ttl",
-  "pagehide",
-  "devicechange",
-  "system-suspend",
-  "lock-screen",
-  "mic-changed",
-  "mic-hold-changed",
-] as const;
+export const WARM_HOLD_RELEASE = Object.freeze({
+  ttl: "listener",
+  pagehide: "listener",
+  devicechange: "listener",
+  "system-suspend": "listener",
+  "lock-screen": "listener",
+  "mic-changed": "listener",
+  "mic-hold-changed": "listener",
+  "mic-hold-off": "listener",
+  "track-ended": "device",
+  "track-muted": "device",
+  refused: "start",
+} as const);
 
-export type WarmHoldLifecycleRelease = typeof WARM_HOLD_LIFECYCLE_RELEASES[number];
+export type WarmHoldReleaseReason = keyof typeof WARM_HOLD_RELEASE;
+
+/** The reasons a subscription may report — the ``listener`` column. */
+export type WarmHoldLifecycleRelease = {
+  [K in WarmHoldReleaseReason]: (typeof WARM_HOLD_RELEASE)[K] extends "listener" ? K : never;
+}[WarmHoldReleaseReason];
+
+/** The ``listener`` column, in table order. */
+export const WARM_HOLD_LIFECYCLE_RELEASES: readonly WarmHoldLifecycleRelease[] = Object.freeze(
+  (Object.keys(WARM_HOLD_RELEASE) as WarmHoldReleaseReason[]).filter(
+    (reason): reason is WarmHoldLifecycleRelease => WARM_HOLD_RELEASE[reason] === "listener",
+  ),
+);
+
+/** What a held track's own state says about keeping the microphone open. */
+export type HeldStreamVerdict =
+  | { hold: true }
+  | { hold: false; reason: "track-ended" | "track-muted" };
+
+/**
+ * Is this state of a track still worth holding the microphone for?
+ *
+ * Asked of the TRACK, not of the event that reported it: ``ended`` and
+ * ``mute`` are two ways a track tells us something, and both mean "the
+ * graph in the hold cannot record any more". A live, unmuted track is
+ * worth holding; anything else is a microphone kept open — and lit — for
+ * nothing. Pure, so the three cases are a unit test rather than a claim
+ * about a live device.
+ */
+export function decideHeldStreamAlive(input: { readyState: string; muted: boolean }): HeldStreamVerdict {
+  if (String(input.readyState || "") !== "live") return { hold: false, reason: "track-ended" };
+  if (input.muted) return { hold: false, reason: "track-muted" };
+  return { hold: true };
+}
 
 export interface WarmReuseInput {
   now: number;

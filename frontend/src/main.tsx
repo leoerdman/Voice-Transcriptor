@@ -81,8 +81,11 @@ import {
   handOverHeldCapture,
   warmHoldMsForOption,
   warmHoldOptionFor,
+  WARM_HOLD_OPTIONS,
   WARM_HOLD_DEFAULT_ID,
+  decideHeldStreamAlive,
   type WarmHoldLifecycleRelease,
+  type WarmHoldReleaseReason,
 } from "./capture-warm";
 import {
   SYSTEM_DEFAULT_MIC,
@@ -6788,6 +6791,24 @@ function warmHoldMs(): number {
   return warmHoldMsForOption(readMicHoldSetting());
 }
 
+/**
+ * Draw the hold's control from ``WARM_HOLD_OPTIONS`` and select the value
+ * the state holds.
+ *
+ * One list, so the markup cannot offer a duration the policy does not
+ * know, cannot put a different option first, and cannot disagree with the
+ * default: the entries, their order and their wording all come from the
+ * table, and the selection from the module state — which starts at
+ * ``WARM_HOLD_DEFAULT_ID`` and is replaced only by a loaded config.
+ * Called once at boot, before any config is read.
+ */
+function renderMicHoldOptions(): void {
+  const el = document.getElementById("micHoldSelect") as HTMLSelectElement | null;
+  if (!el) return;
+  el.replaceChildren(...WARM_HOLD_OPTIONS.map((option) => new Option(option.label, option.id)));
+  el.value = micHoldOptionId;
+}
+
 function readScreenClicksEnabled(): boolean {
   return !!(document.getElementById("screenClicksToggle") as HTMLInputElement | null)?.checked;
 }
@@ -7781,19 +7802,21 @@ async function handleKeyAction(provider: RemoteProvider): Promise<void> {
   });
 });
 ($("screenClicksToggle") as HTMLInputElement).addEventListener("change", () => queueUiPreferencesSave());
+renderMicHoldOptions();
 ($("micHoldSelect") as HTMLSelectElement).addEventListener("change", () => {
   // The timer in force was the old duration: drop the hold and let the
   // next take hold under the new one (./capture-warm WARM_HOLD_OPTIONS).
   // Switched off, the reason says so — the one fact the log cannot infer
   // from a shorter or longer timer.
   const id = setMicHoldSetting(($("micHoldSelect") as HTMLSelectElement).value);
-  releaseWarmCapture(id === "off" ? "mic-hold-off" : "mic-hold-changed");
+  releaseWarmCaptureOnLifecycle(id === "off" ? "mic-hold-off" : "mic-hold-changed");
   queueUiPreferencesSave();
 });
 ($("bluetoothBuiltinMicToggle") as HTMLInputElement).addEventListener("change", () => {
-  // A held microphone was chosen under the old setting: let the next
-  // start choose again instead of reusing it.
-  releaseWarmCapture("mic-setting-changed");
+  // The rule that resolves the pick changed, so the held device may not be
+  // the one this app would open any more: the same premise a new pick
+  // breaks, and therefore the same reason (./capture-warm mic-changed).
+  releaseWarmCaptureOnLifecycle("mic-changed");
   queueUiPreferencesSave();
 });
 ($("settingsAutoSendEnterToggle") as HTMLInputElement).addEventListener("change", () => {
@@ -9925,7 +9948,7 @@ dualSecondaryLanguageSelect()?.addEventListener("change", () => {
   // A hold taken under the previous pick is the wrong device for the next
   // take; ``decideWarmReuse`` would refuse it a press later, but a lit
   // indicator nobody will use is not worth waiting for.
-  releaseWarmCapture("mic-changed");
+  releaseWarmCaptureOnLifecycle("mic-changed");
   queueUiPreferencesSave();
 });
 
@@ -10508,6 +10531,8 @@ interface WarmCapture {
   /** Track label, kept for the trace line. */
   deviceLabel: string;
   heldSince: number;
+  /** The TTL this hold was taken for (the decision's, cap included). */
+  ttlMs: number;
   expiryTimer: number | null;
   /**
    * The worklet has seen the held device deliver nothing but digital
@@ -10598,7 +10623,7 @@ function micTrackDeviceId(s: MediaStream | null): string {
  * a session adopting it, and therefore the only place the microphone is
  * actually released once a recording has ended.
  */
-function releaseWarmCapture(reason: string): void {
+function releaseWarmCapture(reason: WarmHoldReleaseReason, detail = ""): void {
   const held = warmCapture;
   if (!held) return;
   warmCapture = null;
@@ -10617,7 +10642,8 @@ function releaseWarmCapture(reason: string): void {
   // line is the one that says why the microphone was let go.
   console.info(
     `[trace warmCapture] released reason=${reason} heldMs=${heldMs} ` +
-    `signalChanges=${held.signalChanges} silentMs=${silentMs}`,
+    `signalChanges=${held.signalChanges} silentMs=${silentMs}` +
+    (detail ? ` detail=${detail}` : ""),
   );
 }
 
@@ -10653,6 +10679,10 @@ function stopCaptureTracks(): void {
 interface WarmHoldPlan {
   hold: boolean;
   reason: string;
+  /** The TTL this plan holds for — the decision's, cap included. */
+  ttlMs: number;
+  /** Set when the decision shortened the TTL: named in the trace. */
+  capReason?: "output-device-open";
   deviceLabel: string;
   /** The graph this plan promised to keep. Null unless ``hold``. */
   ac: AudioContext | null;
@@ -10661,8 +10691,8 @@ interface WarmHoldPlan {
   workletNode: AudioWorkletNode | null;
 }
 
-function refusedWarmHold(reason: string, deviceLabel: string): WarmHoldPlan {
-  return { hold: false, reason, deviceLabel, ac: null, stream: null, src: null, workletNode: null };
+function refusedWarmHold(reason: string, deviceLabel: string, ttlMs = 0): WarmHoldPlan {
+  return { hold: false, reason, ttlMs, deviceLabel, ac: null, stream: null, src: null, workletNode: null };
 }
 
 /**
@@ -10692,8 +10722,10 @@ function planWarmCaptureHold(): WarmHoldPlan {
     // to the ScriptProcessor has nothing to hold that would pay for the
     // microphone staying open.
     workletCapture: !!workletNode && scriptFallbackState !== "committed",
+    // Asked of the live context, not assumed from the option we passed.
+    outputSilent: ac ? audioContextRendersSilently(ac) : false,
   });
-  if (!decision.hold) return refusedWarmHold(decision.reason, deviceLabel);
+  if (!decision.hold) return refusedWarmHold(decision.reason, deviceLabel, decision.ttlMs);
   const heldAc = ac;
   const heldStream = stream;
   const heldSrc = src;
@@ -10712,6 +10744,8 @@ function planWarmCaptureHold(): WarmHoldPlan {
   return {
     hold: true,
     reason: decision.reason,
+    ttlMs: decision.ttlMs,
+    capReason: decision.capReason,
     deviceLabel,
     ac: heldAc,
     stream: heldStream,
@@ -10770,11 +10804,20 @@ function commitWarmCaptureHold(plan: WarmHoldPlan): boolean {
     signalChanges: 0,
     silentSince: null,
     silentMs: 0,
+    // The plan's TTL, not the setting: an open output caps it, and a
+    // reused hold must expire on the same number it was taken for.
+    ttlMs: plan.ttlMs,
     expiryTimer: window.setTimeout(
       () => releaseWarmCaptureOnLifecycle("ttl"),
-      warmHoldMs(),
+      plan.ttlMs,
     ),
   };
+  if (plan.capReason) {
+    // The hold is shorter than the user asked for: the support log has to
+    // say why, and it is the one line that can (Settings still reads 15
+    // minutes, because that is still the setting).
+    console.info(`[trace warmCapture] hold capped reason=${plan.capReason} ttlMs=${plan.ttlMs}`);
+  }
   // Ownership has moved. Everything below in the teardown chain now
   // finds empty slots, which is precisely the intent.
   ac = null;
@@ -10799,7 +10842,9 @@ function warmReuseDecision(held: WarmCapture, requestedDeviceId: string) {
   return decideWarmReuse({
     now: Date.now(),
     heldSince: held.heldSince,
-    warmHoldMs: warmHoldMs(),
+    // The TTL the hold was TAKEN for, not the setting as it reads now: a
+    // capped hold must expire on its cap even after the user raises it.
+    warmHoldMs: held.ttlMs,
     heldDeviceId: held.deviceId,
     requestedDeviceId,
     trackLive: streamHasLiveAudio(held.stream),
@@ -10817,7 +10862,11 @@ function warmCaptureReusable(requestedDeviceId: string): boolean {
   if (!held) return false;
   const decision = warmReuseDecision(held, requestedDeviceId);
   if (!decision.reuse) {
-    releaseWarmCapture(decision.reason);
+    // ``decideWarmReuse`` has its own vocabulary (expired, silent,
+    // device-changed, …): it describes a verdict on the held graph, not
+    // why it is being released. The release reason is the closed one and
+    // the verdict rides along as detail.
+    releaseWarmCapture("refused", decision.reason);
     return false;
   }
   return true;
@@ -10831,16 +10880,24 @@ function takeWarmCapture(requestedDeviceId: string): WarmCapture | null {
   return held;
 }
 
-// The hold survives an idle window, not a change of circumstances — one
-// listener per entry of ``WARM_HOLD_LIFECYCLE_RELEASES`` (./capture-warm,
-// where each reason and its rationale live), all of them going through
-// the one release path. ``releaseWarmCapture`` itself takes any string,
-// because ``decideWarmReuse`` hands it its own rejection reasons; this
-// wrapper is what holds the lifecycle listeners to the named set.
+// The hold survives an idle window, not a change of circumstances. The
+// reasons live in ONE closed table (./capture-warm WARM_HOLD_RELEASE) and
+// the type is derived from it, so a reason that table does not name
+// cannot reach the release path — one used to, while existing in no
+// table at all. Two doors stand between the observers and the one
+// implementation, each narrowing to its own column of that table:
+// subscriptions report ``listener`` reasons, the held track's own state
+// reports ``device`` ones, and the start path (a refusal) passes its
+// reason with the verdict as detail.
 // Declared, not assigned to a const: the expiry timer in
-// ``commitWarmCaptureHold`` refers to it, and a hoisted declaration
-// cannot be reached before it exists.
+// ``commitWarmCaptureHold`` refers to the lifecycle door, and a hoisted
+// declaration cannot be reached before it exists.
 function releaseWarmCaptureOnLifecycle(reason: WarmHoldLifecycleRelease): void {
+  releaseWarmCapture(reason);
+}
+
+/** The device column: what the held track itself can be. */
+function releaseWarmCaptureForTrack(reason: "track-ended" | "track-muted"): void {
   releaseWarmCapture(reason);
 }
 //
@@ -10950,15 +11007,21 @@ function attachMicTrackWatchers(target: MediaStream): void {
   // A track that dies while it is HELD is a held graph the next take
   // could never use: ``decideWarmReuse`` would refuse it at the press,
   // but the microphone would stay open — and lit — until that press.
-  // The two reasons are the device's, not a lifecycle event's, so they
-  // are not in WARM_HOLD_LIFECYCLE_RELEASES; the release path is the
-  // same one.
-  const releaseIfHeld = (reason: "track-ended" | "track-muted"): void => {
-    if (warmCapture && warmCapture.stream === target) releaseWarmCapture(reason);
+  // What counts as dead is a rule of its own (./capture-warm
+  // ``decideHeldStreamAlive``), asked of the track's state rather than of
+  // the event that fired, and released through the device door.
+  const releaseIfHeldDead = (): void => {
+    if (!warmCapture || warmCapture.stream !== target) return;
+    const track = target.getAudioTracks()[0];
+    const verdict = decideHeldStreamAlive({
+      readyState: track?.readyState ?? "ended",
+      muted: !!track?.muted,
+    });
+    if (!verdict.hold) releaseWarmCaptureForTrack(verdict.reason);
   };
   for (const track of target.getAudioTracks()) {
     track.addEventListener("ended", () => {
-      if (!isRecording) { releaseIfHeld("track-ended"); return; }
+      if (!isRecording) { releaseIfHeldDead(); return; }
       console.warn("Audio track ended (device disconnect) — auto-stopping");
       micHealth.observe({ kind: "track-ended" });
       patchCurrentRecordingSummary(
@@ -10968,7 +11031,7 @@ function attachMicTrackWatchers(target: MediaStream): void {
       void stopLive(shouldAutoTranscribe());
     }, { once: true });
     track.addEventListener("mute", () => {
-      if (!isRecording) { releaseIfHeld("track-muted"); return; }
+      if (!isRecording) { releaseIfHeldDead(); return; }
       micHealth.observe({ kind: "track-muted", muted: true });
     });
     track.addEventListener("unmute", () => {
@@ -12355,6 +12418,30 @@ type SilentSinkContextOptions = AudioContextOptions & { sinkId: { type: "none" }
  * a recording that cannot start is worse than an output device that
  * stays open.
  */
+/**
+ * Did the context we built actually get Chromium's silent sink?
+ *
+ * Asked of the context AFTER it exists, because the option is a request:
+ * a runtime that ignores ``sinkId`` accepts ``new AudioContext({sinkId})``
+ * and builds an ordinary context whose destination is the default output.
+ * Reading it back is the only way to tell, and the answer decides the
+ * hold's length (``decideWarmHold``, the ``outputSilent`` input).
+ *
+ * ``AudioContext.sinkId`` is ``""`` for the system default and
+ * ``{type: "none"}`` for the silent sink; the bundled DOM typings declare
+ * it only on ``HTMLMediaElement``, hence the cast.
+ */
+function audioContextRendersSilently(context: AudioContext): boolean {
+  try {
+    const sink = (context as AudioContext & { sinkId?: unknown }).sinkId;
+    return typeof sink === "object" && sink !== null
+      && String((sink as { type?: unknown }).type || "") === "none";
+  } catch {
+    // Unreadable is not silent: the cap is the safe answer.
+    return false;
+  }
+}
+
 function createSilentCaptureContext(): AudioContext {
   try {
     return new AudioContext({ sinkId: { type: "none" } } as SilentSinkContextOptions);
@@ -13132,7 +13219,8 @@ async function stopLive(
   });
   console.log(
     `[trace stopLive] warm hold=${warmHoldPlan.hold ? 1 : 0} reason=${warmHoldPlan.reason} ` +
-    `ttlMs=${warmHoldMs()} device="${warmHoldPlan.deviceLabel}"`,
+    `ttlMs=${warmHoldPlan.ttlMs} device="${warmHoldPlan.deviceLabel}"` +
+    (warmHoldPlan.capReason ? ` cap=${warmHoldPlan.capReason}` : ""),
   );
   mark("captureFreeze");
   // The WebM container is an INDEPENDENT sink fed by the MediaStream,

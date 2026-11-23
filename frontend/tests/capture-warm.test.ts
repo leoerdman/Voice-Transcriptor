@@ -18,7 +18,11 @@ import {
   handOverHeldCapture,
   isBluetoothInputLabel,
   systemDefaultInput,
+  decideHeldStreamAlive,
+  WARM_HOLD_RELEASE,
+  WARM_HOLD_OUTPUT_OPEN_CAP_MS,
   type WarmHoldInput,
+  type WarmHoldReleaseReason,
   type WarmReuseInput,
 } from "../src/capture-warm";
 
@@ -28,6 +32,7 @@ const holdInput: WarmHoldInput = {
   trackLive: true,
   contextState: "running",
   workletCapture: true,
+  outputSilent: true,
 };
 
 const reuseInput: WarmReuseInput = {
@@ -89,14 +94,15 @@ describe("systemDefaultInput — the alias a request names is the device it open
 });
 
 describe("decideWarmHold", () => {
-  it("holds a live worklet graph on a wired microphone", () => {
-    expect(decideWarmHold(holdInput)).toEqual({ hold: true, reason: "held" });
+  it("holds a live worklet graph on a wired microphone, for the TTL it was asked for", () => {
+    expect(decideWarmHold(holdInput)).toEqual({ hold: true, reason: "held", ttlMs: 30_000 });
   });
 
   it("holds nothing when the TTL is zero — the documented off switch", () => {
     expect(decideWarmHold({ ...holdInput, warmHoldMs: 0 })).toEqual({
       hold: false,
       reason: "disabled",
+      ttlMs: 0,
     });
   });
 
@@ -106,6 +112,7 @@ describe("decideWarmHold", () => {
     expect(decideWarmHold({ ...holdInput, deviceLabel: "AirPods Max" })).toEqual({
       hold: false,
       reason: "bluetooth",
+      ttlMs: 30_000,
     });
   });
 
@@ -113,6 +120,7 @@ describe("decideWarmHold", () => {
     expect(decideWarmHold({ ...holdInput, workletCapture: false })).toEqual({
       hold: false,
       reason: "script-fallback",
+      ttlMs: 30_000,
     });
   });
 
@@ -120,15 +128,68 @@ describe("decideWarmHold", () => {
     expect(decideWarmHold({ ...holdInput, trackLive: false })).toEqual({
       hold: false,
       reason: "track-ended",
+      ttlMs: 30_000,
     });
     expect(decideWarmHold({ ...holdInput, contextState: "suspended" })).toEqual({
       hold: false,
       reason: "context-suspended",
+      ttlMs: 30_000,
     });
     expect(decideWarmHold({ ...holdInput, contextState: "" })).toEqual({
       hold: false,
       reason: "context-unknown",
+      ttlMs: 30_000,
     });
+  });
+
+  it("a graph whose context kept an output device open holds no longer than the old 30 s", () => {
+    // The silent sink is a REQUEST: a runtime that ignores it builds an
+    // ordinary context, whose destination is the default output — and a
+    // fifteen-minute hold would keep the owner's headset streaming
+    // silence for fifteen minutes. Degrade to what 1.6.41 did instead.
+    expect(decideWarmHold({ ...holdInput, warmHoldMs: 900_000, outputSilent: false })).toEqual({
+      hold: true,
+      reason: "held",
+      ttlMs: WARM_HOLD_OUTPUT_OPEN_CAP_MS,
+      capReason: "output-device-open",
+    });
+    expect(WARM_HOLD_OUTPUT_OPEN_CAP_MS).toBe(30_000);
+    // A silent sink takes the setting as it is, and a setting at or below
+    // the cap is never "capped".
+    expect(decideWarmHold({ ...holdInput, warmHoldMs: 900_000 })).toEqual({
+      hold: true,
+      reason: "held",
+      ttlMs: 900_000,
+    });
+    expect(decideWarmHold({ ...holdInput, warmHoldMs: 30_000, outputSilent: false })).toEqual({
+      hold: true,
+      reason: "held",
+      ttlMs: 30_000,
+    });
+  });
+});
+
+describe("decideHeldStreamAlive — what a held track's own state says", () => {
+  it("keeps a live, unmuted track", () => {
+    expect(decideHeldStreamAlive({ readyState: "live", muted: false })).toEqual({ hold: true });
+  });
+
+  it("lets go of an ended track", () => {
+    expect(decideHeldStreamAlive({ readyState: "ended", muted: false })).toEqual({
+      hold: false,
+      reason: "track-ended",
+    });
+  });
+
+  it("lets go of a muted one: nothing it records would be worth holding for", () => {
+    expect(decideHeldStreamAlive({ readyState: "live", muted: true })).toEqual({
+      hold: false,
+      reason: "track-muted",
+    });
+  });
+
+  it("treats an unreadable state as ended", () => {
+    expect(decideHeldStreamAlive({ readyState: "", muted: false }).hold).toBe(false);
   });
 });
 
@@ -291,6 +352,7 @@ describe("WARM_HOLD_OPTIONS — the durations Settings offers, and what each mea
     expect(decideWarmHold({ ...holdInput, warmHoldMs: warmHoldMsForOption("off") })).toEqual({
       hold: false,
       reason: "disabled",
+      ttlMs: 0,
     });
   });
 });
@@ -308,6 +370,7 @@ describe("WARM_HOLD_LIFECYCLE_RELEASES", () => {
       "lock-screen",
       "mic-changed",
       "mic-hold-changed",
+      "mic-hold-off",
     ]);
   });
 
@@ -324,6 +387,27 @@ describe("WARM_HOLD_LIFECYCLE_RELEASES", () => {
     // implies the other) and the shell forwards the name verbatim.
     const locked: WarmHoldLifecycleRelease = "lock-screen";
     expect(WARM_HOLD_LIFECYCLE_RELEASES).toContain(locked);
+  });
+
+  it("is derived from ONE table, and every listener reason is in it", () => {
+    // The table is the vocabulary; the listener list is its "listener"
+    // column. A reason that is not there cannot be passed to the release
+    // path at all (the type is derived from the table), which is what
+    // stops a string like the retired ``mic-setting-changed`` from
+    // reaching the log again.
+    for (const reason of WARM_HOLD_LIFECYCLE_RELEASES) {
+      expect(WARM_HOLD_RELEASE[reason]).toBe("listener");
+    }
+    const everyReason = Object.keys(WARM_HOLD_RELEASE) as WarmHoldReleaseReason[];
+    expect(everyReason).toEqual(expect.arrayContaining([...WARM_HOLD_LIFECYCLE_RELEASES]));
+    // The device's own verdicts and the press's refusal are in the same
+    // vocabulary, and are not lifecycle events.
+    expect(WARM_HOLD_RELEASE["track-ended"]).toBe("device");
+    expect(WARM_HOLD_RELEASE["track-muted"]).toBe("device");
+    expect(WARM_HOLD_RELEASE.refused).toBe("start");
+    expect(WARM_HOLD_LIFECYCLE_RELEASES).not.toContain("track-ended" as never);
+    expect(everyReason).not.toContain("mic-setting-changed" as never);
+    expect(everyReason).not.toContain("window-hidden" as never);
   });
 
   it("does not release on the window becoming hidden", () => {
@@ -434,12 +518,12 @@ describe("the stop-sequence ordering (F-001)", () => {
     // second case was the ONLY reachable one.
     const live = decideWarmHold({ ...holdInput, trackLive: true });
     expect(freezeCaptureForStop({ planHold: () => live, stopTracks: () => { /* unused */ } }))
-      .toEqual({ hold: true, reason: "held" });
+      .toMatchObject({ hold: true, reason: "held" });
 
     const ended = decideWarmHold({ ...holdInput, trackLive: false });
     let stopped = 0;
     expect(freezeCaptureForStop({ planHold: () => ended, stopTracks: () => { stopped += 1; } }))
-      .toEqual({ hold: false, reason: "track-ended" });
+      .toMatchObject({ hold: false, reason: "track-ended" });
     expect(stopped).toBe(1);
   });
 });
@@ -459,7 +543,8 @@ describe("chooseCaptureDevice — Bluetooth default → the Mac's built-in micro
 
   it("the built-in mic it picks is then warm-holdable (the point of the setting)", () => {
     const choice = chooseCaptureDevice({ requestedDeviceId: "", preferBuiltInOverBluetooth: true, devices: macWithHeadset });
-    expect(decideWarmHold({ ...holdInput, deviceLabel: choice.label })).toEqual({ hold: true, reason: "held" });
+    expect(decideWarmHold({ ...holdInput, deviceLabel: choice.label }))
+      .toMatchObject({ hold: true, reason: "held" });
   });
 
   it("the list's \"Default - …\" entry is the system default too, not a pinned device", () => {

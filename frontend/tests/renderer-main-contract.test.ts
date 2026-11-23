@@ -968,7 +968,9 @@ describe("the warm hold: its length, its output, and its releases", () => {
     expect(mainTsx).not.toContain("UI_TOKENS.capture.warmHoldMs");
     expect(mainTsx).not.toMatch(/warmHoldMs:\s*\d/);
     expect(mainTsxSlice("function planWarmCaptureHold(", "\nfunction commitWarmCaptureHold(")).toContain("warmHoldMs: warmHoldMs(),");
-    expect(mainTsxSlice("function commitWarmCaptureHold(", "\nfunction ")).toContain("warmHoldMs(),");
+    // ...and the hold runs on the DECISION's TTL, so an open output can
+    // shorten it (see the sink test below).
+    expect(mainTsxSlice("function commitWarmCaptureHold(", "\nfunction ")).toContain("ttlMs: plan.ttlMs,");
     // One reader, one resolver: the control names an option id and the
     // table in ./capture-warm says what it means. The reader reads STATE —
     // a start has to know the duration with Settings closed.
@@ -976,15 +978,21 @@ describe("the warm hold: its length, its output, and its releases", () => {
     expect(reader).toContain("return micHoldOptionId;");
     expect(reader).not.toContain("getElementById");
     expect(mainTsxSlice("function warmHoldMs(", "\n}\n")).toContain("warmHoldMsForOption(readMicHoldSetting())");
-    // The control offers exactly the table's ids, and says what it costs.
+    // The markup offers NOTHING: the options, their order and their
+    // wording come from the one table, so the page cannot show a duration
+    // the policy does not know or put a different one first.
     const select = html.slice(html.indexOf('<select id="micHoldSelect">'), html.indexOf("</select>", html.indexOf('<select id="micHoldSelect">')));
-    expect(select).toContain('<option value="off">');
-    expect(select).toContain('<option value="30s">');
-    expect(select).toContain('<option value="5m">');
-    expect(select).toContain('<option value="15m">');
-    // Both prices the hold has: the indicator, and the audio system left running.
+    expect(select).toBe('<select id="micHoldSelect">');
+    const render = mainTsxSlice("function renderMicHoldOptions(", "\n}\n");
+    expect(render).toContain("WARM_HOLD_OPTIONS.map((option) => new Option(option.label, option.id))");
+    expect(render).toContain("el.value = micHoldOptionId;");
+    // Before any config is read the state IS the shipped default, and the
+    // control is drawn (and selected) from it at boot.
+    expect(mainTsx).toContain("let micHoldOptionId: string = WARM_HOLD_DEFAULT_ID;");
+    expect(mainTsx).toMatch(/renderMicHoldOptions\(\);\n\(\$\("micHoldSelect"\)/);
+    // Both prices the hold has: the indicator, and the microphone in use.
     expect(html).toContain("the macOS microphone indicator stays on");
-    expect(html).toContain("the audio system keeps running");
+    expect(html).toContain("the microphone stays in use");
   });
 
   it("stores the setting and restores the control from it", () => {
@@ -1010,6 +1018,35 @@ describe("the warm hold: its length, its output, and its releases", () => {
     expect(mainTsxSlice("async function connectLiveCapture(", "\nasync function ")).toContain("ac = createSilentCaptureContext();");
   });
 
+  it("reads the sink back, and a graph that kept the output open is held for the old 30 s", () => {
+    // The option is a request. A runtime that ignores it builds an
+    // ordinary context, and holding that for fifteen minutes keeps the
+    // owner's output streaming silence.
+    const probe = mainTsxSlice("function audioContextRendersSilently(", "\n}\n");
+    expect(probe).toContain('.sinkId');
+    expect(probe).toContain('=== "none"');
+    // Asked of the live context, and answered into the ONE policy.
+    expect(mainTsxSlice("function planWarmCaptureHold(", "\nfunction commitWarmCaptureHold("))
+      .toContain("outputSilent: ac ? audioContextRendersSilently(ac) : false,");
+    // The hold and its timer run on the decision's TTL, not the setting.
+    const commit = mainTsxSlice("function commitWarmCaptureHold(", "\nfunction ");
+    expect(commit).toContain("ttlMs: plan.ttlMs,");
+    expect(commit).toContain("plan.ttlMs,");
+    expect(commit).toContain("hold capped reason=${plan.capReason} ttlMs=${plan.ttlMs}");
+    expect(mainTsxSlice("function warmReuseDecision(", "\n}\n")).toContain("warmHoldMs: held.ttlMs,");
+  });
+
+  it("lets go of a held stream whose track died or was muted", () => {
+    // The rule is a pure function of the track's state (./capture-warm);
+    // the listener only asks it and releases through the device door.
+    const watchers = mainTsxSlice("function attachMicTrackWatchers(", "\n}\n");
+    expect(watchers).toContain("decideHeldStreamAlive({");
+    expect(watchers).toContain("readyState: track?.readyState ?? \"ended\"");
+    expect(watchers).toContain("releaseWarmCaptureForTrack(verdict.reason)");
+    expect(watchers).toContain('track.addEventListener("ended"');
+    expect(watchers).toContain('track.addEventListener("mute"');
+  });
+
   it("is released by the ttl, a locked screen, sleep, a device change, a new pick, a new length and an exit", () => {
     const lifecycle = mainTsxSlice("function releaseWarmCaptureOnLifecycle(", "\n}\n");
     expect(lifecycle).toContain("releaseWarmCapture(reason)");
@@ -1020,8 +1057,27 @@ describe("the warm hold: its length, its output, and its releases", () => {
     // its own reason in the log, not folded into "suspend".
     expect(mainTsx).toContain('kind === "lock-screen" ? "lock-screen" : "system-suspend"');
     expect(mainTsxSlice("function subscribeToSystemSuspend(", "\n}\n")).toContain("releaseWarmCaptureOnLifecycle(why)");
+    // One typed door per column of the table: a subscription reports a
+    // listener reason, the track reports a device one.
     expect(mainTsxSlice('($("micSelect") as HTMLSelectElement).addEventListener("change", () => {', "\n});"))
-      .toContain('releaseWarmCapture("mic-changed")');
+      .toContain('releaseWarmCaptureOnLifecycle("mic-changed")');
+    expect(mainTsxSlice('($("bluetoothBuiltinMicToggle") as HTMLInputElement).addEventListener("change", () => {', "\n});"))
+      .toContain('releaseWarmCaptureOnLifecycle("mic-changed")');
+    expect(mainTsxSlice("function releaseWarmCaptureForTrack(", "\n}\n"))
+      .toContain("releaseWarmCapture(reason)");
+  });
+
+  it("names a release reason only from the one closed table — no string of its own", () => {
+    // ``mic-setting-changed`` was passed to the release path while
+    // existing in no table and no type. The signature now takes the
+    // table's own type, and this is the pin that keeps a new bare string
+    // from appearing beside it.
+    expect(mainTsx).not.toContain("mic-setting-changed");
+    const declaration = mainTsxSlice("function releaseWarmCapture(", "\n}\n");
+    expect(declaration).toContain("reason: WarmHoldReleaseReason");
+    // The start path refuses through the same function, with the reuse
+    // verdict as detail rather than as a reason of its own.
+    expect(mainTsx).toContain('releaseWarmCapture("refused", decision.reason)');
   });
 
   it("is NOT released by the window becoming hidden", () => {
