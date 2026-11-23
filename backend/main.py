@@ -1757,7 +1757,7 @@ def _promote_live_recovery(
                 or RECORDING_COLLECTION_LIVE
             )
             title = f"Recovered {started_at or datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            target_dir = _resolve_recordings_collection_target_dir(
+            target_dir = _recording_save_target_dir(
                 archive_dir or pinned_archive_dir,
                 collection=collection,
             )
@@ -3616,6 +3616,9 @@ AUDIO_RETENTION_POLICIES: dict[str, AudioRetentionPolicy] = {
 # The archive ROOT predates the collection subfolders: everything saved
 # before they existed landed there, and those were voice recordings.
 # It therefore inherits the Live policy rather than a third, invented one.
+# Nothing NEW is filed there any more (``_recording_save_target_dir``): a
+# save that cannot name its collection is refused, and an upload filed in
+# the root by an older build is exactly the hole S-4 closes.
 DEFAULT_AUDIO_RETENTION_POLICY = AUDIO_RETENTION_POLICIES[RECORDING_COLLECTION_LIVE]
 
 # A long-running app must not depend on a save or a restart to enforce
@@ -3716,6 +3719,41 @@ def _resolve_recordings_collection_target_dir(
     except ValueError as exc:
         raise HTTPException(status_code=403, detail="archive_dir is outside allowed directories") from exc
     return resolved_collection_dir
+
+
+def _recording_save_target_dir(
+    archive_dir: str = "",
+    *,
+    collection: object,
+    existing_name: str = "",
+    create: bool = True,
+) -> Path:
+    """The folder a save writes into — the ONE place a save picks its collection.
+
+    ``collection`` is the collection the save route files under; the route
+    owns it, so no caller has to remember it. A NEW recording must have one.
+    Left empty, the layout resolver answers with the archive ROOT — the
+    directory recordings had before the collections existed — and no
+    retention policy governs a file there: the Uploaded Media rule (20
+    newest, nothing older than 7 days) never sees it, so an uploaded file
+    written to the root lives there for good (S-4:
+    ``F8rc-ULd4_4.m4a`` and ``audio_2026-10-31_19-02-39_loud.mp3``, filed
+    by the command-line client, whose token may not even name a
+    collection — ``backend/cli_access.py``).
+
+    An EXISTING recording keeps the folder it is in: ``archive_dir`` is its
+    folder, and a legacy entry sitting in the root is edited where it lies,
+    never moved.
+    """
+    normalized = _normalize_recording_collection(collection)
+    if not existing_name and not normalized:
+        raise HTTPException(
+            status_code=400,
+            detail="recording_collection is required to file a new recording",
+        )
+    return _resolve_recordings_collection_target_dir(
+        archive_dir, collection=normalized, create=create
+    )
 
 
 def _recordings_scan_dirs(root: Path) -> list[Path]:
@@ -9432,7 +9470,6 @@ def save_recording(
     raw_existing_name = str(payload.get("name") or "").strip()
     existing_name = _recording_text_name_leaf(raw_existing_name) if raw_existing_name else ""
     archive_dir = str(payload.get("archive_dir") or "").strip()
-    recording_collection = _normalize_recording_collection(payload.get("recording_collection") or "")
     require_existing = _payload_bool(payload, "require_existing", False)
     fields = _normalize_save_fields(
         title=payload.get("title"),
@@ -9446,9 +9483,10 @@ def save_recording(
     title, source_text, transcript_text = fields.title, fields.source_text, fields.transcript_text
     provider, model, language = fields.provider, fields.model, fields.language
 
-    target_dir = _resolve_recordings_collection_target_dir(
+    target_dir = _recording_save_target_dir(
         archive_dir,
-        collection=recording_collection,
+        collection=payload.get("recording_collection"),
+        existing_name=existing_name,
         create=not require_existing,
     )
     claimed_new_text = False
@@ -9490,9 +9528,9 @@ async def _save_recording_audio_source(
     *,
     orig_name: str,
     write_tmp_audio: Callable[[Path], Awaitable[Any]],
+    recording_collection: str,
     name: str = "",
     archive_dir: str = "",
-    recording_collection: str = "",
     require_existing: bool = False,
     title: str = "recording",
     source_text: str = "",
@@ -9506,6 +9544,11 @@ async def _save_recording_audio_source(
     spoken_text: Optional[str] = None,
 ) -> dict[str, Any]:
     """File a recording with its audio (save-with-audio, save-from-path).
+
+    ``recording_collection`` is not optional and has no default: the route
+    states under which collection it files (``_recording_save_target_dir``
+    refuses a new recording without one), so no entry can forget it and
+    land in the archive root.
 
     ``recorded_at_ms`` is the epoch ms the recording began
     (``_recording_started_at``): a new recording's name is made of it, and
@@ -9542,9 +9585,10 @@ async def _save_recording_audio_source(
     ext = Path(safe_orig_name).suffix.lower() or ".wav"
     source_file_name = _source_recording_display_name(safe_orig_name)
 
-    target_dir = _resolve_recordings_collection_target_dir(
+    target_dir = _recording_save_target_dir(
         archive_dir,
         collection=recording_collection,
+        existing_name=existing_name,
         create=not bool(require_existing),
     )
     claimed_new_text = False
@@ -9785,6 +9829,21 @@ async def save_recording_from_path(
         refusal = cli_save_request_refusal(payload or {})
         if refusal:
             raise HTTPException(status_code=403, detail=refusal)
+    # A file this route copies in was BROUGHT IN from outside the app (a
+    # job's snapshot, a picked file), so it is an Uploaded Media recording —
+    # the route owns that fact, and the caller does not have to name it. The
+    # command-line client cannot even send the field (``cli_access``), and
+    # that omission is how its uploads ended up in the archive ROOT, outside
+    # the Uploaded Media retention rule (S-4). A body that names another
+    # collection is refused rather than silently re-filed.
+    stated_collection = _normalize_recording_collection(
+        str((payload or {}).get("recording_collection") or "")
+    )
+    if stated_collection and stated_collection != RECORDING_COLLECTION_UPLOADS:
+        raise HTTPException(
+            status_code=400,
+            detail="save-from-path files a file from outside the app: its collection is Uploaded Media",
+        )
     source_path = await asyncio.to_thread(
         _resolve_source_media_path,
         (payload or {}).get("source_path") or (payload or {}).get("path"),
@@ -9799,7 +9858,7 @@ async def save_recording_from_path(
         write_tmp_audio=write_tmp_audio,
         name=str((payload or {}).get("name") or ""),
         archive_dir=str((payload or {}).get("archive_dir") or ""),
-        recording_collection=str((payload or {}).get("recording_collection") or ""),
+        recording_collection=RECORDING_COLLECTION_UPLOADS,
         require_existing=_payload_bool(payload, "require_existing", False),
         title=str((payload or {}).get("title") or "recording"),
         source_text=str((payload or {}).get("source_text") or ""),

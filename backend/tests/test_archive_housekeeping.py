@@ -63,6 +63,7 @@ class SaveRunsOffTheEventLoopTests(_MainCase):
         return asyncio.run(self.main._save_recording_audio_source(
             orig_name="take.wav", write_tmp_audio=write_tmp, title=title,
             recorded_at_ms=recorded_at_ms,
+            recording_collection=self.main.RECORDING_COLLECTION_LIVE,
         ))
 
     def test_the_retention_scan_of_a_save_runs_on_a_worker_thread(self) -> None:
@@ -92,6 +93,7 @@ class SaveDoesNotWaitForRetentionTests(_MainCase):
         return asyncio.run(self.main._save_recording_audio_source(
             orig_name="take.wav", write_tmp_audio=write_tmp, title=title,
             recorded_at_ms=recorded_at_ms,
+            recording_collection=self.main.RECORDING_COLLECTION_LIVE,
         ))
 
     def test_a_save_answers_while_its_retention_pass_is_still_blocked(self) -> None:
@@ -289,7 +291,8 @@ class SaveTimingPhasesTests(_MainCase):
             r = client.post(
                 "/api/recordings/save-with-audio",
                 files={"file": ("take.wav", payload, "audio/wav")},
-                data={"title": "t", "transcript_text": "x", "recorded_at_ms": "1795361725000"},
+                data={"title": "t", "transcript_text": "x", "recorded_at_ms": "1795361725000",
+                      "recording_collection": "live"},
                 headers={"x-api-token": self.main.API_TOKEN},
             )
             self.assertEqual(r.status_code, 200, r.text)
