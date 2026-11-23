@@ -158,7 +158,6 @@ body {
   --h-topbar: 46px;
   --h-topbar-control: 34px;
   --h-control-compact: 32px;
-  --h-chip: 28px;
   --surface-bg: var(--bg-2);
   --surface-bg-muted: var(--bg-3);
   --surface-border: var(--line);
@@ -382,39 +381,6 @@ body.platform-darwin .sidebar {
   font-weight: 700;
   color: var(--text);
   line-height: 1.15;
-}
-
-.section-chip {
-  display: inline-flex;
-  align-items: center;
-  min-height: var(--h-chip);
-  max-width: min(100%, 220px);
-  padding: 0 12px;
-  border: 1px solid var(--chip-border);
-  border-radius: var(--chip-radius);
-  background: var(--chip-bg);
-  color: var(--text-2);
-  font-size: 11px;
-  font-weight: 600;
-  box-shadow: var(--glass-surface-outline);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.section-chip.info {
-  border-color: var(--accent-soft-border);
-  background: var(--accent-soft-bg);
-}
-
-.section-chip.success {
-  border-color: var(--success-soft-border);
-  background: var(--success-soft-bg);
-}
-
-.section-chip.warning {
-  border-color: var(--warning-soft-border);
-  background: var(--warning-soft-bg);
 }
 
 .settings-shell {
@@ -704,26 +670,6 @@ body.platform-darwin .sidebar {
   -webkit-app-region: no-drag;
 }
 
-.context-chip {
-  display: inline-flex;
-  align-items: center;
-  min-height: var(--h-chip);
-  max-width: min(100%, 240px);
-  padding: 0 10px;
-  border: 1px solid var(--glass-border);
-  border-radius: var(--chip-radius);
-  background:
-    linear-gradient(180deg, var(--glass-highlight), rgba(255, 255, 255, 0)),
-    var(--glass-chip-bg);
-  color: var(--text-2);
-  font-size: 11px;
-  font-weight: 600;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  box-shadow: var(--glass-surface-outline);
-}
-
 .top-item {
   display: flex;
   flex-direction: column;
@@ -778,13 +724,6 @@ body.platform-darwin .sidebar {
 .mic-select-row select {
   flex: 1 1 auto;
   min-width: 0;
-}
-
-.mic-refresh-btn {
-  width: var(--h-topbar-control);
-  height: var(--h-topbar-control);
-  min-width: var(--h-topbar-control);
-  padding: 0;
 }
 
 .lbl {
@@ -1109,10 +1048,6 @@ textarea:focus-visible,
   overflow: hidden;
 }
 
-.pane-toolbar-actions-live {
-  justify-content: flex-start;
-}
-
 .pane-toolbar-actions-upscale,
 .pane-toolbar-actions-upscale .pane-control-group {
   gap: var(--toolbar-upscale-gap);
@@ -1134,8 +1069,7 @@ textarea:focus-visible,
   min-width: 0;
 }
 
-.pane-control-group-secondary,
-.pane-control-group-compact {
+.pane-control-group-secondary {
   min-width: 0;
 }
 
@@ -1631,8 +1565,6 @@ textarea:focus-visible,
   pointer-events: none;
 }
 
-
-
 #currentRecordingAudio,
 #recordingAudio {
   flex: 1 1 240px;
@@ -1676,54 +1608,6 @@ textarea:focus-visible,
   text-align: center;
 }
 
-.pane-footer-actions {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.current-audio-actions {
-  margin-left: auto;
-}
-
-.link-btn {
-  min-height: 32px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  text-decoration: none;
-  color: var(--text-2);
-  border: 1px solid var(--glass-border);
-  border-radius: var(--control-radius);
-  background: var(--control-bg);
-  padding: 8px 12px;
-  box-shadow: var(--glass-surface-outline);
-}
-
-.link-btn:hover {
-  border-color: var(--glass-border-strong);
-  color: var(--text);
-  background: var(--control-bg-hover);
-}
-
-.resource-row {
-  background: var(--glass-bg);
-}
-
-.pane-footer-label {
-  font-size: 10px;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--text-3);
-  font-weight: 700;
-  margin-right: 2px;
-}
-
 .recordings-head {
   display: flex;
   align-items: flex-start;
@@ -1749,19 +1633,6 @@ textarea:focus-visible,
   margin-top: 0;
 }
 
-.recordings-meta-line {
-  display: none;
-}
-
-.panel-title {
-  font-size: 10px;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--text-2);
-  font-weight: 700;
-}
-
-.archive-status-warning,
 .recordings-head-actions {
   display: inline-flex;
   align-items: center;
@@ -1854,10 +1725,6 @@ textarea:focus-visible,
   height: 40px;
   padding: 0 12px;
   white-space: nowrap;
-}
-
-.recordings-filter-hint {
-  display: none;
 }
 
 .recordings-empty-state {
@@ -2169,10 +2036,6 @@ textarea:focus-visible,
   text-overflow: ellipsis;
 }
 
-.recording-viewer-helper {
-  display: none;
-}
-
 .recording-header-actions {
   flex: 0 0 auto;
   display: inline-flex;
@@ -2180,17 +2043,6 @@ textarea:focus-visible,
   justify-content: flex-end;
   gap: 8px;
   min-width: 0;
-}
-
-.recording-audio-actions {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px;
-  border: 1px solid var(--glass-border);
-  border-radius: var(--chip-radius);
-  background: var(--glass-chip-bg);
-  box-shadow: var(--glass-surface-outline);
 }
 
 #recordingMeta {
@@ -2388,21 +2240,6 @@ textarea:focus-visible,
   font-size: 14px;
 }
 
-.card-description {
-  display: none;
-}
-
-.card-summary-row {
-  display: none;
-}
-
-.card-summary-row .section-chip {
-  min-height: 28px;
-  padding: 0 10px;
-  font-size: 10px;
-}
-
-.card-summary-row .section-chip,
 .settings-save-status,
 .hint {
   line-height: 1.45;
@@ -2943,16 +2780,12 @@ canvas {
   .window-view,
   .window-status-pill,
   .net-pill,
-  .context-chip,
-  .section-chip,
   select,
   input,
   textarea,
   .btn,
   .icon-btn,
-  .link-btn,
   .transcribe-settings-popup,
-  .recording-audio-actions,
   .key-row,
   .settings-toggle,
   .shortcut-btn,
@@ -2987,16 +2820,12 @@ canvas {
   .window-view,
   .window-status-pill,
   .net-pill,
-  .context-chip,
-  .section-chip,
   select,
   input,
   textarea,
   .btn,
   .icon-btn,
-  .link-btn,
   .transcribe-settings-popup,
-  .recording-audio-actions,
   .key-row,
   .settings-toggle,
   .shortcut-btn,
@@ -3058,16 +2887,12 @@ canvas {
   .window-view,
   .window-status-pill,
   .net-pill,
-  .context-chip,
-  .section-chip,
   select,
   input,
   textarea,
   .btn,
   .icon-btn,
-  .link-btn,
   .transcribe-settings-popup,
-  .recording-audio-actions,
   .key-row,
   .settings-toggle,
   .shortcut-btn,
@@ -3113,10 +2938,6 @@ canvas {
 :root.increased-contrast .window-status-pill,
 :root.reduce-transparency .net-pill,
 :root.increased-contrast .net-pill,
-:root.reduce-transparency .context-chip,
-:root.increased-contrast .context-chip,
-:root.reduce-transparency .section-chip,
-:root.increased-contrast .section-chip,
 :root.reduce-transparency select,
 :root.increased-contrast select,
 :root.reduce-transparency input,
@@ -3127,12 +2948,8 @@ canvas {
 :root.increased-contrast .btn,
 :root.reduce-transparency .icon-btn,
 :root.increased-contrast .icon-btn,
-:root.reduce-transparency .link-btn,
-:root.increased-contrast .link-btn,
 :root.reduce-transparency .transcribe-settings-popup,
 :root.increased-contrast .transcribe-settings-popup,
-:root.reduce-transparency .recording-audio-actions,
-:root.increased-contrast .recording-audio-actions,
 :root.reduce-transparency .key-row,
 :root.increased-contrast .key-row,
 :root.reduce-transparency .settings-toggle,
@@ -3200,16 +3017,12 @@ canvas {
   .window-view,
   .window-status-pill,
   .net-pill,
-  .context-chip,
-  .section-chip,
   select,
   input,
   textarea,
   .btn,
   .icon-btn,
-  .link-btn,
   .transcribe-settings-popup,
-  .recording-audio-actions,
   .key-row,
   .settings-toggle,
   .shortcut-btn,
@@ -3277,16 +3090,12 @@ canvas {
 :root.forced-colors .window-view,
 :root.forced-colors .window-status-pill,
 :root.forced-colors .net-pill,
-:root.forced-colors .context-chip,
-:root.forced-colors .section-chip,
 :root.forced-colors select,
 :root.forced-colors input,
 :root.forced-colors textarea,
 :root.forced-colors .btn,
 :root.forced-colors .icon-btn,
-:root.forced-colors .link-btn,
 :root.forced-colors .transcribe-settings-popup,
-:root.forced-colors .recording-audio-actions,
 :root.forced-colors .key-row,
 :root.forced-colors .settings-toggle,
 :root.forced-colors .shortcut-btn,
@@ -3421,11 +3230,6 @@ canvas {
     width: 100%;
   }
 
-  .context-chip {
-    white-space: normal;
-  }
-
-  .recording-summary-main,
   .screen-header,
   .recordings-head,
   .recordings-viewer-header {
@@ -3439,14 +3243,12 @@ canvas {
 
   .screen-header-actions,
   .recordings-head-actions,
-  .recording-summary-actions,
   .recording-header-actions {
     justify-content: flex-start;
     flex-wrap: wrap;
   }
 
   .pane-head-row-bottom .pane-actions,
-  .current-audio-actions,
   .modal-actions {
     width: 100%;
     justify-content: flex-start;
@@ -3475,12 +3277,6 @@ canvas {
     row-gap: var(--toolbar-row-gap);
   }
 
-  .section-summary-row,
-  .card-summary-row {
-    gap: 6px;
-  }
-
-  .recording-summary-title,
   .recording-viewer-title,
   #recordingMeta {
     white-space: normal;
