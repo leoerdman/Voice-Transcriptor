@@ -550,6 +550,17 @@ def _preserve_redacted_provider_keys(update: Dict[str, Any], current: Dict[str, 
             continue
         if _is_masked_key_value(incoming_key, current_key):
             prov.pop("key", None)
+        elif incoming_key == "":
+            # The one request that legitimately clears a key is the card's
+            # "remove" action, and it looks exactly like a client that lost the
+            # field. A key vanishing is invisible until the next transcription
+            # fails, so it is written down when it happens — the desk lost its
+            # Deepgram key once and the log held nothing about it.
+            logger.warning(
+                "provider %r key cleared by a config request (it had %d characters)",
+                name,
+                len(current_key),
+            )
     return update
 
 

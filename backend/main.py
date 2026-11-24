@@ -38,6 +38,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Query,
     Request,
     UploadFile,
     WebSocket,
@@ -81,6 +82,12 @@ from backend.model_catalog import (
 )
 from backend.audio_mime import AUDIO_EXT_TO_MIME, audio_content_type
 from backend.media_tokens import MediaTokens
+from backend.audio_levels import SessionVoice
+from backend.voice_embed import SpeakerEmbedder, SpeakerScorer, default_model_path
+from backend.voice_enrol import EnrolmentError, decode_take, enrol_take, enrol_take_stats, take_level_db
+from backend.voice_mask import VoiceMask
+from backend.voice_mask_worker import MaskState, MaskWorker
+from backend.voice_profiles import NAME_MAX_CHARS, ProfileError, VoiceProfileStore
 from backend.audio import (
     AudioError,
     compact_audio_chunks_for_remote,
@@ -4935,6 +4942,14 @@ async def ws_transcribe(websocket: WebSocket):
         - ``{"type": "final", "text": str, "segments": [...],
              "durationSec": float}`` — the canonical transcript at end
           of session.
+        - ``{"type": "voice-mask", "state": str, "withheldSec": float,
+             "degraded": bool, "final": bool}`` — (only while a voice
+          profile is enabled) how much audio the target-speaker gate
+          zeroed before it reached the provider, sent on every change of
+          state and once more at stop (``final: true``). Drawn as a line
+          beside the pane, never merged into the transcript: a refused
+          voice is silence in the copy the provider reads, and silence
+          that nobody explains reads as lost speech (§5.3, §5.4).
         - ``{"type": "error", "error": str}`` — unrecoverable failure.
     """
     # Kick the recovery cleanup off the event loop — the websocket
@@ -5471,6 +5486,38 @@ def _finalizing_payload(budget_sec: float, expects_more: bool) -> dict:
     }
 
 
+def _voice_mask_event(snapshot: "MaskState") -> dict:
+    """The ``voice-mask`` state line, built in ONE place (§5.3, §5.4).
+
+    ``withheldSec`` is audio this gate zeroed on purpose: it never
+    reached the provider, and it is still in the recording. That pair is
+    the whole reason the message exists — without it, a transcript that
+    is missing a stranger's words *because the mask worked* reads, in the
+    pane, exactly like a transcript that lost them.
+
+    ``final`` marks the report sent at stop: the counter is then the
+    recording's total and no longer moves, so the pane can say "was
+    withheld" instead of "is being withheld".
+    """
+    return {
+        "type": "voice-mask",
+        "state": str(snapshot.state),
+        "withheldSec": float(snapshot.withheld_sec),
+        "degraded": bool(snapshot.degraded),
+        "final": bool(snapshot.final),
+        # The cosine the last verdict was made on, and the pair it was
+        # compared with: the live meter draws the needle and the two lines
+        # from these, so what it shows is the gate's own arithmetic rather
+        # than a guess at it.
+        "score": None if snapshot.score is None else float(snapshot.score),
+        #: Which learned tracks matched this window, by slot: the card lights
+        #: those rows so the owner sees which version is winning right now.
+        "tracks": [{"slot": int(slot), "score": round(float(score), 4)} for slot, score in snapshot.tracks],
+        "openAt": float(snapshot.open_at),
+        "closeAt": float(snapshot.close_at),
+    }
+
+
 def _predicted_recovery_budget_sec(session: Any, spool_sec: float) -> float:
     """The recovery budget this stop looks like it will need, announced early.
 
@@ -5748,6 +5795,60 @@ async def _run_local_live_session(
     session = LiveSession(model_name=model, language=language)
     stop = asyncio.Event()
 
+    # ---- The gate (§3.1): the same one the provider path runs --------
+    #
+    # §3.1 puts the mask in the live receive loop, before whatever consumes
+    # the bytes. On this transport the consumer is the local pipeline rather
+    # than a socket, so the gate sits in the same place: after the recovery
+    # chunk, in front of the whisper ring. §3.5 still holds — with no
+    # profile enabled there is no object and the bytes take the old route,
+    # unchanged and unqueued.
+    #
+    # The hand-off is a queue and not a task per chunk: ``emit`` runs on the
+    # loop thread in submission order, and one consumer awaiting the queue
+    # is what keeps a refused window's silence exactly where its audio was.
+    mask_worker: Optional[MaskWorker] = None
+    mask_reports: set[asyncio.Task] = set()
+    pcm_queue: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue()
+    sink: Optional[asyncio.Task] = None
+
+    def _publish_mask_state(snapshot: MaskState) -> None:
+        """Send one state line (§5.3 of COWORK_MASK). Loop thread only."""
+        try:
+            task = asyncio.get_running_loop().create_task(
+                _ws_send_json(websocket, _voice_mask_event(snapshot))
+            )
+        except RuntimeError:  # pragma: no cover - loop already gone
+            return
+        mask_reports.add(task)
+        task.add_done_callback(mask_reports.discard)
+
+    def _offer_masked(chunk: bytes) -> None:
+        pcm_queue.put_nowait(chunk)
+
+    async def pcm_sink() -> None:
+        while True:
+            chunk = await pcm_queue.get()
+            try:
+                if chunk is None:
+                    return
+                await session.append_pcm16le(chunk)
+            finally:
+                pcm_queue.task_done()
+
+    gate = recording_voice_mask()
+    if gate is not None:
+        sink = asyncio.create_task(pcm_sink(), name="ws-local-mask-sink")
+        mask_worker = MaskWorker(gate, _offer_masked, on_state=_publish_mask_state)
+        logger.info("voice-mask: on for this recording")
+
+    async def _forward_pcm(data: bytes) -> None:
+        """The one call site (§3.4): read a chunk, hand it on."""
+        if mask_worker is None:
+            await session.append_pcm16le(data)
+        else:
+            mask_worker.submit(data)
+
     async def receiver() -> None:
         try:
             while not stop.is_set():
@@ -5759,7 +5860,7 @@ async def _run_local_live_session(
                 if kind == "bytes":
                     data = msg["data"]
                     _record_recovery_chunk(recovery, data)
-                    await session.append_pcm16le(data)
+                    await _forward_pcm(data)
                     continue
                 if kind == "control":
                     if msg["payload"].get("type") == "finalize":
@@ -5817,6 +5918,26 @@ async def _run_local_live_session(
                 task.cancel()
         for task, what in ((rx, "local live receiver"), (tx, "local live transcriber")):
             await await_cancelled(task, what=what, log=logger)
+        # The gate's last window leaves here, in order and before the
+        # pipeline is asked for its tail: a byte still held when the
+        # envelope is built is the last second of the take cut off, which
+        # is §6.3's forbidden cut in a place no window test can see.
+        if mask_worker is not None:
+            try:
+                await mask_worker.close()
+                await asyncio.wait_for(pcm_queue.join(), timeout=5.0)
+                if sink is not None and not sink.done():
+                    sink.cancel()
+                    await await_cancelled(sink, what="local mask sink", log=logger)
+                if mask_reports:
+                    await asyncio.gather(*mask_reports, return_exceptions=True)
+                clear_active_voice_mask()
+                if mask_worker.degraded:
+                    logger.warning(
+                        "voice-mask: forwarded unmasked after falling behind"
+                    )
+            except Exception as e:  # noqa: BLE001 — the take outranks the gate
+                logger.warning("voice-mask: final flush incomplete: %s", e)
         # Best-effort final emit in case transcriber missed the tail.
         # Bounded (BUG-69): maybe_transcribe(force=True) awaits any
         # in-flight pass, and a wedged inference thread has no internal
@@ -6715,6 +6836,47 @@ async def _run_deepgram_live_session(
                 queued_bytes,
             )
 
+    # ---- The gate (§3.1): after the recovery chunk, before the queue ----
+    #
+    # ``None`` is the whole of "off" (§3.4): no object, no copy, no filter
+    # that runs and returns its input. Everything below then calls
+    # ``_offer_pcm`` exactly as it always did, on the same byte count.
+    #
+    # When a profile is enabled the gate owns the bytes between the
+    # renderer and the send queue, and it does so on one thread — one
+    # judgement of a 2 s window is 26 ms of the 50 ms hop, so inline work
+    # here would block this loop for half of every hop (§3.2's "one owner
+    # of time" is also why it is not in the sender).
+    mask_worker: Optional[MaskWorker] = None
+    # Reports are fire-and-forget frames on the socket this handler
+    # already owns: kept referenced until sent (asyncio holds only a weak
+    # reference to a task), and drained before the envelope below so the
+    # last state line is always in front of ``final``.
+    mask_reports: set[asyncio.Task] = set()
+
+    def _publish_mask_state(snapshot: MaskState) -> None:
+        """Send one state line (§5.3). Always on the loop thread."""
+        try:
+            task = asyncio.get_running_loop().create_task(
+                _ws_send_json(websocket, _voice_mask_event(snapshot))
+            )
+        except RuntimeError:  # pragma: no cover - loop already gone
+            return
+        mask_reports.add(task)
+        task.add_done_callback(mask_reports.discard)
+
+    gate = recording_voice_mask()
+    if gate is not None:
+        mask_worker = MaskWorker(gate, _offer_pcm, on_state=_publish_mask_state)
+        logger.info("voice-mask: on for this recording")
+
+    def _forward_pcm(data: bytes) -> None:
+        """The one call site (§3.4): read a chunk, hand it on."""
+        if mask_worker is None:
+            _offer_pcm(data)
+        else:
+            mask_worker.submit(data)
+
     async def _flush_frame(buf: bytearray, size: int) -> None:
         nonlocal pending_since, warm_replay_dropped
         frame = bytes(buf[:size])
@@ -6951,7 +7113,7 @@ async def _run_deepgram_live_session(
     if preconnect_dropped_bytes:
         session.note_undelivered_audio(preconnect_dropped_bytes)
     for _chunk in pending_frames:
-        _offer_pcm(_chunk)
+        _forward_pcm(_chunk)
     pending_frames.clear()
 
     if preconnect_disconnected:
@@ -6966,7 +7128,9 @@ async def _run_deepgram_live_session(
         bytes_received += len(data)
         _record_recovery_chunk(recovery, data)
         if not _upstream_dead():
-            _offer_pcm(data)
+            # Solo sits between the frame and the wire: when a gate exists,
+            # what it withholds never reaches the provider.
+            _forward_pcm(data)
 
     async def _drain_finalize_tail(payload: dict) -> None:
         """C1/C2: drain in-flight binary frames on ``finalize``.
@@ -7140,6 +7304,30 @@ async def _run_deepgram_live_session(
         # gives the sender its last reason to look at the flag (BW-16).
         await cancel_and_await(warm_probe, what="deepgram warm probe", log=logger)
         warm_swap_requested = False
+
+        # §7.3's other half: the gate holds one window, so the recording's
+        # last two seconds are still inside it when the receiver stops.
+        # Flushing here — before the sentinel, which is what makes the
+        # stop's ordering a property of the queue — puts them behind
+        # every byte already forwarded and in front of ``Finalize``, so
+        # the tail is neither cut nor sent to a socket that has closed.
+        if mask_worker is not None:
+            try:
+                await mask_worker.close()
+            except Exception as e:  # pragma: no cover - teardown is best-effort
+                logger.warning("voice-mask: flush on finalize failed: %s", e)
+            clear_active_voice_mask()
+            if mask_worker.degraded:
+                logger.warning(
+                    "voice-mask: this recording was forwarded unmasked after "
+                    "the gate fell behind"
+                )
+            # ``close`` reports the recording's total synchronously, and
+            # that report is one frame to send: awaiting it here is what
+            # makes "how much was withheld" ordered before the envelope
+            # that is about to say what arrived (§5.3).
+            if mask_reports:
+                await asyncio.gather(*tuple(mask_reports), return_exceptions=True)
 
         # Finalize must reach Deepgram AFTER every byte the renderer
         # sent (audit §3.6). The receiver has now stopped, so everything
@@ -8498,6 +8686,914 @@ def disable_cli_access(request: Request, _auth: None = Depends(_require_api_auth
         )
     logger.info("cli access disabled; token revoked")
     return _cli_status_payload(request)
+
+
+# ── Cowork mask: three slots, one kept voice (§5.1, §7.4) ───────────────────
+#
+# Settings owns the press and nothing here owns the audio: a slot is a
+# vector, the take it came from stays in the recording archive, and this is
+# the only place the two meet (§5.5 — a take becomes a profile by an act,
+# never inferred). The mask itself will read `enabled()`; it never asks this
+# route, and the renderer therefore cannot become a second store.
+
+VOICE_PROFILES = VoiceProfileStore()
+
+
+#: The pair shown for a voice nobody has tuned: the diarizer's own scale,
+#: which is what the gate judges by once the room has two voices in it.
+from backend.voice_diarize import DEFAULT_CLOSE_MARGIN as _DEFAULT_CLOSE_AT, DEFAULT_OPEN_MARGIN as _DEFAULT_OPEN_AT
+
+
+def _voice_profiles_payload() -> dict[str, Any]:
+    """The three slots, who owns them, and whether the net's file is there."""
+    model = default_model_path()
+    return {
+        # Three entries always, ``None`` where a slot is empty: a list that
+        # shrinks is how a UI ends up renumbering the slots underneath the
+        # user's finger.
+        "slots": [
+            {
+                "slot": profile.slot,
+                "name": profile.name,
+                "created_at": profile.created_at,
+                # The pair this voice is judged by, tuned or derived, so
+                # the card can say which one it is showing.
+                # The diarizer's own scale, which is what the gate uses when
+                # the owner has not tuned this voice by hand.
+                "open_at": round(
+                    float(getattr(profile, "open_at", 0.0) or 0.0)
+                    or _DEFAULT_OPEN_AT,
+                    4,
+                ),
+                "close_at": round(
+                    float(getattr(profile, "close_at", 0.0) or 0.0)
+                    or _DEFAULT_CLOSE_AT,
+                    4,
+                ),
+                "tuned": bool(float(getattr(profile, "open_at", 0.0) or 0.0)),
+            }
+            if profile is not None
+            else None
+            for profile in VOICE_PROFILES.slots()
+        ],
+        "enabled_slot": VOICE_PROFILES.enabled_slot(),
+        # §6.2: whether the one file ships is the owner's decision, so the
+        # section reports the file's presence rather than offering a press
+        # that could only fail.
+        "model_available": model.is_file(),
+        "model_name": model.name,
+    }
+
+
+@app.get("/api/voice/profiles")
+def get_voice_profiles(_auth: None = Depends(_require_api_auth)):
+    return _voice_profiles_payload()
+
+
+@app.post("/api/voice/profiles/{slot}/enrol")
+def enrol_voice_profile(
+    slot: int,
+    payload: dict = Body(...),
+    _auth: None = Depends(_require_api_auth),
+):
+    recording_name = str(payload.get("recording_name") or "").strip()
+    if not recording_name:
+        raise HTTPException(status_code=400, detail="a profile is made from a recording")
+    if not default_model_path().is_file():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Solo needs models/{default_model_path().name} beside the app; "
+                "nothing can be learned without it"
+            ),
+        )
+    archive_dir = str(payload.get("archive_dir") or "").strip()
+    target_dir = (
+        _resolve_recordings_target_dir(archive_dir, create=False) if archive_dir else None
+    )
+    recording = _recording_path_or_404(recording_name, target_dir=target_dir)
+    audio_path = _recording_audio_path(recording.name, target_dir=target_dir)
+    if audio_path is None:
+        raise HTTPException(status_code=400, detail="this recording has no audio beside it")
+
+    # The store's label for its file. The caller may name it; the default is
+    # the recording's own stem, which is a label nobody chose and can easily
+    # be longer than the store allows ("Recovered 2026-11-13T12:06:54.364931"
+    # is 40). A label derived from a filename must never be the reason a press
+    # fails, so an over-long derivation falls back to what the UI calls the
+    # slot anyway.
+    name = str(payload.get("name") or "").strip() or Path(recording.name).stem
+    if len(name) > NAME_MAX_CHARS:
+        name = f"Voice {slot}"
+    embedder = SpeakerEmbedder()
+    try:
+        decoded = decode_take(audio_path)
+        vector, self_floor = enrol_take_stats(embedder, decoded)
+        level_db = take_level_db(decoded)
+    except EnrolmentError as e:
+        # Every refusal here is about the take the user chose, so it is a
+        # 400 with the reason: "no speech in this take" is actionable, a
+        # generic failure is not.
+        raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
+    except Exception as e:  # noqa: BLE001 — onnxruntime missing, weights corrupt
+        logger.exception("voice profile enrolment failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"enrolment failed: {_safe_error_text(e)}",
+        ) from None
+    finally:
+        # §2.2: unloaded when idle, and enrolment is the idlest this net
+        # ever is. The stage that keeps it warm during a session is §7.3's
+        # business, not a Settings press's.
+        embedder.close()
+
+    try:
+        VOICE_PROFILES.save(slot, name, vector, capture=str(audio_path), self_floor=self_floor, level_db=level_db)
+    except ProfileError as e:
+        raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
+    logger.info("voice profile saved in slot %s", slot)
+    return _voice_profiles_payload()
+
+
+@app.post("/api/voice/profiles/{slot}/enrol-now")
+def enrol_voice_profile_from_live(
+    slot: int,
+    payload: dict = Body(default={}),
+    _auth: None = Depends(_require_api_auth),
+):
+    """Learn a voice from the seconds just recorded — while the take runs.
+
+    The press happens when the other voice is actually talking, so the sample
+    is the same channel, the same room and the same moment the gate is judging.
+    A profile learned this way needs no second trip through History.
+    """
+    label = str(payload.get("name") or "").strip()
+    seconds = float(payload.get("seconds") or 20)
+    spool = sorted(
+        (path for path in LIVE_RECOVERY_DIR.glob("*.pcm16") if path.is_file()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not spool:
+        raise HTTPException(status_code=400, detail="no recording is running right now")
+    raw = spool[0].read_bytes()
+    span = int(seconds * LIVE_SAMPLE_RATE_HZ) * 2
+    if len(raw) < span // 2:
+        raise HTTPException(status_code=400, detail="not enough recorded yet; speak for a few seconds")
+    start = max(0, len(raw) - span)
+    start -= start % 2
+    embedder = SpeakerEmbedder()
+    try:
+        vector, self_floor = enrol_take_stats(embedder, raw[start:])
+    except EnrolmentError as e:
+        raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
+    finally:
+        embedder.close()
+    name = label or f"Voice {slot}"
+    if len(name) > NAME_MAX_CHARS:
+        name = f"Voice {slot}"
+    capture_path = _keep_enrolment_capture(slot, raw[start:])
+    VOICE_PROFILES.save(
+        slot,
+        name,
+        vector,
+        capture=str(capture_path),
+        self_floor=self_floor,
+        level_db=take_level_db(raw[start:]),
+    )
+    logger.info("voice profile saved in slot %s from the live take", slot)
+    return _voice_profiles_payload()
+
+@app.post("/api/voice/profiles/{slot}/enrol-last")
+def enrol_voice_profile_from_last_recording(
+    slot: int,
+    payload: dict = Body(default={}),
+    _auth: None = Depends(_require_api_auth),
+):
+    """Learn a voice from the newest recording in History — one press, no picking.
+
+    A profile captured through the card's microphone press is a different
+    channel from the recordings the gate judges: measured 2026-11-24, a press
+    profile scored its own owner at 0.336 against a take while a profile taken
+    from the take itself separated the two voices completely. Picking a
+    recording by name was the wrong question (the names are timestamps), but
+    the newest one needs no name at all.
+    """
+    newest = _newest_recording(None)
+    if newest is None:
+        raise HTTPException(
+            status_code=400, detail="there is no recording with audio to learn from yet"
+        )
+    name, directory = newest
+    audio = _recording_audio_path(name, target_dir=directory)
+    if audio is None:
+        raise HTTPException(status_code=400, detail="that recording has no audio beside it")
+    pcm = decode_take(audio)
+    # The largest voice of the take, not simply its first seconds: the owner
+    # records his own room, so he is the one who speaks most — while the first
+    # seconds belong to whoever happened to talk first, which on this desk was
+    # the neighbour, and learning those would enrol the stranger.
+    from backend.voice_diarize import _kmeans2
+    from backend.voice_embed import unit_vectors
+    from backend.voice_tune import window_starts
+
+    window_bytes = int(LIVE_SAMPLE_RATE_HZ * 2 * 2)
+    starts = window_starts(len(pcm), limit=400)
+    windows = [pcm[start : start + window_bytes] for start in starts]
+    vectors = unit_vectors(SpeakerEmbedder(), windows)
+    if not vectors:
+        raise HTTPException(status_code=400, detail="that recording holds no speech to learn from")
+    matrix = np.stack(vectors)
+    centroids, labels = _kmeans2(matrix)
+    share = [int((labels == index).sum()) for index in (0, 1)]
+    dominant = int(np.argmax(share))
+    vector = centroids[dominant]
+    self_floor = float(np.median(matrix[labels == dominant] @ centroids[dominant]))
+    level = take_level_db(pcm)
+    label = str(payload.get("name") or "").strip()
+    current = VOICE_PROFILES.profiles().get(int(slot))
+    label = label or (current.name if current is not None else f"Voice {slot}")
+    capture_path = _keep_enrolment_capture(slot, pcm[: window_bytes * min(len(windows), 10)])
+    VOICE_PROFILES.save(
+        slot,
+        label,
+        vector,
+        capture=str(capture_path),
+        self_floor=self_floor,
+        level_db=level,
+    )
+    logger.info(
+        "voice profile saved in slot %s from the newest recording %s", slot, name
+    )
+    return _voice_profiles_payload()
+
+
+@app.post("/api/voice/profiles/{slot}/enrol-mid")
+def enrol_voice_profile_from_middle(
+    slot: int,
+    payload: dict = Body(default={}),
+    _auth: None = Depends(_require_api_auth),
+):
+    """Learn a voice from the MIDDLE of a recording the user chose.
+
+    The desk's calls have one shape: the owner speaks first, the other voice
+    joins in the middle. A profile learned from a press is a different channel
+    from the call's audio (measured: 0.38 to the kept voice against 0.59 for a
+    profile taken from a take), so the ten seconds in the middle of a real
+    recording are the sample that matches what the gate will hear.
+    """
+    label = str(payload.get("name") or "").strip()
+    recording = str(payload.get("recording_name") or "").strip()
+    if not recording:
+        raise HTTPException(status_code=400, detail="choose a recording first")
+    archive = str(payload.get("archive_dir") or "").strip() or str(_resolve_recordings_dir())
+    # The list names the transcript; the audio sits beside it under another
+    # extension. One resolver answers that question for the whole app.
+    path = _recording_audio_path(recording, target_dir=Path(archive))
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=400, detail="that recording has no audio")
+    pcm = decode_take(path)
+    seconds = float(payload.get("seconds") or 20)
+    span = int(seconds * LIVE_SAMPLE_RATE_HZ) * 2
+    if len(pcm) < span:
+        raise HTTPException(status_code=400, detail="that recording is shorter than the sample")
+    # Where in the recording the sample sits: 0 is the start, 1 the end. The
+    # owner knows where the other voice speaks; the middle is only a guess and
+    # measured wrong on the first call it was tried on (the middle was the
+    # owner's own voice).
+    position = min(1.0, max(0.0, float(payload.get("position", 0.5))))
+    start = int((len(pcm) - span) * position) // 2 * 2
+    embedder = SpeakerEmbedder()
+    try:
+        vector, self_floor = enrol_take_stats(embedder, pcm[start : start + span])
+    except EnrolmentError as e:
+        raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
+    finally:
+        embedder.close()
+    name = label or Path(recording).stem
+    if len(name) > NAME_MAX_CHARS:
+        name = f"Voice {slot}"
+    capture_path = _keep_enrolment_capture(slot, pcm[start : start + span])
+    VOICE_PROFILES.save(
+        slot,
+        name,
+        vector,
+        capture=str(capture_path),
+        self_floor=self_floor,
+        level_db=take_level_db(pcm[start : start + span]),
+    )
+    logger.info("voice profile saved in slot %s from the middle of %s", slot, recording[:40])
+    return _voice_profiles_payload()
+
+@app.post("/api/voice/profiles/{slot}/enrol-latest")
+def enrol_voice_profile_from_latest(
+    slot: int,
+    payload: dict = Body(default={}),
+    _auth: None = Depends(_require_api_auth),
+):
+    """Learn a voice from the newest recording — one press, no file picking.
+
+    The recording itself is the sample, so the profile is learned from the same
+    microphone and the same room the desk will judge (§5.5). Everything else is
+    the file route's own work: one place decides what a take can teach.
+    """
+    directory = _resolve_recordings_dir()
+    # The same list History shows: the takes live in per-session folders, so a
+    # walk of the root finds none of them and the press would say "no
+    # recording" over a library of thirty.
+    items = _build_recordings_list_payload(directory).get("items") or []
+    newest = None
+    for item in items:
+        name = str(item.get("name") or "")
+        # A recovered fragment is the tail of an interrupted recording, not a
+        # sample of a voice: it has no audio of its own and teaching from it
+        # writes a profile of nothing. Only takes with audio can teach.
+        if not name or "Recovered" in name or not item.get("has_audio"):
+            continue
+        if not str(item.get("modified_at") or ""):
+            continue
+        if newest is None or str(item["modified_at"]) > str(newest["modified_at"]):
+            newest = item
+    if newest is None:
+        raise HTTPException(status_code=400, detail="no recording to learn from yet")
+    name = str(payload.get("name") or "").strip()
+    request = {
+        "recording_name": newest.get("name"),
+        "archive_dir": str(newest.get("archive_dir") or ""),
+        "name": name or Path(str(newest.get("name"))).stem,
+    }
+    return enrol_voice_profile(slot, payload=request, _auth=None)
+
+
+#: How long the card gives a press to speak, in seconds. Solo's window is
+#: two seconds and `voice_enrol` refuses anything shorter, so six is the
+#: shortest span a person can read a sentence into without hurrying.
+ENROL_LIVE_SECONDS = 20
+#: A body longer than this is not an enrolment; it is a recording that arrived
+#: at the wrong route.
+ENROL_LIVE_MAX_SECONDS = 30
+
+
+def _keep_enrolment_capture(slot: int, pcm: bytes) -> Path:
+    """Write the press to its own WAV beside the profiles, labelled by slot and time."""
+    import wave
+    from datetime import datetime, timezone
+
+    directory = VOICE_PROFILES.captures_dir
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = directory / f"slot{slot}-{stamp}.wav"
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(LIVE_SAMPLE_RATE_HZ)
+        handle.writeframes(pcm)
+    return path
+
+
+@app.post("/api/voice/profiles/{slot}/enrol-live")
+def enrol_voice_profile_live(
+    slot: int,
+    audio: bytes = Body(..., media_type="application/octet-stream"),
+    name: str = Query(""),
+    _auth: None = Depends(_require_api_auth),
+):
+    """A profile made from the seconds the card just recorded.
+
+    The body is what the browser captured and no more: 16 kHz, mono, PCM16LE,
+    no container. Nothing is written to History — an enrolment is a
+    measurement, not a take — so the store's label is the slot's own name;
+    there is no file to derive one from. Kept `def` rather than `async` for the
+    same reason the file-based route is: the embedder is CPU work, and a
+    threadpool is where FastAPI puts it.
+    """
+    if not default_model_path().is_file():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Solo needs models/{default_model_path().name} beside the app; "
+                "nothing can be learned without it"
+            ),
+        )
+    # Whole frames only: an odd trailing byte is half a sample, and slicing it
+    # here is cheaper than explaining a misaligned vector later.
+    pcm = bytes(audio[: len(audio) - (len(audio) % 2)])
+    if len(pcm) < LIVE_PCM_BYTES_PER_SEC * 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Solo needs at least two seconds of speech; hold the switch a little longer",
+        )
+    if len(pcm) > LIVE_PCM_BYTES_PER_SEC * ENROL_LIVE_MAX_SECONDS:
+        # The message names the ceiling, not the span the card offers: a caller
+        # past the ceiling is not six seconds short of an enrolment, it is
+        # posting something else to this route.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"that is longer than an enrolment; this route takes at most "
+                f"{ENROL_LIVE_MAX_SECONDS} seconds"
+            ),
+        )
+
+    embedder = SpeakerEmbedder()
+    try:
+        vector, self_floor = enrol_take_stats(embedder, pcm)
+        level_db = take_level_db(pcm)
+    except EnrolmentError as e:
+        # "no speech Solo could hear" is the common one: the press was
+        # held in a quiet room. It is about what was said, so it is a 400.
+        raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
+    except Exception as e:  # noqa: BLE001 — onnxruntime missing, weights corrupt
+        logger.exception("voice profile enrolment failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"enrolment failed: {_safe_error_text(e)}",
+        ) from None
+    finally:
+        embedder.close()
+
+    capture_path = _keep_enrolment_capture(slot, pcm)
+    # Called as a function (tests, instrumentation) `name` is the Query marker
+    # rather than a string; only a real string can be a label.
+    asked = " ".join(name.split()) if isinstance(name, str) else ""
+    label = asked or f"Voice {slot}"
+    try:
+        VOICE_PROFILES.save(slot, label, vector, capture=str(capture_path), self_floor=self_floor, level_db=level_db)
+    except ProfileError as e:
+        raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
+    logger.info(
+        "voice profile %r learned into slot %s; capture kept at %s",
+        label, slot, capture_path.name,
+    )
+    return _voice_profiles_payload()
+
+
+@app.get("/api/voice/tracks/overlap")
+def voice_track_overlap(_auth: None = Depends(_require_api_auth)):
+    """How alike the learned tracks are, so a redundant one can be dropped.
+
+    Seven tracks are versions of one voice, and versions drift towards each
+    other: two learned in the same room on the same day say nothing new while
+    both cost a comparison and confuse the choice of owner. This is the fact
+    the owner needs to delete one — not a guess about which.
+    """
+    import numpy as np
+
+    profiles = VOICE_PROFILES.profiles()
+    tracks = []
+    for slot in sorted(profiles):
+        entry = profiles[slot]
+        vector = np.asarray(entry.vector, dtype=np.float64)
+        norm = float(np.linalg.norm(vector)) or 1.0
+        tracks.append({"slot": slot, "name": entry.name, "unit": vector / norm})
+    pairs = []
+    for left in range(len(tracks)):
+        for right in range(left + 1, len(tracks)):
+            similarity = float(np.dot(tracks[left]["unit"], tracks[right]["unit"]))
+            pairs.append(
+                {
+                    "a": tracks[left]["slot"],
+                    "a_name": tracks[left]["name"],
+                    "b": tracks[right]["slot"],
+                    "b_name": tracks[right]["name"],
+                    "similarity": round(similarity, 3),
+                    "redundant": similarity >= REDUNDANT_TRACK_COSINE,
+                }
+            )
+    pairs.sort(key=lambda pair: -pair["similarity"])
+    return {
+        "tracks": [{"slot": item["slot"], "name": item["name"]} for item in tracks],
+        "pairs": pairs,
+        "threshold": REDUNDANT_TRACK_COSINE,
+    }
+
+
+@app.post("/api/voice/profiles/{slot}/enable")
+def enable_voice_profile(slot: int, _auth: None = Depends(_require_api_auth)):
+    # A profile learned before the gate measured a voice (its own floor and its
+    # own level) cannot be judged: switching it on would look like it works and
+    # refuse everything, which is the one failure a user must not be able to
+    # cause by pressing a switch. Refuse it with the only useful instruction.
+    #
+    # 0.0 means "not measured", never a level: a level is a negative dBFS
+    # number, so the `<= 0.0` this used to say refused every real profile —
+    # measured 2026-11-25, Solo turned off once and could not be turned back on
+    # because its own level read −53.0.
+    target = VOICE_PROFILES.profiles().get(int(slot))
+    if target is not None and (target.self_floor <= 0.0 or target.level_db == 0.0):
+        raise HTTPException(
+            status_code=400,
+            detail="this voice was learned before Solo could measure it: learn it again",
+        )
+    try:
+        VOICE_PROFILES.set_enabled(slot)
+    except ProfileError as e:
+        # Enabling an empty slot is the one way Settings can ask for a voice
+        # that is not there; the store refuses, and the section re-reads.
+        raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
+    return _voice_profiles_payload()
+
+
+@app.post("/api/voice/disable")
+def disable_voice_profiles(_auth: None = Depends(_require_api_auth)):
+    """Keep nobody: nothing is let through, so the gate has nothing to keep (§5.1)."""
+    VOICE_PROFILES.set_enabled(None)
+    return _voice_profiles_payload()
+
+
+@app.delete("/api/voice/profiles/{slot}")
+def delete_voice_profile(slot: int, _auth: None = Depends(_require_api_auth)):
+    VOICE_PROFILES.delete(slot)
+    return _voice_profiles_payload()
+
+
+
+#: Two learned versions this alike say the same thing twice: the owner can
+#: drop one without losing a voice he would still be caught by.
+REDUNDANT_TRACK_COSINE = 0.85
+
+
+def _gate_thresholds_for(profile) -> tuple[float, float]:
+    """The pair the running gate uses for this voice.
+
+    One function for both readers — the recording's gate and the tuner — so the
+    lines the owner drags are the lines the audio is judged by. A hand-tuned
+    pair wins; otherwise it is the diarizer's own scale, where 0.5 means "as
+    close to this room's owner voice as to the other one".
+    """
+    from backend.voice_diarize import DEFAULT_CLOSE_MARGIN, DEFAULT_OPEN_MARGIN
+
+    tuned_open = float(getattr(profile, "open_at", 0.0) or 0.0)
+    tuned_close = float(getattr(profile, "close_at", 0.0) or 0.0)
+    if 0.0 < tuned_close <= tuned_open:
+        return tuned_open, tuned_close
+    return DEFAULT_OPEN_MARGIN, DEFAULT_CLOSE_MARGIN
+
+def _newest_recording(target_dir: Optional[Path]) -> Optional[tuple[str, Path]]:
+    """The take the tuner opens on: the newest recording that has audio, and its dir.
+
+    Scanned over the History surface's own directories, not just the archive
+    root: this desk files its takes under collection folders ("Live Capsule"),
+    and a scan of the root alone found an empty archive and a dead picker. The
+    directory comes back with the name because that is what later lookups need.
+    """
+    directory = target_dir or _resolve_recordings_dir()
+    scan_dirs = [directory] if target_dir is not None else _recordings_scan_dirs(directory)
+    newest: Optional[tuple[float, str, Path]] = None
+    for scan_dir in scan_dirs:
+        try:
+            candidates = list(_iter_recording_text_files(scan_dir))
+        except OSError:
+            continue
+        for path in candidates:
+            try:
+                stamp = path.stat().st_mtime
+            except OSError:
+                continue
+            if _recording_audio_path(path.name, target_dir=scan_dir) is None:
+                continue
+            if newest is None or stamp > newest[0]:
+                newest = (stamp, path.name, scan_dir)
+    return (newest[1], newest[2]) if newest is not None else None
+
+
+@app.get("/api/voice/profiles/{slot}/tune")
+def tune_voice_profile(
+    slot: int,
+    recording_name: str = Query(""),
+    archive_dir: str = Query(""),
+    _auth: None = Depends(_require_api_auth),
+):
+    """Every window of a take, scored against a slot's voice.
+
+    The user asked to see which parameters work instead of asking for one more
+    guess, so this returns the numbers the gate actually compares: one cosine
+    and one level per window, plus the pair the profile is judged by.
+    """
+    profile = VOICE_PROFILES.profiles().get(int(slot))
+    if profile is None:
+        raise HTTPException(status_code=404, detail="there is no voice in that slot")
+    if not default_model_path().is_file():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Solo needs models/{default_model_path().name} beside the app; "
+                "nothing can be scored without it"
+            ),
+        )
+    target_dir = (
+        _resolve_recordings_target_dir(archive_dir, create=False)
+        if str(archive_dir or "").strip()
+        else None
+    )
+    name = str(recording_name or "").strip()
+    if not name:
+        newest = _newest_recording(target_dir)
+        if newest is None:
+            raise HTTPException(
+                status_code=404, detail="there is no recording with audio to tune against"
+            )
+        name, target_dir = newest
+    # A name from the picker arrives without its directory, and this desk files
+    # takes under collection folders: resolve it over the same surface History
+    # shows rather than only the archive root.
+    search_dirs = (
+        [target_dir] if target_dir is not None else _recordings_scan_dirs(_resolve_recordings_dir())
+    )
+    recording: Optional[Path] = None
+    for candidate_dir in search_dirs:
+        try:
+            recording = _recording_path_or_404(name, target_dir=candidate_dir)
+        except HTTPException:
+            continue
+        break
+    if recording is None:
+        raise HTTPException(status_code=404, detail="recording not found")
+    audio_path = _recording_audio_path(recording.name, target_dir=recording.parent)
+    if audio_path is None:
+        raise HTTPException(status_code=400, detail="this recording has no audio beside it")
+
+    from backend.voice_tune import score_take
+
+    embedder = SpeakerEmbedder()
+    try:
+        pcm = decode_take(audio_path)
+        windows = score_take(
+            embedder,
+            profile.vector,
+            pcm,
+            near_level_db=float(getattr(profile, "level_db", 0.0) or 0.0),
+        )
+    except EnrolmentError as e:
+        raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
+    except Exception as e:  # noqa: BLE001 — onnxruntime missing, weights corrupt
+        logger.exception("voice tuning failed")
+        raise HTTPException(
+            status_code=500, detail=f"tuning failed: {_safe_error_text(e)}"
+        ) from None
+    finally:
+        embedder.close()
+
+    opened, closed = _gate_thresholds_for(profile)
+    return {
+        "slot": profile.slot,
+        "name": profile.name,
+        "recording": recording.name,
+        "self_floor": round(float(profile.self_floor), 4),
+        "level_db": round(float(getattr(profile, "level_db", 0.0) or 0.0), 1),
+        "open_at": round(opened, 4),
+        "close_at": round(closed, 4),
+        "tuned": bool(float(getattr(profile, "open_at", 0.0) or 0.0)),
+        "windows": windows,
+    }
+
+
+@app.post("/api/voice/profiles/{slot}/thresholds")
+def set_voice_thresholds(
+    slot: int,
+    payload: dict = Body(default={}),
+    _auth: None = Depends(_require_api_auth),
+):
+    """Keep the pair the owner dragged to (0, 0 restores the floor's own pair)."""
+    try:
+        opened = float(payload.get("open_at") or 0.0)
+        closed = float(payload.get("close_at") or 0.0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="a threshold is a number") from None
+    try:
+        VOICE_PROFILES.set_thresholds(slot, opened, closed)
+    except ProfileError as e:
+        raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
+    logger.info("voice slot %s tuned to open %.3f / close %.3f", slot, opened, closed)
+    return _voice_profiles_payload()
+
+
+@app.post("/api/voice/profiles/{slot}/tune-live")
+def start_live_voice_tune(slot: int, _auth: None = Depends(_require_api_auth)):
+    """Open a microphone session that scores every window as it arrives.
+
+    The tuner about old recordings asked the wrong question: the take could not
+    be named, and the number the owner wanted was about his microphone. This
+    holds the weights for the life of one listening session instead.
+    """
+    profile = VOICE_PROFILES.profiles().get(int(slot))
+    if profile is None:
+        raise HTTPException(status_code=404, detail="there is no voice in that slot")
+    if not default_model_path().is_file():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Solo needs models/{default_model_path().name} beside the app; "
+                "nothing can be scored without it"
+            ),
+        )
+    from backend.voice_tune_live import LIVE_TUNE, LiveTuneSession
+
+    embedder = SpeakerEmbedder()
+    try:
+        session = LiveTuneSession(
+            embedder,
+            profile.vector,
+            slot=profile.slot,
+            near_level_db=float(getattr(profile, "level_db", 0.0) or 0.0),
+        )
+    except Exception:
+        embedder.close()
+        raise
+    token = LIVE_TUNE.start(session)
+    # The same pair the gate judges by, from the same function: a tuner whose
+    # lines sat at 0.558/0.474 while the gate opened at 0.50 was showing the
+    # owner a number that decided nothing.
+    opened, closed = _gate_thresholds_for(profile)
+    logger.info("live tune session %s opened for slot %s", token[:8], slot)
+    return {
+        "token": token,
+        "slot": profile.slot,
+        "name": profile.name,
+        "self_floor": round(float(profile.self_floor), 4),
+        "level_db": round(float(getattr(profile, "level_db", 0.0) or 0.0), 1),
+        "open_at": round(opened, 4),
+        "close_at": round(closed, 4),
+        "tuned": bool(float(getattr(profile, "open_at", 0.0) or 0.0)),
+    }
+
+
+@app.post("/api/voice/tune-live/{token}/feed")
+def feed_live_voice_tune(
+    token: str,
+    audio: bytes = Body(..., media_type="application/octet-stream"),
+    _auth: None = Depends(_require_api_auth),
+):
+    """Score whatever windows this chunk of microphone audio completes."""
+    from backend.voice_tune_live import LIVE_TUNE, MAX_FEED_SECONDS
+    from backend.audio_constants import pcm16_bytes_per_sec, LIVE_SAMPLE_RATE_HZ
+
+    session = LIVE_TUNE.get(token)
+    if session is None:
+        raise HTTPException(status_code=404, detail="this listening session has ended")
+    limit = int(pcm16_bytes_per_sec(LIVE_SAMPLE_RATE_HZ) * MAX_FEED_SECONDS)
+    if len(audio) > limit:
+        raise HTTPException(
+            status_code=400,
+            detail=f"a feed carries at most {int(MAX_FEED_SECONDS)} seconds of audio",
+        )
+    return {"windows": session.feed(audio)}
+
+
+@app.delete("/api/voice/tune-live/{token}")
+def stop_live_voice_tune(token: str, _auth: None = Depends(_require_api_auth)):
+    """End a listening session and release the weights it was holding."""
+    from backend.voice_tune_live import LIVE_TUNE
+
+    stopped = LIVE_TUNE.stop(token)
+    return {"stopped": bool(stopped)}
+
+
+#: The gate of the recording that is running, so one press can tell it whose
+#: voice is whose. Set by ``recording_voice_mask`` at the start and cleared
+#: when the take stops: a claim about one recording must not outlive it.
+_ACTIVE_VOICE_MASK: Optional[VoiceMask] = None
+
+
+@app.post("/api/voice/claim")
+def claim_voice_for_recording(
+    payload: dict = Body(default={}),
+    _auth: None = Depends(_require_api_auth),
+):
+    """Tell the running gate which voice is the owner's, from the last seconds.
+
+    Inference has failed on this desk every way it can: the first speaker of a
+    take was the neighbour, the majority speaker of another was the neighbour,
+    and the enrolled profile could not separate the two across takes (0.29 for
+    the owner against 0.35 for the stranger). One press during the recording
+    settles it, and a settled reference separates by 0.4.
+    """
+    global _ACTIVE_VOICE_MASK
+    mask = _ACTIVE_VOICE_MASK
+    if mask is None:
+        raise HTTPException(status_code=400, detail="no recording is running with Solo on")
+    scorer = getattr(mask, "scorer", None)
+    if scorer is None or not hasattr(scorer, "set_owner"):
+        raise HTTPException(status_code=400, detail="this recording cannot be claimed")
+    # The windows the gate has already heard are the reference: same audio,
+    # same pipeline, same level as every decision it will make. Reading a
+    # spool file instead was a race - it was empty at the moment of the press,
+    # so the button answered 400 while the take was in full flow.
+    # The audio the gate itself was handed, from memory: no spool file, no lag,
+    # no race with a writer. Embedding it here is the same pipeline the gate
+    # will judge with, so the reference cannot come from another channel.
+    audio = mask.recent_audio(10.0) if hasattr(mask, "recent_audio") else b""
+    heard = len(audio) / (LIVE_SAMPLE_RATE_HZ * 2)
+    if len(audio) < 3 * LIVE_SAMPLE_RATE_HZ * 2:
+        raise HTTPException(
+            status_code=400,
+            detail=f"heard {heard:.1f} s of this take - speak for three seconds, then press again",
+        )
+    embedder = SpeakerEmbedder()
+    try:
+        vector = embedder.embed(audio)
+    finally:
+        embedder.close()
+    if vector is None:
+        raise HTTPException(status_code=400, detail="no voice was heard in those seconds")
+    scorer.set_owner(vector)
+    logger.info("voice claimed for the running recording from its own windows")
+    return {"claimed": True}
+
+
+def clear_active_voice_mask() -> None:
+    """The take ended: a claim about one recording must not outlive it."""
+    global _ACTIVE_VOICE_MASK
+    _ACTIVE_VOICE_MASK = None
+
+
+def recording_voice_mask() -> Optional[VoiceMask]:
+    """The gate for the recording that is starting, or ``None``.
+
+    §3.4: off is no object at all, never a filter that copies. Three
+    things have to be true for a gate to exist — a profile is enabled, the
+    net's file is beside the app, and that profile's vector is whole — and
+    if any of them is not, this returns ``None`` and the receive path is
+    the one it always was.
+
+    The embedder is built per recording rather than cached: §2.2 asks for
+    weights loaded lazily and unloaded when idle, and a recording is the
+    unit of idleness here. The session opens on the worker's first
+    judgement, off the event loop, and is dropped when the recording ends.
+    """
+    slot = VOICE_PROFILES.enabled_slot()
+    if slot is None:
+        return None
+    profile = VOICE_PROFILES.enabled()
+    if profile is None:
+        return None
+    model = default_model_path()
+    if not model.is_file():
+        logger.warning(
+            "voice-mask: slot %d is enabled but %s is not beside the app; "
+            "this recording is forwarded unmasked",
+            slot,
+            model.name,
+        )
+        return None
+    embedder = SpeakerEmbedder(model)
+    # The frame test is the session's own level (§4.3), not a constant: a
+    # fixed floor classified this desk's speech as room and left the gate
+    # unable to refuse anything.
+    from backend.voice_mask import VERDICT_INTERVAL_MS, thresholds_for_floor
+
+    # Raw cosines, and nothing else. A score normalised against an impostor
+    # cohort (AS-Norm) was built and measured here: it held only while the
+    # cohort, the profile and the thresholds were rebuilt together, and the
+    # first re-learned profile turned the kept voice into a refusal (z 0.27
+    # against an open threshold of 0.7). A mechanism that breaks silently
+    # when a user learns a voice again is worse than the thin margin it
+    # bought; §4.5 keeps the record.
+    session_voice = SessionVoice()
+    # The room decides the scale, not a constant measured on another desk:
+    # windows are clustered into the voices actually present, the cluster
+    # nearest the enrolment becomes the session owner, and every window is
+    # scored by its closeness to that. Measured on this desk 2026-11-24:
+    # the owner keeps 84% of his windows and the other speaker 0%, where the
+    # cross-session cosine kept about half of each.
+    from backend.voice_diarize import DiarizedScorer
+    # Every learned track is a version of the owner's voice, so every one of
+    # them counts: a window that matches any is his. Choosing a track before
+    # the room is even heard was a guess, and a wrong guess withheld him.
+    learned = VOICE_PROFILES.profiles()
+    tracks = [(slot, entry.vector) for slot, entry in sorted(learned.items())] or [
+        (slot, profile.vector)
+    ]
+    scorer = DiarizedScorer(embedder, tracks)
+    # The pair comes from the diarizer's own scale, not from the enrolled
+    # voice's floor: 0.5 means "as close to this room's owner voice as to the
+    # other one", which is comparable across recordings in a way a cosine to a
+    # profile from another session never was. A hand-tuned pair still wins.
+    tuned_open = float(getattr(profile, "open_at", 0.0) or 0.0)
+    tuned_close = float(getattr(profile, "close_at", 0.0) or 0.0)
+    if 0.0 < tuned_close <= tuned_open:
+        open_at, close_at = tuned_open, tuned_close
+    else:
+        open_at, close_at = scorer.open_margin, scorer.close_margin
+    global _ACTIVE_VOICE_MASK
+    mask = VoiceMask(
+        scorer,
+        voiced=session_voice,
+        open_at=open_at,
+        close_at=close_at,
+        verdict_interval_ms=VERDICT_INTERVAL_MS,
+        # The desk's own near field: a voiced hop far below the level the voice
+        # was learned at is somebody else in the room.
+        near_level_db=float(getattr(profile, "level_db", 0.0) or 0.0),
+        # A profile learned in this room separates the two voices by 0.20 per
+        # turn and 0.07 per window; one from another channel keeps the
+        # single-window rule that was measured for it.
+        turn_windows=1,
+    )
+    # Reachable by a press while this recording runs: "that's me" is the one
+    # fact no inference on this desk has been able to supply.
+    _ACTIVE_VOICE_MASK = mask
+    return mask
 
 
 @app.get("/api/config")
