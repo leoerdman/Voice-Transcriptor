@@ -18056,6 +18056,18 @@ function renderUploadResultPane(): void {
 setupUploadView();
 
 // Solo: the knob, the tuner and the claim all read the store, so it is
+// read at boot as well as on every visit to Settings. The read waits for
+// the boot sequence, which is where this page is given its API token -
+// asked any earlier it answers 401 and paints "could not read".
+void recordingsBootstrapRun.then(() => {
+  void refreshVoiceProfiles();
+});
+wireVoiceTune();
+$("voiceClaimBtn").addEventListener("click", () => {
+  void claimVoice();
+});
+
+// Solo: the knob, the tuner and the claim all read the store, so it is
 // read at boot as well as on every visit to Settings.
 void refreshVoiceProfiles();
 wireVoiceTune();
