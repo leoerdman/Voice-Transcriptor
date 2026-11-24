@@ -32,7 +32,7 @@
   },
   "devDependencies": {
     "@electron/osx-sign": "2.4.0",
-    "electron": "42.4.1",
+    "electron": "^33.4.11",
     "electron-builder": "26.15.3"
   },
   "build": {
