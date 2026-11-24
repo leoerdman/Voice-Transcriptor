@@ -518,6 +518,12 @@ function _useOneSpellingForUserDataDir() {
   }
   appendMainLog(`[user-data-dir] name=${preferredName} decision=${decision.action}/${decision.reason}`);
 }
+// The log rotation throttle, declared before the first line anything logs:
+// the boot steps below run ahead of this file's later declarations, and a
+// counter declared with them was in its temporal dead zone — the first log
+// line threw and the whole main process died before a window existed.
+let mainLogCheckCounter = 0;
+
 _useOneSpellingForUserDataDir();
 _relocateUserDataOffOneDrive();
 
@@ -816,7 +822,12 @@ const MAIN_LOG_MAX_BYTES = 5 * 1024 * 1024;
 // No cached size: `mainLogSizeCached` was written in two places and read
 // in none, which made it look as if the rotation check avoided a stat it
 // never avoided. mainLogCheckCounter is the real throttle.
-let mainLogCheckCounter = 0;
+//
+// Declared HERE, above the boot steps below, because those steps log: the
+// two calls that settle userData run before this file's later declarations,
+// so a counter declared with them was in its temporal dead zone and the first
+// log line threw "Cannot access 'mainLogCheckCounter' before initialization"
+// — the whole main process died before a window existed.
 
 function mainLogArchivePath(kind) {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
