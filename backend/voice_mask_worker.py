@@ -87,6 +87,8 @@ class MaskState:
     #: Reported so a live meter can show the number the decision was made on
     #: instead of a spectrum the decision never reads.
     score: Optional[float] = None
+    #: The take carried no reliable identity: nothing was withheld on a guess.
+    unverified: bool = False
     #: How many seconds of this take the gate has been handed so far: the press
     #: that claims a voice needs a couple of them, and the button says how many.
     heard_sec: float = 0.0
@@ -341,6 +343,7 @@ class MaskWorker:
             ),
             open_at=round(float(self._mask.open_at), 4),
             close_at=round(float(self._mask.close_at), 4),
+            unverified=bool(getattr(self._mask, "unverified", False)),
             heard_sec=round(float(self._mask.heard_seconds()), 1),
             tracks=tuple(sorted(self._mask.track_scores.items())),
         )
@@ -371,6 +374,7 @@ class MaskWorker:
             # The seconds the gate has been handed, so a press that counts them
             # hears from it once a second even while the room says nothing.
             int(snapshot.heard_sec),
+            bool(snapshot.unverified),
         )
         with self._out_lock:
             if key == self._reported:

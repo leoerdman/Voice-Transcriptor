@@ -5518,6 +5518,9 @@ def _voice_mask_event(snapshot: "MaskState") -> dict:
         "state": str(snapshot.state),
         "withheldSec": float(snapshot.withheld_sec),
         "degraded": bool(snapshot.degraded),
+        #: Solo could not identify this take at all: it withheld nothing, and
+        #: saying so is the answer - a guess at identity is not one.
+        "unverified": bool(snapshot.unverified),
         "final": bool(snapshot.final),
         # The cosine the last verdict was made on, and the pair it was
         # compared with: the live meter draws the needle and the two lines

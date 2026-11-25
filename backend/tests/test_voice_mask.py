@@ -52,6 +52,16 @@ def peak_scorer(high: float, low: float, voice_peak: int = 655):
     return score
 
 
+def constant_scorer(value):
+    """A gate that never changes its mind: every window scores ``value``."""
+
+    def score(window: bytes):
+        if peak_of(window) < 655:
+            return None
+        return value
+
+    return score
+
 def drain(mask: VoiceMask, data: bytes, chunk: int) -> bytes:
     out = b""
     for start in range(0, len(data), chunk):
@@ -424,6 +434,43 @@ class WithheldAccountingTests(unittest.TestCase):
                 zeroed_hops += 1
         self.assertGreater(zeroed_hops, 0, "the fixture must refuse something")
         self.assertEqual(mask.withheld_bytes, zeroed_hops * hop)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TheUnidentifiableTakeTests(unittest.TestCase):
+    """An audio that carries no reliable identity is an ERROR, not a verdict.
+
+    The owner's rule, in his words: if the identifier cannot be extracted
+    reliably, that is an error. So a take whose windows sit between the pair -
+    neither clearly the owner nor clearly anybody else - is withheld from
+    nothing and reported, instead of being guessed at.
+    """
+
+    def test_a_take_of_shrugs_says_it_cannot_identify(self):
+        # open 0.50 / close 0.42, a scorer that always answers 0.46: every
+        # window is a shrug, and enough of them make the take unidentifiable.
+        mask = VoiceMask(constant_scorer(0.46), open_at=0.50, close_at=0.42)
+        data = pcm(OWNER_LEVEL, 3000)
+        out = drain(mask, data, 1600)
+        self.assertTrue(mask.unverified)
+        self.assertEqual(out, data)
+
+    def test_a_clear_stranger_is_still_refused_not_unverified(self):
+        mask = VoiceMask(constant_scorer(0.10), open_at=0.50, close_at=0.42)
+        data = pcm(OTHER_LEVEL, 3000)
+        out = drain(mask, data, 1600)
+        self.assertFalse(mask.unverified)
+        self.assertEqual(out, bytes(len(data)))
+
+    def test_a_clear_owner_is_still_forwarded(self):
+        mask = VoiceMask(constant_scorer(0.90), open_at=0.50, close_at=0.42)
+        data = pcm(OWNER_LEVEL, 3000)
+        out = drain(mask, data, 1600)
+        self.assertFalse(mask.unverified)
+        self.assertEqual(out, data)
 
 
 if __name__ == "__main__":

@@ -108,7 +108,15 @@ DEFAULT_WINDOW_MS = 2000
 # sender's 1600-byte write (§4.2): a released hop IS one frame, so no release
 # can ever split one.
 DEFAULT_HOP_MS = 50
-# Measured (§7.5), not guessed. On 63 s of one LibriSpeech narrator — the
+
+#: How many verdicts inside the pair it takes before the gate admits it cannot
+#: identify this take. A verdict there is a shrug; fifteen of them is about two
+#: seconds of a voice that is neither clearly the owner nor clearly anybody
+#: else, which is where guessing starts. The owner's rule is that an
+#: unidentifiable take is an ERROR, never a verdict. Measured 2026-11-25: this
+#: gate takes about seven verdicts per second of speech.
+UNVERIFIED_AFTER_WINDOWS = 15
+
 # first half enrolled, the second half scored, so the profile never saw the
 # audio it was asked about — his speech-bearing windows sit at 0.611 (min),
 # 0.661 (p5), 0.726 (median), and two unrelated voices reach 0.116 at their
@@ -269,6 +277,12 @@ class VoiceMask:
         self._partial = bytearray()
         self._open = False
         self._tail_left = 0
+        #: Set when the take could not be identified with the evidence it
+        #: carries: the gate then withholds nothing and says so, because a guess
+        #: at identity is the one outcome the owner ruled out. Counted from the
+        #: windows that land between the pair - a shrug, over and over.
+        self._unverified = False
+        self._ambiguous = 0
         self._verdict: Optional[float] = None
         self._judged = False
         # Counted where the decision becomes bytes, so the number the pane
@@ -278,6 +292,16 @@ class VoiceMask:
         # whose voice it is without waiting for a verdict: the spool file on
         # disk is written with a lag and was empty at the moment of the press.
         self._recent_pcm = bytearray()
+
+    @property
+    def unverified(self) -> bool:
+        """Whether this take could not be identified at all.
+
+        The gate does not guess: when the audio carries no reliable identity it
+        withholds nothing and says so, and the owner decides what to do with a
+        take that was not verified.
+        """
+        return self._unverified
 
     @property
     def open(self) -> bool:
@@ -551,6 +575,15 @@ class VoiceMask:
             # is not evidence that this is a stranger, and closing on it is
             # how the owner's own quiet window gets cut.
             return
+        if self._close_at <= verdict <= self._open_at:
+            # Between the pair the window is neither his nor certainly not:
+            # one such window is a shrug, a whole take of them is a take that
+            # cannot be identified. Enough of them and the gate stops deciding.
+            self._ambiguous += 1
+            if self._ambiguous >= UNVERIFIED_AFTER_WINDOWS:
+                self._unverified = True
+        else:
+            self._ambiguous = max(0, self._ambiguous - 1)
         if verdict >= self._open_at:
             self._open = True
             self._tail_left = 0

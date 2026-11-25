@@ -44,6 +44,8 @@ export interface VoiceMaskState {
    * that matched this window: knowing which version is winning right now is
    * the only way to see a track that is doing nothing.
    */
+  /** The take carried no reliable identity: nothing was withheld. */
+  readonly unverified?: boolean;
   /** Seconds of this take the gate has been handed: the press counts them. */
   heardSec?: number;
   tracks?: Array<{ slot: number; score: number }>;
@@ -80,6 +82,7 @@ export function parseVoiceMaskMessage(value: unknown): VoiceMaskMessage | null {
     state: obj.state === "open" || obj.state === "closed" || obj.state === "idle" ? obj.state : "idle",
     withheldSec: Number(obj.withheldSec) || 0,
     degraded: !!obj.degraded,
+    unverified: !!obj.unverified,
     final: !!obj.final,
     score: Number.isFinite(score) && obj.score !== null ? score : null,
     openAt: Number(obj.openAt) || undefined,

@@ -12613,6 +12613,8 @@ function syncLiveOutputFromState(): void {
 let liveVoiceMaskState: VoiceMaskState | null = null;
 // Said once per recording: a toast on every frame would be noise.
 let soloFailureShown = false;
+// Said once per recording: an unidentifiable take is an error, not a verdict.
+let soloUnverifiedShown = false;
 
 /**
  * Draw §5.3's line of state.
@@ -13423,6 +13425,14 @@ async function prepareLiveSession(startAttemptSeq: number): Promise<LiveStartSes
           // A failure of the gate is said out loud, once per recording: the
           // pane line alone reads as "a stranger was withheld", and this is
           // the opposite - Solo stopped and the take is untouched.
+          if (msg.unverified && !soloUnverifiedShown) {
+            soloUnverifiedShown = true;
+            setStatus(
+              "Solo could not identify your voice in this recording - nothing was withheld, " +
+                "so treat it as unverified. Press That is me, or record somewhere quieter.",
+              "error",
+            );
+          }
           if (msg.degraded && !soloFailureShown) {
             soloFailureShown = true;
             setStatus(

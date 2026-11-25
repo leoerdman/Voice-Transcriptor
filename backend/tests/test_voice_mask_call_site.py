@@ -106,6 +106,8 @@ class VoiceMaskEventTests(unittest.TestCase):
                 # Seconds of the take the gate has been handed: the claim
                 # button counts them out.
                 "heardSec",
+                # Solo could not identify this take: nothing was withheld.
+                "unverified",
                 "openAt",
                 "closeAt",
             },
