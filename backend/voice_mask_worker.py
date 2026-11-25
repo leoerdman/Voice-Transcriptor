@@ -368,6 +368,9 @@ class MaskWorker:
             # Rounded to two decimals here, not at the wire: a score that
             # wobbles in the third decimal is the model breathing, not news.
             None if snapshot.score is None else round(snapshot.score, 2),
+            # The seconds the gate has been handed, so a press that counts them
+            # hears from it once a second even while the room says nothing.
+            int(snapshot.heard_sec),
         )
         with self._out_lock:
             if key == self._reported:
