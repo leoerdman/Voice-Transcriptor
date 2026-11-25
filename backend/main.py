@@ -9606,10 +9606,65 @@ def save_claimed_voice(
     except ProfileError as e:
         raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
     logger.info("claimed voice saved as track %s (%r)", slot, name)
+    try:
+        # The ruler this track is judged against: the voices on this desk that
+        # are not it. Built here because this is the one moment the desk knows
+        # exactly which voice it is comparing everything else with.
+        _refresh_voice_cohort(claim["vector"])
+    except Exception:  # noqa: BLE001 - a ruler is an improvement, never a blocker
+        logger.exception("voice cohort could not be rebuilt; the gate keeps its own scale")
     saved = _voice_profiles_payload()
     saved["saved_slot"] = slot
     return saved
 
+
+def _refresh_voice_cohort(track_vector: Any, *, takes: int = 12) -> int:
+    """Rebuild the ruler from this desk's own recordings: the voices that are not his.
+
+    Every take is embedded and every window is scored against the new track. The
+    ones that sit far from it are somebody else - a neighbour, a television, the
+    room with words in it - and they are exactly the cohort a verification system
+    needs. Nothing is labelled by hand and nothing leaves the machine.
+    """
+    import audioop
+    import wave
+
+    import numpy as np
+
+    from backend.voice_cohort import IMPOSTOR_BELOW, load as load_cohort, save as save_cohort
+    from backend.voice_embed import SpeakerEmbedder, cosine, unit_vectors
+    from backend.voice_enrol import enrol_windows
+
+    path = DATA_DIR / "voice_cohort.json"
+    existing = load_cohort(path)
+    rows = [row.tolist() for row in existing] if existing.size else []
+    archives = sorted((DATA_DIR / "recordings").rglob("*.wav"))[-int(takes):]
+    if not archives:
+        return len(rows)
+    track = np.asarray(track_vector, dtype=np.float64)
+    track = track / (float(np.linalg.norm(track)) or 1.0)
+    embedder = SpeakerEmbedder()
+    added = 0
+    try:
+        for recording in archives:
+            try:
+                with wave.open(str(recording)) as handle:
+                    rate = handle.getframerate()
+                    pcm = handle.readframes(handle.getnframes())
+            except (OSError, wave.Error):
+                continue
+            if rate != LIVE_SAMPLE_RATE_HZ:
+                pcm, _ = audioop.ratecv(pcm, 2, 1, rate, LIVE_SAMPLE_RATE_HZ, None)
+            for vector in unit_vectors(embedder, enrol_windows(pcm)[:60]):
+                if cosine(vector, track) < IMPOSTOR_BELOW:
+                    rows.append(np.asarray(vector, dtype=np.float64).tolist())
+                    added += 1
+    finally:
+        embedder.close()
+    kept = save_cohort(path, rows)
+    if added:
+        logger.info("voice cohort: %s vectors, %s of them new", kept, added)
+    return kept
 
 def clear_active_voice_mask() -> None:
     """The take ended: a claim about one recording must not outlive it."""
@@ -9686,7 +9741,10 @@ def recording_voice_mask() -> Optional[VoiceMask]:
         for slot, entry in sorted(learned.items())
         if entry.prototypes
     }
-    scorer = DiarizedScorer(embedder, tracks, closes=closes, prototypes=prototypes)
+    from backend.voice_cohort import load as load_cohort, pair_from_z
+
+    cohort = load_cohort(DATA_DIR / "voice_cohort.json")
+    scorer = DiarizedScorer(embedder, tracks, closes=closes, prototypes=prototypes, cohort=cohort)
     # The pair comes from the diarizer's own scale, not from the enrolled
     # voice's floor: 0.5 means "as close to this room's owner voice as to the
     # other one", which is comparable across recordings in a way a cosine to a
@@ -9695,6 +9753,10 @@ def recording_voice_mask() -> Optional[VoiceMask]:
     tuned_close = float(getattr(profile, "close_at", 0.0) or 0.0)
     if 0.0 < tuned_close <= tuned_open:
         open_at, close_at = tuned_open, tuned_close
+    elif cohort.size:
+        # The pair the cohort's own calibration asks for: a z measured on this
+        # desk, not a share invented for this file.
+        open_at, close_at = pair_from_z()
     else:
         open_at, close_at = scorer.open_margin, scorer.close_margin
     global _ACTIVE_VOICE_MASK

@@ -319,6 +319,7 @@ class DiarizedScorer:
         close_margin: float = DEFAULT_CLOSE_MARGIN,
         closes: Optional[dict[int, float]] = None,
         prototypes: Optional[dict[int, Sequence[Sequence[float]]]] = None,
+        cohort: Optional[np.ndarray] = None,
     ) -> None:
         self._embedder = embedder
         self._profiles = _as_profiles(profile)
@@ -333,6 +334,10 @@ class DiarizedScorer:
         self._closes: dict[int, float] = dict(closes or {})
         #: Several ways each voice sounds, so a noisy window is scored against
         #: the nearest of them instead of against an average of all of them.
+        #: The ruler: other people's voices, so a score reads as "how many
+        #: spreads above the average stranger" instead of a bare cosine. Empty
+        #: until enough non-owner audio has been collected.
+        self._cohort = cohort if cohort is not None and getattr(cohort, "size", 0) else None
         self._prototypes: dict[int, list[np.ndarray]] = {
             slot: [_unit(np.asarray(item, dtype=np.float64).reshape(-1)) for item in items]
             for slot, items in (prototypes or {}).items()
@@ -393,6 +398,17 @@ class DiarizedScorer:
         # seconds (measured 2026-11-25). The absolute cosine to the tracks is the
         # one measure that does not move with who else is talking.
         best_slot, best = self._best_profile(vector)
+        if self._cohort is not None:
+            # The cohort is the identifier: with a ruler the score is comparable
+            # across rooms and noise levels, and the room's own clustering adds
+            # nothing but its own guesswork.
+            from backend.voice_cohort import score_from_z, zscore
+
+            z = zscore(vector, self._profiles[0], self._cohort)
+            if z is None:
+                return best
+            self._last_margin = z
+            return score_from_z(z)
         if best < self._closes.get(best_slot, TRACK_FLOOR):
             self._last_margin = None
             return best
