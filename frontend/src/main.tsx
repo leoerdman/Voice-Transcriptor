@@ -3815,14 +3815,42 @@ function setStatusScoped(scopeToken: string, st: string, kind?: StatusKind): voi
  * is switched off in ordinary use and a button inside it is a button nobody
  * finds - the owner dictated that complaint into a recording before this.
  */
-function syncClaimButton(): void {
+/** When this take started, so the press counts its own seconds. */
+let claimTakeStartedAt = 0;
+let claimTicker = 0;
+
+function paintClaimButton(): void {
   const button = document.getElementById("voiceClaimBtn") as HTMLButtonElement | null;
   if (!button) return;
+  const heard = claimTakeStartedAt > 0 ? (Date.now() - claimTakeStartedAt) / 1000 : 0;
   button.hidden = !(isRecording && voiceProfilesStatus.enabledSlot !== null);
   if (button.hidden) {
     button.disabled = false;
     button.textContent = "That is me — keep my voice";
+    return;
   }
+  // Counted here, not taken from the gate: a quiet room produces no state
+  // reports at all, so a press that waited for one sat on its default label
+  // while the owner spoke into nothing.
+  button.textContent =
+    heard >= 2
+      ? `That is me — keep my voice (${heard.toFixed(0)} s)`
+      : `That is me — speak (${heard.toFixed(1)} s of 2)`;
+  button.disabled = heard < 2;
+}
+
+function syncClaimButton(): void {
+  if (isRecording && voiceProfilesStatus.enabledSlot !== null) {
+    if (claimTakeStartedAt === 0) claimTakeStartedAt = Date.now();
+    if (claimTicker === 0) {
+      claimTicker = window.setInterval(paintClaimButton, 250);
+    }
+  } else if (claimTicker !== 0) {
+    window.clearInterval(claimTicker);
+    claimTicker = 0;
+    claimTakeStartedAt = 0;
+  }
+  paintClaimButton();
 }
 
 function setRecordButton(recording: boolean): void {
