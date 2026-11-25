@@ -55,6 +55,19 @@ export function formatWithheld(seconds: number): string {
   return `${safe.toFixed(1)} s`;
 }
 
+/**
+ * Which tracks are catching this take, by name.
+ *
+ * The rows that glow live in Settings, and nobody is in Settings while they
+ * speak: the pane is where a take happens, so the tracks that matched are
+ * named here, in the one line already being read.
+ */
+export function voiceMaskCaughtText(names: readonly string[]): string {
+  const clean = names.map((name) => name.trim()).filter((name) => name.length > 0);
+  if (clean.length === 0) return "";
+  return `Catching: ${clean.join(", ")}.`;
+}
+
 export function voiceMaskNoteText(state: VoiceMaskState): string {
   const withheld = formatWithheld(state.withheldSec);
   const refused = state.withheldSec > 0;

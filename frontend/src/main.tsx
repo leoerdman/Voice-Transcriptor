@@ -267,7 +267,7 @@ import {
   int16FromFloat,
   resampleTo16k,
 } from "./enrol-audio";
-import { voiceMaskNoteText, type VoiceMaskState } from "./voice-mask-note";
+import { voiceMaskCaughtText, voiceMaskNoteText, type VoiceMaskState } from "./voice-mask-note";
 import { liveSourceNote } from "./live-source-note";
 import {
   SPECTRUM_BARS,
@@ -12612,11 +12612,23 @@ let soloFailureShown = false;
  */
 function applyVoiceMaskNote(): void {
   const el = $("voiceMaskNote");
-  const text = liveVoiceMaskState ? voiceMaskNoteText(liveVoiceMaskState) : "";
+  const state = liveVoiceMaskState;
+  const withheld = state ? voiceMaskNoteText(state) : "";
+  const caught = state ? voiceMaskCaughtText(trackNamesFor(state)) : "";
+  const text = [caught, withheld].filter((part) => part !== "").join(" ");
   if (el.textContent !== text) {
     el.textContent = text;
   }
   el.hidden = text === "";
+}
+
+/** The names of the tracks whose score passed the open threshold. */
+function trackNamesFor(state: VoiceMaskState): string[] {
+  const open = Number(state.openAt ?? 0.5);
+  return (state.tracks ?? [])
+    .filter((track) => Number(track.score) >= open)
+    .map((track) => voiceProfilesStatus.slots[track.slot]?.name ?? `Voice ${track.slot + 1}`)
+    .filter((name) => name.length > 0);
 }
 
 function resetVoiceMaskNote(): void {

@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 
-import { formatWithheld, voiceMaskNoteText, type VoiceMaskState } from "../src/voice-mask-note";
+import { formatWithheld, voiceMaskCaughtText, voiceMaskNoteText, type VoiceMaskState } from "../src/voice-mask-note";
 
 const base: VoiceMaskState = { state: "closed", withheldSec: 0, degraded: false, final: false };
 
@@ -69,5 +69,19 @@ describe("formatWithheld", () => {
   it("never prints a negative or a NaN as an amount of withheld audio", () => {
     expect(formatWithheld(-3)).toBe("0.0 s");
     expect(formatWithheld(Number.NaN)).toBe("0.0 s");
+  });
+});
+
+describe("the tracks catching a take", () => {
+  it("names them where a take is being read, not in another screen", () => {
+    // The rows that glow are in Settings; nobody speaks from Settings.
+    expect(voiceMaskCaughtText(["я · утро"])).toBe("Catching: я · утро.");
+    expect(voiceMaskCaughtText(["я · утро", "я · холод"])).toBe("Catching: я · утро, я · холод.");
+  });
+
+  it("says nothing when no track matched, and skips a nameless one", () => {
+    expect(voiceMaskCaughtText([])).toBe("");
+    expect(voiceMaskCaughtText(["  ", ""])).toBe("");
+    expect(voiceMaskCaughtText(["", "я · вечер"])).toBe("Catching: я · вечер.");
   });
 });
