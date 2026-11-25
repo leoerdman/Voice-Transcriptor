@@ -103,6 +103,9 @@ class VoiceMaskEventTests(unittest.TestCase):
                 # Per-track scores: the card lights the rows that matched
                 # the window just judged.
                 "tracks",
+                # Seconds of the take the gate has been handed: the claim
+                # button counts them out.
+                "heardSec",
                 "openAt",
                 "closeAt",
             },

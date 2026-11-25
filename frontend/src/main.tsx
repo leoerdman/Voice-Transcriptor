@@ -3819,6 +3819,10 @@ function syncClaimButton(): void {
   const button = document.getElementById("voiceClaimBtn") as HTMLButtonElement | null;
   if (!button) return;
   button.hidden = !(isRecording && voiceProfilesStatus.enabledSlot !== null);
+  if (button.hidden) {
+    button.disabled = false;
+    button.textContent = "That is me — keep my voice";
+  }
 }
 
 function setRecordButton(recording: boolean): void {

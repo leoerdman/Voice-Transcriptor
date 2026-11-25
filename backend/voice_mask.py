@@ -346,6 +346,10 @@ class VoiceMask:
         """How much audio the gate is holding right now."""
         return self._held_bytes + len(self._partial)
 
+    def heard_seconds(self) -> float:
+        """How much of this take the gate has been handed, in seconds."""
+        return len(self._recent_pcm) / float(LIVE_SAMPLE_RATE_HZ * 2)
+
     def recent_audio(self, seconds: float) -> bytes:
         """The last ``seconds`` of input audio, as handed to this gate.
 

@@ -87,6 +87,9 @@ class MaskState:
     #: Reported so a live meter can show the number the decision was made on
     #: instead of a spectrum the decision never reads.
     score: Optional[float] = None
+    #: How many seconds of this take the gate has been handed so far: the press
+    #: that claims a voice needs a couple of them, and the button says how many.
+    heard_sec: float = 0.0
     #: Score against each learned track by slot, for the card to light rows.
     tracks: tuple[tuple[int, float], ...] = ()
     #: The pair the gate is judged by, carried with the score so a meter draws
@@ -338,6 +341,7 @@ class MaskWorker:
             ),
             open_at=round(float(self._mask.open_at), 4),
             close_at=round(float(self._mask.close_at), 4),
+            heard_sec=round(float(self._mask.heard_seconds()), 1),
             tracks=tuple(sorted(self._mask.track_scores.items())),
         )
 

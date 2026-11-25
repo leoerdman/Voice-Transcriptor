@@ -5518,6 +5518,9 @@ def _voice_mask_event(snapshot: "MaskState") -> dict:
         #: Which learned tracks matched this window, by slot: the card lights
         #: those rows so the owner sees which version is winning right now.
         "tracks": [{"slot": int(slot), "score": round(float(score), 4)} for slot, score in snapshot.tracks],
+        #: Seconds of this take the gate has been handed: the claim needs two,
+        #: and the button counts them out loud rather than refusing silently.
+        "heardSec": round(float(snapshot.heard_sec), 1),
         "openAt": float(snapshot.open_at),
         "closeAt": float(snapshot.close_at),
     }
@@ -9217,6 +9220,10 @@ def delete_voice_profile(slot: int, _auth: None = Depends(_require_api_auth)):
 #: drop one without losing a voice he would still be caught by.
 REDUNDANT_TRACK_COSINE = 0.85
 
+#: How much of the take a claim needs before it means anything: two seconds,
+#: because that is one window of the gate and a shorter sample is mostly noise.
+CLAIM_MIN_SECONDS = 2.0
+
 
 def _gate_thresholds_for(profile) -> tuple[float, float]:
     """The pair the running gate uses for this voice.
@@ -9494,10 +9501,10 @@ def claim_voice_for_recording(
     # will judge with, so the reference cannot come from another channel.
     audio = mask.recent_audio(10.0) if hasattr(mask, "recent_audio") else b""
     heard = len(audio) / (LIVE_SAMPLE_RATE_HZ * 2)
-    if len(audio) < 3 * LIVE_SAMPLE_RATE_HZ * 2:
+    if len(audio) < CLAIM_MIN_SECONDS * LIVE_SAMPLE_RATE_HZ * 2:
         raise HTTPException(
             status_code=400,
-            detail=f"heard {heard:.1f} s of this take - speak for three seconds, then press again",
+            detail=f"heard {heard:.1f} s of this take - the press needs {CLAIM_MIN_SECONDS:.0f} s, keep speaking",
         )
     embedder = SpeakerEmbedder()
     try:
