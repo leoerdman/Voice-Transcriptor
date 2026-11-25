@@ -2712,8 +2712,30 @@ const keySavedState: Record<RemoteProvider, boolean> = {
 // carries it. Outside the desktop shell (the page opened in a browser, the
 // Vite dev server) there is no token and every API call fails here — the
 // backend is reachable with full rights only through the app's own window.
+//
+// The one deliberate exception is a link the shell prints when it is asked to
+// (`-BrowserLink`): the token travels in the URL fragment, which a browser never
+// sends to a server and never writes to a proxy's log, and it is stripped from
+// the address bar the moment it has been read. It dies with the backend's
+// process, so the link is a session, not a password.
+const tokenFromFragment = (): string => {
+  const hash = window.location.hash.replace(/^#/, "");
+  if (!hash) return "";
+  const params = new URLSearchParams(hash);
+  const token = (params.get("token") || "").trim();
+  if (token) {
+    params.delete("token");
+    const rest = params.toString();
+    const cleaned = `${window.location.pathname}${window.location.search}${rest ? `#${rest}` : ""}`;
+    window.history.replaceState(null, "", cleaned);
+  }
+  return token;
+};
+
+const bootToken = tokenFromFragment();
+
 const apiToken = (): string => {
-  const token = (window.__TRANSCRIPTOR_API_TOKEN || "").trim();
+  const token = (window.__TRANSCRIPTOR_API_TOKEN || bootToken || "").trim();
   if (!token) {
     throw new Error("API token is missing. Restart app.");
   }

@@ -905,6 +905,20 @@ function rotateMainLogIfNeeded() {
   } catch { /* stat failed — nothing to rotate */ }
 }
 
+// A link that lets this window's own rights be exercised in an ordinary
+// browser: the E2E of the desk needs a page that can reach the API, and BM-01
+// keeps the token out of the page by design. The token rides in the fragment -
+// a browser never sends a fragment to a server and a proxy never logs it - and
+// the renderer strips it from the address bar once it has been read. Off unless
+// the shell is started with TRANSCRIPTOR_BROWSER_LINK=1, and it dies with this
+// process, so the link is a session, not a password.
+const BROWSER_LINK_ENABLED = process.env.TRANSCRIPTOR_BROWSER_LINK === "1";
+
+function logBrowserLink() {
+  if (!BROWSER_LINK_ENABLED) return;
+  appendMainLog(`[browser-link] ${BASE_URL}/#token=${BACKEND_API_TOKEN}`);
+}
+
 function appendMainLog(message) {
   try {
     const line = `[${new Date().toISOString()}] ${message}\n`;
@@ -9283,6 +9297,7 @@ async function createWindow(options = {}) {
     // outside shutdown, so the exponential backoff compounded across
     // sessions making the log delay misleading.
     noteBackendHealthy("backend-recovery");
+    logBrowserLink();
     // CLEAR `backendBootError` once /api/health responds OK. Pass-24c
     // added a `did-finish-load` replay of this string so a closed-
     // and-reopened window can re-deliver the diagnostic — but if the
