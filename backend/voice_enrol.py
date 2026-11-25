@@ -197,6 +197,46 @@ def enrol_take_stats(
     against = [cosine(vector, profile) for vector in vectors]
     return profile, float(np.median(against))
 
+def enrol_prototypes(
+    embedder: SpeakerEmbedder,
+    pcm: bytes,
+    *,
+    count: int = 6,
+    voiced: Optional[Callable[[bytes], bool]] = None,
+) -> Tuple[List[np.ndarray], float]:
+    """The voice as a handful of its own windows, and how well its halves agree.
+
+    One mean vector is an average of every way the voice sounded in the take,
+    and a noisy window is scored against that average rather than against the
+    nearest way the voice actually sounds. A prototype set keeps several of
+    them; the gate scores a window by its best match, which is what keeps a
+    noisy or distant take recognisable.
+
+    ``agreement`` is the test-retest measure this identifier has without an
+    impostor set: the mean of the take's first half scored against the mean of
+    its second. A voice that agrees with itself at 0.9 on this microphone gets a
+    high pair; one that manages 0.6 gets a low pair, because that is all the
+    evidence the recording carries.
+    """
+    heard = voiced if voiced is not None else _has_voice
+    windows = [window for window in enrol_windows(pcm) if heard(window)]
+    vectors = unit_vectors(embedder, windows)
+    if not vectors:
+        return [], 0.0
+    agreement = 0.0
+    if len(vectors) >= 2:
+        midpoint = len(vectors) // 2
+        first = mean_direction(vectors[:midpoint])
+        second = mean_direction(vectors[midpoint:])
+        if first is not None and second is not None:
+            agreement = cosine(first, second)
+    wanted = max(1, min(int(count), len(vectors)))
+    if wanted == len(vectors):
+        picks = list(vectors)
+    else:
+        picks = [vectors[round(index * (len(vectors) - 1) / (wanted - 1))] for index in range(wanted)]
+    return picks, float(agreement)
+
 def take_level_db(pcm: bytes, *, voiced: Optional[Callable[[bytes], bool]] = None) -> float:
     """The level this take's own voice sits at, dBFS RMS.
 

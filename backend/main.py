@@ -84,7 +84,14 @@ from backend.audio_mime import AUDIO_EXT_TO_MIME, audio_content_type
 from backend.media_tokens import MediaTokens
 from backend.audio_levels import SessionVoice
 from backend.voice_embed import SpeakerEmbedder, SpeakerScorer, default_model_path
-from backend.voice_enrol import EnrolmentError, decode_take, enrol_take, enrol_take_stats, take_level_db
+from backend.voice_enrol import (
+    EnrolmentError,
+    decode_take,
+    enrol_prototypes,
+    enrol_take,
+    enrol_take_stats,
+    take_level_db,
+)
 from backend.voice_mask import VoiceMask
 from backend.voice_mask_worker import MaskState, MaskWorker
 from backend.voice_profiles import (
@@ -92,6 +99,7 @@ from backend.voice_profiles import (
     SLOTS,
     ProfileError,
     VoiceProfileStore,
+    thresholds_from_agreement,
     thresholds_from_floor,
 )
 from backend.audio import (
@@ -9521,6 +9529,10 @@ def claim_voice_for_recording(
         # and says "learn it again" about a track made a second earlier.
         vector, self_floor = enrol_take_stats(embedder, audio)
         level_db = take_level_db(audio)
+        # The voice as several of its own windows, and how well the take agrees
+        # with itself: the pair that judges this track is derived from the
+        # second, and the first is what makes a noisy window still match.
+        prototypes, agreement = enrol_prototypes(embedder, audio)
     except EnrolmentError:
         raise HTTPException(status_code=400, detail="no voice was heard in those seconds") from None
     finally:
@@ -9534,6 +9546,8 @@ def claim_voice_for_recording(
         "vector": np.asarray(vector, dtype=np.float64),
         "self_floor": float(self_floor),
         "level_db": float(level_db),
+        "prototypes": [np.asarray(item, dtype=np.float64) for item in prototypes],
+        "agreement": float(agreement),
     }
     logger.info("voice claimed for the running recording from its own windows")
     return {"claimed": True, "seconds": round(heard, 1)}
@@ -9578,12 +9592,13 @@ def save_claimed_voice(
             claim["vector"],
             self_floor=float(claim["self_floor"]),
             level_db=float(claim["level_db"]),
+            prototypes=claim.get("prototypes") or (),
         )
         # The pair this voice is judged by comes out of the same take: how alike
         # its own windows are, in shares - never a number somebody picked. A
         # different desk therefore moves the gate with itself instead of needing
         # a hand to retune it.
-        open_at, close_at = thresholds_from_floor(float(claim["self_floor"]))
+        open_at, close_at = thresholds_from_agreement(float(claim.get("agreement") or 0.0))
         VOICE_PROFILES.set_thresholds(slot, open_at, close_at)
     except ProfileError as e:
         raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
@@ -9663,7 +9678,12 @@ def recording_voice_mask() -> Optional[VoiceMask]:
         slot: (float(entry.close_at) if 0.0 < float(entry.close_at) < float(entry.open_at) else thresholds_from_floor(entry.self_floor)[1])
         for slot, entry in sorted(learned.items())
     }
-    scorer = DiarizedScorer(embedder, tracks, closes=closes)
+    prototypes = {
+        slot: [tuple(item) for item in entry.prototypes]
+        for slot, entry in sorted(learned.items())
+        if entry.prototypes
+    }
+    scorer = DiarizedScorer(embedder, tracks, closes=closes, prototypes=prototypes)
     # The pair comes from the diarizer's own scale, not from the enrolled
     # voice's floor: 0.5 means "as close to this room's owner voice as to the
     # other one", which is comparable across recordings in a way a cosine to a

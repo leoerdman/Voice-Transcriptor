@@ -318,6 +318,7 @@ class DiarizedScorer:
         open_margin: float = DEFAULT_OPEN_MARGIN,
         close_margin: float = DEFAULT_CLOSE_MARGIN,
         closes: Optional[dict[int, float]] = None,
+        prototypes: Optional[dict[int, Sequence[Sequence[float]]]] = None,
     ) -> None:
         self._embedder = embedder
         self._profiles = _as_profiles(profile)
@@ -330,6 +331,12 @@ class DiarizedScorer:
         #: own take (``voice_profiles.thresholds_from_floor``); TRACK_FLOOR is
         #: only the answer for a track that predates that derivation.
         self._closes: dict[int, float] = dict(closes or {})
+        #: Several ways each voice sounds, so a noisy window is scored against
+        #: the nearest of them instead of against an average of all of them.
+        self._prototypes: dict[int, list[np.ndarray]] = {
+            slot: [_unit(np.asarray(item, dtype=np.float64).reshape(-1)) for item in items]
+            for slot, items in (prototypes or {}).items()
+        }
         self._last_margin: Optional[float] = None
         #: Score against every learned track, by slot, for the last window:
         #: the card draws these as the tracks matching right now.
@@ -409,10 +416,12 @@ class DiarizedScorer:
     def _best_profile(self, vector: np.ndarray) -> tuple[int, float]:
         """The closest of the owner's versions, by slot - every track counts."""
         unit = _unit(np.asarray(vector, dtype=np.float64).reshape(-1))
-        scores = {
-            slot: float(np.dot(unit, profile))
-            for slot, profile in zip(self._track_slots, self._profiles)
-        }
+        scores = {}
+        for slot, profile in zip(self._track_slots, self._profiles):
+            best = float(np.dot(unit, profile))
+            for prototype in self._prototypes.get(slot, ()):
+                best = max(best, float(np.dot(unit, prototype)))
+            scores[slot] = best
         # Kept for the card: these are the rows that light up while a take runs.
         self.last_tracks = scores
         if not scores:

@@ -62,6 +62,7 @@ class RoundTripTests(StoreTestCase):
                 "created_at",
                 "capture",
                 "self_floor",
+                "prototypes",
                 "level_db",
                 "open_at",
                 "close_at",

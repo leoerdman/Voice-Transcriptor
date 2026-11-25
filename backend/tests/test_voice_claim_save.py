@@ -22,6 +22,8 @@ def claimed(vector=None, self_floor=0.72, level_db=-31.0) -> dict:
         "vector": unit() if vector is None else vector,
         "self_floor": self_floor,
         "level_db": level_db,
+        "prototypes": [],
+        "agreement": 0.9,
     }
 
 

@@ -57,6 +57,11 @@ class VoiceProfile:
     #: gate's thresholds are a share of it, so a profile carries its own scale
     #: instead of borrowing one from another machine.
     self_floor: float = 0.0
+    #: The voice as a handful of its own windows, not one average: a prototype
+    #: set survives noise and distance better than a mean, because a window is
+    #: scored against the nearest way this voice sounds rather than against an
+    #: average of every way it sounded. Empty for a track that predates it.
+    prototypes: Tuple[Tuple[float, ...], ...] = ()
     #: The level this voice spoke at when it was learned, dBFS RMS: the desk's
     #: own near field. Anything far below it is somebody else in the room.
     level_db: float = 0.0
@@ -129,6 +134,30 @@ OPEN_SHARE = 0.62
 CLOSE_SHARE = 0.50
 
 
+#: The same idea, calibrated by the identifier itself: how well the take agrees
+#: with itself when cut in half (voice_enrol.enrol_prototypes). That is the
+#: test-retest measure a verification system has without an impostor set, and it
+#: is the one number that says how much this recording can support. A voice that
+#: agrees at 0.90 gets 0.52/0.42; one that manages 0.60 gets 0.35/0.28.
+OPEN_SHARE_OF_AGREEMENT = 0.58
+CLOSE_SHARE_OF_AGREEMENT = 0.47
+
+
+def thresholds_from_agreement(agreement: float) -> Tuple[float, float]:
+    """The pair a track is judged by, from how well the take agrees with itself.
+
+    Nobody picks it: the recording does. A take made in noise disagrees with
+    itself more, so it gets a wider gate, because that is honestly all it can
+    support - and stating that is better than a constant that pretends the same
+    confidence in a quiet room and a noisy one.
+    """
+    value = float(agreement or 0.0)
+    if value <= 0.0:
+        return thresholds_from_floor(0.0)
+    open_at = round(min(0.85, max(0.20, OPEN_SHARE_OF_AGREEMENT * value)), 3)
+    close_at = round(min(open_at - 0.02, max(0.15, CLOSE_SHARE_OF_AGREEMENT * value)), 3)
+    return open_at, close_at
+
 def thresholds_from_floor(self_floor: float) -> Tuple[float, float]:
     """The pair a voice is judged by, derived from how alike that voice is.
 
@@ -198,6 +227,9 @@ class VoiceProfileStore:
                     capture=str(entry.get("capture") or ""),
                     self_floor=float(entry.get("self_floor") or 0.0),
                     level_db=float(entry.get("level_db") or 0.0),
+                    prototypes=tuple(
+                        _clean_vector(item) for item in (entry.get("prototypes") or [])
+                    ),
                     open_at=float(entry.get("open_at") or 0.0),
                     close_at=float(entry.get("close_at") or 0.0),
                 )
@@ -243,6 +275,7 @@ class VoiceProfileStore:
                     "created_at": profile.created_at,
                     "capture": profile.capture,
                     "self_floor": profile.self_floor,
+                    "prototypes": [list(item) for item in profile.prototypes],
                     "level_db": profile.level_db,
                     "open_at": profile.open_at,
                     "close_at": profile.close_at,
@@ -280,6 +313,7 @@ class VoiceProfileStore:
             created_at=profile.created_at,
             capture=profile.capture,
             self_floor=profile.self_floor,
+            prototypes=profile.prototypes,
             level_db=profile.level_db,
             open_at=opened,
             close_at=closed,
@@ -300,6 +334,8 @@ class VoiceProfileStore:
         self_floor: float = 0.0,
         # The level this voice spoke at, dBFS RMS (0.0 when unknown).
         level_db: float = 0.0,
+        # The voice as a handful of its own windows (see VoiceProfile).
+        prototypes: Sequence[Sequence[float]] = (),
     ) -> VoiceProfile:
         """Put a profile in a slot, replacing whatever was there.
 
@@ -314,6 +350,7 @@ class VoiceProfileStore:
             capture=str(capture or ""),
             self_floor=float(self_floor or 0.0),
             level_db=float(level_db or 0.0),
+            prototypes=tuple(_clean_vector(item) for item in (prototypes or ())),
         )
         profiles = self.profiles()
         profiles[profile.slot] = profile
