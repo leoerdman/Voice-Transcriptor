@@ -1,6 +1,7 @@
 """The one way a track is learned now: a claim, then a name."""
 
 import unittest
+from unittest import mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -63,6 +64,74 @@ class ClaimSaveTests(unittest.TestCase):
         main._ACTIVE_VOICE_VECTOR[0] = unit()
         main.clear_active_voice_mask()
         self.assertIsNone(main._ACTIVE_VOICE_VECTOR[0])
+
+
+class ClaimPressTests(unittest.TestCase):
+    """The press itself: what it keeps for the name step.
+
+    The route reached `np.asarray` without numpy in scope on 2026-11-25 and
+    answered 500 to a real press in the running window - every test here ran
+    against the save, never against the press, so nothing caught it.
+    """
+
+    def setUp(self) -> None:
+        self._saved_mask = main._ACTIVE_VOICE_MASK
+        main._ACTIVE_VOICE_VECTOR[0] = None
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        main._ACTIVE_VOICE_MASK = self._saved_mask
+        main._ACTIVE_VOICE_VECTOR[0] = None
+
+    def test_the_press_keeps_the_vector_it_claimed(self):
+        claimed = []
+
+        class Scorer:
+            def set_owner(self, vector):
+                claimed.append(vector)
+
+        class Mask:
+            scorer = Scorer()
+
+            def recent_audio(self, seconds):
+                return b"\x00\x00" * int(main.LIVE_SAMPLE_RATE_HZ * 3)
+
+        class Embedder:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def embed(self, audio):
+                return unit(7)
+
+            def close(self):
+                pass
+
+        main._ACTIVE_VOICE_MASK = Mask()
+        with mock.patch.object(main, "SpeakerEmbedder", Embedder):
+            answer = main.claim_voice_for_recording()
+
+        self.assertTrue(answer["claimed"])
+        self.assertGreaterEqual(answer["seconds"], main.CLAIM_MIN_SECONDS)
+        self.assertEqual(len(claimed), 1)
+        self.assertIsNotNone(main._ACTIVE_VOICE_VECTOR[0])
+        self.assertEqual(len(main._ACTIVE_VOICE_VECTOR[0]), DIMENSIONS)
+
+    def test_the_press_refuses_a_take_it_has_not_heard(self):
+        class Scorer:
+            def set_owner(self, vector):
+                raise AssertionError("a short press must not claim")
+
+        class Mask:
+            scorer = Scorer()
+
+            def recent_audio(self, seconds):
+                return b"\x00\x00" * int(main.LIVE_SAMPLE_RATE_HZ * 0.5)
+
+        main._ACTIVE_VOICE_MASK = Mask()
+        with self.assertRaises(main.HTTPException) as caught:
+            main.claim_voice_for_recording()
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn("keep speaking", caught.exception.detail)
 
 
 if __name__ == "__main__":

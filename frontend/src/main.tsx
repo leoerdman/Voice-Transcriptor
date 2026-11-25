@@ -267,7 +267,13 @@ import {
   int16FromFloat,
   resampleTo16k,
 } from "./enrol-audio";
-import { voiceMaskCaughtText, voiceMaskNoteText, type VoiceMaskState } from "./voice-mask-note";
+import {
+  parseVoiceMaskMessage,
+  voiceMaskCaughtNames,
+  voiceMaskCaughtText,
+  voiceMaskNoteText,
+  type VoiceMaskState,
+} from "./voice-mask-note";
 import { liveSourceNote } from "./live-source-note";
 import {
   SPECTRUM_BARS,
@@ -743,6 +749,14 @@ function parseLiveWsMessage(raw: string): LiveWsMessage | null {
       error: String(obj.error || "live stream error"),
       fatal: !!obj.fatal,
     };
+  }
+
+  if (type === "voice-mask") {
+    // The gate's line. Parsing it lives in ./voice-mask-note with its own
+    // tests: this function returns null for a type it does not know, and
+    // while the gate's type was missing from it every verdict was dropped
+    // between the socket and the switch.
+    return parseVoiceMaskMessage(obj);
   }
 
   return null;
@@ -12624,11 +12638,10 @@ function applyVoiceMaskNote(): void {
 
 /** The names of the tracks whose score passed the open threshold. */
 function trackNamesFor(state: VoiceMaskState): string[] {
-  const open = Number(state.openAt ?? 0.5);
-  return (state.tracks ?? [])
-    .filter((track) => Number(track.score) >= open)
-    .map((track) => voiceProfilesStatus.slots[track.slot]?.name ?? `Voice ${track.slot + 1}`)
-    .filter((name) => name.length > 0);
+  return voiceMaskCaughtNames(
+    state,
+    (slot) => voiceProfilesStatus.slots.find((entry) => entry?.slot === slot)?.name ?? "",
+  );
 }
 
 function resetVoiceMaskNote(): void {
@@ -13404,18 +13417,9 @@ async function prepareLiveSession(startAttemptSeq: number): Promise<LiveStartSes
           document.querySelectorAll<HTMLElement>(".voice-slot").forEach((row) => {
             row.classList.toggle("is-firing", firing.has(Number(row.dataset.slot)));
           });
-          // The press needs a couple of seconds of this take, and it counts them
-          // out loud: refusing after the owner has spoken made him guess how
-          // much to say, which is not a question the product should ask.
-          const heardSec = Number(msg.heardSec || 0);
-          const claimBtn = document.getElementById("voiceClaimBtn") as HTMLButtonElement | null;
-          if (claimBtn) {
-            claimBtn.textContent =
-              heardSec >= 2
-                ? `That is me — keep my voice (${heardSec.toFixed(0)} s)`
-                : `That is me — speak (${heardSec.toFixed(1)} s of 2)`;
-            claimBtn.disabled = heardSec < 2;
-          }
+          // The press counts its own seconds (paintClaimButton): the gate's
+          // heardSec stops at its ten-second ring, and writing it here made
+          // the button jump backwards on a longer take.
           // A failure of the gate is said out loud, once per recording: the
           // pane line alone reads as "a stranger was withheld", and this is
           // the opposite - Solo stopped and the take is untouched.

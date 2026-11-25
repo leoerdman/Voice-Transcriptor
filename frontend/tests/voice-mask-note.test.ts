@@ -1,6 +1,13 @@
 import { describe, it, expect } from "vitest";
 
-import { formatWithheld, voiceMaskCaughtText, voiceMaskNoteText, type VoiceMaskState } from "../src/voice-mask-note";
+import {
+  formatWithheld,
+  parseVoiceMaskMessage,
+  voiceMaskCaughtNames,
+  voiceMaskCaughtText,
+  voiceMaskNoteText,
+  type VoiceMaskState,
+} from "../src/voice-mask-note";
 
 const base: VoiceMaskState = { state: "closed", withheldSec: 0, degraded: false, final: false };
 
@@ -83,5 +90,61 @@ describe("the tracks catching a take", () => {
     expect(voiceMaskCaughtText([])).toBe("");
     expect(voiceMaskCaughtText(["  ", ""])).toBe("");
     expect(voiceMaskCaughtText(["", "я · вечер"])).toBe("Catching: я · вечер.");
+  });
+});
+
+describe("the gate's message, read off the socket", () => {
+  // The payload the backend actually sent on 2026-11-25, byte for byte.
+  const live = {
+    type: "voice-mask",
+    state: "open",
+    withheldSec: 0.1,
+    degraded: false,
+    final: false,
+    score: 0.6739,
+    tracks: [
+      { slot: 1, score: 0.1509 },
+      { slot: 2, score: 0.6015 },
+    ],
+    heardSec: 12,
+    openAt: 0.5,
+    closeAt: 0.42,
+  };
+
+  it("keeps a real message instead of dropping it", () => {
+    // This is the regression: the live parser returned null for the gate's
+    // type, so 71 messages on one take reached the page and were thrown away.
+    const parsed = parseVoiceMaskMessage(live);
+    expect(parsed).not.toBeNull();
+    expect(parsed?.type).toBe("voice-mask");
+    expect(parsed?.state).toBe("open");
+    expect(parsed?.withheldSec).toBeCloseTo(0.1);
+    expect(parsed?.tracks).toEqual([
+      { slot: 1, score: 0.1509 },
+      { slot: 2, score: 0.6015 },
+    ]);
+    expect(parsed?.openAt).toBeCloseTo(0.5);
+    expect(parsed?.closeAt).toBeCloseTo(0.42);
+  });
+
+  it("refuses everything that is not the gate's message", () => {
+    expect(parseVoiceMaskMessage(null)).toBeNull();
+    expect(parseVoiceMaskMessage("voice-mask")).toBeNull();
+    expect(parseVoiceMaskMessage({ type: "segments", segments: [] })).toBeNull();
+  });
+
+  it("survives a track list it cannot read, and an unknown state", () => {
+    const parsed = parseVoiceMaskMessage({ type: "voice-mask", state: "weird", tracks: [null, {}] });
+    expect(parsed?.state).toBe("idle");
+    expect(parsed?.tracks).toEqual([]);
+    expect(parsed?.score).toBeNull();
+  });
+
+  it("names the tracks that passed the threshold, by their slot's name", () => {
+    const parsed = parseVoiceMaskMessage(live);
+    expect(parsed).not.toBeNull();
+    if (!parsed) return;
+    const bySlot = new Map([[1, "я"], [2, "e2e owner take"]]);
+    expect(voiceMaskCaughtNames(parsed, (slot) => bySlot.get(slot) ?? "")).toEqual(["e2e owner take"]);
   });
 });

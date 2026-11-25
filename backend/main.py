@@ -9485,6 +9485,8 @@ def claim_voice_for_recording(
     the owner against 0.35 for the stranger). One press during the recording
     settles it, and a settled reference separates by 0.4.
     """
+    import numpy as np
+
     global _ACTIVE_VOICE_MASK
     mask = _ACTIVE_VOICE_MASK
     if mask is None:

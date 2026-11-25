@@ -49,6 +49,64 @@ export interface VoiceMaskState {
   tracks?: Array<{ slot: number; score: number }>;
 }
 
+/** The gate's message on /ws/transcribe: its line, tagged. */
+export type VoiceMaskMessage = { type: "voice-mask" } & VoiceMaskState;
+
+/**
+ * Read one `voice-mask` payload the backend sent.
+ *
+ * This lives here, and is tested here, because the parser that reads the live
+ * socket returns `null` for a type it does not know: when the gate's type was
+ * missing from that one function, every verdict was thrown away between the
+ * socket and the switch - the card could not light a row and the pane stayed
+ * empty however well the gate judged. Measured 2026-11-25: 71 state messages
+ * arrived on one take and nothing was drawn.
+ */
+export function parseVoiceMaskMessage(value: unknown): VoiceMaskMessage | null {
+  if (!value || typeof value !== "object") return null;
+  const obj = value as Record<string, unknown>;
+  if (String(obj.type || "").trim() !== "voice-mask") return null;
+  const tracks = Array.isArray(obj.tracks)
+    ? obj.tracks
+        .map((track) => {
+          const entry = (track || {}) as Record<string, unknown>;
+          return { slot: Number(entry.slot), score: Number(entry.score) };
+        })
+        .filter((track) => Number.isFinite(track.slot) && Number.isFinite(track.score))
+    : [];
+  const score = Number(obj.score);
+  return {
+    type: "voice-mask",
+    state: obj.state === "open" || obj.state === "closed" || obj.state === "idle" ? obj.state : "idle",
+    withheldSec: Number(obj.withheldSec) || 0,
+    degraded: !!obj.degraded,
+    final: !!obj.final,
+    score: Number.isFinite(score) && obj.score !== null ? score : null,
+    openAt: Number(obj.openAt) || undefined,
+    closeAt: Number(obj.closeAt) || undefined,
+    heardSec: Number(obj.heardSec) || 0,
+    tracks,
+  };
+}
+
+/**
+ * The names of the tracks whose score passed the open threshold.
+ *
+ * The name comes from a lookup by SLOT, never by position: the status list is
+ * ordered but its index is not the slot's number, and indexing it with the
+ * slot read the wrong track - the pane said nothing while a row was glowing.
+ */
+export function voiceMaskCaughtNames(
+  state: VoiceMaskState,
+  nameForSlot: (slot: number) => string,
+): string[] {
+  const open = Number(state.openAt ?? 0.5);
+  return (state.tracks ?? [])
+    .filter((track) => Number(track.score) >= open)
+    .map((track) => nameForSlot(track.slot).trim())
+    .filter((name) => name.length > 0);
+}
+
 export function formatWithheld(seconds: number): string {
   const safe = Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
   if (safe > 0 && safe < 0.1) return "under 0.1 s";
