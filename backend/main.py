@@ -9461,9 +9461,12 @@ def stop_live_voice_tune(token: str, _auth: None = Depends(_require_api_auth)):
     return {"stopped": bool(stopped)}
 
 
-#: The vector behind the current claim, so the name step stores the same voice.
+#: What the current claim learned, so the name step stores the same voice:
+#: its vector, the voice's own floor and the level it spoke at. A track saved
+#: without the last two cannot be switched on - the enable route refuses a
+#: voice "learned before Solo could measure it".
 from typing import Any  # noqa: E402  (kept beside the state it types)
-_ACTIVE_VOICE_VECTOR: list[Any] = [None]
+_ACTIVE_VOICE_CLAIM: list[Any] = [None]
 
 
 #: The gate of the recording that is running, so one press can tell it whose
@@ -9510,15 +9513,27 @@ def claim_voice_for_recording(
         )
     embedder = SpeakerEmbedder()
     try:
-        vector = embedder.embed(audio)
+        # The press measures the same two numbers an enrolment does, from the
+        # same seconds: the voice's own floor and its level. Storing zeros was
+        # the press writing a track that could never be switched on - the
+        # enable route refuses a track learned before Solo could measure it,
+        # and says "learn it again" about a track made a second earlier.
+        vector, self_floor = enrol_take_stats(embedder, audio)
+        level_db = take_level_db(audio)
+    except EnrolmentError:
+        raise HTTPException(status_code=400, detail="no voice was heard in those seconds") from None
     finally:
         embedder.close()
     if vector is None:
         raise HTTPException(status_code=400, detail="no voice was heard in those seconds")
     scorer.set_owner(vector)
     # Kept here so the name step can store the same voice without asking the
-    # microphone again — the vector is the press's whole result.
-    _ACTIVE_VOICE_VECTOR[0] = np.asarray(vector, dtype=np.float64)
+    # microphone again - the vector is the press's whole result.
+    _ACTIVE_VOICE_CLAIM[0] = {
+        "vector": np.asarray(vector, dtype=np.float64),
+        "self_floor": float(self_floor),
+        "level_db": float(level_db),
+    }
     logger.info("voice claimed for the running recording from its own windows")
     return {"claimed": True, "seconds": round(heard, 1)}
 
@@ -9536,8 +9551,8 @@ def save_claimed_voice(
     take lives in another channel — which is why Solo kept failing to
     recognise its own owner (0.34 against a 0.42 close, measured 2026-11-24).
     """
-    vector = _ACTIVE_VOICE_VECTOR[0]
-    if vector is None:
+    claim = _ACTIVE_VOICE_CLAIM[0]
+    if not claim:
         raise HTTPException(
             status_code=400,
             detail="no voice has been claimed in this recording yet - press That is me first",
@@ -9553,7 +9568,16 @@ def save_claimed_voice(
             detail=f"all {SLOTS} tracks are full - remove one in Settings first",
         )
     try:
-        VOICE_PROFILES.save(slot, name, vector, self_floor=0.0, level_db=0.0)
+        # With the numbers the press measured: a track written with zeros can
+        # never be switched on, and the card would say "learn it again" about
+        # a track the owner had just made.
+        VOICE_PROFILES.save(
+            slot,
+            name,
+            claim["vector"],
+            self_floor=float(claim["self_floor"]),
+            level_db=float(claim["level_db"]),
+        )
     except ProfileError as e:
         raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
     logger.info("claimed voice saved as track %s (%r)", slot, name)
@@ -9566,7 +9590,7 @@ def clear_active_voice_mask() -> None:
     """The take ended: a claim about one recording must not outlive it."""
     global _ACTIVE_VOICE_MASK
     _ACTIVE_VOICE_MASK = None
-    _ACTIVE_VOICE_VECTOR[0] = None
+    _ACTIVE_VOICE_CLAIM[0] = None
 
 
 def recording_voice_mask() -> Optional[VoiceMask]:
