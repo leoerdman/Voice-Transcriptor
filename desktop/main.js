@@ -518,6 +518,12 @@ function _useOneSpellingForUserDataDir() {
   }
   appendMainLog(`[user-data-dir] name=${preferredName} decision=${decision.action}/${decision.reason}`);
 }
+// The log rotation throttle, declared before the first line anything logs:
+// the boot steps below run ahead of this file's later declarations, and a
+// counter declared with them was in its temporal dead zone — the first log
+// line threw and the whole main process died before a window existed.
+let mainLogCheckCounter = 0;
+
 _useOneSpellingForUserDataDir();
 _relocateUserDataOffOneDrive();
 
@@ -816,7 +822,12 @@ const MAIN_LOG_MAX_BYTES = 5 * 1024 * 1024;
 // No cached size: `mainLogSizeCached` was written in two places and read
 // in none, which made it look as if the rotation check avoided a stat it
 // never avoided. mainLogCheckCounter is the real throttle.
-let mainLogCheckCounter = 0;
+//
+// Declared HERE, above the boot steps below, because those steps log: the
+// two calls that settle userData run before this file's later declarations,
+// so a counter declared with them was in its temporal dead zone and the first
+// log line threw "Cannot access 'mainLogCheckCounter' before initialization"
+// — the whole main process died before a window existed.
 
 function mainLogArchivePath(kind) {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -892,6 +903,20 @@ function rotateMainLogIfNeeded() {
       }
     }
   } catch { /* stat failed — nothing to rotate */ }
+}
+
+// A link that lets this window's own rights be exercised in an ordinary
+// browser: the E2E of the desk needs a page that can reach the API, and BM-01
+// keeps the token out of the page by design. The token rides in the fragment -
+// a browser never sends a fragment to a server and a proxy never logs it - and
+// the renderer strips it from the address bar once it has been read. Off unless
+// the shell is started with TRANSCRIPTOR_BROWSER_LINK=1, and it dies with this
+// process, so the link is a session, not a password.
+const BROWSER_LINK_ENABLED = process.env.TRANSCRIPTOR_BROWSER_LINK === "1";
+
+function logBrowserLink() {
+  if (!BROWSER_LINK_ENABLED) return;
+  appendMainLog(`[browser-link] ${BASE_URL}/#token=${BACKEND_API_TOKEN}`);
 }
 
 function appendMainLog(message) {
@@ -9272,6 +9297,7 @@ async function createWindow(options = {}) {
     // outside shutdown, so the exponential backoff compounded across
     // sessions making the log delay misleading.
     noteBackendHealthy("backend-recovery");
+    logBrowserLink();
     // CLEAR `backendBootError` once /api/health responds OK. Pass-24c
     // added a `did-finish-load` replay of this string so a closed-
     // and-reopened window can re-deliver the diagnostic — but if the

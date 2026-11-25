@@ -19,6 +19,7 @@ Voice Transcriptor/
 ├── contracts/                     # cross-domain wire fixtures: live-final-envelope.json, live-defaults.json, screen-session.json (fail the build on drift)
 ├── .env.example                   # user-facing environment-variable SSOT
 ├── docs/                          # PRODUCT.md, VISION.md, ROADMAP.md, OPTIMIZATION.md, TASKS_2026-11-23.md (open-task registry), install guides, research/; archive/ holds past session handoffs and audit ledgers
+├── docs/                          # VERIFIED_AUDIT.md, AUDIT_2026-08.md, PRODUCT.md, VISION.md, SOLO.md (skeleton), BACKLOG.md, install guides
 ├── backend/                       # FastAPI backend and transcription pipeline
 ├── frontend/                      # Vite/TypeScript renderer
 └── desktop/                       # Electron shell and package config
@@ -65,6 +66,11 @@ backend/
 ├── recording_names.py         # recording file-name SSOT: `YYYYMMDD-HHMMSS[-xxxx]` from the recording's local time; recognises legacy `<timestamp>__<title>` stems
 ├── screen_sessions.py         # screen-mode screenshots SSOT: staging → `<stem>.screens` beside the recording, serving, orphan sweep (retention shares the audio rule)
 ├── live_envelope.py           # the `final` WebSocket envelope: one shape, one constructor
+├── voice_mask.py              # target-speaker gate: a refused window is zeroed in the forwarded copy, never a byte fewer
+├── voice_mask_worker.py       # that gate on one thread: submit never waits, close flushes, order and byte count kept
+├── voice_embed.py             # the net behind that gate: 80-dim fbank, one ONNX file, a cosine — no new dependency
+├── voice_profiles.py          # three slots of vectors on disk, one of them switched on; a fourth is refused
+├── voice_enrol.py             # a six-second capture becomes one of those vectors: cut, thinned, voiced-only, averaged
 ├── async_tasks.py             # ending started asyncio tasks without ending the awaiting coroutine (one owner of the pattern)
 ├── http_retry.py              # remote request retry handling
 ├── jobs.py                    # in-memory job store and cancellation
@@ -127,6 +133,10 @@ frontend/
     ├── gated-poll.ts                 # conditional-polling scheduler SSOT (pure, timer-injected)
     ├── error-text.ts                 # readable text for thrown values SSOT (pure)
     ├── list-window.ts                # history-list windowing policy SSOT (pure)
+    ├── voice-mask-note.ts            # the one line that says a refusal is happening: reported seconds, never a lost-take claim (pure)
+    ├── voice-profiles-section.ts     # Settings → Solo: three slots, one switch each, and what the line under the heading says (pure)
+    ├── voice-enrol-prompt.ts         # what a press costs: the six seconds, the line to read out loud, the countdown while it records (pure)
+    ├── enrol-audio.ts                # capture arithmetic: 16 kHz averaging decimation, PCM16LE, seconds held (pure)
     └── update-check.ts               # GitHub release detection (Level 1), version compare (pure)
 ```
 

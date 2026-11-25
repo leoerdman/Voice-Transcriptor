@@ -255,6 +255,54 @@ import {
 import { BoundedChunkWindow, capturedHoursLabel, pcmWavDurationSec } from "./pcm-capture";
 import { draftSpokenText, parsePromotedTake, planTakeRecovery, type PromotedTake } from "./take-recovery";
 import {
+  VOICE_PROFILES_EMPTY,
+  nextFreeSlot,
+  normalizeVoiceProfiles,
+  voiceMaskTarget,
+  voiceMaskView,
+  type VoiceProfilesStatus,
+} from "./voice-profiles-section";
+import {
+  concatSamples,
+  int16FromFloat,
+  resampleTo16k,
+} from "./enrol-audio";
+import {
+  parseVoiceMaskMessage,
+  voiceMaskCaughtNames,
+  voiceMaskCaughtText,
+  voiceMaskNoteText,
+  type VoiceMaskState,
+} from "./voice-mask-note";
+import { liveSourceNote } from "./live-source-note";
+import {
+  SPECTRUM_BARS,
+  meterCaption,
+  meterIsQuiet,
+  meterZone,
+  scorePosition,
+  spectrumBars,
+  spectrumEdges,
+  type MeterState,
+} from "./live-meter";
+import {
+  clampClose,
+  clampOpen,
+  normalizeTuneData,
+  tuneBarHeight,
+  tuneDecisions,
+  tuneSummary,
+  tuneSummaryText,
+  type TuneData,
+  type TuneWindow,
+} from "./voice-tune";
+import {
+  SOLO_INVITE_TEXT,
+  readSoloInviteDismissed,
+  rememberSoloInviteDismissed,
+  soloInviteShows,
+} from "./solo-invite";
+import {
   EMPTY_SCREEN_ANNOTATION,
   annotateTranscript,
   hasScreenAnnotation,
@@ -645,7 +693,9 @@ type LiveWsMessage =
    * verdict — whether that wait is expected to yield words we do not
    * already have. One number, decided where the coverage data lives.
    */
-  | { type: "finalizing"; budgetMs: number; expectsMore: boolean };
+  | { type: "finalizing"; budgetMs: number; expectsMore: boolean }
+  // The gate's own line: what it withheld, and the tracks matching now.
+  | ({ type: "voice-mask" } & VoiceMaskState);
 
 function parseLiveWsMessage(raw: string): LiveWsMessage | null {
   let parsed: unknown;
@@ -699,6 +749,14 @@ function parseLiveWsMessage(raw: string): LiveWsMessage | null {
       error: String(obj.error || "live stream error"),
       fatal: !!obj.fatal,
     };
+  }
+
+  if (type === "voice-mask") {
+    // The gate's line. Parsing it lives in ./voice-mask-note with its own
+    // tests: this function returns null for a type it does not know, and
+    // while the gate's type was missing from it every verdict was dropped
+    // between the socket and the switch.
+    return parseVoiceMaskMessage(obj);
   }
 
   return null;
@@ -2654,8 +2712,30 @@ const keySavedState: Record<RemoteProvider, boolean> = {
 // carries it. Outside the desktop shell (the page opened in a browser, the
 // Vite dev server) there is no token and every API call fails here — the
 // backend is reachable with full rights only through the app's own window.
+//
+// The one deliberate exception is a link the shell prints when it is asked to
+// (`-BrowserLink`): the token travels in the URL fragment, which a browser never
+// sends to a server and never writes to a proxy's log, and it is stripped from
+// the address bar the moment it has been read. It dies with the backend's
+// process, so the link is a session, not a password.
+const tokenFromFragment = (): string => {
+  const hash = window.location.hash.replace(/^#/, "");
+  if (!hash) return "";
+  const params = new URLSearchParams(hash);
+  const token = (params.get("token") || "").trim();
+  if (token) {
+    params.delete("token");
+    const rest = params.toString();
+    const cleaned = `${window.location.pathname}${window.location.search}${rest ? `#${rest}` : ""}`;
+    window.history.replaceState(null, "", cleaned);
+  }
+  return token;
+};
+
+const bootToken = tokenFromFragment();
+
 const apiToken = (): string => {
-  const token = (window.__TRANSCRIPTOR_API_TOKEN || "").trim();
+  const token = (window.__TRANSCRIPTOR_API_TOKEN || bootToken || "").trim();
   if (!token) {
     throw new Error("API token is missing. Restart app.");
   }
@@ -3764,6 +3844,51 @@ function setStatusScoped(scopeToken: string, st: string, kind?: StatusKind): voi
  * per transition regardless of which path caused it, and the button
  * cannot drift out of step with a recording the hotkey started.
  */
+/**
+ * The claim button: offered while a take runs with Solo on, and only then.
+ *
+ * It sits beside Record rather than in the live preview, because the preview
+ * is switched off in ordinary use and a button inside it is a button nobody
+ * finds - the owner dictated that complaint into a recording before this.
+ */
+/** When this take started, so the press counts its own seconds. */
+let claimTakeStartedAt = 0;
+let claimTicker = 0;
+
+function paintClaimButton(): void {
+  const button = document.getElementById("voiceClaimBtn") as HTMLButtonElement | null;
+  if (!button) return;
+  const heard = claimTakeStartedAt > 0 ? (Date.now() - claimTakeStartedAt) / 1000 : 0;
+  button.hidden = !(isRecording && voiceProfilesStatus.enabledSlot !== null);
+  if (button.hidden) {
+    button.disabled = false;
+    button.textContent = "That is me — keep my voice";
+    return;
+  }
+  // Counted here, not taken from the gate: a quiet room produces no state
+  // reports at all, so a press that waited for one sat on its default label
+  // while the owner spoke into nothing.
+  button.textContent =
+    heard >= 2
+      ? `That is me — keep my voice (${heard.toFixed(0)} s)`
+      : `That is me — speak (${heard.toFixed(1)} s of 2)`;
+  button.disabled = heard < 2;
+}
+
+function syncClaimButton(): void {
+  if (isRecording && voiceProfilesStatus.enabledSlot !== null) {
+    if (claimTakeStartedAt === 0) claimTakeStartedAt = Date.now();
+    if (claimTicker === 0) {
+      claimTicker = window.setInterval(paintClaimButton, 250);
+    }
+  } else if (claimTicker !== 0) {
+    window.clearInterval(claimTicker);
+    claimTicker = 0;
+    claimTakeStartedAt = 0;
+  }
+  paintClaimButton();
+}
+
 function setRecordButton(recording: boolean): void {
   const was = isRecording;
   isRecording = !!recording;
@@ -4145,6 +4270,20 @@ async function apiPost<T>(
   return (await r.json()) as T;
 }
 
+
+/**
+ * Post a body that is not JSON: the live tuner sends raw PCM16, which is
+ * the one shape the scoring route takes and no encoder belongs in front of it.
+ */
+async function apiPostBinary<T>(url: string, body: Blob): Promise<T> {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream", ...authHeaders() },
+    body,
+  });
+  if (!r.ok) throw new Error(await parseError(r));
+  return (await r.json()) as T;
+}
 async function apiPut<T>(
   url: string,
   body: unknown,
@@ -8263,6 +8402,962 @@ $("deepgramKeytermsInput").addEventListener("change", () => {
   void flushUiPreferencesSaveNow().then(() => refreshAutoKeyterms());
 });
 
+// ── Settings → Voice mask ───────────────────────────────────────────────────
+//
+// Three slots, one switch each, one Forget per learned voice (§5.1, §7.4). The
+// view is src/voice-profiles-section.ts; this is the part that reads the store
+// and carries out a press.
+//
+// A press on an empty slot is the whole enrolment: there is no take dropdown
+// and no "make a profile" button, because the switch that needs a voice is the
+// one that learns it — it opens the microphone for six seconds and keeps the
+// presser reading the printed line. A voice kept from the newest take would be
+// whoever spoke last in History, which is the one person the mask is least
+// likely to be for. Nothing here filters audio; the gate that reads the
+// profile is §7.3's.
+
+let voiceProfilesStatus: VoiceProfilesStatus = VOICE_PROFILES_EMPTY;
+/**
+ * The slot whose switch is being carried out, drawn as already pressed.
+ *
+ * A switch that waits for the store before it moves reads as a switch that
+ * refused: the write takes as long as enrolment does (seconds, on a cold
+ * model), and until it lands the row paints the old answer, so the knob flicks
+ * on and back. This is the press, held on screen for exactly as long as the
+ * store is being asked — every switch is disabled meanwhile, so the pending
+ * answer cannot be overwritten by a second press.
+ */
+let voiceSwitchPending: { slot: number; on: boolean } | null = null;
+/**
+ * Whether `voiceProfilesStatus` came from the store.
+ *
+ * A failed read leaves the same empty payload a genuinely empty store would,
+ * and the card would then say "nothing learned yet" about a store nobody
+ * read. This is the one bit that tells the two apart, and it is false until
+ * the first answer arrives.
+ */
+let voiceProfilesKnown = false;
+/** Set while one of this section's requests is in flight. */
+let voiceProfilesBusy = false;
+
+
+/**
+ * Which row control had focus, so a rebuild can put it back.
+ *
+ * The rows are thrown away and rebuilt on every render, and a render happens
+ * whenever the store answers — including a refresh that lands while the user
+ * is tabbing through them. Without this, the keyboard focus falls to the body
+ * on a background read and the user has to start the card over.
+ */
+function voiceFocusKey(): { slot: string; kind: "switch" | "forget" } | null {
+  const active = document.activeElement as HTMLElement | null;
+  const row = active?.closest?.(".voice-slot") as HTMLElement | null;
+  if (!active || !row) return null;
+  const kind = active.matches("input[type=checkbox]")
+    ? "switch"
+    : active.matches("button.voice-slot-forget")
+      ? "forget"
+      : null;
+  const slot = row.dataset.slot || "";
+  return kind && slot ? { slot, kind } : null;
+}
+
+function restoreVoiceFocus(key: { slot: string; kind: "switch" | "forget" } | null): void {
+  if (!key) return;
+  const control = key.kind === "switch" ? "input[type=checkbox]" : "button.voice-slot-forget";
+  document
+    .querySelector<HTMLElement>(
+      `#voiceProfileSlots .voice-slot[data-slot="${key.slot}"] ${control}`,
+    )
+    ?.focus({ preventScroll: true });
+}
+
+function setVoiceProfilesError(message: string): void {
+  const node = $("voiceProfilesError");
+  const text = String(message || "").trim();
+  node.textContent = text;
+  node.hidden = !text;
+}
+
+/** localStorage where the browser has one, and nothing where it refuses it. */
+function storageOrNull(): Storage | null {
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Has the one-time call been answered already.
+ *
+ * Read once at boot: a press writes it through, so a later render cannot bring
+ * the call back in the same session, and the next launch reads it back.
+ */
+let soloInviteDismissed = readSoloInviteDismissed(storageOrNull());
+
+/** The three rows, the note, and the topbar's button. */
+function renderVoiceMask(): void {
+  const view = voiceMaskView(voiceProfilesStatus, { unknown: !voiceProfilesKnown });
+  $("voiceProfilesNote").textContent = view.summary;
+
+  // A press in flight is painted as the answer it asked for, not as the one
+  // still in the store: otherwise the button flicks on and back for as long as
+  // enrolment takes, which reads as a rejection.
+  const pending = voiceSwitchPending;
+
+  const solo = $("soloToggleBtn") as HTMLButtonElement;
+  const on = pending ? pending.on : view.checked;
+  solo.setAttribute("aria-pressed", String(on));
+  solo.classList.toggle("is-on", on);
+  solo.disabled = view.disabled || voiceProfilesBusy;
+  // The words the button has no room for.
+  solo.setAttribute("aria-label", view.summary);
+  solo.title = view.summary;
+
+  // No voice learned is no control at all: a press here could only send the
+  // user to another screen, which reads as a button that does nothing. The
+  // one-time call below is how the feature is met instead.
+  $("soloItem").hidden = !view.visible;
+
+  const invite = $("soloInvite");
+  $("soloInviteText").textContent = SOLO_INVITE_TEXT;
+  invite.hidden = !soloInviteShows({ invite: view.invite, dismissed: soloInviteDismissed });
+
+  const list = $("voiceProfileSlots");
+  // The rows are rebuilt wholesale, so whatever had focus is about to be
+  // detached: remember which control it was and put it back at the end.
+  const focusKey = voiceFocusKey();
+  list.textContent = "";
+  for (const row of view.rows) {
+    const item = document.createElement("div");
+    item.className = `voice-slot${row.empty ? " is-empty" : ""}${row.enabled ? " is-kept" : ""}`;
+    item.dataset.slot = String(row.slot);
+    item.setAttribute("role", "listitem");
+
+    if (row.empty) {
+      // Settings no longer learns: a track comes only from a take the owner
+      // claimed with "That is me", through the same channel the gate judges.
+      // An empty row says exactly that and offers nothing to press.
+      const hint = document.createElement("span");
+      hint.className = "voice-slot-hint";
+      hint.textContent = "No track yet — press “That is me” while recording.";
+      item.append(hint);
+      list.appendChild(item);
+      continue;
+    }
+    const copy = document.createElement("div");
+    copy.className = "voice-slot-copy";
+    const label = document.createElement("span");
+    label.className = "voice-slot-name";
+    label.textContent = row.label;
+    const meta = document.createElement("span");
+    meta.className = "voice-slot-meta";
+    // The date is the only fact a filled slot has besides its name. While the
+    // press is recording, the row says so in place of the date — the switch
+    // being on is not the same fact as "six seconds are being taken now".
+    const learning = pending !== null && pending.slot === row.slot && pending.on;
+    // Which track is catching right now, said on the track itself: with seven
+    // tracks the owner must not have to read every row's switch to know.
+    meta.textContent = learning ? "Learning…" : row.enabled ? "Catching now" : row.learnedOn;
+    copy.append(label, meta);
+    if (row.enabled) item.classList.add("is-catching");
+
+    const toggle = document.createElement("label");
+    toggle.className = "toggle-inline voice-slot-switch";
+    const caption = document.createElement("span");
+    caption.textContent = "Let through";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = pending && pending.slot === row.slot ? pending.on : row.enabled;
+    input.disabled = voiceProfilesBusy;
+    input.setAttribute("aria-label", `Let ${row.label} through, and nobody else`);
+    input.addEventListener("change", () => {
+      void switchSlot(row.slot, input.checked);
+    });
+    toggle.append(caption, input);
+    item.append(copy, toggle);
+
+    // The tuner's door: a filled slot can be dragged against a real take.
+    const tune = document.createElement("button");
+    tune.type = "button";
+    tune.className = "btn btn-sm voice-slot-tune";
+    tune.textContent = "Tune";
+    tune.disabled = voiceProfilesBusy;
+    tune.setAttribute("aria-label", `Tune thresholds for ${row.label} against a recording`);
+    tune.addEventListener("click", () => {
+      void openVoiceTune(row.slot);
+    });
+    item.append(tune);
+
+    if (!row.empty) {
+      const forget = document.createElement("button");
+      forget.type = "button";
+      forget.className = "btn btn-ghost voice-slot-forget";
+      forget.textContent = "Remove";
+      forget.disabled = voiceProfilesBusy;
+      forget.setAttribute("aria-label", `Remove ${row.label}`);
+      forget.addEventListener("click", () => {
+        void forgetSlot(row.slot, row.label);
+      });
+      item.appendChild(forget);
+    }
+
+    list.appendChild(item);
+  }
+  restoreVoiceFocus(focusKey);
+}
+
+/** One write against the store, and the re-read that paints what it did. */
+async function writeVoiceProfiles(run: () => Promise<unknown>, failure: string): Promise<void> {
+  voiceProfilesBusy = true;
+  renderVoiceMask();
+  try {
+    voiceProfilesStatus = normalizeVoiceProfiles(await run());
+    voiceProfilesKnown = true;
+    setVoiceProfilesError("");
+  } catch (e) {
+    // Every refusal the backend makes here is about this press ("no speech",
+    // "shorter than the window", "weights not installed"), and the message is
+    // the whole point of it failing.
+    setVoiceProfilesError(sanitizeUiErrorMessage(e, failure));
+    try {
+      voiceProfilesStatus = normalizeVoiceProfiles(await apiGet<unknown>("/api/voice/profiles"));
+      voiceProfilesKnown = true;
+    } catch {
+      voiceProfilesStatus = VOICE_PROFILES_EMPTY;
+      voiceProfilesKnown = false;
+    }
+  } finally {
+    voiceProfilesBusy = false;
+    renderVoiceMask();
+  }
+}
+
+async function refreshVoiceProfiles(): Promise<void> {
+  try {
+    voiceProfilesStatus = normalizeVoiceProfiles(await apiGet<unknown>("/api/voice/profiles"));
+    voiceProfilesKnown = true;
+    setVoiceProfilesError("");
+  } catch (e) {
+    // An unreachable backend is not evidence that no voice is learned: the
+    // card falls back to "could not read" rather than painting an answer.
+    voiceProfilesStatus = VOICE_PROFILES_EMPTY;
+    voiceProfilesKnown = false;
+    setVoiceProfilesError(sanitizeUiErrorMessage(e, "Could not read the voice profiles."));
+  }
+  renderVoiceMask();
+}
+
+// ---- The tuner -------------------------------------------------------------
+//
+// "Which of these parameters work" stopped being a question for the chat and
+// became a picture: one take scored window by window, the two thresholds drawn
+// over it, the owner dragging until the strip shows their voice kept and the
+// other one withheld. The numbers are the gate's own; the module that reads
+// them is pure and unit-tested (./voice-tune).
+
+// ---- The live tuner --------------------------------------------------------
+//
+// The first version opened old recordings. That asked the owner to pick a take
+// from a list he could not name, to answer a question about his own microphone
+// — and he said so, plainly. So the tuner listens instead: the browser sends
+// what it hears, the backend scores every two-second window as it lands, and a
+// bar appears while the voice is still in the room.
+//
+// The two lines are similarity to the voice's own profile, never loudness:
+// `open` is how close a window must be to let it through, `close` is how far it
+// must fall to shut. Loudness has its own rule (the level learned with the
+// profile) and it is already inside the bars as the grey ones.
+
+let voiceTuneSlot: number | null = null;
+let voiceTuneToken: string | null = null;
+let voiceTuneData: TuneData | null = null;
+/** Bars are a feed, not a take: the strip keeps the newest, drops the oldest. */
+let voiceTuneBars: TuneWindow[] = [];
+// What the strip holds: six seconds at a quarter-second hop. Enough to see a
+// handover, short enough that the newest word is at the right edge.
+const VOICE_TUNE_MAX_BARS = 48;
+
+let tuneStream: MediaStream | null = null;
+let tuneCtx: AudioContext | null = null;
+let tuneNode: ScriptProcessorNode | null = null;
+let tuneSource: MediaStreamAudioSourceNode | null = null;
+let tuneSink: GainNode | null = null;
+let tunePending: Float32Array[] = [];
+let tunePumpTimer = 0;
+
+function tuneStripNodes(): HTMLElement[] {
+  const strip = $("voiceTuneStrip");
+  const bars = Array.from(strip.querySelectorAll<HTMLElement>(".voice-tune-bar"));
+  return bars;
+}
+
+/**
+ * The strip, the lines and the two sentences.
+ *
+ * Two facts the first version got wrong and the owner said so about: the bars
+ * accumulate forever (a feed, not a take — the newest matters), and the level
+ * rule colours every bar grey before the sliders ever matter. So the strip now
+ * keeps a window of recent audio and scrolls, and the level rule is a switch
+ * that can be turned off to see what the score alone says.
+ */
+function paintVoiceTune(): void {
+  const data = voiceTuneData;
+  if (data === null || voiceTuneSlot === null) return;
+  const open = clampOpen(data.open_at);
+  const close = clampClose(data.close_at, open);
+
+  const openSlider = $("voiceTuneOpen") as HTMLInputElement;
+  const closeSlider = $("voiceTuneClose") as HTMLInputElement;
+  openSlider.value = String(open);
+  closeSlider.value = String(close);
+  $("voiceTuneOpenVal").textContent = open.toFixed(3);
+  $("voiceTuneCloseVal").textContent = close.toFixed(3);
+
+  const levelOn = ($("voiceTuneLevelRule") as HTMLInputElement).checked;
+  const shown = voiceTuneBars.slice(-VOICE_TUNE_MAX_BARS);
+  const strip = $("voiceTuneStrip");
+  // Fixed-width bars, newest at the right: a strip that shrinks its own bars
+  // to fit is a strip that answers "how long have I been talking" instead of
+  // "what is happening now".
+  let bars = tuneStripNodes();
+  if (bars.length !== shown.length) {
+    strip.textContent = "";
+    bars = shown.map(() => {
+      const bar = document.createElement("span");
+      bar.className = "voice-tune-bar";
+      strip.appendChild(bar);
+      return bar;
+    });
+  }
+  const decisions = tuneDecisions(
+    shown.map((w) => ({ ...w, far: levelOn && w.far })),
+    open,
+    close,
+  );
+  shown.forEach((win, index) => {
+    const bar = bars[index];
+    bar.className = `voice-tune-bar is-${decisions[index]}`;
+    bar.style.height = `${Math.max(4, tuneBarHeight(win.score))}%`;
+    bar.title = `score ${win.score.toFixed(3)} · ${win.level_db.toFixed(1)} dB`;
+  });
+  strip.querySelectorAll(".voice-tune-line").forEach((line) => line.remove());
+  const openLine = document.createElement("span");
+  openLine.className = "voice-tune-line is-open";
+  openLine.style.bottom = `${tuneBarHeight(open)}%`;
+  const closeLine = document.createElement("span");
+  closeLine.className = "voice-tune-line is-close";
+  closeLine.style.bottom = `${tuneBarHeight(close)}%`;
+  strip.append(openLine, closeLine);
+  strip.scrollLeft = strip.scrollWidth;
+
+  if (data.level_db !== 0) {
+    $("voiceTuneLevelText").textContent =
+      `Withhold anything quieter than ${(data.level_db - 12).toFixed(0)} dB ` +
+      `(the voice was learned at ${data.level_db.toFixed(0)} dB)`;
+  }
+  // "This take has no window Solo could score" was written for a recording
+  // and reads as a fault here, where nothing has been heard yet on purpose.
+  $("voiceTuneSummary").textContent =
+    shown.length === 0
+      ? `Nothing heard yet — press Start listening. The lines sit at ${open.toFixed(3)} / ${close.toFixed(3)}.`
+      : tuneSummaryText(
+          tuneSummary(
+            shown.map((w) => ({ ...w, far: levelOn && w.far })),
+            open,
+            close,
+          ),
+        );
+}
+
+/** dBFS of a float buffer, the number the level rule compares. */
+function levelDbOf(samples: Float32Array): number {
+  let sum = 0;
+  for (let i = 0; i < samples.length; i += 1) sum += samples[i] * samples[i];
+  const rms = samples.length > 0 ? Math.sqrt(sum / samples.length) : 0;
+  return rms > 0 ? 20 * Math.log10(rms) : 0;
+}
+
+/** The microphone's own loudness, once per pump — the instant half of the meter. */
+function paintVoiceTuneNow(levelDb: number, score: number | null): void {
+  const level = Number.isFinite(levelDb) && levelDb !== 0 ? `${levelDb.toFixed(0)} dB` : "silent";
+  const heard = score === null ? "first window in a moment" : `last window scored ${score.toFixed(3)}`;
+  $("voiceTuneNow").textContent = `Microphone now: ${level} · ${heard}.`;
+}
+async function startVoiceTune(): Promise<void> {
+  if (voiceTuneSlot === null || voiceTuneToken !== null) return;
+  renderVoiceMask();
+  try {
+    const raw = await apiPost<unknown>(`/api/voice/profiles/${voiceTuneSlot}/tune-live`, {});
+    const data = normalizeTuneData({ ...(raw as object), windows: [] });
+    if (data === null) throw new Error("the backend did not open a listening session");
+    voiceTuneData = data;
+    voiceTuneToken = String((raw as { token?: string }).token || "");
+    if (!voiceTuneToken) throw new Error("the backend returned no session token");
+
+    // Same channel as the recorder: a tuner that heard the microphone through
+    // different processing than the gate does would be tuning a signal nobody
+    // will ever score.
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { ...DICTATION_AUDIO_PROCESSING } });
+    const ctx = new AudioContext();
+    await ctx.resume();
+    const source = ctx.createMediaStreamSource(stream);
+    // 4096 frames is ~85 ms: the backend joins these into 2 s windows itself,
+    // so this only has to hand audio over without any gaps.
+    const node = ctx.createScriptProcessor(4096, 1, 1);
+    node.onaudioprocess = (event) => {
+      if (voiceTuneToken === null) return;
+      tunePending.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+    };
+    const sink = ctx.createGain();
+    sink.gain.value = 0;
+    source.connect(node);
+    node.connect(sink);
+    sink.connect(ctx.destination);
+
+    tuneStream = stream;
+    tuneCtx = ctx;
+    tuneNode = node;
+    tuneSource = source;
+    tuneSink = sink;
+    voiceTuneBars = [];
+    $("voiceTuneStart").hidden = true;
+    $("voiceTuneStop").hidden = false;
+    $("voiceTuneHint").textContent = "Listening. Speak, then move the lines.";
+    paintVoiceTune();
+    // Every 500 ms is the backend's hop: a feed shorter than that would leave
+    // the score moving in steps nobody could tune against.
+    tunePumpTimer = window.setInterval(() => {
+      void pumpVoiceTune();
+    }, 250);
+  } catch (e) {
+    setVoiceProfilesError(sanitizeUiErrorMessage(e, "Could not open the microphone for tuning."));
+    await stopVoiceTune();
+  } finally {
+    renderVoiceMask();
+  }
+}
+
+async function pumpVoiceTune(): Promise<void> {
+  const token = voiceTuneToken;
+  const ctx = tuneCtx;
+  if (token === null || ctx === null || tunePending.length === 0) return;
+  const chunks = tunePending;
+  tunePending = [];
+  const raw16k = resampleTo16k(concatSamples(chunks), ctx.sampleRate);
+  const pcm = int16FromFloat(raw16k);
+  if (pcm.length === 0) return;
+  // Instant half of the meter: what the microphone hears right now, before
+  // any window is long enough to be scored.
+  paintVoiceTuneNow(
+    levelDbOf(raw16k),
+    voiceTuneBars.length > 0 ? voiceTuneBars[voiceTuneBars.length - 1].score : null,
+  );
+  try {
+    const answer = await apiPostBinary<{ windows?: Array<Record<string, unknown>> }>(
+      `/api/voice/tune-live/${token}/feed`,
+      new Blob([new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength) as BlobPart], { type: "application/octet-stream" }),
+    );
+    for (const raw of answer.windows || []) {
+      const win = normalizeTuneData({ slot: 1, windows: [raw] })?.windows[0];
+      if (win) voiceTuneBars.push(win);
+    }
+    if (voiceTuneBars.length > VOICE_TUNE_MAX_BARS) {
+      voiceTuneBars = voiceTuneBars.slice(-VOICE_TUNE_MAX_BARS);
+    }
+    paintVoiceTune();
+  } catch (e) {
+    // A session the backend has already swept is not a reason to keep a
+    // dead microphone open.
+    console.debug("voice tune feed failed", e);
+    await stopVoiceTune();
+  }
+}
+
+async function stopVoiceTune(): Promise<void> {
+  if (tunePumpTimer) {
+    window.clearInterval(tunePumpTimer);
+    tunePumpTimer = 0;
+  }
+  if (tuneNode) {
+    tuneNode.onaudioprocess = null;
+    try { tuneNode.disconnect(); } catch { /* already gone */ }
+  }
+  try { tuneSource?.disconnect(); } catch { /* already gone */ }
+  try { tuneSink?.disconnect(); } catch { /* already gone */ }
+  tuneNode = null;
+  tuneSource = null;
+  tuneSink = null;
+  tunePending = [];
+  for (const track of tuneStream?.getTracks() || []) track.stop();
+  tuneStream = null;
+  const ctx = tuneCtx;
+  tuneCtx = null;
+  if (ctx) void ctx.close().catch(() => undefined);
+  const token = voiceTuneToken;
+  voiceTuneToken = null;
+  if (token) {
+    try {
+      await apiDelete(`/api/voice/tune-live/${token}`);
+    } catch { /* the session expires on its own */ }
+  }
+  $("voiceTuneStart").hidden = false;
+  $("voiceTuneStop").hidden = true;
+  $("voiceTuneHint").textContent = "Move the lines while you speak.";
+}
+
+async function openVoiceTune(slot: number): Promise<void> {
+  await stopVoiceTune();
+  voiceTuneSlot = slot;
+  voiceTuneBars = [];
+  $("voiceTune").hidden = false;
+  $("voiceTuneSummary").textContent = "Press Start listening, then speak.";
+  // The pair shown before the first word is the one the gate is using now.
+  const status = voiceProfilesStatus.slots.find((s) => s?.slot === slot) || null;
+  voiceTuneData = {
+    slot,
+    name: status?.name || "",
+    recording: "",
+    self_floor: 0,
+    level_db: 0,
+    open_at: status ? status.openAt : 0.5,
+    close_at: status ? status.closeAt : 0.42,
+    tuned: false,
+    windows: [],
+  };
+  paintVoiceTune();
+}
+
+async function saveVoiceTune(pair: { open_at: number; close_at: number }): Promise<void> {
+  if (voiceTuneSlot === null) return;
+  const slot = voiceTuneSlot;
+  voiceProfilesBusy = true;
+  renderVoiceMask();
+  try {
+    await apiPost(`/api/voice/profiles/${slot}/thresholds`, pair);
+    setStatus(
+      pair.open_at > 0
+        ? `Solo will open at ${pair.open_at.toFixed(3)} and close at ${pair.close_at.toFixed(3)} for this voice.`
+        : "Solo is back to the measured thresholds for this voice.",
+      "done",
+    );
+  } catch (e) {
+    setStatus(sanitizeUiErrorMessage(e, "Could not save the thresholds."), "error");
+  } finally {
+    voiceProfilesBusy = false;
+    await refreshVoiceProfiles();
+  }
+}
+
+function wireVoiceTune(): void {
+  const openSlider = $("voiceTuneOpen") as HTMLInputElement;
+  const closeSlider = $("voiceTuneClose") as HTMLInputElement;
+  openSlider.addEventListener("input", () => {
+    if (voiceTuneData === null) return;
+    const open = clampOpen(Number(openSlider.value));
+    voiceTuneData.open_at = open;
+    voiceTuneData.close_at = clampClose(voiceTuneData.close_at, open);
+    voiceTuneData.tuned = true;
+    paintVoiceTune();
+  });
+  closeSlider.addEventListener("input", () => {
+    if (voiceTuneData === null) return;
+    voiceTuneData.close_at = clampClose(Number(closeSlider.value), voiceTuneData.open_at);
+    voiceTuneData.tuned = true;
+    paintVoiceTune();
+  });
+  $("voiceTuneStart").addEventListener("click", () => {
+    void startVoiceTune();
+  });
+  $("voiceTuneStop").addEventListener("click", () => {
+    void stopVoiceTune();
+  });
+  // Turning the level rule off is how the owner sees what the score alone
+  // says: the grey bars are the rule, not a verdict about his voice.
+  $("voiceTuneLevelRule").addEventListener("change", () => {
+    paintVoiceTune();
+  });
+  $("voiceTuneSave").addEventListener("click", () => {
+    if (voiceTuneData === null) return;
+    void saveVoiceTune({
+      open_at: clampOpen(voiceTuneData.open_at),
+      close_at: clampClose(voiceTuneData.close_at, voiceTuneData.open_at),
+    });
+  });
+  $("voiceTuneReset").addEventListener("click", () => {
+    void saveVoiceTune({ open_at: 0, close_at: 0 });
+  });
+
+}
+
+// ---- The live meter, while a recording runs --------------------------------
+//
+// Two rows, two questions. The spectrum is what the microphone hears — every
+// voice in the room — and it decides nothing; the needle is the cosine Solo
+// actually computed, drawn between the two lines it is judged by.
+
+let meterState: MeterState = {
+  score: null,
+  openAt: 0,
+  closeAt: 0,
+  state: "idle",
+  withheldSec: 0,
+};
+let meterAnalyser: AnalyserNode | null = null;
+let meterSource: MediaStreamAudioSourceNode | null = null;
+let meterFrame = 0;
+let meterBins: Float32Array<ArrayBuffer> | null = null;
+let meterEdges: number[] = [];
+const meterBars: HTMLElement[] = [];
+
+function meterBarNodes(): HTMLElement[] {
+  const strip = $("liveMeterSpectrum");
+  if (meterBars.length === 0) {
+    for (let i = 0; i < SPECTRUM_BARS; i += 1) {
+      const bar = document.createElement("span");
+      bar.className = "live-meter-bar";
+      strip.appendChild(bar);
+      meterBars.push(bar);
+    }
+  }
+  return meterBars;
+}
+
+/** Paint the needle, the two lines and the sentence — the decision row. */
+function paintMeterJudge(): void {
+  $("liveMeterOpenLine").style.left = `${scorePosition(meterState.openAt) * 100}%`;
+  $("liveMeterCloseLine").style.left = `${scorePosition(meterState.closeAt) * 100}%`;
+  const needle = $("liveMeterNeedle");
+  needle.hidden = meterState.score === null;
+  needle.style.left = `${scorePosition(meterState.score) * 100}%`;
+  $("liveMeterTrack").className = `live-meter-track is-${meterZone(meterState)}`;
+  $("liveMeterCaption").textContent = meterCaption(meterState);
+}
+
+function paintMeterSpectrum(): void {
+  const analyser = meterAnalyser;
+  const bins = meterBins;
+  if (!analyser || !bins) return;
+  analyser.getFloatFrequencyData(bins);
+  const bars = spectrumBars(bins, meterEdges);
+  const nodes = meterBarNodes();
+  for (let i = 0; i < nodes.length; i += 1) {
+    nodes[i].style.height = `${Math.max(1, bars[i] * 100)}%`;
+  }
+  $("liveMeterSpectrum").classList.toggle("is-quiet", meterIsQuiet(bars));
+}
+
+function meterTick(): void {
+  meterFrame = 0;
+  if (!meterAnalyser) return;
+  // A hidden window still records: the bars are the only thing that can wait.
+  if (!document.hidden) paintMeterSpectrum();
+  meterFrame = requestAnimationFrame(meterTick);
+}
+
+/**
+ * Attach the meter to the live capture.
+ *
+ * Its own source node on the same stream: the capture graph already feeds a
+ * worklet and a recorder, and an analyser that reads without connecting to the
+ * destination costs one node and changes nothing those two hear.
+ */
+function startLiveMeter(ctx: AudioContext, stream: MediaStream): void {
+  stopLiveMeter();
+  try {
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    analyser.smoothingTimeConstant = 0.6;
+    const source = ctx.createMediaStreamSource(stream);
+    source.connect(analyser);
+    meterAnalyser = analyser;
+    meterSource = source;
+    meterBins = new Float32Array(analyser.frequencyBinCount);
+    meterEdges = spectrumEdges(ctx.sampleRate, analyser.frequencyBinCount);
+    meterBarNodes();
+    meterState = { score: null, openAt: 0, closeAt: 0, state: "idle", withheldSec: 0 };
+    paintMeterJudge();
+    $("liveMeter").hidden = false;
+    // The claim button only means something while a gate is judging.
+    // Shown from the first second of a take, not from the first verdict:
+    // waiting for the gate to speak made it invisible exactly when it was
+    // needed — the owner never found it.
+    syncClaimButton();
+    if (meterFrame === 0) meterFrame = requestAnimationFrame(meterTick);
+  } catch (e) {
+    // A meter is a courtesy: a browser that refuses a second source node must
+    // not cost the user their recording.
+    console.debug("live meter unavailable", e);
+    $("liveMeter").hidden = true;
+  }
+}
+
+function stopLiveMeter(): void {
+  if (meterFrame !== 0) {
+    cancelAnimationFrame(meterFrame);
+    meterFrame = 0;
+  }
+  try {
+    meterSource?.disconnect();
+  } catch { /* already disconnected */ }
+  meterSource = null;
+  meterAnalyser = null;
+  meterBins = null;
+  $("liveMeter").hidden = true;
+  syncClaimButton();
+}
+
+/**
+ * "That is me" — the one fact no inference here has managed to supply.
+ *
+ * Pressed while a take runs, it pins the gate to the voice of the last ten
+ * seconds. Everything else this desk tried to guess the owner from failed on
+ * real recordings: the first speaker of one take was the neighbour, the
+ * majority speaker of another was the neighbour, and the enrolled profile
+ * could not separate the two across takes. A claimed voice separates by 0.4.
+ */
+/** The name a claim is offered: the owner's own word for today's version. */
+function defaultTrackName(): string {
+  const now = new Date();
+  const pad = (value: number): string => String(value).padStart(2, "0");
+  return `я · ${pad(now.getDate())}.${pad(now.getMonth() + 1)} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
+}
+
+/**
+ * Ask for a track's name, in a dialog this page builds itself.
+ *
+ * `window.prompt` does not exist in the shell's renderer, so the question is
+ * made from the same elements the rest of the app uses.
+ */
+function askTrackName(suggested: string): Promise<string | null> {
+  const modal = document.createElement("div");
+  modal.className = "pick-modal";
+  const card = document.createElement("div");
+  card.className = "pick-card";
+  const title = document.createElement("p");
+  title.className = "pick-title";
+  title.textContent = "Name this track";
+  const field = document.createElement("input");
+  field.type = "text";
+  field.className = "voice-slot-name-input";
+  field.maxLength = 40;
+  field.value = suggested;
+  field.setAttribute("aria-label", "Track name");
+  const actions = document.createElement("div");
+  actions.className = "pick-actions";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "btn btn-ghost";
+  cancel.textContent = "Not now";
+  const save = document.createElement("button");
+  save.type = "button";
+  save.className = "btn btn-primary";
+  save.textContent = "Save track";
+  actions.append(cancel, save);
+  card.append(title, field, actions);
+  modal.append(card);
+  document.body.append(modal);
+  field.focus();
+  field.select();
+  return new Promise<string | null>((resolve) => {
+    const close = (value: string | null): void => {
+      modal.remove();
+      document.removeEventListener("keydown", onKey, true);
+      resolve(value);
+    };
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") close(null);
+      if (event.key === "Enter") close(field.value.trim() || null);
+    };
+    save.addEventListener("click", () => close(field.value.trim() || null));
+    cancel.addEventListener("click", () => close(null));
+    document.addEventListener("keydown", onKey, true);
+  });
+}
+
+async function claimVoice(): Promise<void> {
+  const button = $("voiceClaimBtn") as HTMLButtonElement;
+  const label = button.textContent;
+  button.disabled = true;
+  try {
+    const answer = await apiPost<{ seconds?: number }>("/api/voice/claim", { seconds: 10 });
+    const heard = Number(answer.seconds || 0);
+    button.textContent = `Keeping this voice (${heard.toFixed(0)} s) ✓`;
+    // The press has to answer in the place it was made: "nothing happens" was
+    // the report, and it was true — success and failure both looked like a
+    // button that did not move.
+    const name = await askTrackName(defaultTrackName());
+    if (name) {
+      const saved = await apiPost<unknown>("/api/voice/claim/save", { name });
+      voiceProfilesStatus = normalizeVoiceProfiles(saved);
+      voiceProfilesKnown = true;
+      setStatus(`Saved as “${name}” — it is one of your tracks now.`, "done");
+      renderVoiceMask();
+    } else {
+      setStatus("Claimed for this recording only — it was not saved as a track.", "info");
+    }
+  } catch (e) {
+    button.textContent = "Not enough heard — speak, then press";
+    setStatus(sanitizeUiErrorMessage(e, "Could not claim this voice."), "error");
+  } finally {
+    window.setTimeout(() => {
+      button.textContent = label;
+      button.disabled = false;
+    }, 1800);
+  }
+}
+
+
+async function switchSlot(slot: number, on: boolean): Promise<void> {
+  if (voiceProfilesBusy) return;
+
+  // The press has to answer. When nothing can be learned — the net's file is
+  // not beside the app, nobody read the store — the row still takes the
+  // press and the card says why, in the words the button's tooltip uses. It
+  // used to be a disabled switch instead, which answers nothing at all, and
+  // it must not open the microphone for six seconds to find out.
+  if (on) {
+    const view = voiceMaskView(voiceProfilesStatus, { unknown: !voiceProfilesKnown });
+    if (view.disabled) {
+      setVoiceProfilesError(view.summary);
+      renderVoiceMask();
+      return;
+    }
+  }
+
+  const holdsVoice = (voiceProfilesStatus.slots[slot - 1] ?? null) !== null;
+
+  if (!on && voiceProfilesStatus.enabledSlot !== slot) {
+    // The switch was already where the press puts it: nothing to write, and
+    // nothing to hold on screen.
+    renderVoiceMask();
+    return;
+  }
+
+  // The press is painted for exactly as long as the store is being asked.
+  voiceSwitchPending = { slot, on };
+  voiceProfilesBusy = true;
+  renderVoiceMask();
+  try {
+    if (!on) {
+      await writeVoiceProfiles(
+        () => apiPost<unknown>("/api/voice/disable", {}),
+        "Could not switch Solo off.",
+      );
+      return;
+    }
+
+    if (holdsVoice) {
+      await writeVoiceProfiles(
+        () => apiPost<unknown>(`/api/voice/profiles/${slot}/enable`, {}),
+        "Could not switch that voice on.",
+      );
+      return;
+    }
+
+    // An empty row is not a switch: there is no voice to let through, and
+    // Settings does not record one any more. A track is made by pressing
+    // "That is me" while the take that will be judged is running.
+    setVoiceProfilesError("No voice in that row yet — press “That is me” while recording.");
+  } catch (e) {
+    setVoiceProfilesError(sanitizeUiErrorMessage(e, "Could not switch that voice on."));
+  } finally {
+    voiceSwitchPending = null;
+    voiceProfilesBusy = false;
+    renderVoiceMask();
+  }
+}
+
+async function switchMask(on: boolean): Promise<void> {
+  if (voiceProfilesBusy) return;
+  if (!on) {
+    if (voiceProfilesStatus.enabledSlot === null) {
+      renderVoiceMask();
+      return;
+    }
+    await switchSlot(voiceProfilesStatus.enabledSlot, false);
+    return;
+  }
+
+  // Nothing learned yet: a press here would open the microphone for six
+  // seconds in a window that has no line to read and no countdown — the user
+  // would be asked to talk to a button that turns itself back off. The button
+  // sends them to the card instead, where the six seconds are explained, and
+  // starts nothing.
+  if (voiceProfilesStatus.slots.every((slot) => slot === null)) {
+    renderVoiceMask();
+    switchView("settings");
+    revealVoiceMaskCard();
+    setStatus("Read the line in Settings → Solo, then press Keep.", "info");
+    return;
+  }
+
+  // No choosing: every learned track is a version of the same voice, and the
+  // gate lets a window through when it matches any of them. Asking the owner
+  // to pick a version before the room has spoken was the guess that withheld
+  // him. Which tracks are redundant is shown in the card instead.
+  const target = voiceMaskTarget(voiceProfilesStatus) ?? nextFreeSlot(voiceProfilesStatus);
+  if (target === null) {
+    // Three voices learned and none kept is not a state this card can reach,
+    // but a store edited by hand could hold it: keep the first rather than
+    // swallow the press.
+    await switchSlot(1, true);
+    return;
+  }
+  await switchSlot(target, true);
+}
+
+
+
+function revealVoiceMaskCard(): void {
+  const card = document.querySelector<HTMLElement>(".card-voice");
+  card?.scrollIntoView({ block: "center" });
+  const first = document.querySelector<HTMLInputElement>(
+    "#voiceProfileSlots .voice-slot.is-empty input[type=checkbox]",
+  );
+  // `preventScroll`: the focus must not fight the scroll above, which is
+  // already putting the line to read in the middle of the window.
+  first?.focus({ preventScroll: true });
+}
+
+
+async function forgetSlot(slot: number, label: string): Promise<void> {
+  if (voiceProfilesBusy) return;
+  if (
+    !window.confirm(
+      `Forget ${label}?\n\nSolo has to learn it again before it can ` +
+        "silence anyone. Your recordings stay in History.",
+    )
+  ) {
+    return;
+  }
+  await writeVoiceProfiles(
+    () => apiDelete<unknown>(`/api/voice/profiles/${slot}`),
+    "Could not forget that voice.",
+  );
+}
+
+$("soloToggleBtn").addEventListener("click", () => {
+  void switchMask($("soloToggleBtn").getAttribute("aria-pressed") !== "true");
+});
+
+/** Either control on the one-time call answers it for good. */
+function answerSoloInvite(): void {
+  soloInviteDismissed = true;
+  rememberSoloInviteDismissed(storageOrNull());
+  renderVoiceMask();
+}
+
+$("soloInviteLearnBtn").addEventListener("click", () => {
+  answerSoloInvite();
+  switchView("settings");
+  revealVoiceMaskCard();
+  setStatus("Start a recording, speak, then press “That is me” — it saves that voice as a track.", "info");
+});
+
+$("soloInviteDismissBtn").addEventListener("click", answerSoloInvite);
+
 let recordingItems: RecordingItem[] = [];
 let selectedRecordingName = "";
 let selectedRecordingArchiveDir = "";
@@ -11536,11 +12631,57 @@ function syncLiveOutputFromState(): void {
   scheduleLiveOutputRender();
 }
 
+/** The last gate state this session reported, or null before any report. */
+let liveVoiceMaskState: VoiceMaskState | null = null;
+// Said once per recording: a toast on every frame would be noise.
+let soloFailureShown = false;
+// Said once per recording: an unidentifiable take is an error, not a verdict.
+let soloUnverifiedShown = false;
+
+/**
+ * Draw §5.3's line of state.
+ *
+ * Written straight to the DOM rather than through the rAF coalescer the
+ * transcript uses: reports arrive at most once a second, ordered behind
+ * the audio they describe, and one text write per second is not the
+ * layout thrash that coalescer exists to prevent. The wording is the
+ * unit-tested pure function in ./voice-mask-note; this only decides
+ * whether there is a line at all.
+ */
+function applyVoiceMaskNote(): void {
+  const el = $("voiceMaskNote");
+  const state = liveVoiceMaskState;
+  const withheld = state ? voiceMaskNoteText(state) : "";
+  const caught = state ? voiceMaskCaughtText(trackNamesFor(state)) : "";
+  const text = [caught, withheld].filter((part) => part !== "").join(" ");
+  if (el.textContent !== text) {
+    el.textContent = text;
+  }
+  el.hidden = text === "";
+}
+
+/** The names of the tracks whose score passed the open threshold. */
+function trackNamesFor(state: VoiceMaskState): string[] {
+  return voiceMaskCaughtNames(
+    state,
+    (slot) => voiceProfilesStatus.slots.find((entry) => entry?.slot === slot)?.name ?? "",
+  );
+}
+
+function resetVoiceMaskNote(): void {
+  liveVoiceMaskState = null;
+  // A new recording gets its own chance to report a failure.
+  soloFailureShown = false;
+  applyVoiceMaskNote();
+}
+
 function resetLiveDraftState(): void {
   livePreviewFloorText = "";
   liveDraftText = "";
   liveDraftDisplayText = "";
   liveInterimText = "";
+  // A voice report belongs to the take that produced it.
+  resetVoiceMaskNote();
   syncLiveOutputFromState();
 }
 
@@ -12076,6 +13217,14 @@ async function prepareLiveSession(startAttemptSeq: number): Promise<LiveStartSes
   resetLiveDraftState();
   clearLiveStreamState();
   const sessionWsMode = resolveLiveWsMode(activeLiveSessionSnapshot);
+    // Said once per recording, from the mode that actually ran: the model
+    // select keeps naming what was asked for, not what answered.
+    const liveSourceText = liveSourceNote(
+      sessionWsMode === "deepgram-stream" ? "deepgram-stream" : "local-assist",
+      readProviderSelection(),
+    );
+    $("liveSourceNote").textContent = liveSourceText;
+    $("liveSourceNote").hidden = liveSourceText === "";
   liveTranscriptBuffers.delete(sessionUiToken);
   ensureLiveTranscriptBuffer(sessionUiToken, sessionWsMode);
   setBusy(true, sessionUiToken);
@@ -12276,6 +13425,44 @@ async function prepareLiveSession(startAttemptSeq: number): Promise<LiveStartSes
         applyLiveStreamEvent(sessionBuffer, msg);
         if (isActiveSession) {
           projectLiveTranscriptBufferToActiveState(sessionBuffer);
+        }
+        return;
+      }
+      case "voice-mask": {
+        // The gate's own line, and the tracks matching right now.
+        if (isActiveSession) {
+          liveVoiceMaskState = msg;
+          applyVoiceMaskNote();
+          const firing = new Set<number>(
+            (msg.tracks || [])
+              .filter((track) => Number(track.score) >= Number(msg.openAt ?? 0.5))
+              .map((track) => Number(track.slot)),
+          );
+          document.querySelectorAll<HTMLElement>(".voice-slot").forEach((row) => {
+            row.classList.toggle("is-firing", firing.has(Number(row.dataset.slot)));
+          });
+          // The press counts its own seconds (paintClaimButton): the gate's
+          // heardSec stops at its ten-second ring, and writing it here made
+          // the button jump backwards on a longer take.
+          // A failure of the gate is said out loud, once per recording: the
+          // pane line alone reads as "a stranger was withheld", and this is
+          // the opposite - Solo stopped and the take is untouched.
+          if (msg.unverified && !soloUnverifiedShown) {
+            soloUnverifiedShown = true;
+            setStatus(
+              "Solo could not identify your voice in this recording - nothing was withheld, " +
+                "so treat it as unverified. Press That is me, or record somewhere quieter.",
+              "error",
+            );
+          }
+          if (msg.degraded && !soloFailureShown) {
+            soloFailureShown = true;
+            setStatus(
+              "Solo stopped working on this recording - your audio is safe in History. " +
+                "Turn Solo off, or start a new recording to try it again.",
+              "error",
+            );
+          }
         }
         return;
       }
@@ -12636,6 +13823,9 @@ async function connectLiveCapture(session: LiveStartSession, capture: LiveCaptur
     throwIfStartCancelled();
     recordedWebmChunks = [];
     try {
+    // A spectrum that started a second late would miss the first word of
+    // every take; the meter reads the same stream the recorder does.
+    startLiveMeter(sessionAc, stream);
       mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
       // MediaRecorder emits one chunk per second (see ``start(1000)``
       // below). The same 2h recording-window limit applies: if a
@@ -16683,3 +17873,23 @@ function renderUploadResultPane(): void {
 }
 
 setupUploadView();
+
+// Solo: the knob, the tuner and the claim all read the store, so it is
+// read at boot as well as on every visit to Settings. The read waits for
+// the boot sequence, which is where this page is given its API token -
+// asked any earlier it answers 401 and paints "could not read".
+void recordingsBootstrapRun.then(() => {
+  void refreshVoiceProfiles();
+});
+wireVoiceTune();
+$("voiceClaimBtn").addEventListener("click", () => {
+  void claimVoice();
+});
+
+// Solo: the knob, the tuner and the claim all read the store, so it is
+// read at boot as well as on every visit to Settings.
+void refreshVoiceProfiles();
+wireVoiceTune();
+$("voiceClaimBtn").addEventListener("click", () => {
+  void claimVoice();
+});

@@ -327,7 +327,32 @@
               it read as misplaced rather than as the third control in a
               row of three.
             -->
+            <!--
+              Solo's one control: the same button Rec is, beside it, because
+              both answer "what does the next take do". Pressing it keeps one
+              voice and silences the rest (§5.1); with nothing learned it is
+              still pressable — the press is what sends the user to the card,
+              where the six seconds are explained, because a control that
+              disables itself is one nobody can ask.
+            -->
+            <div class="top-item top-item-solo" id="soloItem" hidden>
+              <span class="lbl">Solo</span>
+              <button class="btn record-toggle-btn solo-toggle-btn" id="soloToggleBtn" type="button"
+                aria-pressed="false" title="Solo" disabled>
+                <span class="record-toggle-dot" aria-hidden="true"></span>
+                <span class="record-toggle-label" id="soloToggleLabel">Solo</span>
+              </button>
+            </div>
             <div class="top-item top-item-record">
+            <!--
+              One fact no inference on this desk can supply: which of the two
+              voices is the owner's. It lives beside Record, not inside the
+              live preview: with the preview switched off - which is how the
+              desk is usually used - a button in there is a button nobody sees.
+            -->
+            <button type="button" class="btn btn-sm" id="voiceClaimBtn" hidden>
+              That is me — keep my voice
+            </button>
               <span class="lbl">Rec</span>
               <button class="btn record-toggle-btn" id="recordToggleBtn" type="button"
                 aria-pressed="false" title="Start recording">
@@ -350,6 +375,50 @@
                 </div>
               </div>
             </div>
+            <!--
+              Solo's one-time call. Nothing learned is no button at all — a
+              control that can only send the user somewhere else is a control
+              that did nothing — so the feature is met here instead, once: the
+              line says what it does and what it costs, Learn opens the card
+              that records a voice, and either press ends the call for good.
+              The text is written at boot from ./src/solo-invite, so the
+              sentence and the flag have one home.
+            -->
+            <div class="solo-invite" id="soloInvite" hidden>
+              <span class="solo-invite-text" id="soloInviteText"></span>
+              <button class="btn btn-ghost solo-invite-learn" id="soloInviteLearnBtn" type="button">Show me</button>
+              <button class="btn btn-ghost solo-invite-not-now" id="soloInviteDismissBtn" type="button">Not now</button>
+            </div>
+            <!--
+              §5.3/§5.4: a refused voice is drawn, never silent. Solo
+              zeroes a window in the copy that goes to the provider, which
+              in the transcript looks exactly like speech the app lost —
+              this line is what tells the two apart, and the only writer
+              is ./src/voice-mask-note (empty text means nothing to say,
+              so the pane carries no permanent chrome).
+            -->
+            <div class="pane-note" id="voiceMaskNote" hidden></div>
+            
+            <!--
+              What the microphone hears, and what Solo did about it — two
+              different questions, drawn as two different rows. The spectrum
+              moves for anybody in the room; the needle is the cosine Solo
+              actually computed, between the two lines it is judged by. Shown
+              only while a recording runs, so the pane carries no meter it is
+              not using.
+            -->
+            <div class="live-meter" id="liveMeter" hidden>
+              <div class="live-meter-spectrum" id="liveMeterSpectrum" aria-hidden="true"></div>
+              <div class="live-meter-judge">
+                <div class="live-meter-track" id="liveMeterTrack">
+                  <span class="live-meter-line is-close" id="liveMeterCloseLine"></span>
+                  <span class="live-meter-line is-open" id="liveMeterOpenLine"></span>
+                  <span class="live-meter-needle" id="liveMeterNeedle"></span>
+                </div>
+                <span class="live-meter-caption" id="liveMeterCaption" role="status"
+                  aria-live="polite"></span>
+              </div>
+            </div>
             <pre class="out" id="liveOutput" data-placeholder="Waiting for audio..."></pre>
           </div>
           <div class="split-gap" id="splitGap"></div>
@@ -363,6 +432,13 @@
                   </label>
                 </div>
               </div>
+              <!--
+                What actually produced this text. The model select says what
+                the user asked for; with no provider key the desk recognises
+                locally and the select keeps saying Deepgram, which read as
+                "Deepgram works" when nothing had been sent to it at all.
+              -->
+              <div class="pane-note" id="liveSourceNote" hidden></div>
               <div class="pane-head-row pane-head-row-bottom pane-toolbar-row">
                 <div class="pane-actions pane-toolbar-actions pane-toolbar-actions-transcribe">
                   <div class="pane-control-group pane-control-group-primary">
@@ -791,6 +867,96 @@
                   step="1" /></label>
             </div>
           </div>
+          <!--
+            Solo (§5.1, §7.4). One row per learned track, a switch and a Forget
+            for each — and nothing that records. A track is made from a take
+            the owner claimed with "That is me", never from this card: a profile
+            learned away from a take comes through another audio channel, which
+            is exactly what kept Solo from recognising its own owner.
+          -->
+          <div class="card card-voice">
+            <div class="card-header">
+              <div class="card-header-copy">
+                <h2>Solo</h2>
+              </div>
+            </div>
+            <div class="field-stack">
+              <!-- Written by renderVoiceMask(); "Checking…" is the one frame
+                   before the store answers. -->
+              <p class="settings-note" id="voiceProfilesNote">Checking…</p>
+              <!--
+                The script, and the only text in the app the user is expected
+                to read out loud. Above the rows on purpose: the card reads as
+                "this is what a press will ask of you" before it reads as a
+                list of voices, and it is visible before anything is fetched.
+              -->
+                            <!--
+                One action on this card: name the voice, learn it from the newest
+                recording. No dropdown, no prompt, nothing on another screen.
+              -->
+                            <!--
+                The rows below are the tracks Solo knows. This card does not
+                record: a track is made by pressing “That is me” while the take
+                that will be judged is running, so the voice it learns came
+                through the same microphone and the same processing.
+              -->
+              <div class="voice-slots" id="voiceProfileSlots" role="list"></div>
+              <!--
+                The tuner: one take scored window by window, the two thresholds
+                drawn over it as lines, and the share numbers under it. This is
+                the answer to "which of these parameters work" — the owner sees
+                it instead of asking for one more guess.
+              -->
+              <div class="voice-tune" id="voiceTune" hidden>
+                <div class="voice-tune-head">
+                  <button type="button" id="voiceTuneStart" class="btn btn-primary">Start listening</button>
+                  <button type="button" id="voiceTuneStop" class="btn" hidden>Stop</button>
+                  <span class="voice-tune-hint" id="voiceTuneHint">Move the lines while you speak.</span>
+
+                </div>
+                <div class="voice-tune-strip" id="voiceTuneStrip" role="img"
+                  aria-label="Every two-second window the microphone heard, scored against this voice"></div>
+                <div class="voice-tune-sliders">
+                  <label class="voice-tune-slider">
+                    <span>Open at</span>
+                    <input type="range" id="voiceTuneOpen" min="0.02" max="0.98" step="0.005" />
+                    <span class="voice-tune-value" id="voiceTuneOpenVal"></span>
+                  </label>
+                  <label class="voice-tune-slider">
+                    <span>Close at</span>
+                    <input type="range" id="voiceTuneClose" min="0.01" max="0.98" step="0.005" />
+                    <span class="voice-tune-value" id="voiceTuneCloseVal"></span>
+                  </label>
+                </div>
+                <p class="settings-note" id="voiceTuneLegend">
+                  Bars are 1-second windows of your microphone, scored against this voice:
+                  <b>green</b> = let through, <b>red</b> = withheld, <b>amber</b> = between the
+                  two lines, <b>grey</b> = withheld by loudness alone. The lines are similarity
+                  to your voice (0 = a stranger, 1 = you) — not volume.
+                </p>
+                <label class="voice-tune-level">
+                  <input type="checkbox" id="voiceTuneLevelRule" checked />
+                  <span id="voiceTuneLevelText">Withhold anything far quieter than the voice was learned at</span>
+                </label>
+                <p class="settings-note" id="voiceTuneNow"></p>
+                <p class="settings-note" id="voiceTuneSummary"></p>
+                <div class="voice-tune-actions">
+                  <button type="button" id="voiceTuneSave" class="btn btn-primary">Save for this voice</button>
+                  <button type="button" id="voiceTuneReset" class="btn">Back to measured</button>
+                </div>
+              </div>
+              <!--
+                The recording indication, while an enrolment is really
+                recording: the window's own dot (`.record-toggle-dot`, red and
+                pulsing with `is-recording`) and a countdown, so a press is
+                never a frozen card with no evidence the microphone is open.
+                aria-live: the countdown changes once a second and a screen
+                reader should hear where it is.
+              -->
+              <div class="settings-save-status settings-save-status-warning" id="voiceProfilesError"
+                hidden></div>
+            </div>
+          </div>
           <div class="card card-recordings">
             <div class="card-header">
               <div class="card-header-copy">
@@ -1005,7 +1171,8 @@
       </div>
     </div>
   </div>
+
   <script type="module" src="/src/main.tsx"></script>
-</body>
+  </body>
 
 </html>

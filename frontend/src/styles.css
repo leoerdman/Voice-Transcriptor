@@ -493,6 +493,23 @@ body.platform-darwin .sidebar {
   .record-toggle-btn.is-recording .record-toggle-dot { animation: none; }
 }
 
+/* Solo: Record's geometry, one state of its own. Off is the neutral surface
+   the shared `.record-toggle-btn` already paints; on is the accent edge,
+   because "keep only this voice" is a setting the next take obeys rather
+   than an alarm. The dot repeats it where the label has no room. */
+.solo-toggle-btn .record-toggle-dot {
+  background: var(--text-3);
+}
+
+.solo-toggle-btn.is-on {
+  border-color: var(--accent-soft-border);
+  color: var(--text);
+}
+
+.solo-toggle-btn.is-on .record-toggle-dot {
+  background: var(--role-transcribe-border);
+}
+
 .status-chip {
   display: inline-flex;
   align-items: center;
@@ -708,6 +725,13 @@ body.platform-darwin .sidebar {
 .top-item-record {
   width: auto;
   margin-left: auto;
+}
+
+/* Solo travels with Rec: `margin-left: auto` on Rec is what puts the pair at
+   the end of the row, so Solo takes a natural width and sits immediately
+   before it. */
+.top-item-solo {
+  width: auto;
 }
 
 .top-item .lbl {
@@ -934,6 +958,51 @@ textarea:focus-visible,
 .pane-header-2row {
   display: flex;
   flex-direction: column;
+}
+
+/* §5.3's line of state: ONE row under the pane title, drawn only while
+   the mask is holding something back (or has stopped keeping up). It is
+   deliberately quiet — 11 px, muted — because the alternative it exists
+   to prevent is not "the user missed a warning", it is "the user thinks
+   the app lost his speech". It must also be readable while the live
+   preview itself is off, which is why it lives above the <pre> rather
+   than inside it. */
+.pane-note {
+  padding: 0 14px 6px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-3);
+  flex-shrink: 0;
+}
+
+/* Solo's one-time call: one line above the pane's own note, two presses, then
+   gone. The accent edge is the one Solo's `is-on` uses, so the feature and its
+   call read as the same thing. `[hidden]` needs its own rule: the global one
+   at the top of this file loses to `.solo-invite` on source order. */
+.solo-invite {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--accent-soft-border);
+  background: var(--accent-soft-bg);
+  color: var(--text-2);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.solo-invite[hidden] {
+  display: none;
+}
+
+.solo-invite-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.solo-invite-learn,
+.solo-invite-not-now {
+  flex: none;
 }
 
 .pane-head-row {
@@ -2638,6 +2707,132 @@ textarea:focus-visible,
   color: var(--text-3);
 }
 
+/* Settings -> voice mask: the learned voices, one row each. */
+
+.voice-slots {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+/* A row is three things in a fixed order: the voice, its switch, its Forget.
+   Grid rather than flex because the first column must be *allowed* to
+   shrink — `minmax(0, 1fr)` is what keeps a long date from wrapping one
+   character per line while the controls keep their natural width. */
+.voice-slot {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 8px 12px;
+  border-radius: var(--control-radius);
+  background: var(--surface-2);
+}
+
+/* The kept row is the one that decides whether anything is forwarded at all,
+   so it carries the accent edge instead of a second label saying the same
+   thing twice. */
+.voice-slot.is-kept {
+  box-shadow: inset 2px 0 0 var(--toggle-track-on);
+}
+
+.voice-slot.is-empty {
+  color: var(--text-3);
+  /* A learning row is four controls in one line: the name, the recording, the
+     place inside it, and the press. Without this they wrap into a stack and
+     the press lands under the field like a second row. */
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr) 96px auto;
+}
+
+.voice-slot.is-empty .voice-slot-name-input,
+.voice-slot.is-empty .voice-slot-take {
+  min-width: 0;
+  width: 100%;
+}
+
+.voice-slot.is-empty .voice-slot-pos {
+  width: 96px;
+}
+
+.voice-slot-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.voice-slot-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: inherit;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.voice-slot-meta {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+/* "Keep" is a caption for its switch, not a settings line: the row already is
+   the surface, so the full-width bordered variant would read as a second card
+   and push Forget off the edge. */
+.voice-slot-switch,
+.voice-slot-forget {
+  flex: 0 0 auto;
+}
+
+.voice-slot-switch {
+  gap: 6px;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.voice-slot-forget {
+  height: 26px;
+  min-height: 26px;
+  padding: 0 10px;
+  font-size: 11px;
+}
+
+/* ── What a press costs, said before the press ──────────────────────── */
+/* The script is quoted, not a paragraph: it is the one text in the app the
+   user is expected to read out loud, so it reads as a line to say rather
+   than as more documentation to skim. */
+.voice-enrol-script {
+  margin: 0;
+  padding: 8px 12px;
+  border-left: 2px solid var(--control-border);
+  border-radius: 0 var(--control-radius) var(--control-radius) 0;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+/* The live line under the card. It carries the window's own dot — the same
+   red, the same pulse — so "recording" in Settings is the same fact in the
+   same colour as "recording" in the topbar, rather than a second vocabulary
+   the user has to learn. */
+.voice-enrol-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--danger-text);
+}
+
+.voice-enrol-live.is-recording .record-toggle-dot {
+  animation: record-toggle-pulse 1.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .voice-enrol-live.is-recording .record-toggle-dot { animation: none; }
+}
+
 /* ── Shortcut picker button ─────────────────────────────────────────── */
 .shortcut-btn {
   display: inline-flex;
@@ -4202,4 +4397,91 @@ canvas {
 }
 .recording-screens.has-expanded {
   flex-wrap: wrap;
+}
+
+/* The passage a voice is learned from: readable at a glance, quoted because it
+   is something to say out loud, not a description of the feature. */
+.settings-script {
+  margin: 8px 0 10px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--toggle-track-on);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--text-1);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* The tuner: a take drawn as bars, the thresholds as lines over them. Only
+   tokens the theme declares: a fallback literal here is a second palette. */
+.voice-tune { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.voice-tune-head { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+.voice-tune-select { flex: 1; min-width: 0; }
+.voice-tune-strip { position: relative; display: flex; align-items: flex-end; gap: 2px; height: 120px; padding: 4px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface-1); overflow-x: auto; overflow-y: hidden; }
+.voice-tune-bar { flex: 0 0 6px; width: 6px; border-radius: 1px 1px 0 0; background: var(--state-success-dot); }
+.voice-tune-bar.is-cut { background: var(--danger-dot); }
+.voice-tune-bar.is-between { background: var(--state-warning-dot); }
+.voice-tune-bar.is-far { background: var(--text-3); opacity: 0.45; }
+.voice-tune-line { position: absolute; left: 4px; right: 4px; height: 0; border-top: 2px dashed var(--text-1); pointer-events: none; z-index: 2; }
+.voice-tune-line.is-open { border-top-color: var(--state-success-dot); }
+.voice-tune-line.is-close { border-top-color: var(--danger-dot); }
+.voice-tune-sliders { display: flex; gap: 16px; margin-top: 10px; }
+.voice-tune-slider { display: flex; align-items: center; gap: 8px; flex: 1; }
+.voice-tune-slider input[type="range"] { flex: 1; }
+.voice-tune-value { min-width: 4ch; font-variant-numeric: tabular-nums; }
+.voice-tune-actions { display: flex; gap: 8px; margin-top: 8px; }
+.voice-slot-tune { flex-shrink: 0; }
+
+/* The live meter: what the microphone hears (bars) and what Solo decided
+   (needle between two lines). Only tokens the theme declares. */
+.live-meter { margin: 6px 0 8px; display: grid; gap: 6px; }
+.live-meter-spectrum { display: flex; align-items: flex-end; gap: 1px; height: 64px; padding: 2px 4px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface-1); overflow: hidden; }
+.live-meter-bar { flex: 1 1 0; min-width: 1px; height: 1%; border-radius: 1px 1px 0 0; background: var(--text-3); opacity: 0.75; transition: height 60ms linear; }
+.live-meter-spectrum.is-quiet .live-meter-bar { opacity: 0.22; }
+.live-meter-judge { display: grid; gap: 4px; }
+.live-meter-track { position: relative; height: 10px; border-radius: var(--radius-xs); background: var(--surface-2); }
+.live-meter-line { position: absolute; top: -2px; bottom: -2px; width: 1px; }
+.live-meter-line.is-open { background: var(--state-success-dot); }
+.live-meter-line.is-close { background: var(--danger-dot); }
+.live-meter-needle { position: absolute; top: -4px; bottom: -4px; width: 3px; margin-left: -1px; border-radius: 2px; background: var(--text-1); transition: left 120ms linear; }
+.live-meter-track.is-owner .live-meter-needle { background: var(--state-success-dot); }
+.live-meter-track.is-stranger .live-meter-needle { background: var(--danger-dot); }
+.live-meter-track.is-between .live-meter-needle { background: var(--state-warning-dot); }
+.live-meter-caption { font-size: 12px; color: var(--text-2); }
+
+.voice-tune-level { display: flex; gap: 8px; align-items: center; margin: 8px 0; font-size: 13px; color: var(--text-2); }
+.voice-tune-hint { font-size: 13px; color: var(--text-2); }
+
+.voice-slot.is-catching { border-color: var(--state-success-dot); }
+
+/* Which learned versions say the same thing twice. */
+.voice-overlap { display: grid; gap: 4px; margin-top: 6px; }
+.voice-overlap-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 13px; color: var(--text-muted); }
+.voice-overlap-row.is-redundant { color: inherit; }
+
+/* The track matching the window just judged, lit for as long as it keeps
+   matching. A version that never lights is a version doing nothing.
+   It has to be unmistakable at a glance: the kept row already carries a green
+   edge, so a brighter edge alone read as "the colour does not change" (the
+   report that produced this rule). A filled row and a word do not. */
+.voice-slot.is-firing {
+  background: rgba(98, 199, 123, 0.18);
+  box-shadow:
+    0 0 0 2px var(--state-success-dot) inset,
+    0 0 16px rgba(98, 199, 123, 0.28);
+  transition: background 120ms linear, box-shadow 120ms linear;
+}
+
+.voice-slot.is-firing .voice-slot-name {
+  color: #e4f7ea;
+}
+
+.voice-slot.is-firing .voice-slot-meta {
+  color: var(--state-success-dot);
+}
+
+.voice-slot.is-firing .voice-slot-meta::after {
+  content: " · catching";
+  color: var(--state-success-dot);
+  letter-spacing: 0.04em;
 }
