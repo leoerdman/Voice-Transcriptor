@@ -67,7 +67,11 @@ describe("the one-time flag", () => {
 describe("the call's sentence", () => {
   it("says what it does and what it costs, in the app's voice", () => {
     expect(SOLO_INVITE_TEXT).toContain("Solo");
-    // Twenty, not six: the press records the passage the card puts in front of\n    // him, and a sentence still promising six would be the wrong number in the\n    // one place he reads before deciding.\n    expect(SOLO_INVITE_TEXT).toContain("twenty seconds");
+    // The press, not a passage and not a card: since the tracks are made by a
+    // take, the one sentence he reads before deciding has to name the button he
+    // will press, or it promises a step that no longer exists.
+    expect(SOLO_INVITE_TEXT).toContain("That is me");
+    expect(SOLO_INVITE_TEXT).not.toMatch(/twenty seconds|six seconds/i);
     // The word the naming round removed, and the promise the feature cannot
     // make: the take keeps everything, only the send is narrowed.
     expect(SOLO_INVITE_TEXT).not.toMatch(/owner/i);

@@ -14,7 +14,7 @@ export const SOLO_INVITE_KEY = "transcriptor.solo.invite.dismissed";
 
 /** The call itself: what the feature does, and what it costs to try. */
 export const SOLO_INVITE_TEXT =
-  "Keep only your voice: Solo learns it from twenty seconds of speech.";
+  "Keep only your voice: make a take, press “That is me”, and Solo saves it as a track.";
 
 export interface SoloInviteState {
   /** Nothing is learned yet and the feature can actually be turned on. */
