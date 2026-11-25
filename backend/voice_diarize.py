@@ -317,6 +317,7 @@ class DiarizedScorer:
         window_limit: int = DEFAULT_WINDOW_LIMIT,
         open_margin: float = DEFAULT_OPEN_MARGIN,
         close_margin: float = DEFAULT_CLOSE_MARGIN,
+        closes: Optional[dict[int, float]] = None,
     ) -> None:
         self._embedder = embedder
         self._profiles = _as_profiles(profile)
@@ -324,6 +325,11 @@ class DiarizedScorer:
         self._diarizer = SessionDiarizer([*self._profiles], window_limit=window_limit)
         self.open_margin = float(open_margin)
         self.close_margin = float(close_margin)
+        #: How close a window must sit to a track before the room may say
+        #: anything about it, per slot. Each track brings its own number from its
+        #: own take (``voice_profiles.thresholds_from_floor``); TRACK_FLOOR is
+        #: only the answer for a track that predates that derivation.
+        self._closes: dict[int, float] = dict(closes or {})
         self._last_margin: Optional[float] = None
         #: Score against every learned track, by slot, for the last window:
         #: the card draws these as the tracks matching right now.
@@ -379,8 +385,8 @@ class DiarizedScorer:
         # a being that scored 0.21 against the track stayed open for 27.7 of 34.5
         # seconds (measured 2026-11-25). The absolute cosine to the tracks is the
         # one measure that does not move with who else is talking.
-        best = self._best_profile_similarity(vector)
-        if best < TRACK_FLOOR:
+        best_slot, best = self._best_profile(vector)
+        if best < self._closes.get(best_slot, TRACK_FLOOR):
             self._last_margin = None
             return best
         margin = self._diarizer.margin(vector)
@@ -400,8 +406,8 @@ class DiarizedScorer:
         return float(np.clip(similarity, 0.0, 1.0))
 
 
-    def _best_profile_similarity(self, vector: np.ndarray) -> float:
-        """The closest of the owner's versions — every track counts."""
+    def _best_profile(self, vector: np.ndarray) -> tuple[int, float]:
+        """The closest of the owner's versions, by slot - every track counts."""
         unit = _unit(np.asarray(vector, dtype=np.float64).reshape(-1))
         scores = {
             slot: float(np.dot(unit, profile))
@@ -409,7 +415,14 @@ class DiarizedScorer:
         }
         # Kept for the card: these are the rows that light up while a take runs.
         self.last_tracks = scores
-        return max(scores.values()) if scores else 0.0
+        if not scores:
+            return (0, 0.0)
+        slot = max(scores, key=lambda key: scores[key])
+        return (slot, scores[slot])
+
+    def _best_profile_similarity(self, vector: np.ndarray) -> float:
+        """The closest of the owner's versions, as one number."""
+        return self._best_profile(vector)[1]
 
 __all__ = [
     "DEFAULT_CLOSE_MARGIN",

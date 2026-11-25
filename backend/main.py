@@ -92,6 +92,7 @@ from backend.voice_profiles import (
     SLOTS,
     ProfileError,
     VoiceProfileStore,
+    thresholds_from_floor,
 )
 from backend.audio import (
     AudioError,
@@ -9578,6 +9579,12 @@ def save_claimed_voice(
             self_floor=float(claim["self_floor"]),
             level_db=float(claim["level_db"]),
         )
+        # The pair this voice is judged by comes out of the same take: how alike
+        # its own windows are, in shares - never a number somebody picked. A
+        # different desk therefore moves the gate with itself instead of needing
+        # a hand to retune it.
+        open_at, close_at = thresholds_from_floor(float(claim["self_floor"]))
+        VOICE_PROFILES.set_thresholds(slot, open_at, close_at)
     except ProfileError as e:
         raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
     logger.info("claimed voice saved as track %s (%r)", slot, name)
@@ -9650,7 +9657,13 @@ def recording_voice_mask() -> Optional[VoiceMask]:
     tracks = [(slot, entry.vector) for slot, entry in sorted(learned.items())] or [
         (slot, profile.vector)
     ]
-    scorer = DiarizedScorer(embedder, tracks)
+    # Each track brings the pair derived from its own take, so the absolute
+    # floor below which the room gets no vote is the voice's own number.
+    closes = {
+        slot: (float(entry.close_at) if 0.0 < float(entry.close_at) < float(entry.open_at) else thresholds_from_floor(entry.self_floor)[1])
+        for slot, entry in sorted(learned.items())
+    }
+    scorer = DiarizedScorer(embedder, tracks, closes=closes)
     # The pair comes from the diarizer's own scale, not from the enrolled
     # voice's floor: 0.5 means "as close to this room's owner voice as to the
     # other one", which is comparable across recordings in a way a cosine to a

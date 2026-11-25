@@ -183,84 +183,36 @@ class TheCardAndTheRouteAgreeTests(unittest.TestCase):
         self.assertEqual(app_main.CLAIM_MIN_SECONDS, 2.0)
 
 class TheSpecAndTheCardAgreeTests(unittest.TestCase):
-    """The document is what the reviewer reads first; it drifted twice.
+    """The contract file describes what runs, and says where the old design went.
 
-    §5.5 said "a take becomes one by an act" and §7.4 said the press learned
-    "from the latest take that still has audio" — both true of the first
-    implementation, both false of the one that records. A spec that describes
-    a discarded behaviour is worse than no spec: it is the version a reviewer
-    trusts.
+    It used to check lines 5.5 and 7.4 of a document that still promised a
+    six-second press in Settings and a room-derived scale - both removed. A spec
+    that describes a discarded implementation is worse than no spec: it is the
+    version the next reader trusts.
     """
 
     def setUp(self):
         from pathlib import Path
 
-        self.doc = (
-            Path(__file__).resolve().parents[2] / "docs" / "SOLO.md"
-        ).read_text(encoding="utf-8")
+        docs = Path(__file__).resolve().parents[2] / "docs"
+        self.doc = (docs / "SOLO.md").read_text(encoding="utf-8")
+        self.archive = (docs / "archive" / "SOLO_FIRST_DESIGN.md").read_text(encoding="utf-8")
 
-    def test_the_press_is_the_take_and_settings_records_nothing(self):
-        # 5.5 used to describe a six-second press in the card. The card no
-        # longer records: a profile learned away from a take lives in another
-        # channel, and that is the failure 8 was written about.
-        line = next(l for l in self.doc.splitlines() if l.startswith("5.5 "))
-        self.assertIn("That is me", line)
-        self.assertIn("Two seconds", line)
-        self.assertNotIn("six seconds", line)
+    def test_the_contract_names_the_press_and_its_floor(self):
+        self.assertIn("That is me", self.doc)
+        self.assertIn("Two seconds is the floor", self.doc)
+        self.assertIn(f"{app_main.CLAIM_MIN_SECONDS:.0f}", self.doc)
 
-    def test_the_settings_line_no_longer_records(self):
-        line = next(l for l in self.doc.splitlines() if l.startswith("7.4 "))
-        self.assertIn("no recording", line)
-        self.assertIn("Remove", line)
-        self.assertNotIn("six seconds", line)
-        self.assertNotIn("countdown", line)
+    def test_the_contract_says_the_thresholds_are_derived(self):
+        self.assertIn("derived, never chosen", self.doc)
+        self.assertIn("thresholds_from_floor", self.doc)
+        self.assertNotIn("hand-picked pair wins", self.doc)
 
-    def test_the_numbers_in_the_spec_are_the_numbers_the_gate_runs(self):
-        """§4.1 and §4.3 drifted from the code in opposite directions.
+    def test_the_contract_says_the_room_may_not_choose_the_owner(self):
+        self.assertIn("The room may not choose the owner", self.doc)
 
-        The document said "a decision each 20-30 ms" and "300 ms tail"; the
-        gate judges every 50 ms and holds half a window, because a 25 ms
-        cadence cannot pay for a 38 ms judgement and a 300 ms tail cut 20 of
-        the owner's own hops at a handover. Both sentences were true of an
-        earlier build. They are pinned to constants now, so the next retune
-        fails a test instead of quietly leaving the document behind.
-        """
-        from backend.voice_mask import (
-            DEFAULT_CLOSE_AT,
-            DEFAULT_HOP_MS,
-            DEFAULT_OPEN_AT,
-            DEFAULT_TAIL_MS,
-            DEFAULT_WINDOW_MS,
-        )
-
-        window = next(l for l in self.doc.splitlines() if l.startswith("4.1 "))
-        self.assertIn(f"{DEFAULT_WINDOW_MS // 1000} s", window)
-        self.assertIn(f"{DEFAULT_HOP_MS} ms", window)
-
-        tail = next(l for l in self.doc.splitlines() if l.startswith("4.3 "))
-        self.assertIn("half a window", tail)
-        self.assertEqual(DEFAULT_TAIL_MS * 2, DEFAULT_WINDOW_MS)
-
-        thresholds = next(l for l in self.doc.splitlines() if l.startswith("4.5 "))
-        self.assertIn(f"{DEFAULT_OPEN_AT:g}", thresholds)
-        self.assertIn(f"{DEFAULT_CLOSE_AT:g}", thresholds)
-        self.assertIn("measured", thresholds)
-        self.assertNotIn("guesses until", thresholds)
-
-    def test_the_spec_does_not_still_describe_the_room_that_was_removed(self):
-        """COWORK_VOICE and its `voice-channel` frame are gone.
-
-        The mask's state rides its own `voice-mask` frame now, and the room
-        modules were deleted when the feature was cut back to the gate. A
-        spec line naming a frame that no longer exists sends the next reader
-        looking for a file that is not in the tree.
-        """
-        line = next(l for l in self.doc.splitlines() if l.startswith("2.1 "))
-        self.assertIn("voice-mask", line)
-        self.assertNotIn("channel event", line)
-
-    def test_the_embedder_line_names_the_file_that_ships(self):
-        """§7.2 said "when the survey lands"; the survey landed."""
-        line = next(l for l in self.doc.splitlines() if l.startswith("7.2 "))
-        self.assertIn("CAM++", line)
-        self.assertNotIn("when the survey lands", line)
+    def test_the_old_design_is_archived_and_named_as_history(self):
+        self.assertIn("six-second press", self.archive)
+        self.assertIn("docs/archive/SOLO_FIRST_DESIGN.md", self.doc)
+        self.assertIn("not** a description of what runs", self.doc)
+        self.assertNotIn("six seconds recorded on the spot", self.doc)

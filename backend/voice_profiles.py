@@ -116,6 +116,37 @@ def _clean_slot(slot: int) -> int:
     return value
 
 
+#: Where the gate opens and closes, as a share of the voice's OWN floor.
+#:
+#: The floor is measured at enrolment from the same take: how alike the voice's
+#: own windows are (median cosine to its mean). Both numbers then come out of
+#: one recording through one microphone, so a different desk or a different
+#: headset moves them together instead of needing a hand to retune a constant -
+#: which is what four rounds of hand-picked thresholds were doing. Measured on
+#: this desk 2026-11-25 (floor 0.845): the owner's windows sit at 0.50-0.87 and
+#: the other voice's at 0.15-0.40, so these shares land inside the gap.
+OPEN_SHARE = 0.62
+CLOSE_SHARE = 0.50
+
+
+def thresholds_from_floor(self_floor: float) -> Tuple[float, float]:
+    """The pair a voice is judged by, derived from how alike that voice is.
+
+    A voice learned badly has a low floor and gets a low pair; a voice learned
+    cleanly gets a high one. Nobody, owner or developer, picks the number - the
+    take does. Clipped so a broken floor cannot produce a gate that is open to
+    everybody or closed to its own owner.
+    """
+    floor = float(self_floor or 0.0)
+    if floor <= 0.0:
+        from backend.voice_diarize import DEFAULT_CLOSE_MARGIN, DEFAULT_OPEN_MARGIN
+
+        return DEFAULT_OPEN_MARGIN, DEFAULT_CLOSE_MARGIN
+    open_at = round(min(0.85, max(0.20, OPEN_SHARE * floor)), 3)
+    close_at = round(min(open_at - 0.02, max(0.15, CLOSE_SHARE * floor)), 3)
+    return open_at, close_at
+
+
 class VoiceProfileStore:
     """The three slots on disk, read whole and written whole.
 
