@@ -9610,7 +9610,15 @@ def save_claimed_voice(
         # The ruler this track is judged against: the voices on this desk that
         # are not it. Built here because this is the one moment the desk knows
         # exactly which voice it is comparing everything else with.
-        _refresh_voice_cohort(claim["vector"])
+        ruled = _refresh_voice_cohort(claim["vector"])
+        if ruled:
+            # The pair written above is in the cosine scale; with a ruler the gate
+            # reads z, so the track keeps the pair of the scale it will be judged
+            # by. One number, one meaning.
+            from backend.voice_cohort import pair_from_z as cohort_pair
+
+            open_at, close_at = cohort_pair()
+            VOICE_PROFILES.set_thresholds(slot, open_at, close_at)
     except Exception:  # noqa: BLE001 - a ruler is an improvement, never a blocker
         logger.exception("voice cohort could not be rebuilt; the gate keeps its own scale")
     saved = _voice_profiles_payload()
@@ -9751,12 +9759,14 @@ def recording_voice_mask() -> Optional[VoiceMask]:
     # profile from another session never was. A hand-tuned pair still wins.
     tuned_open = float(getattr(profile, "open_at", 0.0) or 0.0)
     tuned_close = float(getattr(profile, "close_at", 0.0) or 0.0)
-    if 0.0 < tuned_close <= tuned_open:
-        open_at, close_at = tuned_open, tuned_close
-    elif cohort.size:
-        # The pair the cohort's own calibration asks for: a z measured on this
-        # desk, not a share invented for this file.
+    if cohort.size:
+        # One scale only. With a cohort the score is a z on a sigmoid, so a pair
+        # stored in the cosine scale is not a preference but a different unit:
+        # 0.524 read on this scale means "a stranger" (z 0 sits at 0.5), which
+        # is exactly how a whole take of not-him went through open.
         open_at, close_at = pair_from_z()
+    elif 0.0 < tuned_close <= tuned_open:
+        open_at, close_at = tuned_open, tuned_close
     else:
         open_at, close_at = scorer.open_margin, scorer.close_margin
     global _ACTIVE_VOICE_MASK
