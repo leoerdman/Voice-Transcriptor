@@ -13364,6 +13364,18 @@ async function prepareLiveSession(startAttemptSeq: number): Promise<LiveStartSes
           document.querySelectorAll<HTMLElement>(".voice-slot").forEach((row) => {
             row.classList.toggle("is-firing", firing.has(Number(row.dataset.slot)));
           });
+          // The press needs a couple of seconds of this take, and it counts them
+          // out loud: refusing after the owner has spoken made him guess how
+          // much to say, which is not a question the product should ask.
+          const heardSec = Number(msg.heardSec || 0);
+          const claimBtn = document.getElementById("voiceClaimBtn") as HTMLButtonElement | null;
+          if (claimBtn) {
+            claimBtn.textContent =
+              heardSec >= 2
+                ? `That is me — keep my voice (${heardSec.toFixed(0)} s)`
+                : `That is me — speak (${heardSec.toFixed(1)} s of 2)`;
+            claimBtn.disabled = heardSec < 2;
+          }
           // A failure of the gate is said out loud, once per recording: the
           // pane line alone reads as "a stranger was withheld", and this is
           // the opposite - Solo stopped and the take is untouched.

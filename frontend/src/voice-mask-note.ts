@@ -44,6 +44,8 @@ export interface VoiceMaskState {
    * that matched this window: knowing which version is winning right now is
    * the only way to see a track that is doing nothing.
    */
+  /** Seconds of this take the gate has been handed: the press counts them. */
+  heardSec?: number;
   tracks?: Array<{ slot: number; score: number }>;
 }
 
