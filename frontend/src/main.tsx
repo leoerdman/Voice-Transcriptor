@@ -8920,11 +8920,7 @@ function wireVoiceTune(): void {
   $("voiceTuneReset").addEventListener("click", () => {
     void saveVoiceTune({ open_at: 0, close_at: 0 });
   });
-  $("voiceTuneLearnLast").addEventListener("click", () => {
-    if (voiceTuneSlot === null) return;
-    const name = voiceTuneData?.name || "";
-    void learnFromLastRecording(voiceTuneSlot, name);
-  });
+
 }
 
 // ---- The live meter, while a recording runs --------------------------------
@@ -9053,38 +9049,6 @@ function stopLiveMeter(): void {
  * majority speaker of another was the neighbour, and the enrolled profile
  * could not separate the two across takes. A claimed voice separates by 0.4.
  */
-async function claimVoice(): Promise<void> {
-  const button = $("voiceClaimBtn") as HTMLButtonElement;
-  const label = button.textContent;
-  button.disabled = true;
-  try {
-    const answer = await apiPost<{ seconds?: number }>("/api/voice/claim", { seconds: 10 });
-    const heard = Number(answer.seconds || 0);
-    button.textContent = `Keeping this voice (${heard.toFixed(0)} s) ✓`;
-    // The press has to answer in the place it was made: "nothing happens" was
-    // the report, and it was true — success and failure both looked like a
-    // button that did not move.
-    const name = await askTrackName(defaultTrackName());
-    if (name) {
-      const saved = await apiPost<unknown>("/api/voice/claim/save", { name });
-      voiceProfilesStatus = normalizeVoiceProfiles(saved);
-      voiceProfilesKnown = true;
-      setStatus(`Saved as “${name}” — it is one of your tracks now.`, "done");
-      renderVoiceMask();
-    } else {
-      setStatus("Claimed for this recording only — it was not saved as a track.", "info");
-    }
-  } catch (e) {
-    button.textContent = "Not enough heard — speak, then press";
-    setStatus(sanitizeUiErrorMessage(e, "Could not claim this voice."), "error");
-  } finally {
-    window.setTimeout(() => {
-      button.textContent = label;
-      button.disabled = false;
-    }, 1800);
-  }
-}
-
 /** The name a claim is offered: the owner's own word for today's version. */
 function defaultTrackName(): string {
   const now = new Date();
@@ -9093,11 +9057,10 @@ function defaultTrackName(): string {
 }
 
 /**
- * Ask for a track's name, in a dialog of this page.
+ * Ask for a track's name, in a dialog this page builds itself.
  *
- * `window.prompt` is not available in Electron's renderer, so the question is
- * built from the same elements the rest of the app uses. Resolves with the
- * trimmed name, or null when the owner declines to save the voice.
+ * `window.prompt` does not exist in the shell's renderer, so the question is
+ * made from the same elements the rest of the app uses.
  */
 function askTrackName(suggested: string): Promise<string | null> {
   const modal = document.createElement("div");
@@ -9145,28 +9108,38 @@ function askTrackName(suggested: string): Promise<string | null> {
   });
 }
 
-async function learnFromLastRecording(slot: number, name: string): Promise<void> {
-  if (voiceProfilesBusy) return;
-  voiceProfilesBusy = true;
-  renderVoiceMask();
+async function claimVoice(): Promise<void> {
+  const button = $("voiceClaimBtn") as HTMLButtonElement;
+  const label = button.textContent;
+  button.disabled = true;
   try {
-    const response = await fetch(`/api/voice/profiles/${slot}/enrol-last`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...authHeaders() },
-      body: JSON.stringify({ name }),
-    });
-    if (!response.ok) throw new Error(await parseError(response));
-    voiceProfilesStatus = normalizeVoiceProfiles(await response.json());
-    voiceProfilesKnown = true;
-    setVoiceProfilesError("");
-    setStatus("Learned from the newest recording — the same channel Solo judges.", "done");
+    const answer = await apiPost<{ seconds?: number }>("/api/voice/claim", { seconds: 10 });
+    const heard = Number(answer.seconds || 0);
+    button.textContent = `Keeping this voice (${heard.toFixed(0)} s) ✓`;
+    // The press has to answer in the place it was made: "nothing happens" was
+    // the report, and it was true — success and failure both looked like a
+    // button that did not move.
+    const name = await askTrackName(defaultTrackName());
+    if (name) {
+      const saved = await apiPost<unknown>("/api/voice/claim/save", { name });
+      voiceProfilesStatus = normalizeVoiceProfiles(saved);
+      voiceProfilesKnown = true;
+      setStatus(`Saved as “${name}” — it is one of your tracks now.`, "done");
+      renderVoiceMask();
+    } else {
+      setStatus("Claimed for this recording only — it was not saved as a track.", "info");
+    }
   } catch (e) {
-    setVoiceProfilesError(sanitizeUiErrorMessage(e, "Could not learn from the newest recording."));
+    button.textContent = "Not enough heard — speak, then press";
+    setStatus(sanitizeUiErrorMessage(e, "Could not claim this voice."), "error");
   } finally {
-    voiceProfilesBusy = false;
-    renderVoiceMask();
+    window.setTimeout(() => {
+      button.textContent = label;
+      button.disabled = false;
+    }, 1800);
   }
 }
+
 
 async function switchSlot(slot: number, on: boolean): Promise<void> {
   if (voiceProfilesBusy) return;
@@ -9312,7 +9285,7 @@ $("soloInviteLearnBtn").addEventListener("click", () => {
   answerSoloInvite();
   switchView("settings");
   revealVoiceMaskCard();
-  setStatus("Press Keep on an empty row and read the line out loud.", "info");
+  setStatus("Start a recording, speak, then press “That is me” — it saves that voice as a track.", "info");
 });
 
 $("soloInviteDismissBtn").addEventListener("click", answerSoloInvite);
