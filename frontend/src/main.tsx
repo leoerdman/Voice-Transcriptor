@@ -263,20 +263,8 @@ import {
   type VoiceProfilesStatus,
 } from "./voice-profiles-section";
 import {
-  ENROL_GUIDANCE,
-  ENROL_MIN_SECONDS,
-  ENROL_NO_CAPTURE_API,
-  ENROL_SCRIPT,
-  ENROL_SECONDS,
-  enrolLiveView,
-  enrolMicErrorText,
-  type EnrolLiveView,
-  type MicContext,
-} from "./voice-enrol-prompt";
-import {
   concatSamples,
   int16FromFloat,
-  pcmSeconds,
   resampleTo16k,
 } from "./enrol-audio";
 import { voiceMaskNoteText, type VoiceMaskState } from "./voice-mask-note";
@@ -8384,10 +8372,6 @@ let voiceProfilesKnown = false;
 /** Set while one of this section's requests is in flight. */
 let voiceProfilesBusy = false;
 
-/** What the card calls a slot, in the one voice the rows use. */
-function voiceLabel(slot: number): string {
-  return voiceMaskView(voiceProfilesStatus).rows[slot - 1]?.label ?? `Voice ${slot}`;
-}
 
 /**
  * Which row control had focus, so a rebuild can put it back.
@@ -8472,12 +8456,6 @@ function renderVoiceMask(): void {
   $("soloInviteText").textContent = SOLO_INVITE_TEXT;
   invite.hidden = !soloInviteShows({ invite: view.invite, dismissed: soloInviteDismissed });
 
-  // The passage and how to read it are painted from the same constants the
-  // card and the tests share, so the text on screen is the text that was
-  // measured to work.
-  $("voiceEnrolScript").textContent = ENROL_SCRIPT;
-  $("voiceEnrolGuidance").textContent = ENROL_GUIDANCE;
-
   const list = $("voiceProfileSlots");
   // The rows are rebuilt wholesale, so whatever had focus is about to be
   // detached: remember which control it was and put it back at the end.
@@ -8490,31 +8468,16 @@ function renderVoiceMask(): void {
     item.setAttribute("role", "listitem");
 
     if (row.empty) {
-      // An empty row IS the question: one field, one press. No slot number,
-      // no "Empty", no switch — a label beside a label beside a button is how
-      // "name" and "voice" started looking like two different things.
-      const nameField = document.createElement("input");
-      nameField.type = "text";
-      nameField.id = `voiceName-${row.slot}`;
-      nameField.maxLength = 40;
-      nameField.placeholder = "Name this voice";
-      nameField.className = "voice-slot-name-input";
-      nameField.autocomplete = "off";
-      nameField.disabled = voiceProfilesBusy;
-      const learn = document.createElement("button");
-      learn.type = "button";
-      learn.className = "btn btn-primary voice-slot-learn";
-      learn.textContent = "Learn";
-      learn.disabled = voiceProfilesBusy;
-      learn.setAttribute("aria-label", `Record a voice for this slot`);
-      learn.addEventListener("click", () => {
-        void learnFromThisRow(row.slot);
-      });
-      item.append(nameField, learn);
+      // Settings no longer learns: a track comes only from a take the owner
+      // claimed with "That is me", through the same channel the gate judges.
+      // An empty row says exactly that and offers nothing to press.
+      const hint = document.createElement("span");
+      hint.className = "voice-slot-hint";
+      hint.textContent = "No track yet — press “That is me” while recording.";
+      item.append(hint);
       list.appendChild(item);
       continue;
     }
-
     const copy = document.createElement("div");
     copy.className = "voice-slot-copy";
     const label = document.createElement("span");
@@ -9095,219 +9058,93 @@ async function claimVoice(): Promise<void> {
   const label = button.textContent;
   button.disabled = true;
   try {
-    await apiPost("/api/voice/claim", { seconds: 10 });
+    const answer = await apiPost<{ seconds?: number }>("/api/voice/claim", { seconds: 10 });
+    const heard = Number(answer.seconds || 0);
+    button.textContent = `Keeping this voice (${heard.toFixed(0)} s) ✓`;
     // The press has to answer in the place it was made: "nothing happens" was
     // the report, and it was true — success and failure both looked like a
     // button that did not move.
-    button.textContent = "Keeping this voice ✓";
-    setStatus("Solo will keep the voice it just heard and withhold the other.", "done");
-    window.setTimeout(() => {
-      button.textContent = label;
-      button.disabled = false;
-    }, 2500);
+    const name = await askTrackName(defaultTrackName());
+    if (name) {
+      const saved = await apiPost<unknown>("/api/voice/claim/save", { name });
+      voiceProfilesStatus = normalizeVoiceProfiles(saved);
+      voiceProfilesKnown = true;
+      setStatus(`Saved as “${name}” — it is one of your tracks now.`, "done");
+      renderVoiceMask();
+    } else {
+      setStatus("Claimed for this recording only — it was not saved as a track.", "info");
+    }
   } catch (e) {
     button.textContent = "Not enough heard — speak, then press";
     setStatus(sanitizeUiErrorMessage(e, "Could not claim this voice."), "error");
+  } finally {
     window.setTimeout(() => {
       button.textContent = label;
       button.disabled = false;
-    }, 2500);
+    }, 1800);
   }
 }
 
-/** Is the card showing the microphone as open right now? *//** Is the card showing the microphone as open right now? */
-let enrolRecording = false;
-
-/**
- * The card's live line: dot, countdown, and whether it is really recording.
- *
- * The dot is the window's own (`record-toggle-dot` plus `is-recording`), so
- * "recording" looks the same in Settings as it does in the topbar: same
- * colour, same 1.4 s pulse, none of it under `prefers-reduced-motion`. The
- * card paints from `enrolLiveView` so the caption and the countdown share one
- * clock with the capture timeout.
- */
-function paintEnrolLive(view: EnrolLiveView): void {
-  const box = $("voiceEnrolLive");
-  box.hidden = !enrolRecording;
-  box.classList.toggle("is-recording", enrolRecording && view.recording);
-  $("voiceEnrolLiveText").textContent = view.caption;
+/** The name a claim is offered: the owner's own word for today's version. */
+function defaultTrackName(): string {
+  const now = new Date();
+  const pad = (value: number): string => String(value).padStart(2, "0");
+  return `я · ${pad(now.getDate())}.${pad(now.getMonth() + 1)} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
 }
 
 /**
- * What this page can say about its own ability to capture, before it tries.
+ * Ask for a track's name, in a dialog of this page.
  *
- * Three facts, none of them visible to the backend and all of them the
- * difference between four sentences that send the user to four different
- * places: a frame the embedding window has to hand the microphone to, a page
- * that is not a secure context, and the permission the browser already holds.
+ * `window.prompt` is not available in Electron's renderer, so the question is
+ * built from the same elements the rest of the app uses. Resolves with the
+ * trimmed name, or null when the owner declines to save the voice.
  */
-async function micContext(): Promise<MicContext> {
-  let framed = true;
-  try {
-    framed = window.self !== window.top;
-  } catch {
-    // A cross-origin parent makes ``window.top`` throw; that is a frame too.
-    framed = true;
-  }
-  let permission = "unavailable";
-  try {
-    const status = await navigator.permissions?.query({
-      name: "microphone" as PermissionName,
-    });
-    permission = status?.state || "unavailable";
-  } catch {
-    permission = "unavailable";
-  }
-  return { framed, secure: Boolean(window.isSecureContext), permission,
-           electron: /Electron\//.test(navigator.userAgent) };
-}
-
-/**
- * Open the microphone for six seconds and hand back what it heard.
- *
- * This is the whole point of the card's press: a voice is learned from a
- * recording the user makes on purpose, at the moment they ask for it. It used
- * to enrol from the newest take in the archive, which meant the card silently
- * turned somebody's last meeting — with everyone else in the room — into their
- * voice, and the answer to "what am I supposed to do here" was "already done,
- * from something you did not choose".
- *
- * Returns null when the press has to stop (no microphone, a take already
- * running, the capture was refused), with the reason already on the card.
- */
-async function captureEnrolment(label: string): Promise<Int16Array | null> {
-  if (isRecording) {
-    // Two microphones at once would mean two AudioContexts on one device and
-    // a take whose gate is being pressed mid-stream; one at a time.
-    setVoiceProfilesError("Stop the recording first: Solo listens to one microphone at a time.");
-    return null;
-  }
-  if (!navigator.mediaDevices?.getUserMedia) {
-    setVoiceProfilesError(ENROL_NO_CAPTURE_API);
-    return null;
-  }
-
-  // The page's own situation first: a frame cannot capture whatever the site
-  // permission says, and asking for a stream there only produces a refusal
-  // that reads like a permission problem.
-  const context = await micContext();
-  if (context.framed) {
-    setVoiceProfilesError(enrolMicErrorText(null, location.origin, context));
-    return null;
-  }
-
-  let stream: MediaStream;
-  try {
-    // The same constraints the recorder uses, not `{audio: true}`: the default
-    // turns on echo cancellation, noise suppression and automatic gain, which
-    // reshape the very spectrum a voice profile is made of (measured: a press
-    // captured that way scored its own owner at 0.39 median against the desk's
-    // own recordings, i.e. the profile was from another channel).
-    stream = await navigator.mediaDevices.getUserMedia({ audio: { ...DICTATION_AUDIO_PROCESSING } });
-  } catch (error) {
-    // Classified, not generalised: the sentence names the one action that
-    // applies to this refusal, and the page it applies to.
-    setVoiceProfilesError(enrolMicErrorText(error, location.origin, context));
-    return null;
-  }
-
-  const ctx = new AudioContext();
-  const chunks: Float32Array[] = [];
-  let node: ScriptProcessorNode | null = null;
-  let source: MediaStreamAudioSourceNode | null = null;
-  let sink: GainNode | null = null;
-  let timer = 0;
-  const startedAt = performance.now();
-  const before = { text: liveStatusText, kind: liveStatusKind };
-
-  try {
-    await ctx.resume();
-    source = ctx.createMediaStreamSource(stream);
-    // The app already ships a ScriptProcessor fallback for the same reason:
-    // the worklet needs a module URL and a fetch, and this capture is six
-    // seconds that must start now. 4096 frames is ~85 ms at 48 kHz — the same
-    // buffer size the fallback uses.
-    node = ctx.createScriptProcessor(4096, 1, 1);
-    node.onaudioprocess = (event) => {
-      if (!enrolRecording) return;
-      chunks.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+function askTrackName(suggested: string): Promise<string | null> {
+  const modal = document.createElement("div");
+  modal.className = "pick-modal";
+  const card = document.createElement("div");
+  card.className = "pick-card";
+  const title = document.createElement("p");
+  title.className = "pick-title";
+  title.textContent = "Name this track";
+  const field = document.createElement("input");
+  field.type = "text";
+  field.className = "voice-slot-name-input";
+  field.maxLength = 40;
+  field.value = suggested;
+  field.setAttribute("aria-label", "Track name");
+  const actions = document.createElement("div");
+  actions.className = "pick-actions";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "btn btn-ghost";
+  cancel.textContent = "Not now";
+  const save = document.createElement("button");
+  save.type = "button";
+  save.className = "btn btn-primary";
+  save.textContent = "Save track";
+  actions.append(cancel, save);
+  card.append(title, field, actions);
+  modal.append(card);
+  document.body.append(modal);
+  field.focus();
+  field.select();
+  return new Promise<string | null>((resolve) => {
+    const close = (value: string | null): void => {
+      modal.remove();
+      document.removeEventListener("keydown", onKey, true);
+      resolve(value);
     };
-    // A muted gain into the destination keeps the graph running in Chromium:
-    // a ScriptProcessor with no path to an output is never pulled, so it
-    // never fires.
-    sink = ctx.createGain();
-    sink.gain.value = 0;
-    source.connect(node);
-    node.connect(sink);
-    sink.connect(ctx.destination);
-
-    enrolRecording = true;
-    paintEnrolLive(enrolLiveView(0, label));
-    setStatus(`Recording ${label} — ${ENROL_SECONDS} s left`, "recording");
-
-    const elapsed = () =>
-      new Promise<void>((resolve) => {
-        timer = window.setInterval(() => {
-          const view = enrolLiveView(performance.now() - startedAt, label);
-          paintEnrolLive(view);
-          setStatus(view.caption, view.recording ? "recording" : "processing");
-          if (!view.recording) {
-            window.clearInterval(timer);
-            timer = 0;
-            resolve();
-          }
-        }, 100);
-      });
-    await elapsed();
-  } finally {
-    enrolRecording = false;
-    if (timer) window.clearInterval(timer);
-    if (node) {
-      node.onaudioprocess = null;
-      node.disconnect();
-    }
-    source?.disconnect();
-    sink?.disconnect();
-    for (const track of stream.getTracks()) track.stop();
-    // close() is a promise that nothing awaits: the capture is over either
-    // way, and a device that is slow to release must not hold the press.
-    void ctx.close().catch(() => undefined);
-    paintEnrolLive(enrolLiveView(Number.MAX_SAFE_INTEGER, label));
-    setStatus(before.text || "Idle", before.kind);
-  }
-
-  const heard = resampleTo16k(concatSamples(chunks), ctx.sampleRate);
-  const pcm = int16FromFloat(heard);
-  if (pcmSeconds(pcm) < ENROL_MIN_SECONDS) {
-    // The microphone opened but delivered nothing: a muted device, or a
-    // permission dialog that was answered after the countdown started.
-    setVoiceProfilesError(
-      "Nothing reached the microphone. Check that it is not muted, then press the switch again.",
-    );
-    return null;
-  }
-  return pcm;
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") close(null);
+      if (event.key === "Enter") close(field.value.trim() || null);
+    };
+    save.addEventListener("click", () => close(field.value.trim() || null));
+    cancel.addEventListener("click", () => close(null));
+    document.addEventListener("keydown", onKey, true);
+  });
 }
 
-/**
- * Learn a voice into `slot` from the six seconds just captured.
- *
- * The bytes go up as they are — 16 kHz mono PCM16, no container, no temp file
- * — and the store answers with the whole card, so the row appears from the
- * same read that wrote it. Returns whether a profile was written; every
- * refusal is the backend's own reason, which is actionable ("no speech Solo
- * could hear…"), so it is shown as it came.
- */
-/**
- * One press, no picking: learn this voice from the newest recording.
- *
- * The card's microphone press captures a different channel from the takes the
- * gate judges (measured 2026-11-24: a press profile scored its own owner at
- * 0.336 against a take, while a profile taken from the take separated the two
- * voices completely). The newest recording needs no name, so nothing has to be
- * chosen from a list of timestamps.
- */
 async function learnFromLastRecording(slot: number, name: string): Promise<void> {
   if (voiceProfilesBusy) return;
   voiceProfilesBusy = true;
@@ -9330,31 +9167,7 @@ async function learnFromLastRecording(slot: number, name: string): Promise<void>
     renderVoiceMask();
   }
 }
-async function learnInto(slot: number, name: string): Promise<boolean> {
-  // The name arrived from the row's own field BEFORE the card repainted: a
-  // re-read after the repaint finds a fresh, empty input and saves a voice
-  // called "Voice 2", which is what a user saw and could not explain.
-  const pcm = await captureEnrolment(name || `Voice ${slot}`);
-  if (!pcm) return false;
-  try {
-    const query = name ? `?name=${encodeURIComponent(name)}` : "";
-    const response = await fetch(`/api/voice/profiles/${slot}/enrol-live${query}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/octet-stream", ...authHeaders() },
-      body: pcm.buffer as ArrayBuffer,
-    });
-    if (!response.ok) throw new Error(await parseError(response));
-    voiceProfilesStatus = normalizeVoiceProfiles(await response.json());
-    voiceProfilesKnown = true;
-    setVoiceProfilesError("");
-    return true;
-  } catch (e) {
-    setVoiceProfilesError(sanitizeUiErrorMessage(e, "Could not learn that voice."));
-    return false;
-  }
-}
 
-/** One row's switch: keep that slot, or stop keeping it; learn it if empty. */
 async function switchSlot(slot: number, on: boolean): Promise<void> {
   if (voiceProfilesBusy) return;
 
@@ -9402,15 +9215,10 @@ async function switchSlot(slot: number, on: boolean): Promise<void> {
       return;
     }
 
-    // Empty slot: the press is the recording. Six seconds of the user's
-    // voice, then the slot keeps what it heard.
-    if (await learnInto(slot, voiceLabel(slot))) {
-      voiceProfilesStatus = normalizeVoiceProfiles(
-        await apiPost<unknown>(`/api/voice/profiles/${slot}/enable`, {}),
-      );
-      voiceProfilesKnown = true;
-      setVoiceProfilesError("");
-    }
+    // An empty row is not a switch: there is no voice to let through, and
+    // Settings does not record one any more. A track is made by pressing
+    // "That is me" while the take that will be judged is running.
+    setVoiceProfilesError("No voice in that row yet — press “That is me” while recording.");
   } catch (e) {
     setVoiceProfilesError(sanitizeUiErrorMessage(e, "Could not switch that voice on."));
   } finally {
@@ -9420,24 +9228,6 @@ async function switchSlot(slot: number, on: boolean): Promise<void> {
   }
 }
 
-/** Put the card — and the switch that can learn — in front of the user. */
-function revealVoiceMaskCard(): void {
-  const card = document.querySelector<HTMLElement>(".card-voice");
-  card?.scrollIntoView({ block: "center" });
-  const first = document.querySelector<HTMLInputElement>(
-    "#voiceProfileSlots .voice-slot.is-empty input[type=checkbox]",
-  );
-  // `preventScroll`: the focus must not fight the scroll above, which is
-  // already putting the line to read in the middle of the window.
-  first?.focus({ preventScroll: true });
-}
-/**
- * Turn the gate on or off.
- *
- * No track is chosen here: every learned track is a version of the same
- * voice and the gate lets a window through when it matches any of them.
- * Which one is matching right now is shown on the rows while a take runs.
- */
 async function switchMask(on: boolean): Promise<void> {
   if (voiceProfilesBusy) return;
   if (!on) {
@@ -9477,55 +9267,19 @@ async function switchMask(on: boolean): Promise<void> {
   await switchSlot(target, true);
 }
 
-/** The name typed on an empty row, trimmed; "" when it is still empty. */
-function learnName(slot: number): string {
-  const field = document.getElementById(`voiceName-${slot}`) as HTMLInputElement | null;
-  return (field?.value || "").trim();
+
+
+function revealVoiceMaskCard(): void {
+  const card = document.querySelector<HTMLElement>(".card-voice");
+  card?.scrollIntoView({ block: "center" });
+  const first = document.querySelector<HTMLInputElement>(
+    "#voiceProfileSlots .voice-slot.is-empty input[type=checkbox]",
+  );
+  // `preventScroll`: the focus must not fight the scroll above, which is
+  // already putting the line to read in the middle of the window.
+  first?.focus({ preventScroll: true });
 }
 
-/** Learn from the seconds just recorded, while the take is still running. */
-async function enrolFromLive(slot: number, name: string): Promise<void> {
-  try {
-    const response = await fetch(`/api/voice/profiles/${slot}/enrol-now`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...authHeaders() },
-      body: JSON.stringify({ name }),
-    });
-    if (!response.ok) throw new Error(await parseError(response));
-    voiceProfilesStatus = normalizeVoiceProfiles(await response.json());
-    voiceProfilesKnown = true;
-    setVoiceProfilesError("");
-  } catch (e) {
-    setVoiceProfilesError(sanitizeUiErrorMessage(e, "Could not learn that voice."));
-  }
-}
-async function learnFromThisRow(slot: number): Promise<void> {
-  const name = learnName(slot);
-  if (!name) {
-    setVoiceProfilesError("Name this voice first.");
-    (document.getElementById(`voiceName-${slot}`) as HTMLInputElement | null)?.focus();
-    return;
-  }
-  voiceProfilesBusy = true;
-  renderVoiceMask();
-  try {
-    // A take is already running: its last ten seconds are the sample, so the
-    // press lands on the voice while it speaks. Otherwise the card opens the
-    // microphone itself and takes six seconds — one press, no other screen.
-    const live = $("recordToggleBtn").getAttribute("aria-pressed") === "true";
-    if (live) {
-      await enrolFromLive(slot, name);
-    } else {
-      await learnInto(slot, name);
-    }
-  } finally {
-    // The store answered with the new slot list; the card has to paint it, or
-    // the row that just learned still says "Name this voice" with a Learn
-    // button, which reads as the press having done nothing.
-    voiceProfilesBusy = false;
-    renderVoiceMask();
-  }
-}
 
 async function forgetSlot(slot: number, label: string): Promise<void> {
   if (voiceProfilesBusy) return;

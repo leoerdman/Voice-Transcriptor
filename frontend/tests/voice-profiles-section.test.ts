@@ -346,23 +346,25 @@ describe("the card's presses", () => {
     expect(main).toContain("void switchSlot(row.slot, input.checked)");
   });
 
-  it("learns into the slot whose switch was pressed, from a capture", () => {
-    // The press records the user for six seconds; it does not reach into the
-    // archive. See voice-enrol-prompt.test.ts for what the card promises.
-    expect(main).toContain("async function learnInto(slot: number, name: string)");
-    expect(main).toContain("if (await learnInto(slot, voiceLabel(slot)))");
-    expect(main).toContain("`/api/voice/profiles/${slot}/enrol-live${query}`");
-    expect(main).toContain("async function captureEnrolment");
+
+  it("has no way to record a voice: the card only switches and forgets", () => {
+    // A track is made by "That is me" during the take that will be judged —
+    // never here, where a profile learned away from a take comes through a
+    // different audio channel and stops recognising its own owner.
+    expect(main).not.toContain("learnFromThisRow");
+    expect(main).not.toContain("captureEnrolment");
+    expect(main).not.toContain("voiceName-${row.slot}");
+    expect(main).not.toContain("/enrol-live");
+    expect(main).toContain("No track yet");
   });
 
-  it("takes the voice's name from the row that is being learned", () => {
-    // Each empty row owns its name field (`#voiceName-<slot>`) and records the
-    // voice on the spot, so a press learns the row it pressed with the name
-    // typed in it.
-    expect(main).toContain("voiceName-${row.slot}");
-    expect(main).toContain("learnFromThisRow(row.slot)");
+  it("saves the voice a press claimed, under the name it is given", () => {
+    expect(main).toContain("async function claimVoice");
+    expect(main).toContain("/api/voice/claim/save");
+    expect(main).toContain("function askTrackName");
+    // window.prompt does not exist in the shell, so the question is built
+    // from the page's own elements.
     expect(main).not.toContain("window.prompt(");
-    expect(main).toContain("?name=${encodeURIComponent(name)}");
   });
 
   it("no longer borrows the newest take from History", () => {
@@ -429,22 +431,18 @@ describe("the card's presses", () => {
     const fn = main.slice(main.indexOf("async function switchSlot("));
     const body = fn.slice(0, fn.indexOf("\n}\n"));
     expect(body).toContain("if (view.disabled) {");
-    expect(body).toContain("setVoiceProfilesError(view.summary);");
     expect(body.indexOf("setVoiceProfilesError(view.summary);")).toBeLessThan(
-      body.indexOf("await learnInto("),
+      body.indexOf("await writeVoiceProfiles("),
     );
   });
 
-  it("offers one way to learn, not two", () => {
-    // An empty row is a name field and a press, and that press records the
-    // voice on the spot. The latest-recording lookup and its label went with
-    // it: two paths to the same slot is how the card started asking the user
-    // to understand its plumbing.
-    expect(main).not.toContain("`Learn ${row.label} in six seconds`");
-    expect(main).toContain("learnFromThisRow(row.slot)");
+  it("offers no way to learn from the card at all", () => {
+    // Settings lost its recording press on purpose: a track is made by
+    // "That is me" during the take that will be judged, so the voice it
+    // learns comes through the same channel the gate decides on.
+    expect(main).not.toContain("learnFromThisRow");
     expect(main).not.toContain("enrol-latest");
   });
-
   it("forgets the voice in the row it belongs to", () => {
     expect(main).toContain("async function forgetSlot(slot: number, label: string)");
     expect(main).toContain("() => apiDelete<unknown>(`/api/voice/profiles/${slot}`)");

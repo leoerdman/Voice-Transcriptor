@@ -868,21 +868,11 @@
             </div>
           </div>
           <!--
-            Solo (§5.1, §7.4). Three slots, one switch each, and a Forget for
-            every voice that was learned.
-
-            The rows are NOT written here: main.tsx builds them from
-            GET /api/voice/profiles, because the store is the only author of
-            what exists. What is *not* here is a take dropdown or a "make a
-            profile" press: a voice is learned by the switch that needs it.
-
-            What a press costs is documented here, before the press, because
-            it costs seconds of the user's attention and a sentence out loud:
-            the line below is the script, the note says how many seconds are
-            given, and `#voiceEnrolLive` is the same dot and countdown the
-            window uses while a take is running. The note is rewritten from
-            src/voice-enrol-prompt at boot so the number cannot drift from the
-            countdown; without JS it still reads correctly.
+            Solo (§5.1, §7.4). One row per learned track, a switch and a Forget
+            for each — and nothing that records. A track is made from a take
+            the owner claimed with "That is me", never from this card: a profile
+            learned away from a take comes through another audio channel, which
+            is exactly what kept Solo from recognising its own owner.
           -->
           <div class="card card-voice">
             <div class="card-header">
@@ -905,17 +895,12 @@
                 recording. No dropdown, no prompt, nothing on another screen.
               -->
                             <!--
-                One question and one press. Nothing here names a person:
-                the example is a role, not somebody's name.
+                The rows below are the tracks Solo knows. This card does not
+                record: a track is made by pressing “That is me” while the take
+                that will be judged is running, so the voice it learns came
+                through the same microphone and the same processing.
               -->
-                            <p class="settings-note" id="voiceEnrolGuidance"></p>
-              <blockquote class="settings-script" id="voiceEnrolScript"></blockquote>
-              <p class="settings-note">
-                Type a name and press Learn, then read the passage above: it opens
-                the microphone for twenty seconds, or — while a recording runs — keeps
-                the last twenty seconds of it.
-              </p>
-<div class="voice-slots" id="voiceProfileSlots" role="list"></div>
+              <div class="voice-slots" id="voiceProfileSlots" role="list"></div>
               <!--
                 The tuner: one take scored window by window, the two thresholds
                 drawn over it as lines, and the share numbers under it. This is
@@ -968,10 +953,6 @@
                 aria-live: the countdown changes once a second and a screen
                 reader should hear where it is.
               -->
-              <div class="voice-enrol-live" id="voiceEnrolLive" hidden role="status" aria-live="polite">
-                <span class="record-toggle-dot" aria-hidden="true"></span>
-                <span id="voiceEnrolLiveText">Recording — 6 s left</span>
-              </div>
               <div class="settings-save-status settings-save-status-warning" id="voiceProfilesError"
                 hidden></div>
             </div>

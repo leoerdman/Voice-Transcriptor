@@ -87,7 +87,12 @@ from backend.voice_embed import SpeakerEmbedder, SpeakerScorer, default_model_pa
 from backend.voice_enrol import EnrolmentError, decode_take, enrol_take, enrol_take_stats, take_level_db
 from backend.voice_mask import VoiceMask
 from backend.voice_mask_worker import MaskState, MaskWorker
-from backend.voice_profiles import NAME_MAX_CHARS, ProfileError, VoiceProfileStore
+from backend.voice_profiles import (
+    NAME_MAX_CHARS,
+    SLOTS,
+    ProfileError,
+    VoiceProfileStore,
+)
 from backend.audio import (
     AudioError,
     compact_audio_chunks_for_remote,
@@ -9449,6 +9454,11 @@ def stop_live_voice_tune(token: str, _auth: None = Depends(_require_api_auth)):
     return {"stopped": bool(stopped)}
 
 
+#: The vector behind the current claim, so the name step stores the same voice.
+from typing import Any  # noqa: E402  (kept beside the state it types)
+_ACTIVE_VOICE_VECTOR: list[Any] = [None]
+
+
 #: The gate of the recording that is running, so one press can tell it whose
 #: voice is whose. Set by ``recording_voice_mask`` at the start and cleared
 #: when the take stops: a claim about one recording must not outlive it.
@@ -9497,14 +9507,57 @@ def claim_voice_for_recording(
     if vector is None:
         raise HTTPException(status_code=400, detail="no voice was heard in those seconds")
     scorer.set_owner(vector)
+    # Kept here so the name step can store the same voice without asking the
+    # microphone again — the vector is the press's whole result.
+    _ACTIVE_VOICE_VECTOR[0] = np.asarray(vector, dtype=np.float64)
     logger.info("voice claimed for the running recording from its own windows")
-    return {"claimed": True}
+    return {"claimed": True, "seconds": round(heard, 1)}
+
+
+@app.post("/api/voice/claim/save")
+def save_claimed_voice(
+    payload: dict = Body(default={}),
+    _auth: None = Depends(_require_api_auth),
+):
+    """Store the voice just claimed as a track, under the name it was given.
+
+    This is the only way a track is learned now: from the take the owner is
+    actually making, through the same pipeline the gate judges with. The
+    recording press in Settings is gone because a profile learned away from a
+    take lives in another channel — which is why Solo kept failing to
+    recognise its own owner (0.34 against a 0.42 close, measured 2026-11-24).
+    """
+    vector = _ACTIVE_VOICE_VECTOR[0]
+    if vector is None:
+        raise HTTPException(
+            status_code=400,
+            detail="no voice has been claimed in this recording yet - press That is me first",
+        )
+    name = " ".join(str(payload.get("name") or "").split())[:NAME_MAX_CHARS]
+    if not name:
+        raise HTTPException(status_code=400, detail="a track needs a name")
+    taken = set(VOICE_PROFILES.profiles())
+    slot = next((index for index in range(1, SLOTS + 1) if index not in taken), None)
+    if slot is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"all {SLOTS} tracks are full - remove one in Settings first",
+        )
+    try:
+        VOICE_PROFILES.save(slot, name, vector, self_floor=0.0, level_db=0.0)
+    except ProfileError as e:
+        raise HTTPException(status_code=400, detail=_safe_error_text(e)) from None
+    logger.info("claimed voice saved as track %s (%r)", slot, name)
+    saved = _voice_profiles_payload()
+    saved["saved_slot"] = slot
+    return saved
 
 
 def clear_active_voice_mask() -> None:
     """The take ended: a claim about one recording must not outlive it."""
     global _ACTIVE_VOICE_MASK
     _ACTIVE_VOICE_MASK = None
+    _ACTIVE_VOICE_VECTOR[0] = None
 
 
 def recording_voice_mask() -> Optional[VoiceMask]:
