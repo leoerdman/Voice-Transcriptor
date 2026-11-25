@@ -40,3 +40,31 @@ Presumptive; the person running the app decides. Off is the default.
 7.3 The call site: one line after the recovery chunk, and the flush on finalize, nothing else.
 7.4 Settings: three slots, one switch each, one Forget per voice — a press on an empty slot asks whose voice it is, then records six seconds of the person pressing it, saying the printed line; the countdown, the row's "Learning…" and the window's red dot say it is running, and the capture is kept beside the profiles as the evidence the vector came from — never as a take, never in History, so a later sweep can tell whose voice landed in which slot.
 7.5 Smoke on real takes: the thresholds are measured there, and the tail is the number that sweep paid for.
+
+8. The desk as it stands (2026-11-25, 1.6.42)
+8.1 A track is made by a take, never in Settings: the owner presses "That is me"
+    while recording, the gate keeps the audio it was handed, and the press
+    claims that voice for the take (measured separation 0.82 against 0.41).
+    A name is asked next and the vector is stored as a track
+    (POST /api/voice/claim/save); the claim is dropped when the take ends.
+8.2 Settings only switches and forgets: nine rows, no recording press, no
+    script, no countdown. An empty row says how a track is made. The press it
+    used to carry was removed for a measured reason, not for taste: a profile
+    learned away from a take comes through another audio channel, and scored
+    its own owner at 0.34 against a 0.42 close while the take's own channel
+    separated him at 0.82.
+8.3 Every tracked version counts: the gate compares a window with all learned
+    tracks and passes it on the best match. No track is chosen in advance - a
+    first-filled guess withheld the owner and let the neighbour through on a
+    real take.
+8.4 The card lights what matched: each verdict carries the score per track,
+    and every row at or above open_at glows. A version that never lights is a
+    version doing nothing.
+8.5 Thresholds on the diarizer's own scale: open 0.50, close 0.42, where 0.5
+    means "as close to this room's owner voice as to the other one". A
+    hand-tuned pair on the profile still wins.
+8.6 The press counts itself: two seconds of the take is the floor, counted in
+    the window from the moment the take starts, not from gate reports - a
+    quiet room sends none. The button says "speak (0.8 s of 2)" and then
+    "keep my voice (2 s)".
+8.7 A full store refuses the save instead of overwriting a track.
