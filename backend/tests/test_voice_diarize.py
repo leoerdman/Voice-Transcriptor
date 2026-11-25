@@ -122,6 +122,32 @@ class TheScorerTests(unittest.TestCase):
     def test_the_same_voice_pin_is_where_the_theme_says(self):
         self.assertEqual(SAME_VOICE_COSINE, 0.75)
 
+    def test_a_room_of_strangers_never_opens(self):
+        """The session owner is not simply whoever dominates the room.
+
+        Measured on the desk 2026-11-25: a take of a voice scoring 0.21-0.25
+        against the owner's track stayed OPEN for 27.7 of 34.5 seconds, because
+        the gate let the room pick its owner and then measured every window
+        against that pick. The absolute cosine to the tracks is the floor.
+        """
+        owner = unit(1)
+        stranger = unit(2)
+        # Among themselves the strangers are one cluster and the best one could
+        # be: the room's own scale says "the owner is here". Only the track says
+        # otherwise.
+        embedder = FakeEmbedder([stranger for _ in range(24)])
+        scorer = DiarizedScorer(embedder, owner)
+        scores = [float(scorer(None)) for _ in range(24)]
+        self.assertTrue(scores)
+        self.assertLess(max(scores), DEFAULT_CLOSE_MARGIN)
+
+    def test_the_owner_still_opens_the_gate(self):
+        owner = unit(5)
+        embedder = FakeEmbedder([owner for _ in range(12)])
+        scorer = DiarizedScorer(embedder, owner)
+        scores = [float(scorer(None)) for _ in range(12)]
+        self.assertGreater(float(np.median(scores)), DEFAULT_OPEN_MARGIN)
+
 
 if __name__ == "__main__":
     unittest.main()

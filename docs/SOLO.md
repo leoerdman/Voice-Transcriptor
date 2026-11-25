@@ -30,7 +30,7 @@ Presumptive; the person running the app decides. Off is the default.
 5.2 A cold is one of the three, switched on like any other: no mark, no expiry, whoever runs it decides.
 5.3 A closed Solo is drawn: the refusal is visible, never silent.
 5.4 Silence reads as lost speech; a line of state costs less than a lost utterance.
-5.5 A profile is made in Settings, on the Solo card, two ways and both by an act: six seconds recorded on the spot, or a recording the owner points at ("From last recording"). The second is the stronger one for Solo's purpose — the sample then comes through the same microphone and room the desk judges, and measured 2026-11-21 the condition mattered as much as the speaker (0.528-0.734 across conditions against 0.447-0.495 between two voices). A take that cannot teach still refuses with its reason: two voices in it, or speech shorter than the window.
+5.5 A track is made by the take it is made from, and nowhere else: the owner presses "That is me" while recording, the press keeps the seconds the gate itself was handed, and a name is asked straight after. Settings records nothing - a profile learned away from a take comes through another audio channel and scored its own owner at 0.34 against a 0.42 close, while the take's own channel separated him at 0.82 (2026-11-24). Two seconds of the take is the floor, and a take with no voice in it still refuses with its reason.
 6.1 Tests: a word on the gate's edge, zeroing that keeps the timeline, off that changes nothing.
 6.2 A new model is its own decision; the weights here are a file, and whoever runs it decides.
 6.3 Never: a cut word, a dropped byte, a shifted timeline, a silent refusal, a fourth profile.
@@ -38,7 +38,7 @@ Presumptive; the person running the app decides. Off is the default.
 7.1 The gate, pure: a scorer injected, one hop out, the byte count kept — the tests are the first half.
 7.2 The embedder and a profile store: MFCC as the floor, CAM++ as the shipped file — one ONNX, loaded lazily, dropped when the recording ends.
 7.3 The call site: one line after the recovery chunk, and the flush on finalize, nothing else.
-7.4 Settings: three slots, one switch each, one Forget per voice — a press on an empty slot asks whose voice it is, then records six seconds of the person pressing it, saying the printed line; the countdown, the row's "Learning…" and the window's red dot say it is running, and the capture is kept beside the profiles as the evidence the vector came from — never as a take, never in History, so a later sweep can tell whose voice landed in which slot.
+7.4 Settings: seven rows, one switch and one Remove each, and no recording of any kind - the press that used to learn here is gone, and an empty row says where a track comes from. The row that is catching a take lights for as long as it keeps catching it, and the pane names the tracks that matched, because nobody speaks from Settings.
 7.5 Smoke on real takes: the thresholds are measured there, and the tail is the number that sweep paid for.
 
 8. The desk as it stands (2026-11-25, 1.6.42)

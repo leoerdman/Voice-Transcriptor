@@ -53,6 +53,17 @@ BOOTSTRAP_WINDOWS = 3
 #: apart by it: the roles stay as they are rather than swapping mid-take.
 TIE_MARGIN = 0.06
 
+#: How close a window must sit to a learned track before the room is allowed
+#: to say anything about it. Without this floor the session owner was simply
+#: whoever dominated the room: measured on the desk 2026-11-25, a take of a
+#: voice that scored 0.21-0.25 against the owner's track was held OPEN for
+#: 27.7 of its 34.5 seconds, because the gate let the room pick its owner and
+#: then asked how close each window was to that pick. His own windows sit at
+#: 0.50-0.87 against the same track, so 0.45 is inside the gap and closer to
+#: the lower half of it: cutting his own words costs him a sentence, and
+#: passing a stranger's words costs him the feature.
+TRACK_FLOOR = 0.45
+
 #: The margin a window must reach to count as the owner's own voice. Measured
 #: on the desk 2026-11-24: the owner's windows never fell below +0.23 and the
 #: other speaker's never rose above −0.23, so zero sits in the middle of a
@@ -362,6 +373,16 @@ class DiarizedScorer:
         if vector is None:
             return None
         self._diarizer.observe(vector)
+        # Nobody in this room is a version of the owner: the gate has nothing to
+        # keep and everything is a stranger. The room's own scale cannot decide
+        # this - it would make whoever dominates the room the owner, which is how
+        # a being that scored 0.21 against the track stayed open for 27.7 of 34.5
+        # seconds (measured 2026-11-25). The absolute cosine to the tracks is the
+        # one measure that does not move with who else is talking.
+        best = self._best_profile_similarity(vector)
+        if best < TRACK_FLOOR:
+            self._last_margin = None
+            return best
         margin = self._diarizer.margin(vector)
         if margin is None:
             return self._best_profile_similarity(vector)
@@ -397,5 +418,6 @@ __all__ = [
     "DiarizedScorer",
     "MIN_WINDOWS",
     "SAME_VOICE_COSINE",
+    "TRACK_FLOOR",
     "SessionDiarizer",
 ]

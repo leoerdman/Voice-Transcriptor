@@ -4460,6 +4460,28 @@ canvas {
 .voice-overlap-row.is-redundant { color: inherit; }
 
 /* The track matching the window just judged, lit for as long as it keeps
-   matching. A version that never lights is a version doing nothing. */
-.voice-slot.is-firing { box-shadow: 0 0 0 2px var(--state-success-dot) inset; }
-.voice-slot.is-firing .voice-slot-meta { color: var(--state-success-dot); }
+   matching. A version that never lights is a version doing nothing.
+   It has to be unmistakable at a glance: the kept row already carries a green
+   edge, so a brighter edge alone read as "the colour does not change" (the
+   report that produced this rule). A filled row and a word do not. */
+.voice-slot.is-firing {
+  background: rgba(98, 199, 123, 0.18);
+  box-shadow:
+    0 0 0 2px var(--state-success-dot) inset,
+    0 0 16px rgba(98, 199, 123, 0.28);
+  transition: background 120ms linear, box-shadow 120ms linear;
+}
+
+.voice-slot.is-firing .voice-slot-name {
+  color: #e4f7ea;
+}
+
+.voice-slot.is-firing .voice-slot-meta {
+  color: var(--state-success-dot);
+}
+
+.voice-slot.is-firing .voice-slot-meta::after {
+  content: " · catching";
+  color: var(--state-success-dot);
+  letter-spacing: 0.04em;
+}

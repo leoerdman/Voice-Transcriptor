@@ -174,20 +174,13 @@ class EnrolLiveRouteTests(unittest.TestCase):
 
 
 class TheCardAndTheRouteAgreeTests(unittest.TestCase):
-    """Six seconds in the card, six seconds the route will take."""
+    """A press and the route that answers it agree on how much audio is enough."""
 
-    def test_the_span_the_card_offers_is_inside_what_the_route_accepts(self):
-        # The number in `voice-enrol-prompt.ts` and the ceiling here are two
-        # languages describing one press; this is the seam where they could
-        # drift, and it is a file read rather than a copy.
-        from pathlib import Path
-
-        source = Path(__file__).resolve().parents[2] / "frontend" / "src" / "voice-enrol-prompt.ts"
-        text = source.read_text(encoding="utf-8")
-        self.assertIn("export const ENROL_SECONDS = 20;", text)
-        self.assertEqual(app_main.ENROL_LIVE_SECONDS, 20)
-        self.assertLessEqual(app_main.ENROL_LIVE_SECONDS, app_main.ENROL_LIVE_MAX_SECONDS)
-
+    def test_the_floor_is_the_number_the_button_counts(self):
+        # The button counts to this number in the pane; the route refuses below
+        # it. Two languages for one press, and this is the seam where they can
+        # drift - a constant read, not a copy.
+        self.assertEqual(app_main.CLAIM_MIN_SECONDS, 2.0)
 
 class TheSpecAndTheCardAgreeTests(unittest.TestCase):
     """The document is what the reviewer reads first; it drifted twice.
@@ -206,23 +199,21 @@ class TheSpecAndTheCardAgreeTests(unittest.TestCase):
             Path(__file__).resolve().parents[2] / "docs" / "SOLO.md"
         ).read_text(encoding="utf-8")
 
-    def test_the_press_is_described_as_a_recording_of_six_seconds(self):
-        # §5.5 carries two acts now: the six-second press and a recording the
-        # owner points at. Both are acts; neither is inferred.
+    def test_the_press_is_the_take_and_settings_records_nothing(self):
+        # 5.5 used to describe a six-second press in the card. The card no
+        # longer records: a profile learned away from a take lives in another
+        # channel, and that is the failure 8 was written about.
         line = next(l for l in self.doc.splitlines() if l.startswith("5.5 "))
-        self.assertIn("six seconds recorded on the spot", line)
-        self.assertIn("From last recording", line)
-        self.assertNotIn("take becomes one", line)
+        self.assertIn("That is me", line)
+        self.assertIn("Two seconds", line)
+        self.assertNotIn("six seconds", line)
 
-    def test_the_settings_line_no_longer_learns_from_an_existing_take(self):
+    def test_the_settings_line_no_longer_records(self):
         line = next(l for l in self.doc.splitlines() if l.startswith("7.4 "))
-        self.assertIn("records six seconds", line)
-        self.assertNotIn("latest take", line)
-        # What the user sees while it runs is part of the promise, so it is
-        # part of the spec.
-        self.assertIn("countdown", line)
-        self.assertIn("Learning…", line)
-        self.assertIn("kept beside the profiles", line)
+        self.assertIn("no recording", line)
+        self.assertIn("Remove", line)
+        self.assertNotIn("six seconds", line)
+        self.assertNotIn("countdown", line)
 
     def test_the_numbers_in_the_spec_are_the_numbers_the_gate_runs(self):
         """§4.1 and §4.3 drifted from the code in opposite directions.
