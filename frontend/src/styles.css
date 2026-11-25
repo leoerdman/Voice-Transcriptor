@@ -2705,7 +2705,10 @@ textarea:focus-visible,
 .auto-keyterms-blocked .auto-keyterm-action {
   background: var(--surface-2);
   color: var(--text-3);
-/* ── Settings → Voice mask: three slots, one switch each (§5.1) ───────── */
+}
+
+/* Settings -> voice mask: the learned voices, one row each. */
+
 .voice-slots {
   display: flex;
   flex-direction: column;
@@ -4394,7 +4397,6 @@ canvas {
 }
 .recording-screens.has-expanded {
   flex-wrap: wrap;
-}
 }
 
 /* The passage a voice is learned from: readable at a glance, quoted because it
